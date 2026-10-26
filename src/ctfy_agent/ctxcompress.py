@@ -31,12 +31,15 @@ DEFAULT_TOOL_CHARS = 1600
 # 关键行：命中这些词的行在瘦身时保留（flag/凭据/会话/接口/错误）
 KEY_LINE_RE = re.compile(
     r"(?i)(flag\{|token|secret|passwd|password|session|set-cookie|authorization|"
-    r"admin|internal|restricted|/api/|/kb/|/portal|/docs|traceback|error|403|401|500)"
+    r"admin|internal|restricted|/api/|/kb/|/portal|/docs|traceback|error|403|401|500|"
+    # 表单结构：压掉了模型就得反复 grep 表单字段（m5j 实测白烧 6 步 ≈ 48k token）
+    r"<(?:input|textarea|select|option|button|form)|name=|type=.hidden|csrf)"
 )
 
 FLAG_RE = re.compile(r"FLAG\{[^}\s]{4,120}\}")
 PATH_RE = re.compile(r"/[A-Za-z0-9_\-]{2,}(?:/[A-Za-z0-9_\-.]+)+")
 HREF_RE = re.compile(r"""href=["'](/[^"']{2,80})["']""")
+FIELD_RE = re.compile(r"""name=["']([^"']{1,40})["']""")
 CRED_RE = re.compile(r"(?i)(?:authorization|set-cookie|x-api-key|bearer)\s*[:=]\s*[^\s\"'<>]{6,120}")
 TOOL_NAME_RE = re.compile(r"@@TOOL:\s*([A-Za-z_][\w]*)")
 TOOL_DEF_RE = re.compile(r"\b([a-z_]{3,32})\(([^)]{0,24})\)")
@@ -175,6 +178,19 @@ class FactsBoard:
                     self._add(f"href:{href}", f"列表里的详情页链接：{href}（直接用，别猜路径）")
                     if len([k for k in self._facts if k.startswith("href:")]) >= 2:
                         break
+
+        # 表单字段：直接抽 name="..." 去重后记成事实，模型就不必为抄字段名反复抓页面。
+        # m5j 实测：压缩把中段 <input name=...> 切掉后，模型连抓 6 次 /portal/new ≈ 48k token。
+        fields: list[str] = []
+        for field in FIELD_RE.findall(raw):
+            name = field.strip()
+            if name and name.lower() not in ("csrf", "csrf_token") and name not in fields:
+                fields.append(name)
+            if len(fields) >= 8:
+                break
+        if fields:
+            self._add("form:" + ",".join(fields),
+                      "表单字段：" + ", ".join(fields) + "（按这些字段名 POST，别反复抓表单页）")
 
         # 关键线索：只有在「敏感上下文」里出现的 ticket 编号才算线索。
         # 反面教训（m5g 实测）：把页面上任意 "ticket #6" 都当线索，模型以为自己的工单里
