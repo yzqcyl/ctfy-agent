@@ -24,6 +24,8 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository_owner }}/ctfy-agent
+  # push 触发时 inputs.tag 为空，用 || 兜底成 v1
+  TAG: ${{ github.event.inputs.tag || 'v1' }}
 
 jobs:
   build:
@@ -36,15 +38,15 @@ jobs:
       - name: Build image（普通 docker build，让镜像落在本地 daemon，供校验/导出用）
         run: |
           docker build \
-            -t "$IMAGE:${{ github.event.inputs.tag }}" \
+            -t "$IMAGE:$TAG" \
             -t "$IMAGE:latest" \
             .
 
       - name: 校验：B1 契约（体积 / 目录洁净度 / cwd 无关 / 五条路径全部 exit 0）
-        run: python3 tools/container_check.py --no-build --image "$IMAGE:${{ github.event.inputs.tag }}"
+        run: python3 tools/container_check.py --no-build --image "$IMAGE:$TAG"
 
       - name: 导出 tar 制品
-        run: docker save "$IMAGE:${{ github.event.inputs.tag }}" | gzip > ctfy-agent.tar.gz
+        run: docker save "$IMAGE:$TAG" | gzip > ctfy-agent.tar.gz
 
       - name: 上传制品（留档 / 下载）
         uses: actions/upload-artifact@v4
@@ -62,5 +64,5 @@ jobs:
 
       - name: 推送到 GHCR
         run: |
-          docker push "$IMAGE:${{ github.event.inputs.tag }}"
+          docker push "$IMAGE:$TAG"
           docker push "$IMAGE:latest"

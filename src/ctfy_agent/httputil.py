@@ -51,16 +51,28 @@ class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GuardedRedirect(urllib.request.HTTPRedirectHandler):
-    """每次跳转都重新校验目标，且禁止 https→http 降级。check 抛异常即拦截。"""
+    """每次跳转都重新校验目标，且禁止 https→http 降级。check 抛异常即拦截。
 
-    def __init__(self, check):
+    `capture`（可选）：跳转响应的头也会回调一次。很多站点把会话 cookie 种在
+    302 上（登录/注册成功 → Location: /portal/ + Set-Cookie），而 urllib 跟随跳转后
+    调用方只看到最终响应头——不在这里捞就会把会话丢掉，表现为「登录成功却一直
+    是未登录页」。tools_local 用它把 302 上的 Set-Cookie 存进自己的 jar。
+    """
+
+    def __init__(self, check, capture=None):
         super().__init__()
         self._check = check
+        self._capture = capture
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urlparse(req.full_url).scheme == "https" and urlparse(newurl).scheme == "http":
             raise urllib.error.URLError("拒绝从 https 降级到 http 的重定向")
         self._check(newurl)
+        if self._capture is not None and headers is not None:
+            try:
+                self._capture(req, headers)
+            except Exception:  # noqa: BLE001 - 捞 cookie 失败不该击穿请求
+                pass
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
