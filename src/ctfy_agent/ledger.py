@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -125,7 +126,7 @@ def normalize_args(tool: str, args: dict | None) -> dict:
         method = (_norm_scalar(args.get("method")) or "GET").upper()
         # grep/offset/limit 是「看哪一段」的投影：同投影重复读才算重复
         out = {"method": method, "url": normalize_url(args.get("url"))}
-        body = normalize_body(args.get("body") or args.get("data"))
+        body = normalize_body(args.get("body") or args.get("data") or args.get("body_b64"))
         if body:
             out["body"] = body
         for key in ("grep", "offset", "limit"):
@@ -135,6 +136,19 @@ def normalize_args(tool: str, args: dict | None) -> dict:
         # 落账后反手把后续普通读也误拦（审计 B2）。
         if args.get("diff") in (True, "true", "1", "yes", "on"):
             out["diff"] = True
+        # follow_redirect=false 返回 3xx+Location，与跟随后的响应完全不同，同样必须进键。
+        # 语义与 tools_local.as_bool 对齐：缺省 True，只有「非真值」才改变行为（NoRedirect）。
+        # 只写死 "false"/"0" 会漏掉 ""、"n" 等 as_bool 判 False 的值，导致与普通 GET 撞键误拦。
+        follow = args.get("follow_redirect")
+        if follow is not None:
+            if isinstance(follow, bool):
+                follows = follow
+            elif isinstance(follow, (int, float)):
+                follows = bool(follow)
+            else:
+                follows = str(follow).strip().lower() in ("1", "true", "yes", "y", "on")
+            if not follows:
+                out["follow_redirect"] = False
         return out
     if tool == "shell":
         return {"command": " ".join(_norm_scalar(args.get("command")).split())}
@@ -143,6 +157,17 @@ def normalize_args(tool: str, args: dict | None) -> dict:
         # objective 为主；task 是 A2 之前的旧字段，兼容保留（crew.py 已把 task 折进 objective）。
         objective = " ".join(_norm_scalar(args.get("objective") or args.get("task") or "").split())
         return {"role": _norm_scalar(args.get("role")), "objective": objective}
+    if tool == "jwt_forge":
+        # secret/token 绝不进明文：label 会经 ledger.digest() → 下一轮 task 流进别的角色上下文
+        # （拦截消息 solver.py:247 也打印 label）。只存 sha1 前 8 位：同 secret 仍能去重，明文不出账本。
+        return {
+            "alg": (_norm_scalar(args.get("alg")) or "HS256").upper(),
+            "secret_fp": hashlib.sha1(_norm_scalar(args.get("secret") or "").encode("utf-8")).hexdigest()[:8],
+            "token_fp": hashlib.sha1(_norm_scalar(args.get("token") or "").encode("utf-8")).hexdigest()[:8],
+            "claims": normalize_body(args.get("claims")),
+            "header": normalize_body(args.get("header")),
+            "remove": [str(x) for x in (args.get("remove") or [])] if isinstance(args.get("remove"), list) else [],
+        }
     return {key: normalize_body(value) if isinstance(value, (dict, list)) else _norm_scalar(value)
             for key, value in args.items() if key not in ("headers", "timeout", "verify")}
 
@@ -166,6 +191,13 @@ def attempt_label(tool: str, args: dict | None) -> str:
         return f"shell {norm.get('command', '')}"[:_MAX_LABEL]
     if tool == "delegate":
         return f"delegate {norm.get('role', '')} {norm.get('objective', '')}"[:_MAX_LABEL]
+    if tool == "jwt_forge":
+        parts = ["jwt", norm.get("alg", "HS256")]
+        if norm.get("secret_fp"):
+            parts.append(f"secret=#{norm['secret_fp']}")
+        if norm.get("token_fp"):
+            parts.append("rewrite")
+        return (" ".join(parts))[:_MAX_LABEL]
     return f"{tool} {json.dumps(norm, ensure_ascii=False, sort_keys=True)}"[:_MAX_LABEL]
 
 

@@ -33,6 +33,7 @@ from ctfy_agent.solver import _compact_history, _est_tokens, looks_accepted  # n
 from ctfy_agent.tools_local import LocalTools, ToolError  # noqa: E402
 from smoke_ai_chat import case_ai_chat  # noqa: E402
 from smoke_http_session import case_http_302_cookie  # noqa: E402
+from smoke_context import case_context_compress  # noqa: E402
 from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
@@ -693,7 +694,9 @@ def case_compact(tmp: Path) -> None:
     trimmed = _compact_history(msgs, 9000)
     assert trimmed[0] == head[0] and trimmed[1] == head[1]
     assert _est_tokens(trimmed) < full
-    assert len(trimmed) < len(msgs)
+    # M5 成本优化后：超软阈值先压缩旧步（条数不变、token 变少），超硬阈值才整块丢；
+    # 两种都算「压缩生效」，这里断言副作用确实发生。
+    assert len(trimmed) < len(msgs) or _est_tokens(trimmed) < _est_tokens(msgs)
 
     seen = {c["id"] for m in trimmed if m["role"] == "assistant" for c in (m.get("tool_calls") or [])}
     for m in trimmed:
@@ -2948,6 +2951,211 @@ def case_crew_step_limit(tmp: Path) -> None:
         server.server_close()
 
 
+def case_jwt_forge(tmp: Path) -> None:
+    """jwt_forge：none / HS256 / RS256+jwk / 改写+remove，且 secret 不进账本明文。"""
+    import base64 as b64  # noqa: PLC0415
+    import hashlib  # noqa: PLC0415
+    import hmac  # noqa: PLC0415
+
+    from ctfy_agent import tools_misc_ext as tme  # noqa: PLC0415
+    from ctfy_agent.ledger import attempt_key, attempt_label  # noqa: PLC0415
+
+    def u(raw: bytes) -> str:
+        return b64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    def ud(text: str) -> bytes:
+        return b64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+    store = Store(tmp / "jwt").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    local = LocalTools(store, "web-01")
+
+    # none：三段且签名段为空
+    out = json.loads(local.call("jwt_forge", {"alg": "none", "claims": {"sub": "admin"}}))
+    assert out["header"]["alg"] == "none" and out["token"].split(".")[2] == ""
+
+    # HS256 往返 + secret 不回显
+    out = json.loads(local.call("jwt_forge", {"alg": "HS256", "secret": "k3y", "claims": {"role": "admin"}}))
+    h, p, sig = out["token"].split(".")
+    assert sig == u(hmac.new(b"k3y", (h + "." + p).encode(), hashlib.sha256).digest())
+    assert "k3y" not in json.dumps(out) and out["secret_len"] == 3
+
+    # RS256：jwk 注入 + 用公钥验 PKCS#1 v1.5 结构
+    out = json.loads(local.call("jwt_forge", {"alg": "RS256", "claims": {"sub": "root"}}))
+    assert out["header"]["jwk"]["kty"] == "RSA" and out["header"]["jwk"]["alg"] == "RS256"
+    sig_int = int.from_bytes(ud(out["token"].split(".")[2]), "big")
+    k = (tme._RSA_N.bit_length() + 7) // 8
+    em = pow(sig_int, tme._RSA_E, tme._RSA_N).to_bytes(k, "big")
+    assert em[:2] == b"\x00\x01" and tme._SHA256_DI in em
+
+    # token 基底改写 + remove
+    base = json.loads(local.call("jwt_forge", {"alg": "HS256", "secret": "k", "claims": {"sub": "a", "exp": 1}}))
+    out = json.loads(local.call("jwt_forge", {"token": base["token"], "alg": "HS256", "secret": "k",
+                                              "claims": {"role": "admin"}, "remove": ["exp"]}))
+    assert out["claims"]["role"] == "admin" and out["claims"]["sub"] == "a" and "exp" not in out["claims"]
+
+    # 账本：secret/token 只留 sha1 前 8 位
+    key = attempt_key("jwt_forge", {"alg": "HS256", "secret": "S3cret!", "claims": {"sub": "x"}})
+    label = attempt_label("jwt_forge", {"alg": "HS256", "secret": "S3cret!", "claims": {"sub": "x"}})
+    assert "S3cret!" not in key and "S3cret!" not in label
+    ok("jwt_forge：none/HS256/RS256+jwk/改写+remove + secret 不进账本明文")
+
+
+def case_http_p0(tmp: Path) -> None:
+    """http_request P0：elapsed_ms / OPTIONS / follow_redirect=false / body_b64。"""
+    import base64 as b64  # noqa: PLC0415
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/landing")
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"hello")
+
+        def do_OPTIONS(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"options-ok")
+
+        def do_POST(self):  # noqa: N802
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(raw.hex().encode())  # 回显十六进制，断言确定
+
+        def log_message(self, *a):  # noqa: N802
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = Store(tmp / "p0").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        local = LocalTools(store, "web-01")
+        local.allow_instance("127.0.0.1", port)
+        base = f"http://127.0.0.1:{port}"
+
+        out = json.loads(local.http_request(base + "/"))
+        assert "elapsed_ms" in out and out["elapsed_ms"] >= 0, out
+
+        out = json.loads(local.http_request(base + "/opt", method="OPTIONS"))
+        assert out["status"] == 200 and "options-ok" in out["body"], out
+
+        # BUG-2 回归：先默认跟随（缓存 /redirect 的落地页 200），再 follow_redirect=false
+        # 必须绕过缓存看到原始 302，而不是吃到缓存的落地页。
+        followed = json.loads(local.http_request(base + "/redirect"))
+        assert followed["status"] == 200, followed
+        out = json.loads(local.http_request(base + "/redirect", follow_redirect=False))
+        assert out["status"] == 302 and out["headers"].get("Location") == "/landing", out
+
+        blob = b"\x00\xff\x10hello\x00"
+        out = json.loads(local.http_request(base + "/", method="POST", body_b64=b64.b64encode(blob).decode()))
+        assert blob.hex() in out["body"], out
+
+        try:
+            local.http_request(base + "/", method="POST", body="x", body_b64="eA==")
+        except ToolError:
+            pass
+        else:
+            raise AssertionError("body 与 body_b64 互斥未拦截")
+        ok("http P0：elapsed_ms / OPTIONS / follow_redirect=false(302+Location) / body_b64 + 互斥拦截")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def case_http_burst(tmp: Path) -> None:
+    """http_burst：race 竞态分组 + batch 枚举（url/body 的 {v} 替换）+ count 钳制。"""
+    hits: list[int] = []
+    lock = threading.Lock()
+    state = [0]   # 有状态计数：GET /state 读、POST /bump 加一（测 burst 后缓存是否失效）
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path == "/race":
+                with lock:
+                    hits.append(1)
+                    n = len(hits)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"TARGET_REACHED" if n == 1 else b"MISS")
+            elif self.path.startswith("/enum/"):
+                v = self.path.split("/", 2)[2]
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(f"user={v}".encode())
+            elif self.path == "/state":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(str(state[0]).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):  # noqa: N802
+            if self.path == "/bump":
+                state[0] += 1
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n).decode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(f"echo={raw}".encode())
+
+        def log_message(self, *a):  # noqa: N802
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = Store(tmp / "burst").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        local = LocalTools(store, "web-01")
+        local.allow_instance("127.0.0.1", port)
+        base = f"http://127.0.0.1:{port}"
+
+        out = json.loads(local.http_burst(url=base + "/race", method="GET", count=8))
+        assert out["mode"] == "race" and out["requested"] == 8 and out["ok"] == 8, out
+        assert out["distinct_bodies"] == 2 and out["groups"][0]["count"] == 7, out
+        assert "ms" in out and out["ms"]["max"] >= out["ms"]["min"] >= 0, out
+
+        out = json.loads(local.http_burst(url=base + "/enum/{v}", method="GET", values=["alice", "bob", "carol"]))
+        assert out["mode"] == "batch" and out["distinct_bodies"] == 3, out
+        assert sorted(g["v"][0] for g in out["groups"]) == ["alice", "bob", "carol"], out
+
+        out = json.loads(local.http_burst(url=base + "/submit", method="POST", body='{"id":"{v}"}', values=["1", "2"]))
+        bodies = sorted(g["head"] for g in out["groups"])
+        assert bodies == ['echo={"id":"1"}', 'echo={"id":"2"}'], bodies
+
+        out = json.loads(local.http_burst(url=base + "/race", method="GET", count=99))
+        assert out["requested"] == 24, out
+
+        # BUG-1 回归：burst 的非 GET 必须失效同 host 缓存，否则后续 GET 读到 burst 之前的旧值
+        first = json.loads(local.http_request(base + "/state"))
+        assert first["body"] == "0", first
+        json.loads(local.http_burst(url=base + "/bump", method="POST", count=2))
+        after = json.loads(local.http_request(base + "/state"))
+        assert after["body"] == "2", after
+
+        ok("http_burst：race 竞态分组 + batch URL/body 替换 + count 钳制 + 缓存失效")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def main() -> int:
     tmp = Path(os.environ.get("TEMP", ".")) / "ctfy_agent_smoke"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -3011,12 +3219,16 @@ def main() -> int:
         ("agent_cli_entry", case_agent_cli_entry),
         ("agent_mcp_url", case_agent_mcp_url),
         ("crew_step_limit", case_crew_step_limit),
+        ("jwt_forge", case_jwt_forge),
+        ("http_p0", case_http_p0),
+        ("http_burst", case_http_burst),
         ("ai_chat", case_ai_chat),
         ("ai_contract", case_ai_contract),
         ("ai_wiring", case_ai_wiring),
         ("ai_fixtures", case_ai_fixtures),
         ("ai_agent_e2e", case_ai_agent_e2e),
         ("http_302_cookie", case_http_302_cookie),
+        ("context_compress", case_context_compress),
         ("misc_ext", case_misc_ext),
     ]
     for name, case in cases:

@@ -15,20 +15,25 @@ shell 默认关闭（config: allow_shell=false）。开启后：
 
 from __future__ import annotations
 
+import base64
 import difflib
 import inspect
 import json
+import http.client
 from http.cookies import SimpleCookie
 import os
 import re
+import ssl
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
-from .httputil import GuardedRedirect, build_opener, read_limited
+from .httputil import GuardedRedirect, NoRedirect, build_opener, read_limited
 from .tools_misc_ext import MISC_EXT_SPECS, call_ext as _call_ext
 
 MAX_BODY = 8000
@@ -47,6 +52,8 @@ CHAT_MAX_REPLY = 2500             # chat 单次回复上限：一句回复 + 元
 CHAT_MAX_HISTORY = 6              # history 参数最多回几条（回太多等于把整段对话塞回上下文）
 CHAT_MAX_TURNS = 40               # 单个会话最多保留的消息条数（防无界增长）
 CHAT_TIMEOUT = 20                 # 与 http_request 同量级；流式接口必须限时，否则挂死整步
+# 值得回给模型的响应头白名单（成功与 3xx/4xx/5xx 两条路径共用；401 的 WWW-Authenticate、302 的 Location 都要见得到）
+_INTERESTING_HEADERS = ("content-type", "location", "set-cookie", "server", "www-authenticate")
 
 
 def as_bool(value) -> bool:
@@ -68,8 +75,8 @@ HTTP_SPEC = {
         "name": "http_request",
         "description": (
             "向题目实例发一个 HTTP 请求（只允许访问平台下发的实例地址，重定向也会被拦截校验）。"
-            "返回状态码、响应头与一个正文窗口（默认前 5000 字符；窗口后还有内容时带 "
-            "truncated/next_offset，可继续翻页）。大文件（打包 JS/HTML）务必用 grep 搜关键词，"
+            "返回状态码、响应头（含 elapsed_ms 请求耗时，毫秒）与一个正文窗口（默认前 5000 字符；"
+            "窗口后还有内容时带 truncated/next_offset，可继续翻页）。大文件（打包 JS/HTML）务必用 grep 搜关键词，"
             "或带 offset 分段读，别整段读进上下文——那会很快耗尽 token。不要用 Range 头逐段"
             "硬翻（会被自动当作 offset 处理）。枚举类题目（IDOR/改 id 看回显）用 diff=true："
             "只回与同路径上一次响应的差异行。"
@@ -78,8 +85,9 @@ HTTP_SPEC = {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "完整 URL，例如 http://10.0.0.9:31001/login"},
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"], "default": "GET"},
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], "default": "GET"},
                 "body": {"type": "string", "description": "请求体（表单或 JSON 字符串）"},
+                "body_b64": {"type": "string", "description": "base64 编码的二进制请求体（反序列化/上传等；与 body 互斥）"},
                 "headers": {"type": "object", "description": "附加请求头，例如 {\"Content-Type\": \"application/json\"}"},
                 "grep": {
                     "type": "string",
@@ -105,6 +113,48 @@ HTTP_SPEC = {
                         "没有基线（该路径本轮第一次请求）时退回普通窗口输出并标注 baseline_had=false。"
                     ),
                 },
+                "follow_redirect": {
+                    "type": "boolean",
+                    "description": (
+                        "默认 true 跟随重定向。false 时不跟随，直接返回 3xx 状态码与 Location 头"
+                        "（打开重定向、登录跳转链、SSRF 链要看到原始 302 时用）。"
+                    ),
+                },
+            },
+            "required": ["url"],
+        },
+    },
+}
+
+# http_burst 的并发护栏：一次调用顶多 24 个请求，单请求 socket 超时 20s，总墙钟 45s。
+# 读满 2048 字节做「响应分组」的指纹（竞态/枚举关心的通常是错误提示 vs 成功页的前几行）。
+MAX_BURST = 24
+BURST_TIMEOUT = 20
+BURST_TOTAL_TIMEOUT = 45
+BURST_READ_BYTES = 2048
+MAX_BURST_GROUPS = 12             # 分组详情最多展开这么多组，其余折叠（防 JSON 被 solver 截半）
+
+BURST_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "http_burst",
+        "description": (
+            "并发/批量发多个 HTTP 请求（竞态 or 枚举）。values 为空时同一请求并发 count 次"
+            "（竞态条件、一次性状态、验证码限流等）；values 非空时每个值一个请求，{v} 原样替换"
+            "url 与 body（批量枚举 IDOR/参数，需要 URL 编码请在 values 里先编好）。"
+            "按响应正文分组返回：status 直方图、每组代表正文前 200 字符与成员序号、每请求耗时 ms。"
+            "一次调用顶多 24 个请求；同参重跑会被账本判重，想合法重试就改 nonce。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "完整 URL；批量模式可用 {v} 占位"},
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "POST"},
+                "body": {"type": "string", "description": "请求体；批量模式可用 {v} 占位"},
+                "headers": {"type": "object", "description": "附加请求头"},
+                "count": {"type": "integer", "description": "竞态模式并发数（2..24，默认 8）；与 values 互斥"},
+                "values": {"type": "array", "items": {"type": "string"}, "description": "批量模式的值列表（最多 24）；与 count 互斥"},
+                "nonce": {"type": "string", "description": "去重键：同一批想重跑就换这个值"},
             },
             "required": ["url"],
         },
@@ -334,7 +384,7 @@ class LocalTools:
     # ---------- 规格 ----------
 
     def specs(self) -> list[dict]:
-        specs = [HTTP_SPEC, NOTE_SPEC]
+        specs = [HTTP_SPEC, NOTE_SPEC, BURST_SPEC]
         if self.allow_chat:
             specs.append(CHAT_SPEC)
         if self.allow_shell:
@@ -417,6 +467,14 @@ class LocalTools:
 
     def hexpeek(self, path: str, offset: int = 0, length: int = 256) -> str:
         return _call_ext("hexpeek", {"path": self._resolve_path(path), "offset": offset, "length": length})
+
+    def jwt_forge(self, alg: str = "HS256", secret: str = "", token: str = "",
+                  claims: dict | None = None, header: dict | None = None,
+                  remove: list[str] | None = None) -> str:
+        return _call_ext("jwt_forge", {
+            "alg": alg, "secret": secret, "token": token,
+            "claims": claims, "header": header, "remove": remove,
+        })
 
     @staticmethod
     def _parse_range(value: str, current: int) -> int:
@@ -505,12 +563,21 @@ class LocalTools:
         jar = self._jar.get(netloc)
         return "; ".join(f"{k}={v}" for k, v in jar.items()) if jar else None
 
-    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False) -> str:
+    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False, follow_redirect: bool = True, body_b64: str = "") -> str:
         self._check_target(url)
         netloc = urlparse(url).netloc
         method = (method or "GET").upper()
         diff = as_bool(diff)
-        data = body.encode("utf-8") if body else None
+        follow = as_bool(follow_redirect)
+        if body and body_b64:
+            raise ToolError("body 与 body_b64 互斥，只填一个")
+        if body_b64:
+            try:
+                data = base64.b64decode(body_b64, validate=True)
+            except Exception as exc:
+                raise ToolError(f"body_b64 不是合法 base64：{exc}") from None
+        else:
+            data = body.encode("utf-8") if body else None
 
         # 拦截模型常写的 Range 头：不转发给服务器（越界会 416、且分片再被截断就成盲区），
         # 本地解析成 offset。这样服务器永远回 200，416 从根上消失。
@@ -549,8 +616,9 @@ class LocalTools:
             effective_cookie = next((v for k, v in forwarded.items() if str(k).lower() == "cookie"), "") or ""
             cache_key = (netloc, path_q, effective_cookie)
             hit = self.cache.get(cache_key)
-            # diff 要「这次真实响应」当右侧：跳过缓存读（cache_key 仍留着事后落盘）
-            if hit is not None and not diff:
+            # diff 要「这次真实响应」当右侧：跳过缓存读（cache_key 仍留着事后落盘）。
+            # follow_redirect=false 同理：要看到原始 3xx+Location，不能拿缓存的落地页顶替。
+            if hit is not None and not diff and follow:
                 if not grep and not offset:
                     # 完全重复读：返回桩而不是再次塞全文进上下文（省 token 的真正来源）
                     return self._render_cache_stub(hit)
@@ -567,18 +635,22 @@ class LocalTools:
 
         # 恒读满 2MB：小响应读到 EOF 即止（无额外成本），大响应保留中/尾供 offset 切片。
         # capture：跳转响应上的 Set-Cookie 也要入 jar（登录/注册常 302 种会话）。
-        opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect, decorate=self._decorate_redirect))
+        if follow:
+            opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect, decorate=self._decorate_redirect))
+        else:
+            opener = build_opener(NoRedirect())
         status = 0
         interesting: dict = {}
         content_length = None
         payload = ""
+        t0 = time.perf_counter()
         try:
             with opener.open(request, timeout=20) as response:
                 payload = read_limited(response, MAX_GREP_BYTES).decode("utf-8", "replace")
                 status = response.status
                 interesting = {
                     key: value for key, value in response.headers.items()
-                    if key.lower() in ("content-type", "location", "set-cookie", "server", "www-authenticate")
+                    if key.lower() in _INTERESTING_HEADERS
                 }
                 self._capture_cookies(netloc, response.headers.items())
                 content_length = response.headers.get("Content-Length")
@@ -589,6 +661,10 @@ class LocalTools:
             except Exception:
                 payload = ""
             if exc.headers:
+                interesting = {
+                    key: value for key, value in exc.headers.items()
+                    if key.lower() in _INTERESTING_HEADERS
+                }
                 self._capture_cookies(netloc, exc.headers.items())
                 content_length = exc.headers.get("Content-Length")
         except urllib.error.URLError as exc:
@@ -598,6 +674,7 @@ class LocalTools:
             # 不走 URLError），统一转成 ToolError 回给模型，别让整轮崩掉。
             raise ToolError(f"请求失败 {url}: {exc}") from None
         # ToolError 从 GuardedRedirect 的 _check_target 抛出来，原样上抛
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
         # 基线必须在上面的 _cache_put 之前取：否则刚抓到的这一份会变成「最近一条」，自己和自己比。
         baseline = self._diff_baseline(netloc, urlparse(url).path) if diff else None
@@ -614,8 +691,8 @@ class LocalTools:
                 },
             )
         if diff:
-            return self._render_diff(status, interesting, payload, baseline, grep, offset, content_length, limit)
-        return self._render_http(status, interesting, payload, grep, offset, content_length, limit)
+            return self._render_diff(status, interesting, payload, baseline, grep, offset, content_length, limit, elapsed_ms)
+        return self._render_http(status, interesting, payload, grep, offset, content_length, limit, elapsed_ms)
 
     def _diff_baseline(self, netloc: str, path: str) -> str | None:
         """diff 的基线：缓存里同 host + 同 path（忽略 query）的**最近一条**响应的正文。
@@ -635,10 +712,11 @@ class LocalTools:
 
     @staticmethod
     def _render_diff(status: int, headers: dict, payload: str, baseline: str | None,
-                     grep: str, offset: int, content_length: str | None, limit: int) -> str:
+                     grep: str, offset: int, content_length: str | None, limit: int,
+                     elapsed_ms: float | None = None) -> str:
         """diff=true 的输出：有基线只回行级差异；没基线退回普通窗口（不假装比过）。"""
         if baseline is None:
-            out = json.loads(LocalTools._render_http(status, headers, payload, grep, offset, content_length, limit))
+            out = json.loads(LocalTools._render_http(status, headers, payload, grep, offset, content_length, limit, elapsed_ms))
             out["baseline_had"] = False
             out["added_lines"] = 0
             out["removed_lines"] = 0
@@ -684,6 +762,8 @@ class LocalTools:
             "baseline_had": True,
             "truncated": truncated,
         }
+        if elapsed_ms is not None:
+            out["elapsed_ms"] = elapsed_ms
         if content_length is not None:
             out["total_bytes"] = int(content_length)
         if not shown:
@@ -691,7 +771,7 @@ class LocalTools:
         return json.dumps(out, ensure_ascii=False)
 
     @staticmethod
-    def _render_http(status: int, headers: dict, payload: str, grep: str, offset: int = 0, content_length: str | None = None, limit: int = 0) -> str:
+    def _render_http(status: int, headers: dict, payload: str, grep: str, offset: int = 0, content_length: str | None = None, limit: int = 0, elapsed_ms: float | None = None) -> str:
         offset = max(0, int(offset or 0))
         wsize = HTTP_WINDOW
         if limit:
@@ -724,6 +804,8 @@ class LocalTools:
                 "truncated": truncated,
                 "body": "\n".join(shown),
             }
+            if elapsed_ms is not None:
+                out["elapsed_ms"] = elapsed_ms
             if content_length is not None:
                 out["total_bytes"] = int(content_length)
             elif capped:
@@ -733,6 +815,8 @@ class LocalTools:
         window = payload[offset : offset + wsize]
         # 元数据放在 body 之前：即使结果被 solver 截断，翻页锚点也不会丢
         out = {"status": status, "headers": headers}
+        if elapsed_ms is not None:
+            out["elapsed_ms"] = elapsed_ms
         if offset > 0:
             out["offset"] = offset
         more = offset + wsize < total
@@ -748,6 +832,177 @@ class LocalTools:
             out["past_end"] = True
         out["body"] = window
         return json.dumps(out, ensure_ascii=False)
+
+    # ---------- 并发/批量请求（竞态 & 枚举） ----------
+
+    def http_burst(self, url: str, method: str = "POST", body: str = "", headers: dict | None = None,
+                   count: int = 8, values: list[str] | None = None, nonce: str = "") -> str:
+        """并发/批量发多个请求（纯 stdlib 线程，无三方库）。
+
+        - values 为空：竞态模式，同一请求并发 count 次；
+        - values 非空：批量模式，每个值一个请求，{v} 原样替换 url 与 body。
+
+        线程先各自 connect() 再一起过 Barrier 释放，尽量让请求「同时」打在服务端，
+        以触发竞态窗口；有一路建连失败就 abort 屏障、整轮作废并明说（避免 BrokenBarrier
+        掩掉真实错误）。cookie 在主线程先快照、join 后再统一收 Set-Cookie，规避并发写丢键。
+        """
+        self._check_target(url)
+        netloc = urlparse(url).netloc
+        method = (method or "POST").upper()
+        if method == "HEAD":
+            raise ToolError("http_burst 不支持 HEAD（无响应体，分组无意义）")
+        if method != "GET":
+            # 与 http_request 对齐：非 GET 会改服务端状态，清同 host 旧缓存防脏读
+            self._invalidate_host(netloc)
+
+        if values is not None and not isinstance(values, list):
+            raise ToolError("values 必须是数组（list），例如 [\"alice\", \"bob\"]")
+        vals = [str(v) for v in (values or [])]
+        if vals:
+            if len(vals) > MAX_BURST:
+                raise ToolError(f"values 最多 {MAX_BURST} 个，收到 {len(vals)}")
+            targets = []
+            for v in vals:
+                u = url.replace("{v}", v)
+                b = body.replace("{v}", v)
+                self._check_target(u)   # 每个替换后的 URL 也要过白名单
+                targets.append((u, b))
+            mode = "batch"
+        else:
+            try:
+                n = max(2, min(int(count or MAX_BURST), MAX_BURST))
+            except (TypeError, ValueError):
+                raise ToolError(f"count 必须是 2..{MAX_BURST} 的整数，收到 {count!r}") from None
+            targets = [(url, body)] * n
+            mode = "race"
+
+        # cookie 在主线程先快照：并发写 jar 会丢键（后写覆盖先写）。
+        # 自动 cookie 只发给「与模板同 netloc」的目标：batch 的 {v} 若落在主机部分，
+        # 替换后的另一白名单 host 不该收到本 host 的会话 Cookie（防跨主机泄漏）。
+        hdrs = {str(k): str(v) for k, v in (headers or {}).items()}
+        auto_cookie = self._cookie_header(netloc)
+        if auto_cookie and any(k.lower() == "cookie" for k in hdrs):
+            auto_cookie = None   # 模型显式传了 Cookie，尊重它，别叠加 jar
+        if not any(k.lower() == "accept-encoding" for k in hdrs):
+            hdrs["Accept-Encoding"] = "identity"
+        if not any(k.lower() == "user-agent" for k in hdrs):
+            hdrs["User-Agent"] = "ctfy-agent/0.2"
+
+        results: list[dict | None] = [None] * len(targets)
+        barrier = threading.Barrier(len(targets))
+
+        def worker(i: int, u: str, b: str) -> None:
+            conn = None
+            try:
+                parsed = urlparse(u)
+                if parsed.scheme == "https":
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=BURST_TIMEOUT, context=ctx)
+                else:
+                    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=BURST_TIMEOUT)
+                conn.connect()
+            except Exception as exc:  # noqa: BLE001
+                results[i] = {"i": i, "error": f"建连失败 {type(exc).__name__}: {exc}"}
+                try:
+                    barrier.abort()   # 有同伴没连上，让其余线程也别傻等屏障
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            try:
+                barrier.wait(timeout=BURST_TIMEOUT)
+            except threading.BrokenBarrierError:
+                results[i] = {"i": i, "error": "本轮作废：有同伴建连失败（重试或调低 count）"}
+                conn.close()
+                return
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            req_hdrs = dict(hdrs)
+            if auto_cookie and parsed.netloc == netloc:
+                req_hdrs["Cookie"] = auto_cookie
+            t0 = time.perf_counter()
+            try:
+                conn.request(method, path, body=b.encode("utf-8") if b else None, headers=req_hdrs)
+                resp = conn.getresponse()
+                raw = resp.read(BURST_READ_BYTES)
+                results[i] = {
+                    "i": i,
+                    "status": resp.status,
+                    "ms": round((time.perf_counter() - t0) * 1000, 1),
+                    "body": raw.decode("utf-8", "replace"),
+                    "set_cookie": resp.headers.get_all("Set-Cookie") or [],
+                }
+            except Exception as exc:  # noqa: BLE001
+                results[i] = {"i": i, "error": f"{type(exc).__name__}: {exc}"}
+            finally:
+                conn.close()
+
+        threads = [(i, threading.Thread(target=worker, args=(i, u, b), daemon=True)) for i, (u, b) in enumerate(targets)]
+        for _i, t in threads:
+            t.start()
+        deadline = time.time() + BURST_TOTAL_TIMEOUT
+        for _i, t in threads:
+            t.join(max(0.1, deadline - time.time()))
+        for idx in range(len(results)):
+            if results[idx] is None:
+                results[idx] = {"i": idx, "error": "未在时限内返回"}
+        for r in results:
+            for sc in (r or {}).get("set_cookie") or []:
+                self._capture_cookies(netloc, [("Set-Cookie", sc)])
+
+        # 按响应正文分组（正文即指纹：错误提示 vs 成功页的分界通常在前几行）
+        ok = failed = 0
+        status_counter: dict[int, int] = {}
+        times: list[float] = []
+        groups: dict[str, dict] = {}
+        for r in results:
+            r = r or {}
+            if "error" in r:
+                failed += 1
+                continue
+            ok += 1
+            status_counter[r["status"]] = status_counter.get(r["status"], 0) + 1
+            times.append(r["ms"])
+            g = groups.setdefault(r["body"], {"count": 0, "i": [], "status": r["status"], "head": r["body"][:120]})
+            g["count"] += 1
+            g["i"].append(r["i"])
+
+        groups_sorted = sorted(groups.values(), key=lambda g: -g["count"])
+        shown = groups_sorted[:MAX_BURST_GROUPS]
+        if len(groups_sorted) > MAX_BURST_GROUPS:
+            # 折叠长尾：只展开头部分组，其余按 status 计数并汇总成员，避免 JSON 被 solver 截半
+            tail = groups_sorted[MAX_BURST_GROUPS:]
+            collapsed_status: dict = {}
+            collapsed_i: list[int] = []
+            for g in tail:
+                collapsed_status[g["status"]] = collapsed_status.get(g["status"], 0) + g["count"]
+                collapsed_i.extend(g["i"])
+            shown.append({
+                "count": sum(g["count"] for g in tail),
+                "status": collapsed_status,
+                "i": collapsed_i,
+                "head": "",
+                "collapsed": len(tail),
+            })
+        summary: dict = {
+            "mode": mode,
+            "requested": len(targets),
+            "ok": ok,
+            "failed": failed,
+            "status": status_counter,
+            "distinct_bodies": len(groups),
+            "groups": shown,
+        }
+        if times:
+            summary["ms"] = {"min": min(times), "max": max(times), "spread": round(max(times) - min(times), 1)}
+        if mode == "batch":
+            for g in shown:
+                g["v"] = [vals[j] for j in g["i"]]
+        if failed:
+            summary["errors"] = [r for r in results if r and "error" in r]
+        return json.dumps(summary, ensure_ascii=False)
 
     # ---------- 对话工具（AI 安全题型：靶子是「会聊天的服务」） ----------
 

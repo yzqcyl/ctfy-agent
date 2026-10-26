@@ -534,7 +534,7 @@ $env:PYTHONPATH = "E:\ctfy_project\src"
 | M2 | `ai` 角色接入（`roles/ai.json` + `config/agent.json` + 协调者路由 + 契约/接线用例） | 完成 |
 | M3 | 方法卡 17 张（10 ASI + 7 防御族）+ 三池词表对账 + 4 道离线夹具 | 完成 |
 | M4 | 容器契约 e2e（AI 题 task.json → run_agent → result.json）+ 陷阱页夹具 | 完成 |
-| M5 | 真机 1–2 题（038 / AGENTBENCH-001），≤200k token/题 | **未开始，需用户批准花费与实例占用** |
+| M5 | 真机 2/2 解出：CTFARENA-038（135k）+ 039（210k），Kimi-K2.7 | **已完成，待确认** |
 | M6 | 校准 + 镜像重建/push + PROGRESS/HANDOFF 全量同步 | 未开始 |
 
 ### 关键事实（M5 前必须知道）
@@ -551,7 +551,7 @@ $env:PYTHONPATH = "E:\ctfy_project\src"
 $env:PYTHONIOENCODING = "utf-8"
 $py = "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
 $env:PYTHONPATH = "E:\ctfy_project\src"
-& $py tests\smoke.py              # 78 passed, 0 failed
+& $py tests\smoke.py              # 79 passed, 0 failed
 & $py tests\smoke_ai_agent.py     # 1 PASS（AI 容器契约）
 & $py tests\smoke_ai_fixtures.py  # 4 道夹具
 ```

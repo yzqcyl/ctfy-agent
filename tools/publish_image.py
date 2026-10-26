@@ -127,11 +127,12 @@ def push(tok: str, owner: str) -> None:
     print("[推送] 完成")
 
 
-def dispatch(tok: str, owner: str) -> int:
+def dispatch(tok: str, owner: str, tag: str = "v1") -> int:
     branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
-    print(f"[触发] workflow {WORKFLOW_FILE} @ {branch}")
+    print(f"[触发] workflow {WORKFLOW_FILE} @ {branch} tag={tag}")
+    # 必须显式带 inputs.tag：workflow 的默认值是 v1，漏传就会移动已提交的 v1 tag（tag_moved 判负）
     api("POST", f"/repos/{owner}/{REPO_NAME}/actions/workflows/{WORKFLOW_FILE}/dispatches",
-        {"ref": branch}, token_value=tok, expect=(204,))
+        {"ref": branch, "inputs": {"tag": tag}}, token_value=tok, expect=(204,))
     # 拿刚触发的那次 run
     for _ in range(10):
         time.sleep(3)
@@ -184,6 +185,7 @@ def main(argv=None) -> int:
     parser.add_argument("--status", action="store_true", help="只看最近一次构建")
     parser.add_argument("--visibility", action="store_true", help="只改 ghcr 包可见性")
     parser.add_argument("--skip-watch", action="store_true", help="触发后不等待")
+    parser.add_argument("--tag", default="v1", help="镜像 tag（发新版本用 v2；覆盖 v1 会让平台标记 tag_moved）")
     args = parser.parse_args(argv)
 
     tok = token()
@@ -202,16 +204,20 @@ def main(argv=None) -> int:
 
     user = whoami(tok)
     owner = str(user["login"])
+    tag = (args.tag or "v1").strip()
+    if tag == "v1":
+        print("[警告] tag=v1 会移动已冻结并提交审核的 digest（平台会判 tag_moved）。"
+              "发新版本请用 --tag v2。")
     ensure_repo(tok, owner)
     push(tok, owner)
-    run_id = dispatch(tok, owner)
+    run_id = dispatch(tok, owner, tag)
     if not args.skip_watch:
         run = watch(tok, owner, run_id)
         if run.get("conclusion") != "success":
             print("\n构建没成功，先看上面失败的是哪一步。")
             return 1
         set_visibility(tok)
-        print(f"\n镜像地址：ghcr.io/{owner}/{PACKAGE_NAME}:v1")
+        print(f"\n镜像地址：ghcr.io/{owner}/{PACKAGE_NAME}:{tag}")
     return 0
 
 

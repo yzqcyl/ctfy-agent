@@ -33,6 +33,7 @@ from .platform import CtfyPlatform
 from .solver import Solver, _compact_history, _untrusted, MAX_TOOL_TEXT
 from .state import Store
 from .tools_local import (
+    BURST_SPEC,
     CHAT_SPEC,
     HTTP_SPEC,
     NOTE_SPEC,
@@ -157,6 +158,8 @@ COORDINATOR_PROMPT = """你是 CTF 解题**协调者**。你不亲自探测，�
    重复侦察会把预算吃光。一次就把整条链交给 ai（读文档摸工具面 → 注册/登录 →
    提交带注入的业务输入 → 取回显并摘出目标值），done_when 直接写「拿到 flag 或目标值原文」。
    只有上一轮明确卡在某个具体环节（如某个端点 401）才拆成单步派活。
+   载体是表单/工单的题：派活时直接要求「第一张工单就写注入载荷，别做 benign 测试」，
+   并提醒内部工具参数先试低编号（系统预置的 #1/#2），模型容易误对自己的新工单调用。
 - 专家回来会交一份结论；对照 done_when 判断是否达成，再决定继续派活、换方向、submit 或 done。
 - flag 只能通过 submit 提交；一旦平台确认通过就调用 done 收尾。
 - 不要臆造事实，不要重复派相同的活，不要连发 submit。
@@ -279,6 +282,8 @@ class Crew:
         specs.append(NOTE_SPEC)
         if "http_request" in local:
             specs.append(HTTP_SPEC)
+        if "http_burst" in local:
+            specs.append(BURST_SPEC)
         if "chat" in local:
             specs.append(CHAT_SPEC)
         if "shell" in local:

@@ -179,7 +179,7 @@ def case_ai_contract(tmp: Path) -> None:
         covered = set().union(*(set(keys) for keys, _ in AI_CARDS))
         missing = AI_TAGS - covered - {"agentic_ai"}
         assert not missing, f"这些 AI tag 没有卡片覆盖（新增陷阱时必须补卡）：{sorted(missing)}"
-        assert len(AI_CARDS) == 17, f"AI 卡应为 10 张 ASI + 7 张防御族，实有 {len(AI_CARDS)}"
+        assert len(AI_CARDS) == 18, f"AI 卡应为 10 张 ASI + 1 张载荷清单 + 7 张防御族，实有 {len(AI_CARDS)}"
 
         all_keys = covered | set().union(*(set(keys) for keys, _ in CARDS)) | set(IGNORED_TAGS)
         exempt = {"agentic_ai"}  # 族标签：全族共有的粗粒度标签，无专属打法

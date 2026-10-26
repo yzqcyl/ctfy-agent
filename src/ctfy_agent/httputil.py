@@ -90,3 +90,14 @@ class GuardedRedirect(urllib.request.HTTPRedirectHandler):
 def build_opener(handler: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
     """用自定义重定向处理器建 opener（build_opener 不会重复装默认重定向处理器）。"""
     return urllib.request.build_opener(handler)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随任何重定向：3xx 会作为 HTTPError 抛给调用方（code=3xx，headers 含 Location）。
+
+    用于打开重定向、登录跳转链、SSRF 链等需要「看到原始 302 而不是最终页面」的场景。
+    urllib 约定：redirect_request 返回 None 即不处理该重定向，最终按 HTTPError 上抛。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
