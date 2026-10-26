@@ -1,8 +1,12 @@
 # 构建 + 校验 + 推送 agent 镜像到 ghcr.io（全程云端，不碰本地虚拟网卡）
 #
+# ⚠️ 只有手动触发（workflow_dispatch）。自动构建已刻意关掉：
+#    审核按 **digest** 钉死，tag 一移动，运营方批准的和实际跑的就不是同一份字节。
+#    要发新版本时手动 Run workflow，并把 tag 换成新号（如 v2），不要覆盖已提交的 v1。
+#
 # 触发：仓库 Actions → 选本 workflow → Run workflow（手动）
 # 产物：
-#   - ghcr.io/yzqcyl/ctfy-agent:v1 和 :latest（推送到 GHCR）
+#   - ghcr.io/<owner>/ctfy-agent-pub:v1（正式提交用这个，匿名可拉取）
 #   - 一个 ctfy-agent.tar.gz 制品（可在 Actions 运行页下载留档）
 # 前提：仓库是私有/公有均可；推 GHCR 用自带的 GITHUB_TOKEN，无需额外 secret。
 name: build-agent-image
@@ -14,8 +18,6 @@ on:
         description: "镜像 tag（不带 ghcr.io 前缀）"
         required: false
         default: "v1"
-  push:
-    branches: [master]
 
 permissions:
   contents: read
