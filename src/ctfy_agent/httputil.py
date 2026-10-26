@@ -57,12 +57,17 @@ class GuardedRedirect(urllib.request.HTTPRedirectHandler):
     302 上（登录/注册成功 → Location: /portal/ + Set-Cookie），而 urllib 跟随跳转后
     调用方只看到最终响应头——不在这里捞就会把会话丢掉，表现为「登录成功却一直
     是未登录页」。tools_local 用它把 302 上的 Set-Cookie 存进自己的 jar。
+
+    `decorate`（可选）：跳转后的**新请求**建好后回调，用来补上依新 jar 计算的请求头
+    （典型是 Cookie）。urllib 复制原请求头时还没有这个 cookie，不补则跳转后的页面
+    仍是无会话的。
     """
 
-    def __init__(self, check, capture=None):
+    def __init__(self, check, capture=None, decorate=None):
         super().__init__()
         self._check = check
         self._capture = capture
+        self._decorate = decorate
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urlparse(req.full_url).scheme == "https" and urlparse(newurl).scheme == "http":
@@ -73,7 +78,13 @@ class GuardedRedirect(urllib.request.HTTPRedirectHandler):
                 self._capture(req, headers)
             except Exception:  # noqa: BLE001 - 捞 cookie 失败不该击穿请求
                 pass
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if self._decorate is not None and new_req is not None:
+            try:
+                self._decorate(new_req)
+            except Exception:  # noqa: BLE001
+                pass
+        return new_req
 
 
 def build_opener(handler: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:

@@ -488,7 +488,21 @@ class LocalTools:
                 else:
                     jar[name] = morsel.value
 
-    def _cookie_header(self, netloc: str) -> str | None:        jar = self._jar.get(netloc)
+    def _capture_redirect(self, req, headers) -> None:
+        """跳转响应的 Set-Cookie 也入 jar（登录/注册常 302 种会话，不捞就丢会话）。"""
+        netloc = urlparse(getattr(req, "full_url", "") or "").netloc
+        if netloc:
+            self._capture_cookies(netloc, headers.items())
+
+    def _decorate_redirect(self, req) -> None:
+        """跳转后的新请求补上 Cookie（urllib 复制原请求头时 jar 里还没有会话）。"""
+        netloc = urlparse(getattr(req, "full_url", "") or "").netloc
+        cookie = self._cookie_header(netloc) if netloc else None
+        if cookie and not req.has_header("Cookie"):
+            req.add_header("Cookie", cookie)
+
+    def _cookie_header(self, netloc: str) -> str | None:
+        jar = self._jar.get(netloc)
         return "; ".join(f"{k}={v}" for k, v in jar.items()) if jar else None
 
     def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False) -> str:
@@ -553,7 +567,7 @@ class LocalTools:
 
         # 恒读满 2MB：小响应读到 EOF 即止（无额外成本），大响应保留中/尾供 offset 切片。
         # capture：跳转响应上的 Set-Cookie 也要入 jar（登录/注册常 302 种会话）。
-        opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect))
+        opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect, decorate=self._decorate_redirect))
         status = 0
         interesting: dict = {}
         content_length = None
@@ -860,7 +874,7 @@ class LocalTools:
             request.add_header(header, value)
         request.add_header("User-Agent", "ctfy-agent/0.2")
 
-        opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect))
+        opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect, decorate=self._decorate_redirect))
         status = 0
         payload = ""
         ctype = ""

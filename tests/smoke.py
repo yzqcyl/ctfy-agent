@@ -32,6 +32,7 @@ from ctfy_agent.mcp_client import classify_tool, mask_token, mcp_tool_to_openai 
 from ctfy_agent.solver import _compact_history, _est_tokens, looks_accepted  # noqa: E402
 from ctfy_agent.tools_local import LocalTools, ToolError  # noqa: E402
 from smoke_ai_chat import case_ai_chat  # noqa: E402
+from smoke_http_session import case_http_302_cookie  # noqa: E402
 from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
@@ -3015,6 +3016,7 @@ def main() -> int:
         ("ai_wiring", case_ai_wiring),
         ("ai_fixtures", case_ai_fixtures),
         ("ai_agent_e2e", case_ai_agent_e2e),
+        ("http_302_cookie", case_http_302_cookie),
         ("misc_ext", case_misc_ext),
     ]
     for name, case in cases:
