@@ -40,6 +40,8 @@ jobs:
           docker build \
             -t "$IMAGE:$TAG" \
             -t "$IMAGE:latest" \
+            -t "${IMAGE}-pub:$TAG" \
+            -t "${IMAGE}-pub:latest" \
             .
 
       - name: 校验：B1 契约（体积 / 目录洁净度 / cwd 无关 / 五条路径全部 exit 0）
@@ -66,3 +68,7 @@ jobs:
         run: |
           docker push "$IMAGE:$TAG"
           docker push "$IMAGE:latest"
+          # 同一个镜像再用一个新包名推一份：包可见性只在创建时继承仓库可见性，
+          # 老包在私有仓库时期创建，永远是 private；新包在公开仓库下创建，默认 public。
+          docker push "${IMAGE}-pub:$TAG"
+          docker push "${IMAGE}-pub:latest"
