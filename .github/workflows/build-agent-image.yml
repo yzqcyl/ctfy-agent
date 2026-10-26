@@ -21,7 +21,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ghcr.io/yzqcyl/ctfy-agent
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ctfy-agent
 
 jobs:
   build:
