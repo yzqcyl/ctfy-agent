@@ -8,13 +8,14 @@
 验收项（全部不联网、不烧 LLM token）：
   1. 构建成功；镜像体积在上限内（主办方要求：太大传不上去）
   2. 镜像内容洁净：只有 /ctfy/src 与 /ctfy/config，没有 .env / tests / runs / docs
-  3. cwd 无关性：在 /tmp 下也能 import ctfy_agent（PYTHONPATH 生效）
-  4. 五条契约路径都必须：退出码 0 + 写出合法 result.json
-       4.1 dry_run            → stop_reason=dry_run
-       4.2 缺 task.json       → stop_reason=halted
-       4.3 run_mode 不支持    → stop_reason=refused
-       4.4 缺凭证             → stop_reason=refused
-       4.5 无 MCP 端点        → stop_reason=halted
+  3. 非 root：Config.User 必须声明且 uid != 0（平台协议检查硬性要求，root 直接判失败）
+  4. cwd 无关性：在 /tmp 下也能 import ctfy_agent（PYTHONPATH 生效）
+  5. 五条契约路径都必须：退出码 0 + 写出合法 result.json
+       5.1 dry_run            → stop_reason=dry_run
+       5.2 缺 task.json       → stop_reason=halted
+       5.3 run_mode 不支持    → stop_reason=refused
+       5.4 缺凭证             → stop_reason=refused
+       5.5 无 MCP 端点        → stop_reason=halted
      （这五条覆盖了「任务不合法/环境不全时也不许崩」——崩了就是 0 分）
 
 用法：
@@ -107,6 +108,28 @@ def check_cwd_independent(tag: str) -> None:
         raise Fail(f"在 /tmp 下 import 失败：{proc.stdout}{proc.stderr}")
 
 
+def check_nonroot(tag: str) -> None:
+    """镜像必须声明非 root USER，且实际运行 uid != 0。
+
+    平台在「注册并检查」的协议检查里直接判这一点（v2 镜像就是这里挂的：
+    Dockerfile 没写 USER → 以 root 运行 → 「协议检查：发现问题 / 试运行：失败」）。
+    静态看 Config.User，动态再 `id -u` 实测一次——只声明不生效的镜像同样是坑。
+    """
+    proc = sh(["docker", "image", "inspect", tag, "--format", "{{.Config.User}}"], check=True)
+    declared = (proc.stdout or "").strip()
+    proc = sh(["docker", "run", "--rm", "--entrypoint", "id", tag, "-u"], check=True)
+    running = (proc.stdout or "").strip()
+    print(f"[非 root] Config.User={declared!r} 运行时 uid={running}")
+    uid = declared.split(":")[0].strip()
+    if not declared or uid in ("", "0", "root"):
+        raise Fail(
+            f"镜像没有声明非 root USER（Config.User={declared!r}）：平台协议检查会直接判失败。"
+            "请在 Dockerfile 末尾加 `RUN useradd -u 10001 ... && USER app`。"
+        )
+    if running in ("", "0"):
+        raise Fail(f"容器实际以 uid={running!r} 运行：平台要求非 root（uid != 0）。")
+
+
 def read_result(host_dir: Path) -> dict:
     path = host_dir / "result.json"
     if not path.is_file():
@@ -135,6 +158,13 @@ def run_case(tag: str, name: str, task: dict | None, env_extra: dict, expect_rea
     if host_dir.exists():
         shutil.rmtree(host_dir)
     host_dir.mkdir(parents=True)
+    # 平台把 /ctfy/work 以 0o777 的 staging 目录 `docker cp` 进容器（harness.py），
+    # 镜像现在跑非 root 用户；本地用 bind mount 时必须同样放开，否则契约用例会因
+    # 「写不出 result.json」假失败（这是本地验收与平台的已知差异）。
+    try:
+        host_dir.chmod(0o777)
+    except OSError:
+        pass
     if task is not None:
         (host_dir / "task.json").write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -232,6 +262,7 @@ def main(argv=None) -> int:
             raise Fail(f"镜像 {size:.1f} MB 超过上限 {args.max_mb:.0f} MB")
 
         check_clean(args.image)
+        check_nonroot(args.image)
         check_cwd_independent(args.image)
         contract_cases(args.image)
 

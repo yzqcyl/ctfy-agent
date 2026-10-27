@@ -1,5 +1,31 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
+## ⚠️ 2026-10-27 平台实测：`:v2` 被「协议检查」拒绝（以 root 运行）
+
+平台「注册并检查」对 `ghcr.io/yzqcyl/ctfy-agent-pub:v2` 的判定：
+
+| 检查项 | 结果 |
+|---|---|
+| 已注册为 `ctfy-agent-pub` | ✅ |
+| 协议检查 | ❌ 以 root 运行——用户镜像必须以非 root 用户运行 |
+| 试运行 | ❌ 同上 |
+| 审核 | ⚠️ 等待人工审核（修复前不可运行） |
+
+**根因**：`Dockerfile` 没有 `USER` 指令（`Config.User=""` → docker 判 root）。
+**修复**（已入库）：Dockerfile 末尾
+```dockerfile
+RUN useradd --create-home --uid 10001 --shell /bin/bash app
+ENV HOME=/home/app
+USER app
+```
+运行期不需要 root：平台把 `/ctfy/work` 以 0o777 的 staging 目录 `docker cp` 进容器
+（`providers/docker_provider/harness.py`），运行期状态全部写在 `/ctfy/work/runs`，`/ctfy` 只读即可。
+
+**重建 + 重新检查**（不要覆盖 `:v2`）：
+1. 构建新 tag：`python tools/publish_image.py --tag v2.1`（或本地 `docker build` 后 push）
+2. 页面「配置本次测评」→ 镜像地址改成 `ghcr.io/yzqcyl/ctfy-agent-pub:v2.1` → 点「重新检查」
+3. 五项全绿（注册 / 协议检查 / 试运行 / 审核）后再提交审核
+
 ## ✅ v2 已冻结，提交这个
 
 ```
