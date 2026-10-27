@@ -36,6 +36,7 @@ from smoke_http_session import case_http_302_cookie  # noqa: E402
 from smoke_context import case_context_compress  # noqa: E402
 from smoke_webmap import case_http_map, case_http_map_wiring  # noqa: E402
 from smoke_brake import case_no_progress_brake  # noqa: E402
+from smoke_gate import case_done_gate, case_convergence_stalled  # noqa: E402
 from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
@@ -2519,6 +2520,7 @@ def case_checkpoint_resume(tmp: Path) -> None:
     server, url = fake_llm.start_fake_mcp()
     try:
         config = make_config(url, tmp)
+        config.extra["candidate_gate"] = False  # 本用例测断点续跑，不测候选闸门：零候选 done 应正常收工
         platform = CtfyPlatform(url, config.token)
         platform.connect()
         store = Store(tmp / "resume").load()
@@ -3235,6 +3237,8 @@ def main() -> int:
         ("http_map", case_http_map),
         ("http_map_wiring", case_http_map_wiring),
         ("misc_ext", case_misc_ext),
+        ("done_gate", case_done_gate),
+        ("convergence_stalled", case_convergence_stalled),
     ]
     for name, case in cases:
         try:

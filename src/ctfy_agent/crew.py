@@ -178,6 +178,61 @@ def _strategy_nudge(prior: list[str]) -> str:
     )
 
 
+# ---------- 候选闸门 + 假设收敛（v3 P0） ----------
+# 实测三臂（SAMPLE-009 crew 806k / AGENTBENCH-002 crew 804k / SAMPLE-009 solo 642k）
+# 全部 attempts=0、oracle_calls=0、observations=0：agent 在「探测」层无限打转，从不进入
+# 「验证/提交」层。这两条是确定性收口，与 B1 的「无进展刹车/换族干预」互补——
+# B1 抓「同一动作重复」，这里抓「零候选就收尾」和「假设只增不驳且零证据」。
+MAX_DONE_BLOCKS = 2           # done 被候选闸门拦下的次数上限（有界，避免死循环）
+CONVERGENCE_STALL_ROUNDS = 3  # 连续 N 轮「无证据 + 无证伪 + 假设只增」才注入收敛刹车
+
+_NO_CANDIDATE_GATE = (
+    "[候选闸门] 目前 attempts=0 且没有任何逐字候选被验证过，不能就此 done 收尾。\n"
+    "要么把你最有把握的候选用 submit 提交（拿不准先 verify_answer 自校验，不消耗提交次数），\n"
+    "要么用 note 写清「已排除的范围 + 卡点」再 done。"
+)
+_CONVERGENCE_HINT = (
+    "[假设收敛] 最近 {rounds} 轮只有新假设在涨（open={open_n}），没有任何逐字证据、也没有方向被证伪。\n"
+    "在无反馈的探测里无限扩展假设不会产生答案：请先把你最有把握的候选 verify_answer / submit，\n"
+    "或换一个从未试过的信息维度再派活（不要继续枚举同类路径/参数）。"
+)
+_FLAG_CANDIDATE_HINT = (
+    "[候选出现] 账本已自动收录到工具输出里的逐字候选：{cand}\n"
+    "不要继续侦察了：立即用 verify_answer 校验（不消耗提交次数），通过就 submit。"
+)
+
+
+def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: int,
+               max_blocks: int = MAX_DONE_BLOCKS) -> tuple[str, bool, bool]:
+    """候选闸门：零候选（未提交、零尝试、零逐字证据）时拦 done 至多 max_blocks 次。
+
+    返回 (text, stop, no_candidate)。stop=False 表示拦下（本轮不结束，把闸门文案回灌给协调者），
+    stop=True 且 no_candidate=True 表示「多次拦截后放行，并记为 no_candidate」。
+    """
+    if not submitted and attempts == 0 and not observations:
+        if done_blocks < max_blocks:
+            return _NO_CANDIDATE_GATE, False, False
+        return "协调结束（无候选，候选闸门放行并记为 no_candidate）。", True, True
+    return "协调结束。", True, False
+
+
+def _convergence_stalled(stats: dict, last_open: int, last_refuted: int,
+                         stalls: int) -> tuple[int, int, int]:
+    """假设收敛信号：零证据 + 零新证伪 + 假设数只增 → stalls 累加，否则清零。
+
+    返回 (new_stalls, new_last_open, new_last_refuted)。调用方拿 new_stalls 与
+    CONVERGENCE_STALL_ROUNDS 比较决定是否注入收敛刹车。
+    """
+    obs = int(stats.get("observations") or 0)
+    opn = int(stats.get("open") or 0)
+    ref = int(stats.get("refuted") or 0)
+    if obs == 0 and opn > last_open and ref == last_refuted:
+        stalls += 1
+    else:
+        stalls = 0
+    return stalls, opn, ref
+
+
 def _delegate_task(objective: str, done_when: str) -> str:
     """把「一个 objective + done_when」拼成专家任务头（A2：一次只派一件 + 明确完成判据）。
 
@@ -502,6 +557,13 @@ class Crew:
         ledger = Ledger.from_config(self.config)  # 跨 delegate 共享：知识不随专家上下文消失
         plan = PlanTrack()  # 协调者自己的计划状态：防「同一份侦察重写三遍」
 
+        # 候选闸门 / 假设收敛 状态（v3 P0）
+        done_blocks = 0
+        last_open = -1
+        last_refuted = -1
+        convergence_stalls = 0
+        flag_nudged = False
+
         # 断点续跑（P0-1）：协调者上下文是本 run 最贵的状态，崩溃即清零（003 实测烧掉 135k token）。
         # 每轮开跑前把 messages/reports/ledger/plan 快照到 run_dir/checkpoints/；正常收尾删除，
         # 进程被 kill 则残留 → 下次跑题时续跑。extra.resume 设为 false/off/no/0 可强制从零重跑。
@@ -692,9 +754,22 @@ class Crew:
                         self.store.add_note(challenge_id, str(args.get("text") or ""))
                         text = "已记录。"
                     elif name == "done":
-                        text = "协调结束。"
-                        reason = "coordinator_done"
-                        stop = True
+                        if self.config.extra.get("candidate_gate", True):
+                            text, stop, no_cand = _done_gate(
+                                submitted, challenge.attempts, ledger.observations, done_blocks
+                            )
+                            if not stop:
+                                done_blocks += 1
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "gate", "step": rnd, "note": f"done 被候选闸门拦下（第 {done_blocks} 次）"},
+                                )
+                            else:
+                                reason = "no_candidate" if no_cand else "coordinator_done"
+                        else:
+                            text = "协调结束。"
+                            reason = "coordinator_done"
+                            stop = True
                     else:
                         text = f"[未知动作] {name}"
 
@@ -728,6 +803,19 @@ class Crew:
                             challenge_id, {"role": "ledger", "step": rnd, "content": digest}
                         )
 
+                # 候选出现（v3 P0·候选闸门）：账本自动收录了工具输出里的 flag 形态 → 立即推去验证/提交。
+                if ledger.observations and challenge.attempts == 0 and not flag_nudged:
+                    flag_nudged = True
+                    messages.append({
+                        "role": "user",
+                        "content": _FLAG_CANDIDATE_HINT.format(cand=ledger.observations[-1].text),
+                    })
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "gate", "step": rnd,
+                         "note": f"候选出现注入（observations={len(ledger.observations)}）"},
+                    )
+
                 # A2 伴生文本：协调者的「推进」= 账本里出现新的派活目标。
                 # 老问题是三轮派活都在重写同一份侦察，这里用确定性信号把它照出来。
                 seen = plan.observe(content, progressed=len(ledger.order) > attempts_before)
@@ -736,6 +824,22 @@ class Crew:
                     messages.append({"role": "user", "content": hint})
                     self.store.append_transcript(
                         challenge_id, {"role": "plan", "step": rnd, "content": hint}
+                    )
+
+                # 假设收敛（v3 P0）：账本信号——只有假设在涨、零逐字证据、零新证伪。
+                convergence_stalls, last_open, last_refuted = _convergence_stalled(
+                    ledger.stats(), last_open, last_refuted, convergence_stalls
+                )
+                if convergence_stalls >= CONVERGENCE_STALL_ROUNDS:
+                    convergence_stalls = 0
+                    messages.append({
+                        "role": "user",
+                        "content": _CONVERGENCE_HINT.format(rounds=CONVERGENCE_STALL_ROUNDS, open_n=last_open),
+                    })
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "gate", "step": rnd,
+                         "note": f"假设收敛刹车注入（open={last_open}, refuted={last_refuted}, observations=0）"},
                     )
             else:
                 # 轮数耗尽（for 自然结束、没有任何 break）：区别于「模型主动停手」的 no_more_actions
@@ -781,6 +885,7 @@ class Crew:
             "submitted": submitted,
             "steps": rnd,
             "attempts": challenge.attempts,
+            "no_candidate": (not submitted and challenge.attempts == 0),
             "reason": reason,
             "budget": end_usage,
             "usage": usage,
