@@ -26,6 +26,24 @@ USER app
 2. 页面「配置本次测评」→ 镜像地址改成 `ghcr.io/yzqcyl/ctfy-agent-pub:v2.1` → 点「重新检查」
 3. 五项全绿（注册 / 协议检查 / 试运行 / 审核）后再提交审核
 
+## ✅ v2.1 已构建并校验（2026-10-27 23:37 +08:00）
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v2.1` |
+| digest | `sha256:6406286f857e5cbe6efd36645e1347a3f8c8f9b94efda179c03904cf9fe151bb` |
+| 构建 | GitHub Actions run `40532627504`（branch `master`、sha `429d280`）→ 全绿 |
+| 非 root | ✅ `Config.User="app"`（uid 10001，`HOME=/home/app`、`PYTHONPATH=/ctfy/src`） |
+| 入口 | `Entrypoint=["python","-m","ctfy_agent","agent"]`、`WorkingDir=/ctfy` |
+| 体积 | 10 层，压缩后 47.4 MB |
+| 契约 | CI 内五条路径全部 `exit 0`（dry_run / no_task / bad_run_mode / no_creds / no_mcp） |
+| 代码基线 | **与已实测的 v2 完全一致**，仅增加非 root 运行（master 线最小改动） |
+
+校验方式（不启 docker daemon，直接查 registry API）：
+`python runs/_ghcr_check.py yzqcyl/ctfy-agent-pub v2.1`
+
+**下一步（人工）**：平台「配置本次测评」→ 镜像地址改为 `ghcr.io/yzqcyl/ctfy-agent-pub:v2.1` → 点「重新检查」→ 五项全绿后提交审核。
+
 ## ✅ v2 已冻结，提交这个
 
 ```
