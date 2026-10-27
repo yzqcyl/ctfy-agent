@@ -535,7 +535,7 @@ $env:PYTHONPATH = "E:\ctfy_project\src"
 | M3 | 方法卡 17 张（10 ASI + 7 防御族）+ 三池词表对账 + 4 道离线夹具 | 完成 |
 | M4 | 容器契约 e2e（AI 题 task.json → run_agent → result.json）+ 陷阱页夹具 | 完成 |
 | M5 | 真机：038/040/041 解出（104k/79k/84k）+ 039 回归未解（266k，见 ai-plan §7.7） | **已完成，待确认** |
-| M6 | 校准 + 镜像重建/push + PROGRESS/HANDOFF 全量同步 | 未开始 |
+| M6 | 校准 + 镜像重建/push + PROGRESS/HANDOFF 全量同步 | 校准/同步完成；镜像重建阻塞（无 Docker） |
 
 ### 关键事实（M5 前必须知道）
 
@@ -621,3 +621,32 @@ $py = "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\pytho
 & $py tools\container_check.py            # 构建 + 全部验收；通过即可上传
 & $py tools\container_check.py --no-build # 复用已构建镜像复验
 ```
+
+---
+
+## 11. M6 完成情况（2026-10-27）
+
+### 11.1 校准结论（量测 + 三臂交叉验证）
+
+- `web.max_steps` 量测（`runs/_calib_websteps.py`）：全量转录中 web 专家 **48 轮打满 10 步**，
+  其余 1–7 步。但「出不来 report」已被 M5.6/B1 的 rescue 机制消解，`web.max_steps` 非瓶颈，不改动。
+- 三臂交叉验证（SAMPLE-009 @800k，同一失败面）：A 干净 Crew 806k / B 干净 solo 642k /
+  C B1+候选闸门+收敛提示 803k —— 全部 **0 候选、0 提交、budget_exhausted**。
+- **结论：编排/机制/模型均非瓶颈，瓶颈=flag 发现（access-control 面），非调参可解。现有参数无需调整。**
+
+### 11.2 SAMPLE-009 手动探测（4 轮，~150 变体）
+
+公开路由仅 4 个：`/`、`/api/status`（`{"operators":1}`）、`/api/operators`（`["alice"]`）、`/healthz`。
+debug 视图（"for operators"）不在任何可猜路径，不吃 query/身份头/Host 越权/方法枚举，且无 500 可触发。
+agent 已发现 `/api/operators→alice` 并试过 alice 子路径，仍未破 → 真 access-control 面，非词表可解。
+
+### 11.3 镜像重建（阻塞）
+
+- `tools/container_check.py --local` 五条契约路径全绿（dry_run/no_task/bad_run_mode/no_creds/no_mcp）。
+- 镜像重建+push 需 Docker（本机无），或走 GitHub Actions —— 用户侧阻塞。
+
+### 11.4 代码提交
+
+- `462e1bf` B1 无进展刹车 + http_map 接线 + B2 交接文档（= M5.6）。
+- `f4e1d3b` 候选闸门 + 假设收敛提示（安全网；arm C 验证无害、不改 attempts）。
+- smoke `88 passed / 0 failed`（新增 `tests/smoke_gate.py`）。

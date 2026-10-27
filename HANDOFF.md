@@ -15,11 +15,12 @@
 | **大规模基准测试** | ✅ 完成。报告：**`runs/bench-web-report.md`**（16 道归档 + 3 道中断 + A/B 对照 + 并行求解器评估，含勘误记录）。 |
 | **模型 A/B 对照** | ✅ 结论：**换更强模型不涨分**（同题 Pro 0/3 vs K2.7 0/3，速度 2.27×，覆盖面反而更窄）。 |
 | **并行求解器可行性** | ✅ 已评估（报告 §12）：**模型路线已被证伪，多策略并行未被测量**，且必须先解决"预算 ×N"与"环境失败乘 N"两个硬前提。**建议先不做。** |
-| **代码版本** | 提交 `1aeee61` = v2 镜像同源代码。**工作区另有并行会话的未提交改动（12 文件 +490/−25），未经过任何测试**，见 §6。 |
+| **800k 复测（arm C）** | ✅ SAMPLE-009 @800k 三臂（干净 Crew / solo / B1+闸门+收敛）全部 **0 候选 0 提交 budget_exhausted** → 编排/模型/调参均非瓶颈；**瓶颈=flag 发现（access-control 面）**。 |
+| **代码版本** | HEAD `f4e1d3b`（v3）。`462e1bf`=B1 无进展刹车+http_map 接线（M5.6）；`f4e1d3b`=候选闸门+收敛提示（安全网）。v2 镜像同源 `1aeee61` 不变。 |
 | **实例** | 0 个（已清空）。 |
-| **单测基线** | `python tests/smoke.py`：**v2 提交版 83/83**；**当前工作区 2026-10-26 实测 86/86 全绿**（新增 `no_progress_brake`、`http_map`、`http_map_wiring`）。 |
+| **单测基线** | `python tests/smoke.py`：**v2 83/83**；**当前工作区 88/88 全绿**（新增 `no_progress_brake`、`http_map`、`http_map_wiring`、`smoke_gate`）。 |
 
-**一句话**：镜像和基准都已完成，剩下的主要是"等平台审核"+"用户决定并行会话那批改动要不要收"。
+**一句话**：v2 镜像待用户提交；v3 代码已收口（B1+安全网）并 smoke 88/88，但**三臂实测 + SAMPLE-009 手动探测证明失败根因是 flag 发现（access-control 面），非编排/调参可解**；v3 镜像重建阻塞于本机无 Docker。
 
 ---
 
@@ -155,11 +156,11 @@
 
 ## 6. 待办与阻塞
 
-1. **等平台审核 + 提交**（用户）：`docs/submit-image-runbook.md`；提交时显式 `:v2`，别用 `latest`。
-2. **并行会话的未提交改动必须由用户决定去留**（12 文件 +490/−25：`config/agent.json`、`crew.py`+67、`tools_local.py`+255（`http_map`）、`ctxcompress.py`、`roles/ai*`、`roles/misc.json`、`tests/smoke*.py`、`docs/ai-plan.md`、新增 `docs/ai-borrowable.md`、`tests/smoke_webmap.py`）。**这些改动没有进过 v2 镜像、也没有跑过基准**——新会话不要擅自 commit 或 revert。
+1. **等平台审核 + 提交 v2**（用户）：`docs/submit-image-runbook.md`；提交时显式 `:v2`，别用 `latest`。
+2. **v3 镜像重建/push 阻塞于本机无 Docker**。`container_check.py --local` 静态验收已 5/5 绿；装 Docker 后 `python tools/container_check.py` 构建+验收，通过再 push `:v3`（或走 GitHub Actions）。
 3. **CTFARENA 50 道 web 需换时间窗重测**（上游限流是暂时的，不是我们代码问题）。
 4. **GitHub PAT 吊销**（此前暴露过，仍未处理）。
-5. 若要继续做能力线：优先"提高预算到 800k 复测 medium/hard"（比加并行路数更划算），其次"实例失败即硬停"、"report 证据校验放宽"。
+5. 失败根因=flag 发现（access-control 面），非编排/预算/模型可调。若要提分，方向是**补 web 安全领域知识**（Werkzeug debug 模式 / 访问控制绕过 playbook），不是加并行路数或调参。
 
 ---
 
@@ -168,7 +169,7 @@
 - Python：`$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
 - 先 `$env:PYTHONIOENCODING="utf-8"`；跑批量再设 `$env:PYTHONUNBUFFERED="1"`（否则后台 job 看不到进度）。
 - 跑题：后台 job 跑 `cmd /c run.cmd crew <ID>`；**先确认转录文件出现**再判定跑过。
-- 单测：`python tests/smoke.py`，v2 基线 **83 passed**，当前工作区 **85 passed / 0 failed**（含并行会话新增用例）；改动后必须全绿。
+- 单测：`python tests/smoke.py`，v2 基线 **83 passed**，当前工作区 **88 passed / 0 failed**（含 B1 刹车 / http_map / smoke_gate 新增用例）；改动后必须全绿。
 - 无 Docker / 无 WSL / 非管理员（镜像构建走 GitHub Actions）。
 - `web_search` 不可用；`raw.githubusercontent.com` 被 DNS 拦；`git clone --filter=blob:none` + `git show HEAD:path` 取单文件可用。
 - 凭据在 `.env`（`CTFY_TOKEN`、`DEEPSEEK_API_KEY`），**引用时打码**；临时目录里复制 `.env` 后**用完必须删**。

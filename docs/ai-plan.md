@@ -27,7 +27,7 @@
 | M4 | 容器契约 e2e：AI 题 task.json → run_agent → result.json + 陷阱页夹具 | **已完成，待确认** | 见 §5 |
 | M5 | 真机 2/2 解出（038 ASI01 + 039 ASI02，Kimi-K2.7） | **已完成，待确认** | 见 §6 |
 | M5.5 | 效率优化 R1/R2（GitHub 调研落地）：038 135k→104k | **已完成，待确认** | 见 §7 |
-| M6 | 校准 + 镜像重建 + PROGRESS/HANDOFF 同步 | 未开始 | — |
+| M6 | 校准 + 镜像重建 + PROGRESS/HANDOFF 同步 | 校准/同步完成；镜像重建阻塞（本机无 Docker） | 见 §9 |
 
 ## 2. M1 证据：`chat` 工具
 
@@ -515,3 +515,33 @@ eason=step_limit，不误伤。
 - 模型名必须用部署名，聚合网关对未知模型返回 400 而不是 404。
 - 首次读全文、之后命中缓存返回「桩」：两步文本不同，会让「无进展」计数晚一步触发，用例里留了 +2 余量。
 - Store.upsert 只写白名单字段，测试里挂 challenge.instance 必须直接赋值再 save()。
+
+## 9. M6 证据：校准 + 同步完成；镜像重建阻塞（2026-10-27）
+
+### 9.1 校准结论（`web.max_steps` 量测 + 三臂交叉验证）
+
+量测（`runs/_calib_websteps.py`，全量转录）：web 专家单轮 step 分布中，**48 个轮次打满
+`max_steps=10`**，其余为 1–7 步。但「出不来 report」已被 M5.6/B1 的 rescue 机制消解
+（专家打满后由协调者 rescue 取报告），故 `web.max_steps` **不是当前瓶颈，不改动**。
+
+三臂交叉验证（SAMPLE-009 @800k，同一失败面）：
+
+| 臂 | 配置 | 结果 |
+|---|---|---|
+| A | 干净 Crew | 806k / 0 候选 / 0 提交 / budget_exhausted |
+| B | 干净 solo（单 agent） | 642k / 0 候选 / 0 提交 |
+| C | B1 + 候选闸门 + 假设收敛提示 | 803k / 0 候选 / 0 提交 / budget_exhausted |
+
+结论：**编排/机制/模型均非瓶颈**；失败根因是 flag 发现（access-control 面），非调参可解。
+校准结论 = 现有参数无需调整，瓶颈在解题能力。
+
+### 9.2 镜像重建阻塞
+
+本机无 Docker/podman/WSL（PROGRESS.md 待办已记）。`tools/container_check.py --local` 五条
+契约路径全绿（dry_run/no_task/bad_run_mode/no_creds/no_mcp 均 exit 0 且写合法 result.json）。
+镜像重建+push 需在有 Docker 的环境执行或走 GitHub Actions，属用户侧阻塞。
+
+### 9.3 代码提交
+
+`f4e1d3b`（候选闸门 + 假设收敛提示，作为安全网保留；arm C 验证无害但不改 attempts）。
+`462e1bf`（B1 无进展刹车 + http_map 接线 + B2 交接文档，即 M5.6）。
