@@ -34,6 +34,8 @@ from ctfy_agent.tools_local import LocalTools, ToolError  # noqa: E402
 from smoke_ai_chat import case_ai_chat  # noqa: E402
 from smoke_http_session import case_http_302_cookie  # noqa: E402
 from smoke_context import case_context_compress  # noqa: E402
+from smoke_webmap import case_http_map, case_http_map_wiring  # noqa: E402
+from smoke_brake import case_no_progress_brake  # noqa: E402
 from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
@@ -3229,6 +3231,9 @@ def main() -> int:
         ("ai_agent_e2e", case_ai_agent_e2e),
         ("http_302_cookie", case_http_302_cookie),
         ("context_compress", case_context_compress),
+        ("no_progress_brake", case_no_progress_brake),
+        ("http_map", case_http_map),
+        ("http_map_wiring", case_http_map_wiring),
         ("misc_ext", case_misc_ext),
     ]
     for name, case in cases:

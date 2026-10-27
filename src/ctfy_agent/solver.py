@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from json import JSONDecodeError
@@ -46,6 +47,24 @@ def _est_tokens(messages: list[dict]) -> int:
 
 SOFT_COMPACT_RATIO = 0.55  # 超过预算的这个比例就先压缩旧步（而不是等爆窗再整块丢）
 KEEP_TAIL_GROUPS = 3       # 最近 3 步永远保持原样：模型紧接着还要用
+
+# ---------- 无进展刹车（M5.6） ----------
+# 实机证据：039 连发 8 次 `GET /playground?message=…`（GET 不执行消息，页面永远不变），
+# 043 连发 3 次同一页面换 grep/offset（每步仍烧 ~7k prompt）。账本去重按「参数完全相同」
+# 判定，抓不到「换参数读同一份内容」，所以再加一条不依赖模型自述的信号：
+# **工具输出与之前完全相同 = 这一步没有产生新信息**。
+NO_PROGRESS_HINT_AFTER = 3   # 连续 N 步无新信息 → 注入换方向提示
+NO_PROGRESS_STOP_AFTER = 5   # 连续 N 步无新信息 → 提前止损（交报告，让协调者换人/换法）
+_NO_PROGRESS_HINT = (
+    "[框架·无进展] 你最近 {rounds} 步拿到的工具输出与此前完全相同，这个动作不会产生新信息。\n"
+    "常见原因：GET 带查询参数不会触发服务端动作（很多靶子必须 POST/表单提交才会执行）；"
+    "或者只是把同一页换 offset/grep 重读。立刻换方向：\n"
+    "- 改方法：改用 POST（body 写成表单字段）再试同一业务动作\n"
+    "- 改载体：换端点、换工单号/资源 id、换账号角色\n"
+    "- 改载荷：编码变形、工具指令语法变体（@@TOOL / tool= / JSON 字段）\n"
+    "若确实已无方向，直接 report 交结论（写明卡点），不要再空转。"
+)
+_NO_PROGRESS_STOP = "[无进展刹车] 连续 {rounds} 步工具输出完全重复，判定原地打转，提前停止以节省预算。"
 
 
 def _group_messages(messages: list[dict]) -> tuple[list[dict], list[list[dict]]]:
@@ -975,6 +994,9 @@ class Solver:
         actions: list[str] = []  # 供步数/预算耗尽时合成一份有信息量的报告，别只交一行占位符
         last_content = ""
         plan = PlanTrack()
+        # 无进展刹车状态：seen_outputs 累积本轮见过的工具输出摘要，still_rounds 数连续无新信息的步数
+        seen_outputs: set[str] = set()
+        still_rounds = 0
         for step in range(1, int(max_steps) + 1):
             try:
                 messages[1]["content"] = with_facts(base_head, facts.render())
@@ -1024,6 +1046,7 @@ class Solver:
                 break
 
             attempts_before = len(ledger.order)
+            step_progress = False  # 本步有没有产生「此前没见过的工具输出」
             for call in calls:
                 function = call.get("function") or {}
                 name = function.get("name") or ""
@@ -1080,6 +1103,11 @@ class Solver:
                 self.store.append_transcript(
                     challenge_id, {"role": role, "step": step, "tool": name, "args": args, "result": text[:2000]}
                 )
+                # 无进展信号：被账本拦下（重复调用）或输出摘要与之前完全一致 → 本步没产生新信息
+                digest = hashlib.sha1(str(text).encode("utf-8", "replace")).hexdigest()[:16]
+                if not gate and digest not in seen_outputs:
+                    seen_outputs.add(digest)
+                    step_progress = True
                 facts.observe(name, args, text)
                 messages.append(
                     {
@@ -1107,6 +1135,28 @@ class Solver:
 
             if report:
                 break
+
+            # 无进展刹车：连续多步「工具输出与之前一模一样」= 原地打转（039/043 实机形态）。
+            # 先用一句提示逼它换方法，再不改就提前止损，把预算留给协调者换人/换法。
+            if step_progress:
+                still_rounds = 0
+            else:
+                still_rounds += 1
+                if still_rounds == NO_PROGRESS_HINT_AFTER:
+                    messages.append({"role": "user", "content": _NO_PROGRESS_HINT.format(rounds=still_rounds)})
+                    self.store.append_transcript(
+                        challenge_id, {"role": role, "step": step, "no_progress": still_rounds}
+                    )
+                elif still_rounds >= NO_PROGRESS_STOP_AFTER:
+                    reason = "no_progress"
+                    report = _NO_PROGRESS_STOP.format(rounds=still_rounds)
+                    tail = self._action_summary(actions, last_content)
+                    if tail:
+                        report += "\n最近动作：\n" + tail
+                    self.store.append_transcript(
+                        challenge_id, {"role": role, "step": step, "no_progress_stop": still_rounds}
+                    )
+                    break
 
             # A2 伴生文本：专家同样受「计划不变 + 无新尝试 = 停滞」约束，
             # 但提示只是注入一句，不消耗步数、不硬拦调用（与账本闸的分工一致）。

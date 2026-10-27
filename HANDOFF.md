@@ -1,191 +1,201 @@
 # 交接文档 — TPCTF 2026 智能体赛道
 
-> 给新对话的 agent：先读完这一页，再动手。所有结论都有实测依据，**不要重新推导已经验证过的东西**（会浪费大量 token 和实例时间）。
->
-> 只想粘一段话开新对话 → 用 `docs/HANDOFF-2026-10-25.txt`（本文件的纯文本自包含版）。
+> 给新对话的 agent：先读完 **§0** 再动手。§0 是当前真实状态，其余章节是仍然有效的背景与禁忌。
+> 所有结论都有实测依据；**不要重新推导已验证过的东西**（会浪费 token 和实例配额）。
+> 只想粘一段话开新对话 → 用 `docs/OPENING.txt`（本文件的自包含浓缩版）。
 
-## 1. 任务
+---
 
-- 目标：TPCTF 2026 **智能体团队赛道**的提交物 = **一个容器镜像**（不是本地 CLI）。
-- 契约：平台写只读 `/ctfy/work/task.json`（CTFY-0001 schema v2）→ 我们把结论写成 `/ctfy/work/result.json` 并 `exit 0`。**stdout 对用户镜像不读**（平台自有镜像才有 legacy 兜底，且它把整段 stdout 当一个 JSON 解析）→ 日志一律 stderr，stdout 最多留一行 JSON。
-- 计分：解题在**运行期**通过 MCP 的 `submit_answer` 完成，不是赛后判分。
-- 合规赛道：**Web / Pwn / AI 安全**；Web 优先，Pwn 时间够才做。
-- 代码约束：**纯 stdlib Python**（无第三方依赖），模型走 DeepSeek/Paratera 的 OpenAI 兼容接口。
+## 0. 当前状态（2026-10-27）
+
+| 项 | 状态 |
+|---|---|
+| **交付物（容器镜像）** | ✅ **v2 已完成并推送**：`ghcr.io/yzqcyl/ctfy-agent-pub:v2`，digest `sha256:73b39430873a1bf3d213e2881722a7aa69d78d1a24932790e932043306cf09e5`（provenance 已核验）。v1 冻结在 `sha256:a68ebe6e619b95191cc5168c9e35f2e92788970cfca823093ba8d1100d66ec4b`，仅留档。**`:latest` 现在也指向 v2 的 digest，提交时务必显式填 `:v2`。** |
+| **平台审核 / 提交** | ⬜ **未开始**。只能由用户走浏览器 4 步，步骤见 `docs/submit-image-runbook.md`。这是当前唯一卡在"人"身上的事。 |
+| **大规模基准测试** | ✅ 完成。报告：**`runs/bench-web-report.md`**（16 道归档 + 3 道中断 + A/B 对照 + 并行求解器评估，含勘误记录）。 |
+| **模型 A/B 对照** | ✅ 结论：**换更强模型不涨分**（同题 Pro 0/3 vs K2.7 0/3，速度 2.27×，覆盖面反而更窄）。 |
+| **并行求解器可行性** | ✅ 已评估（报告 §12）：**模型路线已被证伪，多策略并行未被测量**，且必须先解决"预算 ×N"与"环境失败乘 N"两个硬前提。**建议先不做。** |
+| **代码版本** | 提交 `1aeee61` = v2 镜像同源代码。**工作区另有并行会话的未提交改动（12 文件 +490/−25），未经过任何测试**，见 §6。 |
+| **实例** | 0 个（已清空）。 |
+| **单测基线** | `python tests/smoke.py`：**v2 提交版 83/83**；**当前工作区 2026-10-26 实测 86/86 全绿**（新增 `no_progress_brake`、`http_map`、`http_map_wiring`）。 |
+
+**一句话**：镜像和基准都已完成，剩下的主要是"等平台审核"+"用户决定并行会话那批改动要不要收"。
+
+---
+
+## 1. 任务与契约要点
+
+- 目标：TPCTF 2026 **智能体团队赛道**的提交物 = **一个容器镜像**（不是本地 CLI）。纯 stdlib Python，模型走 DeepSeek/Paratera 的 OpenAI 兼容接口。
+- 入口：`python -m ctfy_agent agent`；读 `/ctfy/work/task.json`（CTFY-0001 schema v2）→ 写 `/ctfy/work/result.json` → `exit 0`。
+- **stdout 对用户镜像不读**（平台自有镜像才有 legacy 兜底）→ 日志一律 stderr。
+- 解题在**运行期**通过 MCP `submit_answer` 完成，不是赛后判分。
+- 合规赛道：**Web / Pwn / AI 安全**；当前全部实测都在 Web。
 - 工作目录：`E:\ctfy_project`。
 
-## 2. 仓库地图（关键锚点，行号已核）
+---
+
+## 2. 仓库地图（关键锚点）
 
 | 文件 | 作用 | 关键位置 |
 |---|---|---|
-| `src/ctfy_agent/crew.py` | 多智能体：协调者 + web/rev/crypto/misc/**ai** 专家 | `_brief` 583（**已输出 facets：难度/已解/tags**）、`_prior_digest` 74（账本为主+结论为辅）、`_delegate_task` 99（**A2：objective+done_when 任务头**）、`COORDINATOR_PROMPT` 115（**含 ai 路由判据：asi/prompt_injection/agent/LLM/助手/bot/聊天/RAG；陷阱页可派 web**）、`COORDINATOR_TOOLS` 130（**delegate 必填 role/objective/done_when，task 仅兼容**）、`_delegate` 257（`ledger=` 透传、`allow_chat` 按角色 local 传）、`_role_system` 287（**追加 COMPANION_RULE**）、`solve` 326（**391 建账本、392 建 plan；delegate 也进账；每次 solve 新建 Solver**）、`PLATFORM_SCOPE` 32-44（含 `list_hints/view_hint`，共 26 项） |
-| `src/ctfy_agent/solver.py` | 专家主循环、工具分派、上下文滑窗 | `_ledger_gate` 172 / `_ledger_after` 200（**A1 去重闸；均包 try，归一化异常降级不击穿 run**）、`_check_report` 214（**A2 证据契约**）、`_execute` 354、`solve` 486（单 agent，**入口 `_http_cache.clear()`**）、`run_role` 727（账本摘要+**题型背景**前置、跨 delegate 共享、**A2 plan 注入**）、`_role_context` 932、`_initial_prompt` 950 |
-| `src/ctfy_agent/companion.py` | **A2 伴生文本**：`parse_companion` / `PlanTrack` | `parse_companion` 62（标签宽容解析：强调符/全角冒号/列表/多行）、`PlanTrack` 82（`observe` 101 只认「账本新增尝试」作推进信号、`reminder` 136 有配额、`stalled`/`stall_hint` 143/146 每 episode 一次、`stats` 153） |
-| `src/ctfy_agent/ledger.py` | **A1 确定性账本 + A2 证据校验** | `normalize_args` 121（URL/body 归一、**delegate 读 `objective`**）、`attempt_key` 146、`looks_failed` 209（http 优先看 status）、`claims_discovery` 227（先摘否定式）、`Ledger` 282（`seen` 315 / `record` 329）、`verify_evidence` 394、`recent_sources` 427、`rotate` 440、`digest` 454、`stats` 487 |
-| `src/ctfy_agent/state.py` | 状态持久化 `runs/<run>/state.json` | `Challenge` 141（**已含 `tags/difficulty/solves_count`**）、`from_dict` 172（归一）、`facets()` 181、`upsert` 238（**已合并 tags 并集 + 难度/已解**）、`normalize_tags` 87（宽容解析） |
-| `src/ctfy_agent/cli.py` | 子命令 | `normalize_challenge` 65（**已映射三字段；tags 兜底已摘**）、`ensure_challenge_meta` 87（**老 state 补 tags**） |
-| `src/ctfy_agent/tools_local.py` | 本地工具 http_request/shell/note/report + misc 三工具薄方法 | `call()` 签名过滤、`_render_http`（窗口 5000） |
-| `src/ctfy_agent/tools_misc_ext.py` | **外包 misc 模块**：decode_blob / unpack_archive / hexpeek（纯 stdlib，501 行） | `call_ext` 统一 ≤6000 与 ToolError 语义；Zip Slip / 解压炸弹已拦 |
-| `src/ctfy_agent/llm.py` | OpenAI 兼容客户端（urllib） | **`chat` 104-114，`"stream": False`；非流式平台网关也支持（`proxy.py:621,1041`），故 B2 是健壮性项不是阻断项**；只有 `/chat/completions`（`:120`），**不认 `anthropic` flavor** |
-| `src/ctfy_agent/platform.py` | MCP 客户端 | 97 个工具暴露；**`MODEL_TOOLS` 55 起**是单 agent 路径的真白名单（26 项，含 `list_hints/view_hint`），`PLATFORM_SCOPE`（crew.py:31-45）只是 crew 的角色分组 |
-| `config/agent.json` | 角色/模型/预算 | coordinator+web=Kimi-K2.7、rev=Kimi-K3、**ai=Kimi-K3**、crypto=DeepSeek-V4-Pro-0813、misc=GLM-Z1-AirX；`max_tokens_per_challenge=500000`、`max_llm_calls=80`。**容器里角色 model 会被 `agent_main._build_config` 抹掉，统一用 `LLM_MODEL`** |
-| `Dockerfile` | 只有工具链 + COPY src，**无 entrypoint** | 需补 B1/B3 |
-| `tests/smoke.py` | 离线回归 | **79/79 通过**（含 AI/M1–M4 五个用例：`ai_chat`/`ai_contract`/`ai_wiring`/`ai_fixtures`/`ai_agent_e2e`），改动后必须保持全绿 |
-| `src/ctfy_agent/method_cards.py` | 题型方法卡 | `CARDS`（web 50 题词表）+ **`AI_CARDS` 17 张**（10 ASI + 7 防御族）、`AI_TAGS` 80 个、`method_cards()` AI 卡优先 |
-| `roles/ai.json` + `roles/ai.system.txt` | ai 专家角色与提示词（1627 字符） | 契约用例守卫零漂移；提示词避开 `report`/`evidence`/`PLAN` 字面（框架规则自动拼） |
-| `tests/fixtures/ai/` | AI 安全离线夹具 + 三池词表快照 | `pool_tags.json`（10+5+37=52 题）由 `case_ai_contract` 对账；4 道夹具由 `case_ai_fixtures` 双跑验证 |
-| `tests/smoke_ai_*.py` | AI 专项用例 | `smoke_ai_chat`（chat 工具）/`smoke_ai_role`（契约+接线）/`smoke_ai_fixtures`（夹具）/`smoke_ai_agent`（容器契约 e2e） |
-| `docs/ai-plan.md` | AI 安全纵向的计划与逐里程碑证据（M1–M4） | 含审计记录、探针数据、已知边界 |
-| `tools/make_misc_kit.py` | misc 外包 kit 生成器 | `--verify` 在 kit 内实跑单测；自带泄密断言（禁 `.env`/`runs/`/`HANDOFF.md`） |
-| `tools/misc_contract_selftest.py` | 契约测试的自测 | 沙箱造 5 种交付，断言「该过过、该挂挂」 |
-| `roles/` + `tests/fixtures/misc/` | 外包产物落地位（已内置一套 misc） | 由 `case_misc_contract` 校验（7 项）；含 config↔roles 防漂移断言 |
-| `docs/misc-handover.md` | **交接单**：给队员哪些文件/信息 + 给他的 AI 的第一段话 | 发外包前照它走，别手挑文件 |
-| `.tools/ctfy-src/` | **平台源码**（契约真源，别去网上找文档） | 见 §6 |
-| `PROGRESS.md` | 耐久 checkpoint（§3.1-§3.7 是本轮全部结论） | 先读 §3.3-§3.7 |
+| `src/ctfy_agent/agent_main.py` | **B1 适配层**（镜像入口） | 读 task.json → env 组 Config → dry_run 分支 → 非 instance 拒跑 → Crew（**关 stop_instance**）→ 原子写 rollup；启动即写 provisional result.json |
+| `src/ctfy_agent/crew.py` | 多智能体：协调者 + web/rev/crypto/misc/ai 专家 | `_brief`、`_prior_digest`、`_delegate_task`、`COORDINATOR_PROMPT`/`_TOOLS`、`_delegate`、`_role_system`、`solve` |
+| `src/ctfy_agent/solver.py` | 专家主循环、工具分派、上下文滑窗 | `_ledger_gate`/`_ledger_after`（去重闸）、`_check_report`（证据契约）、`_execute`、`solve`、`run_role`（专家侧注入）、`_role_context`、**无进展刹车（`_NO_PROGRESS_*`）** |
+| `src/ctfy_agent/ledger.py` | 确定性账本 + 证据校验 | `normalize_args`、`attempt_key`、`looks_failed`、`claims_discovery`、`Ledger`、`verify_evidence`、`digest` |
+| `src/ctfy_agent/companion.py` | PLAN/REFLECTION 有状态伴生文本 | `parse_companion`、`PlanTrack`（推进信号只认账本新增尝试） |
+| `src/ctfy_agent/ctxcompress.py` | 工具结果瘦身 + 关键事实常驻 + 两级滑窗 | v2 新增 |
+| `src/ctfy_agent/tools_local.py` | 本地工具 http_request/shell/note/report + `jwt_forge`/`http_burst`/`http_map` | `http_map` = crawl 站点成图（链接/表单/字段/接口线索）+ probe 常见端点 |
+| `src/ctfy_agent/tools_misc_ext.py` | misc 外包：decode_blob / unpack_archive / hexpeek | 纯 stdlib |
+| `src/ctfy_agent/platform.py` | MCP 客户端 | 97 个工具暴露；`MODEL_TOOLS` = 单 agent 真白名单 |
+| `src/ctfy_agent/llm.py` | OpenAI 兼容客户端（urllib，非流式） | 只有 `/chat/completions`，**不认 anthropic flavor** |
+| `config/agent.json` | 角色/模型/预算 | coordinator+web=Kimi-K2.7、rev=Kimi-K3、ai=Kimi-K3、crypto=DeepSeek-V4-Pro-0813、misc=GLM-Z1-AirX；`max_tokens_per_challenge=800000`、`max_llm_calls=80`。**容器里角色 model 会被 `agent_main._build_config` 覆盖为 `LLM_MODEL`** |
+| `tests/smoke.py` | 离线回归（总入口，跑完打印 `N passed, N failed`） | **v2 提交版 83/83**；当前工作区 **86/86**（新增 `http_map`、`http_map_wiring`、`no_progress_brake`）。改动后必须保持全绿 |
+| `tests/smoke_context.py` | 上下文压缩/事实/滑窗/证据逐字性 12 组断言 | 并行会话有改动 |
+| `tests/smoke_http_session.py` | 302 上 Set-Cookie 入 jar 回归 | — |
+| `tests/smoke_webmap.py` | `http_map` 站点成图/probe/白名单 + 角色挂载接线 | 专抓「工具存在但没下发给模型」这类漏接线 |
+| `tests/smoke_brake.py` | 无进展刹车：输出重复 3 步提示、5 步止损；内容有变化不误伤 | 039/043 退化循环的回归 |
+| `src/ctfy_agent/method_cards.py` | 题型方法卡 | web 50 题词表 + AI 17 张 + 80 个 AI tag |
+| `roles/` + `tests/fixtures/` | 角色提示词与离线夹具 | `roles/misc.json` **不会被框架读**，必须并入 config |
+| `docs/submit-image-runbook.md` | **提交镜像的操作手册**（digest、4 步、快照命令） | 提交前必读 |
+| `docs/b1-adapter-plan.md` | B1 方案 + 平台源码硬事实 + 容器内 G1–G8 | — |
+| `docs/report-ctfy-rules.md` | 官网规则调研；标准全文在 `runs/site/standards/` | — |
+| `.tools/ctfy-src/` | **平台源码**（契约真源，别去网上找文档） | 见 §5 |
+| `PROGRESS.md` | 耐久 checkpoint（历史细节都在这里） | §§3.1–3.13 |
+| `runs/bench-web-report.md` | **本轮大规模实测报告（最新事实）** | 见 §4 |
 
-## 3. 已完成
+---
 
-- 框架跑通：MCP 握手、多智能体、预算三层刹车、实例生命周期、转录、49 个单测。
-- **A0 完成**（题型信息送达 + 提示工具放行）：tags/difficulty/solves_count 入库并送达三处提示（协调者 brief / crew 专家背景 / 单 agent 初始提示）；老 state 自动补线索；`list_hints/view_hint` 真正放行到模型工具面。M1 已在真实平台验证（详见 PROGRESS §3.8）。**关键：`run_role` 原本根本不给专家 Challenge 对象，只改 `_brief` 够不到专家。**
-- **A1 完成**（确定性 Ledger）：`ledger.py` 记录归一化 args（URL query 排序、body JSON 键排序），**crew 跨 delegate 共享**；同参数重复调用硬拦，方向证伪只定向提示不硬拦；`_prior_digest` 改为账本为主。真实转录回放：**能拦 18 次重复（≈15.5 万 prompt token）、`POST /api/login` 18 个候选全 401 → 证伪成立（M3）**，详见 PROGRESS §3.9。
-- **A2 切片完成**（证据契约）：`report` 必填 `evidence`，必须是某次工具输出的逐字连续子串；无证据却在声称发现 → 拒绝重交（上限 2 次，超限打 `[无逐字证据·未验证]`）；否定型结论不要求证据；证据写进 `ledger.observations` 并以 `[evidence|<来源>]` 回传协调者。踩坑：否定式「未拿到凭据」曾被断言词误伤（已用正则摘除）、转录追加写导致测试计数翻倍（用例开头 unlink）。详见 PROGRESS §3.10。
-- **A2 全部完成**（伴生文本 + 派活契约，用户单独批准后实施；48/48 绿，见 PROGRESS §3.11）：新 `companion.py` 把 `PLAN:`/`REFLECTION:` 做成**有状态**的（不是只写进提示词）；`delegate` 改成 `role + objective + done_when`（`task` 仅兼容）。**关键设计：停滞判定的「推进」信号只认账本新增的、非重复的尝试**——模型自述「我推进了」不算数。**尚未真实 run 验证。**
-- **全量代码审计 + 修复**（2026-10-25；48/48 绿，详见 `docs/audit-2026-10-25.md`）：三个探针实测坐实 5 个缺陷并全部修复——#1 非法端口让 `normalize_url` 抛 `ValueError` 击穿整个 run（`_ledger_gate`/`_ledger_after` 均在 try 外）→ 归一化降级 + gate/after 包 try；#2 delegate 去重键丢 `objective`（A2 回归，同 role 所有派活撞同一键）→ 归一化改读 objective；#3 `note`/`report` 进账本伪造「推进」信号 → `_ledger_after` 对 `NO_DEDUPE` 跳过；#4 HTTP 缓存跨题不清理 → `solve` 入口 clear；#5 账本摘要双重注入 → 删 `run_role` 前置。补 `case_audit_regression` 反向断言。
-- **misc 能力外包全流程**（外包→审查→合并，用户批准后实施；**49/49 绿**，见 PROGRESS §3.12–§3.13 与 `docs/review-misc-module.md`）：3 个纯 stdlib 工具（decode_blob/unpack_archive/hexpeek）+ 3397 字提示词 + 3 道夹具，全部离线验收。**P0 坑：`roles/misc.json` 不会被框架读（框架只读 `config/agent.json` 的 `extra.roles`），必须合并进 config 才生效**；已加 config↔roles 防漂移断言。
-- 两轮实测（CTFARENA-035）与 6+4 项修复：https 端口护栏、`_compact_history` 滑窗、grep、角色深合并、预算前置检查、`try/finally` 释放实例、`limit` 参数、`**kwargs` 过滤、delegate 摘要、预算扩容。全部技术生效（详见 PROGRESS §3.1/§3.2）。
-- 开源调研（读源码，非二手）：Cybench / HackSynth / PentestGPT 新版，结论见 §5。
-- 平台契约逐字读出：rollup / task.json / env / 网关，见 §6。
+## 3. 已完成的能力线（浓缩，细节见 PROGRESS）
 
-## 4. CTFARENA-035 的硬结论（**不要再重推**）
+- **框架**：MCP 握手、多智能体、预算三层刹车、实例生命周期、转录、单测。
+- **A0 题型信息送达**：`tags/difficulty/solves_count` 入库并送达三处提示；`list_hints/view_hint` 放行。M1 真机验证。
+- **A1 确定性 Ledger**：归一化 args 去重，**crew 跨 delegate 共享**；真实转录回放拦 18 次重复（≈15.5 万 prompt token）。
+- **A2 输出契约 + 逐字证据**：`report` 必填 `evidence`（工具输出逐字子串）；`PLAN:`/`REFLECTION:` 由 `PlanTrack` 有状态消费；`delegate` 改 `role+objective+done_when`。
+- **全量代码审计**：5 个缺陷已修（详见 `docs/audit-2026-10-25.md`）。
+- **misc 外包全流程**：3 个工具 + 提示词 + 夹具，离线验收（`docs/review-misc-module.md`）。
+- **B1 适配层 + v2 镜像**：见 §0 / §5。
+- **v2 新增工具**：`jwt_forge`（none/HS256-512/RS256，secret 只进账本指纹）、`http_burst`、`http_request` P0 修复、`ctxcompress`。
 
-**地面真相（黑盒实测）**
-- 真实接口只有 3 个：`/api/team`、`/api/company`、`POST /api/login`。
-- **所有未知路径都返回同一份 215B `index.html` + 200**（SPA 兜底）——「200」在这题上不代表端点存在。`/.env`、`/robots.txt`、`/api/flag`、`/api/admin`、`/team/*.jpg`、`/assets/*.js.map`、`/graphql`、`/.git/HEAD` 全是 215B。
-- flag **只能**来自 `/api/login` 成功响应体（前端 `i.value = await c.json()` 后渲染 `<pre>`）。
-- 服务端 `X-Powered-By: Express`；query 参数被忽略；无附件（`attachments: []`）；无提示（`hints.tiers: []`）；图片不存在（无 EXIF 路）。
-- **`get_challenge` 原始字段（关键）**：`difficulty=easy`、`solves_count=10`、`tags=["owasp_2025_a07","authentication_failures","weak_password","osint","social_engineering","express","vue3"]`。
+---
 
-**凭据探索已穷尽（~1202 次全 401，别再试）**
-216 数据词 + 168 组合（词+年份/人名+宠物名）+ 20 SQLi/NoSQL/类型混淆 + 10 请求体变形 + 488 补漏（漏掉的数据词 golden/retriever/tortoise/endurance…、带空格标点的短语原形、8 种用户名变体含全名/邮箱/拼接）+ 300 经典弱口令表。**密码仍未找到**——但 tags 证明**方向就是弱口令+OSINT+社工**，所以不要断言「凭据路是死路」（这是上一轮的判断错误，已修正）。
+## 4. 实测基准（2026-10-26 晚，**本轮核心，勿重推**）
 
-**两轮 run 数据**
-| | run1（6 修复） | run2（+4 修复） |
+完整报告：`runs/bench-web-report.md`；原始数据：`runs/bench-*/`、`runs/ab-pro-*/`。
+
+### 4.1 口径（先看这个，否则数字会误读）
+
+- 单题预算 **150,000 token**（环境变量 `AGENT_MAX_TOKENS_PER_CHALLENGE=150000`），**生产默认是 800,000**——这是理解全部结果的前提。
+- 模型 = `config/agent.json` 的角色模型（Kimi-K2.7 / K3 / Pro-0813），全部 `category=web`。
+- 代码 = 提交 `1aeee61`（v2 同源），**不含**并行会话的未提交改动。
+
+### 4.2 总体
+
+| 指标 | 数值 |
+|---|---|
+| 归档 | **16 道**（另 3 道中断） |
+| 解出 | **5（31.2%）**；easy 5/9=56%、medium 0/4、hard 0/3 |
+| 平均耗时 / 消耗 | **290.4 s** / **99,313 token** 每题 |
+| 吞吐 | **12.4 题/小时**（串行，含实例启停） |
+| token 合计 | K2.7 臂 **2,130,710** + Pro 臂 **437,299** = **2,568,009** |
+| **失败题 attempts** | **全部为 0**——没有一道是"提交了但 flag 错"，失败都在"没产出候选 flag" |
+
+### 4.3 卡点（这是报告最值钱的部分）
+
+| 卡点 | 次数 | 说明 |
 |---|---|---|
-| 调用/token | 34 / 302,145 | 50 / 504,953 |
-| 协调轮/delegate | 5 / 3 | 8 / 6 |
-| report（真交结论） | 0 | 1 |
-| flag | 0 | 0 |
+| **预算耗尽** | 6 | medium/hard 平均 159k，正好撞 150k 上限 |
+| **协调者空转** | 2 | 只写 PLAN 不发工具调用 → 被判完成，1 步归零（非截断） |
+| **实例起不来** | 2 | 上游 `Rate limited by upstream API`，且**失败后不硬停**，空转烧完整轮 |
+| 协调者自认完成但未提交 | 1 | — |
 
-run2 工具分布：`http_request 65 / delegate 6 / note 1 / report 1` —— **平台工具 0 次**。
+工具层摩擦：`shell` 报错 **67%**（Windows 不认 POSIX 写法）、`start_instance` **61%**、`http_burst` **25%**、`report` 被拒 **13 次**（证据必须逐字子串）、账本拦截 **23 次**（K2.7 19 + Pro 4）。
 
-**根因链（逐环已验证）**
-`Challenge` 数据类没有 tags/difficulty/solves_count → `from_dict`/`normalize_challenge` 丢弃 → `upsert` 只合并 4 字段 → `_brief` 无法展示 → 专家从不调平台工具（协调者又没有平台工具）→ **agent 全程不知道这是道 weak_password/OSINT 题，50 万 token 盲跑**。
+**环境级阻塞**：**CTFARENA 全库 50 道 web 全部起不来**（同一个上游限流），整库缺席；SAMPLE/CYBENCH/AGENTBENCH/AGENT-DEFENSE 正常。
 
-## 5. 开源调研结论（该抄什么）
+**无效样本**：SAMPLE-006 复用了已死实例（23 次 404、0 次 2xx，156k token 纯浪费）。剔除后 **5/15 = 33.3%**。
 
-| 项目 | 机制 | 采纳 |
-|---|---|---|
-| **Cybench** `agent/agent.py`(734行)+`agent/prompt.py` | 强制四段自述：Reflection / **Research Plan and Status（未改则原样复制）** / Thought / **Log（已执行命令+结论枚举）**；子任务脚手架；`iterations_until_hint`；头尾截断；反幻觉剥离 | 借 Plan/Reflection 思想。**Log 由确定性 ledger 取代**（它的 Log 靠模型自觉复制，且会被自家截断丢弃）。**子任务机制不可复制**（依赖基准自带答案） |
-| **HackSynth** `pentest_agent.py` | Planner 只看滚动摘要、从不见原始输出；Summarizer 用新摘要整体替换 | 借「滚动摘要」控制上下文；**不借**「看不到原文」（web 题要精确响应体） |
-| **PentestGPT 新版** `pentestgpt_agent/plan.py`+`agents.py`+`loop.py` | 计划是**校验过的状态对象**：TaskKind(discover/enumerate/test/exploit/verify/recover) + `done_when` + `basis_ids` 证据引用；一次只租一个任务；`EXPLOIT` 必须先有完成的 `TEST`；无证据不许 finish；Executor 输出 `evidence_excerpt`＝**单一输出里的逐字连续子串** | 全采纳为设计蓝本（简化版） |
-| **D-CIPHER**（arXiv 2502.10931，**无公开代码**） | Planner-Executor + 动态反馈 + Auto-prompter | 仅作校准：SOTA 也只有 **22.0% NYU / 22.5% Cybench / 44.0% HTB** → 我们 0/1 不算异常 |
-| **EnIGMA**（arXiv 2409.16165，ICML 2025，代码在 **SWE-agent v0.7**） | 交互式 gdb/netcat 工具；命名 **soliloquizing**（模型幻觉观测、不与环境交互） | pwn 轨道时再读；soliloquizing 是 evidence 纪律要防的 |
+### 4.4 模型 A/B（回答"是不是 K2.7 能力不足"）
 
-**方法论坦白**：上述 ★ 评级是机制合理性判断，**没有任何 ablation 数据**支撑某个机制的增益。真正的证据只能来自我们自己的验收指标（M1-M5）。
+同代码、同配置、同预算，只把 6 个角色换成 `DeepSeek-V4-Pro-0813`，跑同 3 道 K2.7 失败题：
 
-## 6. 平台契约（从 `.tools/ctfy-src` 逐字读出）
+| 题 | K2.7 | Pro | 速度比 |
+|---|---|---|---|
+| SAMPLE-007 | ✗ 335 s | ✗ 849 s | 2.53× |
+| SAMPLE-009 | ✗ 464 s | ✗ 1,196 s | 2.58× |
+| AGENTBENCH-002 | ✗ 352 s | ✗ 597 s（LLM 504） | 1.70× |
 
-**rollup（`eval/harness.py:125-137`，平台自有 harness 的字段，可照抄）**——写 `$CTFY_WORK_DIR/result.json`；**用户镜像不读 stdout**（`result.stdout_fallback` 为 false）：
-```json
-{"challenge_id","instance_id","solved","fully_solved","input_tokens","output_tokens","turns","tool_calls_made","stop_reason"}
-```
-`stop_reason` 取值：`final | max_turns | halted | cut_off | refused | dry_run | done`（**`exit_<n>` 前缀才算 aborted**）。
+**结论：0/3 vs 0/3，慢 2.27×，覆盖面更窄**（SAMPLE-007：K2.7 探 38 条路径，Pro 仅 10 条，其中 8 条被 K2.7 包含，Pro 独有 2 条）。→ **瓶颈在预算与机制，不在模型 IQ。换模型不解决问题。**
 
-**task.json（`core/agent_brief.py:399-442`，schema_version=2）**：
-```json
-{"schema_version":2,"run_mode":"instance|qa|defence|engagement|awd",
- "challenge":{"id","name","description"},"competition_id",
- "questions":[{"id","prompt"}],"gated_questions","scope","rules_of_engagement",
- "deliverable","platform_url","max_turns":null|int,"result":{"path","stdout_fallback"},
- "target_instance":null|str}
-```
+### 4.5 并行求解器（多 LLM 同题并行）评估结论
 
-**环境变量（以 CTFY-0001 §1.1 为准，用户镜像实收）**：`CTFY_PLATFORM_URL`、`CTFY_TOKEN`、`CTFY_EVAL_CHALLENGE_ID`、`CTFY_EVAL_COMPETITION_ID`、`CTFY_EVAL_MAX_TURNS`（**缺失=无预算**）、`CTFY_WORK_DIR`、`CTFY_EVAL_DRY_RUN`（dry run 才为 `1`）。
-**⚠️ `CTFY_MCP_URL` / `CTFY_TARGET_URL` 不存在于用户镜像**——它们只出现在平台自有 harness（`eval/external.py`）。MCP 地址只能从 `$CTFY_WORK_DIR/mcp.json` 或 `CTFY_PLATFORM_URL + /api/v1/mcp/` 拼。`config.py:50` 的 `CTFY_MCP_URL` 映射是死项。
-**LLM 网关**：`LLM_FLAVOR`（`openai` | `anthropic`）+ `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`；平台同时下发对应 provider 的原生变量名（`OPENAI_*` 或 `ANTHROPIC_*`）。**`LLM_API_KEY` 为空是真实状态，必须大声失败，禁止回退自有 key**；`LLM_BASE_URL` 与 `LLM_API_KEY` 是「一个决定」，有 base url 就必须用。
+- **"多 LLM（换模型）"已被 A/B 证伪**；
+- **"多策略并行"没有被直接测量过**，唯一硬支撑是"失败主要是策略塌缩"（同一 POST 原样重发 5 次全被账本拦、反复换措辞重派同一思路）；
+- 两个硬前提：①预算必须 **×N**（否则等于拆预算，必亏）；②环境失败（实例限流、旧实例、504）对 N 路**同时生效**，只是把浪费乘以 N；
+- 实现上**不是改配置能解决的**：`Crew` 是单线程顺序编排，需要改编排层 + 预算/账本并发安全；建议先做 **2 路 × 4–6 道 medium** 的小实验；
+- 并行会话正在加的**串行换路线干预**（`STRATEGY_SIMILARITY_LIMIT`）能以 1× 成本吃到大部分多样性收益，**它上线后并行的边际收益更小**。
 
-**result.json（CTFY-0001 §3）**：写 `$CTFY_WORK_DIR/result.json` 后 `exit 0`（非 0 一律判失败）。字段全可选，`schema_version: 2` 只是 advisory；核心字段 `answers`（按 question id，平台代交）、`solved`（**平台按自己的提交记录重算，写它不加分**）、`turns` / `tool_calls_made` / `input_tokens` / `output_tokens` / `stop_reason` / `writeup`（可选 markdown，不参与判分）。dry run 写 `{"schema_version":2,"solved":[],"fully_solved":false,"stop_reason":"dry_run"}` 再 exit 0。
+### 4.6 数据可信度（坑）
 
-**work dir 里还有 `mcp.json`**（`docker_provider/harness.py:775` `TASK_MCP="mcp.json"`）：平台预写好的 MCP 客户端配置（含端点与鉴权方式），dry run 不写。我们的 `platform.py` 自己从 env 构建、不强制读它，但 B1 必须知道它存在——平台文档明说「`--mcp-config $CTFY_WORK_DIR/mcp.json` is the whole integration」。
+- 150k 口径使 medium/hard 偏悲观；CTFARENA 缺席；A/B 样本仅 3 道。
+- **统计时警惕重复计数**：拦截标记串会被账本重渲染与结论回显重复计入（"35 次账本拦截"就是这么来的，精确值是 23）。验尸一律按"结果行"计数，不按文本出现次数。
+- 本次审核已修正 3 处初版数字（报告 §11 有记录）：账本拦截 35→23、"Pro 找到 K2.7 漏掉的端点"→ 不成立、"{v} 落 host 段两人都撞过"→ 仅 Pro。
 
-## 7. 已批准的方案（按此执行）
+---
 
-### 能力线（本地可测，串行）
-- **A0 题型信息送达**（✅ 已完成，48/48 + M1 真实平台验证，见 PROGRESS §3.8）：`state.py` Challenge 加 `tags/difficulty/solves_count` + **扩 `upsert` 合并列表**；`cli.py` normalize 加三字段 + **摘掉 `pick` 里的 "tags" 兜底**；**三处确定性送达** `难度 X | 已解 N 队 | tags: …`：`crew.py:_brief`（协调者）、**`solver.py:_role_context`（`run_role` 专家背景——原方案只写 `_initial_prompt`，那是 `solve()` 专用、够不到 crew 专家，必须保留）**、`solver.py:_initial_prompt`（单 agent 路径）。验收 M1：已通过。
-  **附带项（同样 A0 做）**：`PLATFORM_SCOPE["read"]`（crew.py:30-41）补 `list_hints` / `view_hint`——平台允许清单里有这两个工具（`list_hints` 需 `challenge_id`+`competition_id`，返回 `tiers` 字段），我们没放行 → **agent 结构性拿不到提示**。035 的 `tiers=[]` 用不上，但正赛有 hints 的题会吃亏。
-- **A1 确定性 Ledger**（1 天）：新文件 `ledger.py`（`Tried`/`Hypothesis`/`Observation`/`Ledger`），**去重键含归一化 args**；挂在 `solver.py:717`（run_role）与 `solver.py:552-560`（单 agent）以及协调者循环；`_prior_digest` 改为渲染 ledger；`rotate(k=3)` 做假设轮换并注入「禁止再试」。验收 M2 跨 delegate 重复=0、M3 ≥1 次 open→refuted。
-- **A2 输出契约 + 逐字证据**（✅ 已完成，48/48）：**保留 tool_calls，不照搬自由文本解析**；`report` 增加必填 `evidence`（逐字子串，写入 ledger.observations）；系统提示加 `PLAN:`/`REFLECTION:` 伴随文本（**由 `companion.PlanTrack` 消费**，不是只写进提示词）；协调者派活改成「一个 objective + done_when」。验收 M4 已离线端到端；**M6（计划漂移/停滞）指标已生成进 summary["plan"]，待真实 run 取证**。
-- **A3 题型方法卡**（2 小时，**需用户单独批准**——属提示词工程，与「先不管提示词」冲突）：tags → 任务序列/检查项映射。
-- **A4 批量基线**（1 天）：10 道 web，**单题预算压到 150-200k**（500k×10 太贵）。产出命中率表 + 失败归因。
+## 5. 平台契约（从 `.tools/ctfy-src` 逐字读出，硬点）
 
-### 交付线（B3/B4 需用户提供外部资源）
-- **B1 适配层**（1 天）：新 `src/ctfy_agent/agent_main.py` + `python -m ctfy_agent agent`：读 task.json → 映射 env 到 Config → `run_mode=="instance"` 走 Crew、`target_instance` 非空则不重复起实例 → 映射 rollup（含 stop_reason 枚举转换）→ 写 `result.path` **且** print。用 fake MCP + task.json fixture 离线验收。
-- **B2 网关流式**（0.5 天）：`llm.py` 改 `"stream": True` + urllib SSE 解析（`data:` 行 → `[DONE]`）。
-- **B3 Docker build/push**：**需要用户提供可跑 Docker 的环境**。
-- **B4 三道门**（镜像注册 → 组织审批 digest 锁定 → provider key）：**需要用户提供 key**；外部人工延迟大，**应尽早并行启动**。
+- **result.json**：写 `$CTFY_WORK_DIR/result.json` 后 `exit 0`（非 0 一律失败）。核心字段 `answers`（按 question id，平台代交）；`solved` 由平台按提交记录重算，写它不加分；其余 `turns/tool_calls_made/input_tokens/output_tokens/stop_reason/writeup` 可选。dry run 写 `{"schema_version":2,"solved":[],"fully_solved":false,"stop_reason":"dry_run"}`。
+- **task.json**（schema_version=2）：`run_mode` ∈ instance|qa|defence|engagement|awd；含 `challenge/competition_id/questions/gated_questions/scope/rules_of_engagement/deliverable/platform_url/max_turns/result{path,stdout_fallback}/target_instance`。
+- **环境变量**：`CTFY_PLATFORM_URL`、`CTFY_TOKEN`、`CTFY_EVAL_CHALLENGE_ID`、`CTFY_EVAL_COMPETITION_ID`、`CTFY_EVAL_MAX_TURNS`（缺失=无预算）、`CTFY_WORK_DIR`、`CTFY_EVAL_DRY_RUN`。**`CTFY_MCP_URL`/`CTFY_TARGET_URL` 在用户镜像里不存在**——MCP 地址从 `$CTFY_WORK_DIR/mcp.json` 或 `CTFY_PLATFORM_URL + /api/v1/mcp/` 拼。
+- **LLM 网关**：`LLM_FLAVOR`(openai|anthropic) + `LLM_API_KEY/LLM_BASE_URL/LLM_MODEL`。**`LLM_API_KEY` 为空必须大声失败，禁止回退自有 key**。
+- **赛事硬约束**（实测）：`internet_policy=deny`（容器无外网）、`max_instances_per_team_effective=1`、3 段 session（11/15、11/21、11/22 各 10:00–20:00 CST）、同分先解出者靠前。
+- 竞赛 id：`TPCTF`=`c0d8b4e3dd3b42c095d63d7dfa66431f`；练习库：CTFARENA=`4394a10aa5d24f97a1ec3301ca718a45`、CYBENCH=`d35cc057773c44f79eec192b54551327`、AGENTBENCH=`9f613f261b68469b9c4da805197983b2`、AGENT-DEFENSE=`d4917609895644e1bcf92b3c9b3bc70f`、SAMPLE=`e4e78ff318dc4844beac13f9ea7409aa`。
 
-## 8. 本地环境与操作要点（踩过坑）
+---
+
+## 6. 待办与阻塞
+
+1. **等平台审核 + 提交**（用户）：`docs/submit-image-runbook.md`；提交时显式 `:v2`，别用 `latest`。
+2. **并行会话的未提交改动必须由用户决定去留**（12 文件 +490/−25：`config/agent.json`、`crew.py`+67、`tools_local.py`+255（`http_map`）、`ctxcompress.py`、`roles/ai*`、`roles/misc.json`、`tests/smoke*.py`、`docs/ai-plan.md`、新增 `docs/ai-borrowable.md`、`tests/smoke_webmap.py`）。**这些改动没有进过 v2 镜像、也没有跑过基准**——新会话不要擅自 commit 或 revert。
+3. **CTFARENA 50 道 web 需换时间窗重测**（上游限流是暂时的，不是我们代码问题）。
+4. **GitHub PAT 吊销**（此前暴露过，仍未处理）。
+5. 若要继续做能力线：优先"提高预算到 800k 复测 medium/hard"（比加并行路数更划算），其次"实例失败即硬停"、"report 证据校验放宽"。
+
+---
+
+## 7. 本地环境与操作要点（踩过坑）
 
 - Python：`$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
-- 必须先 `$env:PYTHONIOENCODING="utf-8"`；PowerShell 5.1 **不要**用 `Tee-Object -Encoding` 或 `*>`，用 `| Out-File -FilePath X -Encoding utf8`
-- 跑题：`cmd /c run.cmd crew CTFARENA-035 > runs\x.txt 2>&1`，作为**后台 job**；先确认转录文件存在再判定跑过
-- 单测：`python tests/smoke.py`（须 **49/49**，当前基线；改动后保持全绿）
-- 无 Docker / 无 WSL / 非管理员
-- `web_search` **不可用**（搜索后端缺 API key）；`raw.githubusercontent.com` 被 DNS 拦；`api.github.com` 限流；**`git clone` 可用**（用 `--filter=blob:none --no-checkout` 做元数据克隆，再 `git show HEAD:path` 取单文件）；jsDelivr 取单文件可用；arXiv `export.arxiv.org` 可用
-- 凭据在 `.env`（`CTFY_TOKEN`、`DEEPSEEK_API_KEY`），**引用时打码**
-- 计费/额度：预算按题**累计**（`state.json` 的 `tokens`），重跑要先跑 `runs/preflight_035.py`（清 tokens/status/instance/tool_counts 并轮转转录）
-- 实例配额 = 每题 1 个；`start_instance` 必须带 `competition_id`（否则 403 `competition_required`）
-- **`runs/` 分析脚本**（全部带 `.txt` 输出）：`preflight_035.py`（**重跑前必跑**：清预算/状态/实例计数 + 轮转转录）、`dump_login.py`（M2 统计登录尝试用）、`verify_6fix.py`、`dump_http.py`、`probe_content.py`、`probe_challenge.py`、`brute_cands.py`、`inject_test.py`、`surface_probe.py`、`login_get_test.py`、`combo_test.py`、`audit_close.py`、`common_pw_test.py`
-- **转录结构** `runs/default/transcripts/<ID>.jsonl`：追加式、**跨 run 累积**，按 `## 题目` 分段；每行 `role/step/tool/args/result/at`；**result 截断到 2000 字符**——完整响应体只在模型上下文里，转录拿不回。验尸统计时防「delegate 汇报里引用拦截文本」被重复计数（run2 的『2 次合规拦截』实为 1 真 + 1 引用）
-- 竞赛 id：`TPCTF` = `c0d8b4e3dd3b42c095d63d7dfa66431f`，练习 `CTFARENA` = `4394a10aa5d24f97a1ec3301ca718a45`
+- 先 `$env:PYTHONIOENCODING="utf-8"`；跑批量再设 `$env:PYTHONUNBUFFERED="1"`（否则后台 job 看不到进度）。
+- 跑题：后台 job 跑 `cmd /c run.cmd crew <ID>`；**先确认转录文件出现**再判定跑过。
+- 单测：`python tests/smoke.py`，v2 基线 **83 passed**，当前工作区 **85 passed / 0 failed**（含并行会话新增用例）；改动后必须全绿。
+- 无 Docker / 无 WSL / 非管理员（镜像构建走 GitHub Actions）。
+- `web_search` 不可用；`raw.githubusercontent.com` 被 DNS 拦；`git clone --filter=blob:none` + `git show HEAD:path` 取单文件可用。
+- 凭据在 `.env`（`CTFY_TOKEN`、`DEEPSEEK_API_KEY`），**引用时打码**；临时目录里复制 `.env` 后**用完必须删**。
+- **实例**：配额 1，串行；`runs/_instances.py`（`--stop` 清实例）；`start_instance` 必须带 `competition_id`；失败常见 "Rate limited by upstream API"；**跑前务必确认 0 实例**（旧实例会污染：SAMPLE-006 复用死实例白烧 156k）。
+- **基准/分析脚本**（全在 `runs/`，只读）：`_bench_web.py`（批量驱动）、`_bench_report.py`（分类统计）、`_final_stats.py`、`_consolidate.py`（两臂汇总）、`_cluster_eval.py`（并行求解器评估）、`_tools_stats.py`、`_start_probe.py`（零 LLM 探实例）、`_model_probe.py`（探模型可用性）、`_audit_*.py`（数字审核）。
+- 转录 `runs/<run>/transcripts/<ID>.jsonl`：**一行一个工具调用+结果**（`role`=专家名、`tool`、`args`、`result`、`usage`、`step`）；统计一律按行，不按文本出现次数。
 
-## 9. 禁忌（别重做）
+---
 
-1. **不要再穷举 035 的凭据**（~1202 次已试，全 401）。
-2. **不要断言「凭据路是死路」**——tags 证明方向对，是候选生成覆盖不足。
-3. **不要照搬 Cybench 自由文本 COMMAND 格式**（我们用 OpenAI tool_calls，会倒退）。
-4. **不要未经批准改提示词内容**（用户明确「先不管提示词」，A3 需单独批准）。
-5. **不要用 500k 预算跑批量**（10 题 = 5M token）。
-6. **不要重复审计 tags 发现**（PROGRESS §3.4/§3.6 已固化）。
+## 8. 禁忌（别重做）
 
-## 10. 下一步
+1. 不要重新推导 A/B 结论、基准数字、卡点分类——都在 `runs/bench-web-report.md`，直接引用。
+2. 不要用 150k 预算再跑一遍就去解释"模型不行"——那是预算掐断，不是能力结论。
+3. 不要在大规模测试里复用已存在的实例（先 `_instances.py --stop`）。
+4. 不要提交 `:v1` 或 `:latest`；不要移动 v1 的 digest。
+5. 不要统计时按文本出现次数数拦截/报错（会翻倍）。
+6. 不要擅自 commit / revert 并行会话的未提交改动。
+7. 不要重复穷举 CTFARENA-035 的凭据（~1202 次全 401 已试；但**不要断言凭据路是死路**——tags 指明方向对，是候选覆盖不足）。
+8. 未经用户单独批准，不要改提示词内容。
 
-**A0 + A1 + A2 已全部完成**（49/49 绿；M1 真实平台验证、M2/M3 真实转录回放、M4/M6 离线端到端，见 PROGRESS §3.8–§3.11）。A2 的两项提示词改动已获用户单独批准并实施。**另完成一轮全量代码审计并修复 5 个缺陷（见 §3 与 `docs/audit-2026-10-25.md`），并完成 misc 能力外包全流程接入（见 §3 与 `docs/review-misc-module.md`）。**
+---
 
-**近期新产出（新对话必读）**：
-- `docs/b1-adapter-plan.md` —— B1 完整方案 + 可行性审核（8 条从平台源码读出的硬事实 + 容器内会踩的 G1-G8）。
-- `docs/report-ctfy-rules.md` —— 官网规则调研；标准全文已落地 `runs/site/standards/CTFY-0001.md`（943 行）、`CTFY-0002.md`（1285 行）。
-- `docs/HANDOFF-2026-10-25.txt` —— 本文件的纯文本可粘贴版（新对话首条消息直接用）。
-- `docs/review-misc-module.md` —— misc 外包交付包验收报告（P0 缺口、核验矩阵、合并步骤）。
+## 9. 与用户的协作偏好
 
-剩下待决策的只有 **A3 题型方法卡**（属提示词工程，仍需单独批准）。
-
-**⭐ 唯一硬阻塞**：注册模型时 `LLM_FLAVOR` 是 `openai` 还是 `anthropic`？我们 `llm.py:120` 只有 OpenAI `/chat/completions`；若平台按 anthropic 下发，镜像完全不可用（需另写客户端，+0.5 天）。**这条确认前，B1 的 LLM 接线无法定案**（其余 90% 可先写离线版）。
-
-下一步：
-1. **B1 适配层**（关键路径，比赛交的是镜像）：方案已就绪，先用 fake MCP + task.json fixture 做离线版；`agent_main.py` 必须「启动即写 provisional result.json → dry_run 分支 → 非 instance 拒跑 → env 组 Config → 读 mcp.json → Crew（**关掉 stop_instance**）→ 原子写 rollup」。容器内 G1-G8 见方案。
-2. **A4 批量基线**（§7）：单题预算压到 150–200k，产出命中率表 + 失败归因。**A0/A1/A2 至今没有真实 run 验证**——A4 就是第一次真机检验，建议先单跑 1 道确认新契约不崩。
-3. **出题（authoring）能力**：正赛 `authoring_enabled=true`（11/21 三个 2h 窗口 + 人工审），我们目前**零支持**，是被忽略的一块，需先调研再排期。
-
-⚠️ 赛事硬约束（`GET /api/v1/competitions/c0d8b4e3dd3b42c095d63d7dfa66431f` 实测）：`internet_policy=deny`（容器无外网）、`max_instances_per_team_effective=1`、3 段 session（11/15、11/21、11/22 各 10:00–20:00 CST）、同分先解出者靠前、报名 11-13 20:00 截止（已 177 队 > 150）。规则附件当前为空，判罚细则未公开。
-
-⚠️ 重跑 CTFARENA-035 前必须先 reset（该题累计 504,953 已超 500,000），且一次约 20–50 万 token。
-⚠️ A2 新增 `PLAN:`/`REFLECTION:` 会让每步输出多约 30–60 token（估算，未实测）；按 50 步算约 1.5–3k token，相对 8.6k/调用的 prompt 占比很小。
-⚠️ **A2 的最大未知**：035 的历史转录里 131 条记录只有 **7 条**有非空 assistant 文本（其余只发 tool_calls、不写文本）。所以模型很可能压根不写 PLAN，`missing_steps` 会接近 100%、2 次提醒配额用完即止——机制安全降级但也失效。首次真实 run 优先看 `summary["plan"]["missing_steps"]` 与 `plan_changes`；缺失率过高说明提示词强度不够，属提示词改动，**要再批准**。
-
-## 11. 与用户的协作偏好（新对话必读）
-
-- **只认实验数据，不猜测**；每个断言先自查——用行号、转录或实测输出验证，不凭印象写数字。
-- 方案先批准再实施；**提示词内容类改动必须单独批准**（用户明言「先不管提示词」，A3 就是因这条单列的）。
-- 密钥（`.env` 里的 `CTFY_TOKEN` / `DEEPSEEK_API_KEY`）引用时打码。
-- 两条线并行：外部资源（Docker、provider key）到位前，先把本地可测的部分做完。
-- 验尸/统计时警惕**同一事实的多重计数**（拦截文本被汇报引用、echo 重复），先归类再报数。
+- **只认实验数据**；写数字前用脚本/行号核实，不凭印象。
+- 方案先批准再实施；**提示词改动单独批准**。
+- 密钥打码。
+- 用户在意成本：实验要设预算上限，能提前停就停，报告要给"钱花在哪"的结构化拆解。
+- 验尸/统计警惕**同一事实多重计数**（拦截文本被汇报引用、echo 重复），先归类再报数。
+- 回答用中文，简洁 + 表格 + 明确口径与置信度。

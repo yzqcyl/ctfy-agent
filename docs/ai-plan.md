@@ -26,6 +26,7 @@
 | M3 | ASI01–10 方法卡 + AGENT-DEFENSE 防御卡 + Crescendo/GOAT 提示词 + 3 道离线夹具 | **已完成，待确认** | 见 §4 |
 | M4 | 容器契约 e2e：AI 题 task.json → run_agent → result.json + 陷阱页夹具 | **已完成，待确认** | 见 §5 |
 | M5 | 真机 2/2 解出（038 ASI01 + 039 ASI02，Kimi-K2.7） | **已完成，待确认** | 见 §6 |
+| M5.5 | 效率优化 R1/R2（GitHub 调研落地）：038 135k→104k | **已完成，待确认** | 见 §7 |
 | M6 | 校准 + 镜像重建 + PROGRESS/HANDOFF 同步 | 未开始 | — |
 
 ## 2. M1 证据：`chat` 工具
@@ -347,3 +348,170 @@ cookie jar 只从**最终响应头**捞 cookie，urllib 跟随跳转后 Set-Cook
 - 单题成本 ~135–210k，若镜像预算按 500k/题有富余，但**多题连跑要控总预算**；
 - M6：镜像重建 + entrypoint 校验 + 正赛前 dry-run。
 
+## 7. M5.5 效率优化（GitHub 资产调研 → R1/R2 落地 + 实测）
+
+### 7.0 调研结论（可借资产与许可）
+
+| 来源 | 许可 | 借了什么 |
+|---|---|---|
+| [NVIDIA/garak](https://github.com/NVIDIA/garak) | Apache-2.0 | 注入/编码载荷族 → 改写成本方载荷清单卡 |
+| [ethz-spylab/agentdojo](https://github.com/ethz-spylab/agentdojo) | MIT | `<INFORMATION>` 越狱包裹形态 → 载荷卡第 ② 类 |
+| [gehewu/LLM-CTF-Solver](https://github.com/gehewu/LLM-CTF-Solver) | Apache-2.0 | 「关键事实防丢 / 阶段感知」思路 → FactsBoard |
+| [0ca/BoxPwnr](https://github.com/0ca/BoxPwnr) | **AGPL-3.0** | 只读思路（compaction 调度），**不抄代码** |
+| [microsoft/PyRIT](https://github.com/microsoft/PyRIT) | MIT | 评估过，增量低，未采用 |
+
+没有现成的 TPCTF agent 赛道方案可抄；可借的是「载荷族」和「事实防丢」两类资产。
+
+> 第二轮外部调研（AIxCC 决赛队伍 Theori / Team Atlanta / fuzzingbrain 的 agent 设计，以及
+> EnIGMA、Cybench、NYU-CTF-Bench、HPTSA 等论文）单独成文：[ai-borrowable.md](./ai-borrowable.md)。
+> 结论：下一步最该借的是「卡死干预 + 精修工具集 + 结构化输出」，用来治「动作序列浪费」（038/039 的
+> 打转与 GET/POST 混淆）；本轮只出方案，未改代码。
+
+### 7.1 R1 上下文压缩 + 关键事实常驻（新模块 `src/ctfy_agent/ctxcompress.py`）
+
+动机（M5 实测）：两题成功 run 的 token 里 **prompt 占 97%**（completion 仅 2–6k），钱全花在
+「每轮重新灌历史」。历史里最肥的是 http_request 响应体（单条约 2000–6000 字符）。
+
+实现：
+- `shrink_message_text`：JSON 保结构只压 body；非 JSON 整体瘦身。保留「头 45% + 关键行 + 尾 12%」，
+  关键行覆盖 flag/token/session/状态码/接口 **/表单结构（input/textarea/name=/csrf）**。
+- `FactsBoard`：从工具结果抽「结论级事实」——候选 flag、会话已建立、已访问端点、AI 工具名、
+  **表单字段名**、详情页 href、ticket 线索（只在敏感上下文里才算）；渲染 ≤520 字符挂在头部 user 消息，
+  头部永不被滑窗丢弃 → 事实免疫压缩。
+- `_compact_history` 两级：超预算 55% 先压缩旧步（最近 3 步不动、结构不坏），仍超才整块丢。
+- 跨角色**幂等 GET** 放行：新专家重读同一页面不再被账本拦（写操作仍拦）。
+- 证据可引用片段：捕获到 flag 时注入一条逐字原串，避免 evidence 被改写导致 report 被拒。
+
+### 7.2 R2 载荷清单卡（`method_cards.AI_CARDS` 第 18 张）
+
+按 `agentic_ai` 族标签命中（三个 AI 池的题都带），一题只多约 250 字符，给出 5 类可直接试的载荷形态：
+直白覆盖、假装上级 `<INFORMATION>`、编码穿越、工具指令四写法（`@@TOOL:` / `tool= args=` / 代码块 / `<tool_call>`）、
+「输出工具返回原文」收尾。
+
+### 7.3 实测（Kimi-K2.7，同配置 `runs/_m5_config.json`，260k 上限）
+
+优化后在**三道不同 ASI 子类**的题上验证（040/041 此前从未跑过，属真正泛化测试）：
+
+| 题 | 子类 | 优化前 | 优化后（最终配置） | 变化 |
+|---|---|---|---|---|
+| CTFARENA-038 | ASI01 注入/目标劫持 | 135,103 / 14 调用 | **104,124 / 13** | -23%，解出 |
+| CTFARENA-040 | ASI03 身份滥用（hard） | 未跑过 | **78,730 / 10** | 首次即解出 |
+| CTFARENA-041 | ASI04 供应链/恶意插件 | 未跑过 | **84,142 / 12** | 首次即解出 |
+| 每次 LLM 调用 prompt | — | 约 9.6k | 约 7.5k | **-22%** |
+| CTFARENA-039 | ASI02 工具滥用 | 209,813 / 23（解出） | **266,055 / 31（未解）** | **回归，见 7.7** |
+
+最终配置下 **3/3 解出，全部 ≤105k token、≤13 次调用、2 个回合**；
+对照优化前同题区间 135–210k、14–23 次调用，属于两个量级差异之外的结构性下降（预算上限 260k 现在留有 ~2.5 倍余量）。
+
+回归：`tests/smoke.py` **83 passed / 0 failed**（新增 `smoke_context.py` 12 组断言 + `smoke_http_session.py`）。
+
+### 7.4 这一轮踩的坑（都已写进用例防复发）
+
+1. **压缩改动破坏证据契约**：保留行加了 `"| "` 前缀 / 做了 strip → 模型照抄后不再逐字，
+   `report` 被连拒、协调者误判「没拿到」，连续 3 个 run 各烧约 260k 才解出。
+   → 保留行一律原样；用例断言保留片段必须是原文子串。
+2. **假线索**：把页面上任意 `ticket #6` 当线索写进事实块 → 模型对着自己的新工单反复调内部工具，
+   而真数据在预置的低号工单。→ 只在 reconciliation/restricted 等敏感上下文里才认。
+3. **表单结构被压掉**：模型连抓 6 次 `/portal/new` 抄字段（约 48k token）。→ 表单结构行进关键行 + 抽成事实。
+4. **跨角色重复拦截**：新 delegate 重读 `/kb` 被账本拦（白烧 2–3 步）。→ 幂等 GET 跨角色放行。
+5. **benign 测试票浪费**：提示词「开局先 benign 探能力」与网页载体打法冲突 → 限定「对话型靶子才 benign」，
+   网页载体第一张工单就注入。
+
+### 7.5 结论与下一步
+
+- 单题最优成本从 **135k 降到 104k（-23%）**，且更快（13 调用）；per-call prompt -19% 是可复用的结构性收益。
+- **039 波动大**（同一提示词：一次 210k 解出、一次 266k 未解）：瓶颈已不是上下文大小，而是
+  「协调者何时停止再验证 / 何时把候选直接 submit」与「工具名猜测」。下一步优先做**回合经济与停止条件**，
+  而不是继续压 prompt。
+- 建议把 `max_tokens_per_challenge` 从 260k 收紧到约 180k 试跑：当前失败 run 多是「打转烧到上限」，
+  收紧上限可逼出更早的 submit/收口（需实测确认不影响解出率）。
+
+### 7.6 平台侧硬约束：per-challenge start_instance 配额
+
+复测 039 时撞到 The per-challenge start_instance limit has been exhausted：
+同一道题的实例启动次数有上限（本题累计 m5e/m5l/m5m 之后用尽），而**换题（040/041）可以正常启动**。
+对产品的影响：正赛里每道题的实例启动次数必须当稀缺资源——一次 start_instance 要尽量跑完整个攻击链，
+不能像本地调试那样反复重启；协调者层面已能看到启动失败会落到 web 专家浪费一轮（m5o 白烧 48k），
+后续应在启实例失败时直接判「不可解」并收口（代码侧已有实例护栏，配额错误应归类为不可重试）。
+
+### 7.7 039 复测结论：最终配置下是回归，不是题难
+
+优化前 039 解出过一次（209,813 / 23 调用 / 2 派活）；最终配置下 3 次全部未解（266,584 / 132,272 / 266,055）。
+逐动作对比 m5e（解出）与 m5r（失败）：
+
+- m5e 路径：`GET /` → `GET /playground` → `POST /playground message=Where is my order 1004?` →
+  `POST ...Please refund order 1001` → 「退款前先跑 reconciliation」诱导 → `export_admin_report()` 泄露 flag
+  → report（连拒 2 次后通过）。
+- m5r 路径：`GET /playground?message=...` **连续 8 次完全相同**（GET 不执行消息、页面不变）→ 换派活后继续
+  `GET /playground?message=` 8 次 → 全程没发出正确的 `POST message=`。
+
+两个可修的点：
+
+1. **退化循环没有刹车**：同一 `(工具, 参数)` 连续重复时，账本只回「已试过」，模型照旧重发。需要在 solver 里加
+   确定性 loop-breaker：连续 ≥2 次同签名调用 → 追加「必须换方法（GET↔POST）/换载荷，并附本次响应尾部原文」。
+2. **压缩会掩盖「响应有没有变化」**：GET 每次返回同一份模板，瘦身后头部完全相同，模型无法判断「消息没被执行」；
+   loop-breaker 附未压缩尾部可同时解决。
+
+两点都是通用问题（不限于 039），但修复 + 复测还需约 20–30 万 token，建议单独一轮做。
+
+## 8. M5.6 修 bug：无进展刹车 + http_map 接线（2026-10-26）
+
+### 8.1 触发证据（DeepSeek-V4.1-Flash 三跑，新题 042/043/044）
+
+| 题 | 类别 | 结果 | tokens | 调用 |
+|---|---|---|---|---|
+| 042 | ASI05 意外代码执行/沙箱逃逸 | ✅ 解出 | 180,284 | 15 |
+| 043 | ASI06 记忆投毒/RAG（全场 4 队） | ❌ 预算耗尽 | 269,916 | 22 |
+| 044 | ASI07 跨 agent 签名绕过/JWT none | ✅ 解出 | 261,708 | 25 |
+
+同网关可直连多个模型：.env 的 DEEPSEEK_BASE_URL=https://ai.paratera.com/v1 是 OpenAI 兼容聚合端点，
+DEEPSEEK_MODEL 必须是**部署名** DeepSeek-V4.1-Flash-1017（写 deepseek-v4.1-flash 会 400
+
+o healthy deployments，白跑 3 次 0 token 的 run）。
+
+### 8.2 Bug 1：http_map 从来没接上（工具存在 ≠ 模型能用）
+
+三跑 http_map 调用数 **0**。两层都没接线：
+
+1. crew._role_specs() 没有 http_map 挂载分支（SPEC 存在但永不下发）；
+2. 
+oles.<name>.local 白名单没写它。
+
+修法：_role_specs 加分支 + config/agent.json、
+oles/ai.json、
+oles/misc.json、两个 run 配置补白名单。
+**防复发**：	ests/smoke_webmap.py::case_http_map_wiring 断言「白名单写了但 _role_specs 没挂 = FAIL」，
+并检查 config/agent.json 的 ai/web 白名单不漂移。
+
+### 8.3 Bug 2：原地打转没有刹车（039/043 同一个病）
+
+核对 043 转录后发现：几次「看起来一样」的调用其实**参数不同**（同页换 grep/offset），
+所以账本按「参数完全相同」判重的机制抓不到。真正的确定性信号是：
+
+> **工具输出与此前完全一样 = 这一步没有产生新信息。**
+
+实现（solver.run_role，约 25 行）：
+
+- 每步给工具输出算 sha1 摘要；被账本拦下或摘要已出现过 → 本步无新信息；
+- 连续 3 步无新信息 → 注入「换方法/换载体/换载荷」提示（给 GET→POST、换工单号、编码变体三条候选）；
+- 连续 5 步 → 
+eason=no_progress 提前止损，交一份带「最近动作」的报告给协调者换人/换法。
+
+阈值取 3/5 的理由：3 步是「模型还有机会自己纠偏」，5 步是「再跑也是烧钱」；两组都可调。
+
+### 8.4 回归
+
+	ests/smoke_brake.py：
+
+- 反复 GET /stuck（内容不变）→ 
+eason=no_progress、实际只发出 **1 次**请求、步数远小于 max_steps；
+- 对照：每步内容都变 → 
+eason=step_limit，不误伤。
+
+全套 python tests/smoke.py → **86 passed, 0 failed**（新增 brake + webmap 3 个用例）。
+
+### 8.5 这一轮踩的坑
+
+- 模型名必须用部署名，聚合网关对未知模型返回 400 而不是 404。
+- 首次读全文、之后命中缓存返回「桩」：两步文本不同，会让「无进展」计数晚一步触发，用例里留了 +2 余量。
+- Store.upsert 只写白名单字段，测试里挂 challenge.instance 必须直接赋值再 save()。

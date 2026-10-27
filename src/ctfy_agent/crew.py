@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import re
 from json import JSONDecodeError
 
 from .budget import Budget, BudgetExceeded
@@ -36,6 +37,7 @@ from .tools_local import (
     BURST_SPEC,
     CHAT_SPEC,
     HTTP_SPEC,
+    MAP_SPEC,
     NOTE_SPEC,
     REPORT_SPEC,
     SHELL_SPEC,
@@ -128,6 +130,52 @@ def _prior_digest(prior: list[str], cap: int = 600, max_entries: int = 3, ledger
     if not blocks:
         return ""
     return "\n\n" + "\n\n".join(blocks)
+
+
+# 换措辞重派同一思路的相似度阈值（字符/词 Jaccard）。0.5 是实测折中：
+# 真实的「换一个方向」通常 <0.3，而「同一件事换个说法」容易 >0.6。
+STRATEGY_SIMILARITY_LIMIT = 0.5
+
+# 未试路线清单：按 CTF 常见推进族写死，命中相似度时注入给专家/协调者挑一个。
+# 依据：Theori（AIxCC 决赛第 3）的干预范式——卡住时要 remeasure 并换假设，而不是重述同一件事。
+STRATEGY_FAMILIES = (
+    "编码/变形载荷（base64、URL、Unicode、大小写、多语言）",
+    "工具指令语法变体（@@TOOL / tool= args= / 代码块 / <tool_call> / JSON 字段）",
+    "身份与权限（改 cookie/令牌/role 字段、越权读他人资源、IDOR 枚举 id）",
+    "端点与参数发现（http_map 爬链接/表单、probe 常见 API 文档端点）",
+    "参数污染/批量赋值（多余字段、类型混淆、重复键、数组注入）",
+    "顺序与时序（先良性别名再恶意、竞态、重复提交、重放）",
+    "读取面（响应头/Set-Cookie/备注/内部 note/日志/错误栈/导出报表）",
+)
+
+
+def _strategy_tokens(text: str) -> set[str]:
+    """粗粒度分词：中文按字、英文数字按词。用于「是不是同一件事换个说法」的相似度。"""
+    lowered = (text or "").lower()
+    latin = set(re.findall(r"[a-z0-9_]{2,}", lowered))
+    cjk = set(re.findall(r"[\u4e00-\u9fff]", lowered))
+    return latin | cjk
+
+
+def _strategy_similarity(left: str, right: str) -> float:
+    """两段派活目标的 Jaccard 相似度（0..1）。空串安全。"""
+    a, b = _strategy_tokens(left), _strategy_tokens(right)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _strategy_nudge(prior: list[str]) -> str:
+    """相似派活时追加的「换族」指令（确定性文本，只在该命中时进上下文）。"""
+    tried = "；".join(f"第{i + 1}轮「{(p or '')[:40]}」" for i, p in enumerate(prior[-3:]))
+    families = "\n".join(f"- {item}" for item in STRATEGY_FAMILIES)
+    return (
+        "【换族要求】本轮的 objective 与前几轮高度相似，重跑同一思路不会产生新信息。\n"
+        f"已派过：{tried}\n"
+        "必须从上表里挑一个**完全没试过**的族，把 objective 改写成该族的具体动作，再开始执行：\n"
+        f"{families}\n"
+        "若上表 7 个族都已试过，就改用「换资源范围」（换端点点位/换工单编号区间/换账号角色）并说明依据。"
+    )
 
 
 def _delegate_task(objective: str, done_when: str) -> str:
@@ -282,6 +330,8 @@ class Crew:
         specs.append(NOTE_SPEC)
         if "http_request" in local:
             specs.append(HTTP_SPEC)
+        if "http_map" in local:
+            specs.append(MAP_SPEC)
         if "http_burst" in local:
             specs.append(BURST_SPEC)
         if "chat" in local:
@@ -480,6 +530,10 @@ class Crew:
                 )
 
         try:
+            # 策略多样性台账：role -> 已派过的 objective 列表。用于识别「换个措辞重派同一思路」。
+            # 依据：AIxCC 决赛队伍 Theori 的干预范式——agent 卡住时要它「列 3 个假设、逐个验证」，
+            # 而不是把同一件事重说一遍。039 观测到 3 轮重派 plan 几乎相同，白白烧掉 26 万 token。
+            strategy_log: dict[str, list[str]] = {}
             for rnd in range(start_rnd, rounds + 1):
                 try:
                     _ckpt_save(ckpt_path, challenge_id=challenge_id, next_round=rnd,
@@ -571,6 +625,19 @@ class Crew:
                                     challenge_id,
                                     {"role": "ledger", "step": rnd, "note": f"派活与第 {same.seq} 步重复"},
                                 )
+                            # 换措辞重派同一思路 = 变相重复。相似度命中就注入「未试路线清单」，
+                            # 强制从没试过的方向里挑一个（确定性检查，不依赖模型自觉）。
+                            prior_objectives = strategy_log.setdefault(role_name, [])
+                            if prior_objectives:
+                                worst = max(_strategy_similarity(objective, old) for old in prior_objectives)
+                                if worst >= STRATEGY_SIMILARITY_LIMIT:
+                                    task_text += "\n\n" + _strategy_nudge(prior_objectives)
+                                    self.store.append_transcript(
+                                        challenge_id,
+                                        {"role": "strategy", "step": rnd,
+                                         "note": f"派活与既往目标相似度 {worst:.2f}，已注入换族要求"},
+                                    )
+                            prior_objectives.append(objective)
                             try:
                                 text = self._delegate(
                                     challenge_id, role_name, task_text, solver, prior=reports, ledger=ledger

@@ -46,6 +46,11 @@ TOOL_DEF_RE = re.compile(r"\b([a-z_]{3,32})\(([^)]{0,24})\)")
 STATUS_RE = re.compile(r'"status"\s*:\s*(\d{3})')
 TICKET_RE = re.compile(r"(?i)ticket\s*#?\s*(\d{1,3})")
 
+# <meta name>/隐藏校验字段不是「要 POST 的业务字段」，别混进事实块
+META_FIELD_NAMES = {
+    "csrf", "csrf_token", "viewport", "description", "keywords", "robots", "author", "theme-color",
+}
+
 
 def shrink_tool_text(text: str, limit: int = DEFAULT_TOOL_CHARS) -> str:
     """把过长的工具结果压成「头 + 关键行 + 尾」，并标注原文长度。
@@ -91,6 +96,9 @@ def shrink_tool_text(text: str, limit: int = DEFAULT_TOOL_CHARS) -> str:
         keep(match.group(0))
     for match in CRED_RE.finditer(raw):
         keep(match.group(0)[:120])
+    # 表单字段名：模型要照着 POST，压掉了就会反复抓页面
+    for match in FIELD_RE.finditer(raw):
+        keep(match.group(0))
 
     # ② 短行里的关键行：整行原样保留（不 strip，否则缩进行就不是原串了）
     for line in raw.splitlines():
@@ -143,19 +151,30 @@ class FactsBoard:
         raw = str(text or "")
         args = args or {}
 
-        for match in FLAG_RE.finditer(raw):
+        # 扫描面 = 原始渲染文本 + JSON 里解出来的 body。
+        # 只扫 raw 会漏：http_request 的结果是 JSON，HTML 属性在 raw 里是转义形态（name=\"x\"），
+        # 正则匹配不到；解出 body 再扫才能拿到真实字段名/链接/行内文本。
+        scan = raw
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("body"), str):
+            scan = raw + "\n" + data["body"]
+        lowered = scan.lower()
+
+        for match in FLAG_RE.finditer(scan):
             self._add("flag", f"候选 flag：{match.group(0)}（下一步 submit 验证）")
             break
 
-        lowered = raw.lower()
         if "set-cookie" in lowered or "session" in lowered:
             self._add("session", "会话：cookie jar 已建立，后续请求自动带（不要重新注册/登录）")
 
-        for name in TOOL_NAME_RE.findall(raw):
+        for name in TOOL_NAME_RE.findall(scan):
             self._add(f"tool:{name}", f"AI 工具面：可调用 {name}()")
         # 只认「文档/工具清单」里的定义形态（出现 ≥2 次的不同工具名），避免把普通函数名当工具
         defined: dict[str, int] = {}
-        for name, _arg in TOOL_DEF_RE.findall(raw):
+        for name, _arg in TOOL_DEF_RE.findall(scan):
             if name.startswith("_"):
                 continue
             defined[name] = defined.get(name, 0) + 1
@@ -167,13 +186,13 @@ class FactsBoard:
             url = str(args.get("url") or "")
             path = urlparse(url).path or "/"
             method = str(args.get("method") or "GET").upper()
-            status = STATUS_RE.search(raw)
+            status = STATUS_RE.search(scan)
             code = status.group(1) if status else ("?" if "http" in lowered else "")
             self._add(f"endpoint:{method} {path}", f"已访问 {method} {path}" + (f" → {code}" if code else ""))
             if "/kb/" in path or "/docs" in path:
                 self._add(f"doc:{path}", f"已读文档 {path}（工具面/流程线索在这里）")
             # 详情页 URL 从列表页 href 直接取，避免模型连猜路径吃 404（m5f 实测白烧 3 步）
-            for href in HREF_RE.findall(raw):
+            for href in HREF_RE.findall(scan):
                 if any(word in href.lower() for word in ("ticket", "detail", "view", "item")):
                     self._add(f"href:{href}", f"列表里的详情页链接：{href}（直接用，别猜路径）")
                     if len([k for k in self._facts if k.startswith("href:")]) >= 2:
@@ -182,9 +201,9 @@ class FactsBoard:
         # 表单字段：直接抽 name="..." 去重后记成事实，模型就不必为抄字段名反复抓页面。
         # m5j 实测：压缩把中段 <input name=...> 切掉后，模型连抓 6 次 /portal/new ≈ 48k token。
         fields: list[str] = []
-        for field in FIELD_RE.findall(raw):
+        for field in FIELD_RE.findall(scan):
             name = field.strip()
-            if name and name.lower() not in ("csrf", "csrf_token") and name not in fields:
+            if name and name.lower() not in META_FIELD_NAMES and name not in fields:
                 fields.append(name)
             if len(fields) >= 8:
                 break
@@ -195,7 +214,7 @@ class FactsBoard:
         # 关键线索：只有在「敏感上下文」里出现的 ticket 编号才算线索。
         # 反面教训（m5g 实测）：把页面上任意 "ticket #6" 都当线索，模型以为自己的工单里
         # 有目标数据，反复对自己的新工单调用内部工具，而真数据其实在系统预置的低号工单里。
-        ticket = TICKET_RE.search(raw)
+        ticket = TICKET_RE.search(scan)
         if ticket and any(word in lowered for word in ("reconciliation", "bootstrap", "restricted",
                                                        "internal note", "内部", "预置")):
             self._add(f"ticket:{ticket.group(1)}",

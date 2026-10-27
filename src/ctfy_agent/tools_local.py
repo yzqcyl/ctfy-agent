@@ -20,6 +20,7 @@ import difflib
 import inspect
 import json
 import http.client
+from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 import os
 import re
@@ -31,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from .httputil import GuardedRedirect, NoRedirect, build_opener, read_limited
 from .tools_misc_ext import MISC_EXT_SPECS, call_ext as _call_ext
@@ -54,6 +55,76 @@ CHAT_MAX_TURNS = 40               # 单个会话最多保留的消息条数（�
 CHAT_TIMEOUT = 20                 # 与 http_request 同量级；流式接口必须限时，否则挂死整步
 # 值得回给模型的响应头白名单（成功与 3xx/4xx/5xx 两条路径共用；401 的 WWW-Authenticate、302 的 Location 都要见得到）
 _INTERESTING_HEADERS = ("content-type", "location", "set-cookie", "server", "www-authenticate")
+
+# ---------- http_map：爬取 / 端点探测 ----------
+# 灵感来自 AIxCC 决赛队伍 Theori 的经验：「窄工具 > 通用 bash，精修工具集是最耗时的部分」，
+# 以及 EnIGMA 用交互式工具把 CTF agent 做到三项 SOTA。对 HTTP 靶子，最稀缺的窄工具是
+# 「一次看清站点结构」：现在模型靠反复 grep href、猜路径，既烧步数又容易漏掉泄露端点。
+MAP_MAX_LINKS = 40          # 站点地图里最多列多少条链接
+MAP_MAX_FORMS = 8           # 最多展开多少张表单
+MAP_MAX_FIELDS = 12         # 单张表单最多列多少字段
+MAP_MAX_API_HINTS = 20      # JS 里挖出的接口路径上限
+MAP_PROBE_LIMIT = 14        # probe 模式最多探多少个路径（每个一次请求，总墙钟受 MAP_PROBE_BUDGET 限制）
+MAP_PROBE_BUDGET = 25.0     # probe 总墙钟秒数
+MAP_PROBE_TIMEOUT = 6.0     # probe 单请求超时
+MAP_TIMEOUT = 15            # crawl 抓页面超时
+# 常见「能拿到工具面/接口清单」的路径：AI 靶场的 agent 常把能力暴露在这些地方
+PROBE_PATHS = (
+    "/openapi.json", "/swagger.json", "/api-docs", "/docs", "/swagger", "/redoc",
+    "/api", "/api/tools", "/api/v1/tools", "/mcp", "/sse", "/health", "/debug", "/admin",
+)
+# 链接排序权重：命中这些词的端点更有可能是题目入口（工单/文档/管理/接口）
+_LINK_PRIORITY = ("ticket", "portal", "kb", "doc", "admin", "api", "user", "account",
+                  "note", "order", "report", "flag", "debug", "internal")
+
+
+class _MapParser(HTMLParser):
+    """把 HTML 解析成「链接 + 表单」结构（纯 stdlib；不执行 JS，解析失败由调用方兜底）。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[dict] = []
+        self.forms: list[dict] = []
+        self._form: dict | None = None
+        self._select: dict | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        amap = {key.lower(): (value or "") for key, value in attrs}
+        if tag == "a":
+            href = amap.get("href", "").strip()
+            if href:
+                self.links.append({"href": href, "text": ""})
+        elif tag == "form":
+            self._form = {
+                "action": amap.get("action", "").strip() or "",
+                "method": (amap.get("method") or "GET").upper(),
+                "fields": [],
+            }
+            self.forms.append(self._form)
+        elif tag in ("input", "textarea", "select") and self._form is not None:
+            name = amap.get("name", "").strip()
+            if name:
+                self._form["fields"].append({
+                    "name": name,
+                    "type": amap.get("type") or tag,
+                })
+            if tag == "select":
+                self._select = self._form
+        elif tag == "option" and self._select is not None:
+            value = amap.get("value", "").strip()
+            if value and self._select["fields"]:
+                last = self._select["fields"][-1]
+                options = last.setdefault("options", [])
+                if value not in options and len(options) < 6:
+                    options.append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form":
+            self._form = None
+            self._select = None
+        elif tag == "select":
+            self._select = None
+
 
 
 def as_bool(value) -> bool:
@@ -160,6 +231,37 @@ BURST_SPEC = {
         },
     },
 }
+
+# 站点结构工具：一次调用拿到「有哪些链接 / 表单 / 字段 / 接口线索」，或探测常见 API·文档端点。
+# 设计依据（AIxCC 决赛队伍 Theori）：窄工具比通用 grep 少走死路；工具集决定了 agent 的可行路径密度。
+MAP_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "http_map",
+        "description": (
+            "把靶子结构化成「站点地图」，一次调用代替反复 grep 找链接。"
+            "mode=crawl（默认）：抓一个页面，返回同源链接、表单（action/method/字段名+类型+枚举选项）、"
+            "以及 JS 里出现的接口路径；用于发现「工单/详情/管理/接口」等入口。"
+            "mode=probe：按常见路径清单（openapi.json/swagger/docs/api/mcp/sse/health/admin…）逐个探测，"
+            "返回状态码表——AI 靶子常在这些地方暴露工具面。"
+            "crawl 之后再对具体端点用 http_request（grep/offset）细读；不要把本工具当浏览器，它不执行 JS。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要成图的页面 URL（probe 模式只取它的 origin）"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["crawl", "probe"],
+                    "default": "crawl",
+                    "description": "crawl=解析页面结构与接口线索；probe=探常见端点",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+}
+
 
 # AI 安全题的核心工具：面对的是「会聊天的靶子」，不是静态页面。
 # 历史存在工具侧（跨 delegate 共享），模型每次只发「这一句」——这样 10 步能覆盖 10 轮真实对话，
@@ -384,7 +486,7 @@ class LocalTools:
     # ---------- 规格 ----------
 
     def specs(self) -> list[dict]:
-        specs = [HTTP_SPEC, NOTE_SPEC, BURST_SPEC]
+        specs = [HTTP_SPEC, MAP_SPEC, NOTE_SPEC, BURST_SPEC]
         if self.allow_chat:
             specs.append(CHAT_SPEC)
         if self.allow_shell:
@@ -1003,6 +1105,155 @@ class LocalTools:
         if failed:
             summary["errors"] = [r for r in results if r and "error" in r]
         return json.dumps(summary, ensure_ascii=False)
+
+    # ---------- http_map：站点结构 / 端点探测（窄工具，替代反复 grep 与猜路径） ----------
+
+    def _map_fetch(self, url: str, timeout: float = MAP_TIMEOUT) -> tuple[int, str, str]:
+        """抓一页（带 cookie jar、重定向 Set-Cookie 捕获），返回 (status, content_type, text)。"""
+        self._check_target(url)
+        netloc = urlparse(url).netloc
+        headers = {"Accept-Encoding": "identity", "User-Agent": "ctfy-agent/0.2"}
+        cookie = self._cookie_header(netloc)
+        if cookie:
+            headers["Cookie"] = cookie
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        opener = build_opener(
+            GuardedRedirect(self._check_target, capture=self._capture_redirect, decorate=self._decorate_redirect)
+        )
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                raw = read_limited(response, MAX_GREP_BYTES)
+                self._capture_cookies(netloc, response.headers.items())
+                return (response.status, response.headers.get("Content-Type") or "",
+                        raw.decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = read_limited(exc, MAX_GREP_BYTES)
+            except Exception:  # noqa: BLE001
+                raw = b""
+            if exc.headers:
+                self._capture_cookies(netloc, exc.headers.items())
+            ctype = (exc.headers.get("Content-Type") if exc.headers else "") or ""
+            return exc.code, ctype, raw.decode("utf-8", "replace")
+        except urllib.error.URLError as exc:
+            raise ToolError(f"请求失败 {url}: {exc.reason}") from None
+        except OSError as exc:
+            raise ToolError(f"请求失败 {url}: {exc}") from None
+
+    @staticmethod
+    def _map_path(target: str, base_url: str) -> str:
+        """把链接/action 归一成同源 path（带 query）；跨域/伪协议返回空串。"""
+        target = (target or "").strip()
+        if not target or target.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            return ""
+        absolute = urljoin(base_url, target)
+        parts = urlparse(absolute)
+        if parts.netloc and parts.netloc != urlparse(base_url).netloc:
+            return ""
+        path = parts.path or "/"
+        return path + (f"?{parts.query}" if parts.query else "")
+
+    def http_map(self, url: str, mode: str = "crawl") -> str:
+        """站点结构成图（crawl）或常见端点探测（probe）。"""
+        self._check_target(url)
+        mode = (mode or "crawl").strip().lower()
+        if mode not in ("crawl", "probe"):
+            raise ToolError(f"mode 只能是 crawl 或 probe，收到 {mode!r}")
+
+        if mode == "probe":
+            parts = urlparse(url)
+            origin = f"{parts.scheme}://{parts.netloc}"
+            hits: list[dict] = []
+            missed = 0
+            started = time.perf_counter()
+            for path in PROBE_PATHS[:MAP_PROBE_LIMIT]:
+                if time.perf_counter() - started > MAP_PROBE_BUDGET:
+                    break
+                if len(hits) >= 6:
+                    break
+                try:
+                    status, ctype, text = self._map_fetch(origin + path, timeout=MAP_PROBE_TIMEOUT)
+                except ToolError:
+                    continue
+                if status in (200, 201, 202, 204, 301, 302, 401, 403, 405):
+                    short = ctype.split(";")[0].strip()
+                    hits.append({
+                        "path": path,
+                        "status": status,
+                        "type": short[:40],
+                        "bytes": len(text),
+                        "hint": ("命中，直接读" if status in (200, 201) else
+                                 "存在但需鉴权/方法不对" if status in (401, 403, 405) else "跳转"),
+                    })
+                else:
+                    missed += 1
+            payload = {
+                "mode": "probe",
+                "origin": origin,
+                "hits": hits,
+                "not_found": missed,
+                "next": ("对命中的 path 用 http_request 读原文；AI 靶子的工具面常在 openapi/docs/mcp 里。"
+                         if hits else "常见端点都不存在：回到 crawl 从页面链接/表单里找入口，别继续猜路径。"),
+            }
+            return json.dumps(payload, ensure_ascii=False)
+
+        status, ctype, text = self._map_fetch(url)
+        parser = _MapParser()
+        try:
+            parser.feed(text)
+        except Exception:  # noqa: BLE001  解析失败不该让整步崩，退回纯文本线索
+            pass
+
+        links: list[str] = []
+        for item in parser.links:
+            path = self._map_path(item.get("href", ""), url)
+            if path and path not in links:
+                links.append(path)
+        # 把更可能是入口的链接排到前面（工单/文档/管理/接口/用户）
+        links.sort(key=lambda p: (0 if any(word in p.lower() for word in _LINK_PRIORITY) else 1, len(p)))
+
+        forms: list[dict] = []
+        seen_forms: set[tuple] = set()
+        for form in parser.forms[: MAP_MAX_FORMS * 2]:
+            action = self._map_path(form.get("action", ""), url) or urlparse(url).path or "/"
+            fields = []
+            for field in form.get("fields", [])[:MAP_MAX_FIELDS]:
+                entry = {"name": field["name"], "type": (field.get("type") or "text")[:16]}
+                if field.get("options"):
+                    entry["options"] = field["options"][:6]
+                fields.append(entry)
+            key = (action, form.get("method", "GET"), tuple(f["name"] for f in fields))
+            if key in seen_forms:
+                continue
+            seen_forms.add(key)
+            forms.append({"action": action, "method": form.get("method", "GET"), "fields": fields})
+            if len(forms) >= MAP_MAX_FORMS:
+                break
+
+        # JS 里出现的接口路径：SFT 题里工具面常直接写在前端代码里
+        api_hints: list[str] = []
+        for match in re.finditer(r"""(?:fetch|url|endpoint|api|action)\s*[:=(]\s*["']([^"']{2,80})["']""",
+                                 text, re.I):
+            path = self._map_path(match.group(1), url)
+            if path and any(word in path.lower() for word in ("api", "v1", "v2", "graphql", "mcp", "tool", "chat")):
+                if path not in api_hints:
+                    api_hints.append(path)
+            if len(api_hints) >= MAP_MAX_API_HINTS:
+                break
+
+        payload = {
+            "status": status,
+            "mode": "crawl",
+            "page": urlparse(url).path or "/",
+            "content_type": ctype.split(";")[0].strip()[:40],
+            "links": links[:MAP_MAX_LINKS],
+            "forms": forms,
+            "api_hints": api_hints,
+            "counts": {"links": len(links), "forms": len(forms), "api_hints": len(api_hints)},
+            "next": ("对关键链接逐个 http_request 细读；AI 靶子优先看 kb/docs 与工单/order 详情。"
+                     if links or forms else "页面没有可解析结构（可能是纯 JS 渲染）：改用 http_map(mode='probe') 探端点。"),
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
     # ---------- 对话工具（AI 安全题型：靶子是「会聊天的服务」） ----------
 

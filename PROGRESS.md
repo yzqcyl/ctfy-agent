@@ -534,7 +534,7 @@ $env:PYTHONPATH = "E:\ctfy_project\src"
 | M2 | `ai` 角色接入（`roles/ai.json` + `config/agent.json` + 协调者路由 + 契约/接线用例） | 完成 |
 | M3 | 方法卡 17 张（10 ASI + 7 防御族）+ 三池词表对账 + 4 道离线夹具 | 完成 |
 | M4 | 容器契约 e2e（AI 题 task.json → run_agent → result.json）+ 陷阱页夹具 | 完成 |
-| M5 | 真机 2/2 解出：CTFARENA-038（135k）+ 039（210k），Kimi-K2.7 | **已完成，待确认** |
+| M5 | 真机：038/040/041 解出（104k/79k/84k）+ 039 回归未解（266k，见 ai-plan §7.7） | **已完成，待确认** |
 | M6 | 校准 + 镜像重建/push + PROGRESS/HANDOFF 全量同步 | 未开始 |
 
 ### 关键事实（M5 前必须知道）

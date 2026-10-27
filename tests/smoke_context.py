@@ -78,19 +78,22 @@ def case_context_compress(tmp: Path) -> None:
     assert board.render() == rendered, "重复渲染必须稳定"
 
     # 表单字段事实（m5j 实测教训）：压缩切掉 <input name=...> 后，模型会反复抓表单页。
-    form_board = FactsBoard()
-    form_board.observe(
-        "http_request", {"url": "https://h.example/portal/new"},
-        '{"status": 200, "body": "<form><input name=\\"subject\\"><textarea name=\\"body\\"></textarea>'
-        '<input type=\\"hidden\\" name=\\"csrf_token\\" value=\\"x\\"><select name=\\"priority\\"></select></form>"}',
+    form_html = (
+        '<form><input name="subject"><textarea name="body"></textarea>'
+        '<input type="hidden" name="csrf_token" value="x">'
+        '<select name="priority"></select></form>'
     )
+    form_board = FactsBoard()
+    form_board.observe("http_request", {"url": "https://h.example/portal/new"},
+                       json.dumps({"status": 200, "body": form_html}))
     form_text = form_board.render()
     assert "subject" in form_text and "body" in form_text and "priority" in form_text, form_text
     assert "csrf_token" not in form_text, "csrf 值不该进事实块（模型会照抄过期值）"
 
     # 关键行保留：表单结构行不能被瘦身丢掉（否则模型只能反复 grep）
-    form_html = '<html>' + 'x' * 3000 + '<input name=\\"subject\\">' + 'y' * 400 + '<textarea name=\\"body\\"></textarea></html>'
-    slim_form = shrink_tool_text(form_html, 1200)
+    long_form = '<html>' + "x" * 3000 + '<input name="subject">' + "y" * 400 + \
+                '<textarea name="body"></textarea></html>'
+    slim_form = shrink_tool_text(long_form, 1200)
     assert 'name="subject"' in slim_form and 'name="body"' in slim_form, slim_form[-300:]
 
     # 去重：同一端点观察两次不产生两条

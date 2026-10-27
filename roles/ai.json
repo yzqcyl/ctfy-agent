@@ -17,6 +17,7 @@
     ],
     "local": [
       "http_request",
+      "http_map",
       "chat"
     ]
   }

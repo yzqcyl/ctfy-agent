@@ -11,6 +11,7 @@
       ],
       "local": [
         "http_request",
+        "http_map",
         "shell",
         "decode_blob",
         "unpack_archive",
