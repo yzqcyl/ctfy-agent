@@ -28,6 +28,13 @@
 2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
 3. 提交审核 → 通过后用「测评我的 Agent」跑一遍
 
+### ⚠️ v3 已知风险：思考模式未显式关闭
+
+v3 镜像里**没有** `LLM_ENABLE_THINKING=0`（`.env` 容器读不到，平台也不注入）。本地所有实测都在 `LLM_ENABLE_THINKING=0` 下完成；v3 实跑是端点默认（百炼默认开思考），可能把 `max_tokens=8192` 烧在 `reasoning_content` 上 → `content` 空、`finish_reason=length`、白丢一步。
+- 观察点：评估结果里 `stop_reason` 是否 `max_turns`/`halted`、`tool_calls_made` 是否异常少、有没有空回答。
+- 处理：Dockerfile 加 `ENV LLM_ENABLE_THINKING=0` 重建 v4（初赛百炼 OK；11-21 正式赛换智谱后需确认该字段兼容性）。
+- 决策记录：2026-10-29 先用 v3 跑免费样例验证端到端，再决定是否重建 v4。
+
 ---
 
 ## 历史：`v2.1`（非 root 修复版，已被 v3 取代）
