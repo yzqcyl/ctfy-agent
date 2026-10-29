@@ -217,3 +217,16 @@ k = clamp(1..3,
 
 剩余仍属未实现（**均为集群-A / 调度层，非本模块**）：§2 三阶段 P1 广扫/P3 收口、§8 无状态题并行、§11 `AGENT_CONCURRENCY` env 开关。
 验收：`smoke.py` 110/110 + 集群-B 离线 6 脚本（retry 自检新增 resolve_k/candidates/限额共 13 条断言）全绿。
+
+### 16.7 二轮核查：正则误收 + crew 黑板事实空盒（已修）
+
+按用户要求「检查相关项是否正确，然后补充其他」复核后，发现并修复两处真问题：
+
+| 项 | 问题 | 修复 |
+|---|---|---|
+| §7 候选值正则 | `_CAND_RE` 前缀 `{0,24}` 可空 + 内容 `[^{}\s]` 不排除 `"` → 工具输出里的 **JSON 对象 `{"status":"ok"}` 会被误收为候选值** | 修为 `[A-Za-z0-9_]{1,24}\{[^{}\"\\\s]{3,120}\}`（前缀≥1 标识符、内容排除 `"`/`\`）；自检加「不收 JSON 对象」断言 |
+| §7 黑板「事实」段 | **crew（正式赛）路径 facts 恒空**：`_ledger_facts` 读 `ledger.observations`，而 observations 只在 `FLAG_RE` 命中工具输出（或 report evidence 验真）时产出——非 flag 题（如 SAMPLE-007 proof-of-exploitation）永远为空。与并行会话 SAMPLE-007 实测「黑板事实继承空盒」互证 | 专家 `run_role` 内已有 `FactsBoard` 提炼结论（endpoint/form/doc…）但未回流。修复：`run_role` 返回 `facts` → `_delegate` 收进 `facts_sink` → `solve` 的 `summary["facts"] = 去重(facts_sink + _ledger_facts)`。facts 仍不进协调者文本（只进黑板），不属提示词改写 |
+
+关键澄清：solver（CLI）路径的黑板 facts 一直生效（源自 `FactsBoard`），只有 crew（容器/正式赛）路径空盒——本次是让两条路径口径对齐，非新增提示词内容。
+
+验收：`tests/smoke.py` **111/111**（新增 `clusterb_facts_reflow` case：run_role 结论事实经 `_delegate` 收进 facts_sink 且不进协调者文本；`case_run_role_synthesis` 加 `result["facts"]` 列表断言）。

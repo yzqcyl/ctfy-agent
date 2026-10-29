@@ -41,7 +41,7 @@ from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
 from smoke_case_misc import case_misc_ext  # noqa: E402
-from smoke_clusterb_crew import case_clusterb_crew  # noqa: E402
+from smoke_clusterb_crew import case_clusterb_crew, case_clusterb_facts_reflow  # noqa: E402
 from smoke_llm_retry import case_llm_timeout_retry  # noqa: E402
 
 PASSED: list[str] = []
@@ -1114,6 +1114,7 @@ def case_run_role_synthesis(tmp: Path) -> None:
         assert result["reason"] == "step_limit", result
         assert "最近动作" in result["report"] and "note" in result["report"], result
         assert "最后思考" in result["report"] and "/admin" in result["report"], result
+        assert isinstance(result.get("facts"), list), result.get("facts")  # 集群-B：facts 回流字段
         ok("run_role 步数耗尽合成报告：动作清单 + 最后思考交还协调者")
     finally:
         server.shutdown()
@@ -4082,6 +4083,7 @@ def main() -> int:
         ("done_gate", case_done_gate),
         ("convergence_stalled", case_convergence_stalled),
         ("clusterb_crew", case_clusterb_crew),
+        ("clusterb_facts_reflow", case_clusterb_facts_reflow),
         ("llm_timeout_retry", case_llm_timeout_retry),
     ]
     for name, case in cases:

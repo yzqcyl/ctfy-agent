@@ -1397,7 +1397,7 @@ class Solver:
             tail = self._action_summary(actions, last_content)
             if tail:
                 report += "\n最近动作：\n" + tail
-        return {"report": report, "steps": step, "reason": reason}
+        return {"report": report, "steps": step, "reason": reason, "facts": facts.as_list()}
 
     @staticmethod
     def _action_summary(actions: list[str], last_content: str) -> str:

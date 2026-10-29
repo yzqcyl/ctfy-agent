@@ -478,7 +478,7 @@ class Crew:
     # ---------- 专家 ----------
 
     def _delegate(self, challenge_id: str, role: str, task: str, solver: Solver, prior: list[str] | None = None,
-                  ledger: Ledger | None = None) -> str:
+                  ledger: Ledger | None = None, facts_sink: list[str] | None = None) -> str:
         spec = self.roles.get(role)
         if not spec:
             return f"[拒绝] 未知角色 {role!r}，可选：{sorted(self.roles)}"
@@ -508,6 +508,10 @@ class Crew:
             ledger=ledger,
         )
         self.on_event("report", {"role": role, "report": result["report"]})
+        if facts_sink is not None:
+            for f in (result.get("facts") or []):
+                if f not in facts_sink:
+                    facts_sink.append(f)
         return f"[{role} 结论（{result['steps']} 步，{result['reason']}）]\n{result['report']}"
 
     @staticmethod
@@ -649,6 +653,7 @@ class Crew:
         reports: list[str] = []  # 已交回的专家结论，供下一轮派活做增量摘要
         ledger = Ledger.from_config(self.config)  # 跨 delegate 共享：知识不随专家上下文消失
         plan = PlanTrack()  # 协调者自己的计划状态：防「同一份侦察重写三遍」
+        facts_sink: list[str] = []  # 集群-B：累计各专家 run_role 的结论事实（run_role 返回 facts 回流到这里）
 
         # 候选闸门 / 假设收敛 状态（v3 P0）
         done_blocks = 0
@@ -796,7 +801,8 @@ class Crew:
                             prior_objectives.append(objective)
                             try:
                                 text = self._delegate(
-                                    challenge_id, role_name, task_text, solver, prior=reports, ledger=ledger
+                                    challenge_id, role_name, task_text, solver, prior=reports, ledger=ledger,
+                                    facts_sink=facts_sink,
                                 )
                             except LLMError as exc:
                                 text = f"[专家执行失败] {exc}"
@@ -1010,8 +1016,9 @@ class Crew:
             "transcript": str(self.store.transcript_path(challenge_id)),
             "ledger": ledger.stats(),
             "plan": plan.stats(),
-            # 集群-B：导出给黑板继承（只有结论事实/判错死路，不含轨迹与判决理由）
-            "facts": _ledger_facts(ledger),
+            # 集群-B：导出给黑板继承（只有结论事实/判错死路/候选值，不含轨迹与判决理由）
+            # facts = 各专家 run_role 提炼的结论事实（endpoint/form/doc…）∪ ledger 收的 flag 候选；去重保序。
+            "facts": list(dict.fromkeys([*facts_sink, *_ledger_facts(ledger)])),
             "dead_ends": _ledger_dead_ends(ledger),
             "candidates": _ledger_candidates(ledger),
             "tail_action": (ledger.order[-1].tool if ledger.order else ""),

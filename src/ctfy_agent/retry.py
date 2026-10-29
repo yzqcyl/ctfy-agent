@@ -137,8 +137,9 @@ FACTS_MAX_CHARS = 800
 DEAD_ENDS_MAX_CHARS = 400
 CANDIDATES_MAX_CHARS = 300
 
-# 「像 flag」的花括号形态：flag{...} / CTF{...} / 任意前缀{...}。只收括号形式，裸长串噪声太大。
-_CAND_RE = re.compile(r"[A-Za-z0-9_]{0,24}\{[^{}\s]{3,120}\}")
+# 「像 flag」的花括号形态：flag{...} / CTF{...} / 任意标识符前缀{...}。
+# 前缀至少 1 个标识符字符、内容排除 `"`/`\`（JSON 对象/字符串特征）——否则会把 {"status":"ok"} 误当候选值。
+_CAND_RE = re.compile(r"[A-Za-z0-9_]{1,24}\{[^{}\"\\\s]{3,120}\}")
 
 
 def _clip_join(items, limit: int) -> str:

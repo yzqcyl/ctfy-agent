@@ -59,6 +59,10 @@ def _mk(tmp: Path, **extra):
         def tool_names():
             return []
 
+        @staticmethod
+        def openai_tools_for(names):
+            return []  # _role_specs 需要；真实平台才返回工具规格，这里空即可
+
     crew = Crew(config, StubPlatform(), store, lambda model=None: None)
     return crew, store, config
 
@@ -96,6 +100,33 @@ def _install_solve_stub(crew, script):
 
     crew.solve = fake_solve
     return calls
+
+
+def case_clusterb_facts_reflow(tmp: Path) -> None:
+    """集群-B facts 回流：run_role 返回的结论事实 → _delegate 收进 facts_sink（不回协调者文本）。
+
+    修复根因（SAMPLE-007 实测「黑板事实继承空盒」）：crew 路径的黑板 facts 原本只读
+    ledger.observations（仅 FLAG_RE 匹配才产出，非 flag 题恒空）；现在专家 run_role 的
+    FactsBoard 结论（endpoint/form…）也回流，合并进 summary.facts。
+    """
+    import types
+
+    crew, store, _ = _mk(tmp / "reflow")
+
+    class FakeSolver:
+        llm = types.SimpleNamespace(budget=None)
+
+        def run_role(self, challenge_id, **kwargs):
+            return {"report": "已发现 /api", "steps": 2, "reason": "ok",
+                    "facts": ["endpoint:GET /api → 200", "form:user,pass"]}
+
+    crew.llm_factory = lambda model=None: types.SimpleNamespace(budget=None, temperature=0.2)
+
+    sink: list[str] = []
+    text = crew._delegate("web-01", "web", "侦察 /api", FakeSolver(), facts_sink=sink)
+    assert "endpoint:GET /api → 200" in sink and "form:user,pass" in sink, sink
+    assert "GET /api" not in text, text  # 事实只进黑板，不进协调者看到的专家结论文本
+    _ok("集群-B facts 回流：run_role 结论事实经 _delegate 收进 facts_sink")
 
 
 def case_clusterb_crew(tmp: Path) -> None:
