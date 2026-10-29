@@ -25,8 +25,8 @@ solve_clusterb(challenge_id)
  ├─ trigger = cluster_a_concurrency∈[2,3] 且 category∈stateless_categories ── 否 → 原串行 Orchestrator（集群-B，不变）
  └─ 是 → ThreadPoolExecutor(max_workers=N) 并行 N 路：
         lane_i = new Store(run_dir).load() → new Crew(config, platform, lane_store, llm_factory)
-        summary_i = lane_crew.solve(cid, attempt_caps=cap_i, temperature=SPECS[i].temperature)
-        任一路 solved → cancel_event.set() → 未启动的路直接 superseded
+        summary_i = lane_crew.solve(cid, attempt_caps=cap_i, temperature=SPECS[i].temperature, cancel_event=cancel)
+        任一路 solved → cancel_event.set() → 未启动的路直接 superseded；已启动的路下一轮开跑前退出（轮粒度真取消）
      → 合并 facts/dead_ends/candidates（去重）+ 各路终态快照并入主 store + 用量合并记账
      → 归因落盘 → 权威单次 save → 汇总 summary{cluster_a:{...}}
 ```
@@ -73,7 +73,7 @@ def _stateless_categories(cfg) -> set[str]:
 | 项 | 机制 |
 |---|---|
 | submit 先到先赢 | 复用 `reserve_submit`/`mark_submitted` 文件锁（state.py:301/322，`state.lock` + `_refresh_flags` 读磁盘），跨 Store 实例安全 |
-| 取消 | `threading.Event` 广播；solve 内无细粒度取消点 → 仅 **lane 启动前检查**（未启动的路直接 superseded）+ 结果层仲裁；已启动的路跑完各自预分配切片（设计权衡，见 §8） |
+| 取消 | `threading.Event` 广播（`solve(cancel_event=…)`）；**轮粒度真取消**：未启动的路直接 superseded；已启动的路在下一轮 coordinator 开跑前检查事件、让出（reason=superseded），不再烧后续预算。已交回的在途轮不硬杀 |
 | 单路异常 | `LLMError`/`BudgetExceeded(attempt)` 只结束该路，不影响其它路 |
 | 黑板合并 | 并行无「前次」→ `prior_text=""`，仅 `temperature` 差异化起步；`card_hint/first_action` 注入仍受 HANDOFF §8 禁忌 8 约束（待单独批准） |
 
@@ -102,8 +102,8 @@ def _stateless_categories(cfg) -> set[str]:
 | 拆预算可能有害（k=3 串行实测有害：切片切断累积上下文） | 默认关闭 + multiplier=1.0 仅换墙钟 + 实验开关；真机 A/B 前不启用 |
 | category 误判无状态 | 保守白名单 + 兜底串行 |
 | store 中间 save 竞态（N 路各自 os.replace state.json） | submit 走文件锁（`_refresh_flags` 读盘）；预算/token 累计各算各的不依赖实时合并；结束由主线程单一 save 收口 |
-| 无细粒度取消 | 软取消（下一检查点退出），不做硬 kill |
-| transcript.jsonl 并行 append 单行可能交错（各路 open-write-close 不持锁） | 诊断数据非关键路径，离线套件未见损坏；如需严格再改每路独立文件 |
+| 无细粒度取消 | 轮粒度真取消（coordinator 每轮开跑前检查 cancel_event）；在途轮不硬杀（粒度=一轮） |
+| transcript.jsonl 并行 append 单行可能交错（各路 open-write-close 不持锁） | 已加跨实例锁 `Store._transcript_lock`，append 串行化 |
 | 中间态 state.json 脏写（慢路无锁整体 save 会洗掉 winning lane 刚落盘的 flag） | 每路收尾捕获终态快照（内存），收口合并 + 单次权威 save 覆盖所有脏写（§9 F1） |
 
 ## 9. 审查修正（2026-11 二轮）
@@ -113,15 +113,25 @@ def _stateless_categories(cfg) -> set[str]:
 | # | 严重度 | 初版缺陷 | 修复 |
 |---|---|---|---|
 | F1 | 严重 | winning lane 的提交状态/flag 只写进它自己的 lane Store 内存（solve 内 set_tokens/状态写入均针对本路视图）；且慢路的无锁整体 save 会把磁盘上刚写的 flag 洗掉 → 主 store 与磁盘**双双丢提交状态**，result.json 的 answers 通道失效 | 每路收尾**捕获该路 store 终态快照**（flag/提交状态/flags_tried/计数），收口按「只升不降」并入主 store，最后一次权威 save 覆盖所有中间脏写 |
-| F2 | 严重 | 各路各自 `set_tokens`+save，磁盘「最后写者胜」→ 用量只记一路，**低计 (N−1) 路费用**；续跑预算闸误判、费用报表失真 | 用量合并：各路 usage 求和后扣回 (N−1)×初值，回写主 store；summary 的 usage/budget/tokens_spent 同口径 |
+| F2 | 严重 | 各路各自 `set_tokens`+save，磁盘「最后写者胜」→ 用量只记一路，**低计 (N−1) 路费用**；续跑预算闸误判、费用报表失真 | 用量合并：`usage`（净增量）直接累加 + 初值；`budget.calls`（累计）逐路扣回初值得净增量再累加；回写主 store、summary 的 usage/budget/tokens_spent 同口径 |
 | F3 | 高 | `cluster_a_concurrency: 10` → 10 线程，违反平台规则 QA#26「agent 自主并发 ≤3」 | 触发处钳制 `n = min(n, 3)` |
 | F4 | 高 | `int("auto")` 直接 ValueError 炸掉编排入口（整题报废） | try/except 兜底串行（对齐 resolve_k 的宽容语义） |
 | F5 | 高 | solve_attempts 归因一条没写（与集群-B 及本方案 §7 承诺不符） | 每路一条（index/strategy/temperature/reason/steps/tokens/calls），按 lane 序落盘 |
 | F6 | 中 | 无预检：复跑已解题照样烧 N 路 | 对齐集群-B precheck_fn（store 状态 + my_solved_ids）→ `_presolved_summary` 零成本收口 |
 | F7 | 中 | `preallocate_caps` 池=0（=不限）时被 min_calls 错切成每路 4 次 | 池>0 才应用下限；池=0 切片=0（对齐 Budget / 集群-B caps_fn 语义） |
 | F8 | 中 | 未解出不置 stalled；收口无权威 save，state.json 终态=某路中间脏写 | 合并后置 stalled（未解出时）+ 单次权威 save 收口 |
-| F9 | 中 | 回归脚本只在 gitignored 的 `runs/`，新克隆零编排覆盖；且 `del Crew.solve` 是破坏性 monkeypatch（会把被替换的方法整个删掉） | 正式用例迁入 `tests/smoke_clustera.py` 并注册进 smoke.py（111→**124** passed）；桩一律存引用再还原 |
+| F9 | 中 | 回归脚本只在 gitignored 的 `runs/`，新克隆零编排覆盖；且 `del Crew.solve` 是破坏性 monkeypatch（会把被替换的方法整个删掉） | 正式用例迁入 `tests/smoke_clustera.py` 并注册进 smoke.py（111→**126** passed）；桩一律存引用再还原 |
 
-低危记录（不修，留档）：软取消下已启动的各路仍会烧完预分配切片（设计权衡，§5）；多问题题 next_question_id 并行下不共享（各路各答各的，提交以先到先赢+文件锁为准）。
+低危记录（留档，不修）：多问题题 next_question_id 并行下不共享（各路各答各的，提交以先到先赢+文件锁为准）；`multiplier>N` 被题级池静默钳制（§3 已注明，属安全上限非缺陷）。
 
-验收：`tests/smoke.py` **124 passed / 0 failed**；retry 自检（含 4 条 preallocate 断言）+ 集群-B 离线 6 脚本 + `runs/_verify_clustera_step1.py` 全绿。仍**未真机并发**（真机 A/B 留正式赛，2 路 × crypto/rev medium）。
+验收：`tests/smoke.py` **126 passed / 0 failed**；retry 自检 + 集群-B 离线 6 脚本 + `runs/_verify_clustera_step1.py` 全绿。仍**未真机并发**（真机 A/B 留正式赛，2 路 × crypto/rev medium）。
+
+## 10. 二轮补修（「修复」后）
+
+对「审查修正」版再补三处（全部离线回归）：
+
+| 项 | 问题 | 修复 |
+|---|---|---|
+| F2 公式 bug（本轮新发现） | v1 把 `usage` 当成「含初值累计」、用 `Σusage − (N−1)×初值`，但 `usage` 实为 **净增量**（solve 里 `end−start`）→ **init>0（续跑）时低计 (N−1)×初值**；init=0 时被掩盖，原评测仅 init=0 故漏检 | 改「逐路净增量」口径：tokens=初值+Σusage；calls=初值+Σmax(0,budget.calls−初值)。新增 `smoke_clustera` `init>0` 续跑断言（80+3×150=530 / 7+3×10=37） |
+| 软取消 → 真取消 | v1 已启动的各路仍烧完各自切片（预算浪费） | `solve(cancel_event=…)` 轮粒度真取消：coordinator 每轮开跑前检查事件，置位则 `reason=superseded` 让出；superseded 路跳过 my_solved_ids 兜底防止污染仲裁 base |
+| transcript 并行交错 | 各路独立 Store 并发 append 同一文件，单行可能交错 | `Store._transcript_lock`（跨实例锁）串行化 append |

@@ -15,7 +15,7 @@
 | **大规模基准测试** | ✅ 完成。报告：**`runs/bench-web-report.md`**（16 道归档 + 3 道中断 + A/B 对照 + 并行求解器评估，含勘误记录）。 |
 | **模型 A/B 对照** | ✅ 结论：**换更强模型不涨分**（同题 Pro 0/3 vs K2.7 0/3，速度 2.27×，覆盖面反而更窄）。 |
 | **并行求解器可行性** | ✅ 已评估（报告 §12）：**模型路线已被证伪**。多策略并行未测 → 2026-11 已落地为**集群-A**（见下一行），真机 A/B 留正式赛。 |
-| **集群-A（无状态题同题 N 路并行）** | ✅ **已实施 + 二轮审查修正（默认关闭，实验开关）**：`crew._solve_clustera` 对无状态题（category∈crypto/rev 白名单）同题 N∈[2,3] 路并行独立尝试，每路独立 Crew/Store 视图 + 预分配预算切片（`cluster_a_multiplier` 默认 1.0=总预算不增只换墙钟）+ 温度差异化 + 先到先赢(file lock)+黑板合并。**默认关闭**（config 不加 `cluster_a_concurrency`=走原串行、零回归）；激活=config.extra 加 `cluster_a_concurrency: 2~3`。审查修正（详见 plan-cluster-a.md §9）：提交状态从 lane 终态快照回传主 store（answers 不丢）、用量合并记账（防最后写者胜低计）、solve_attempts 归因落盘、预检短路、并发钳制 ≤3（QA#26）、非法配置兜底串行。方案见 `docs/plan-cluster-a.md`；真机 A/B 留正式赛。 |
+| **集群-A（无状态题同题 N 路并行）** | ✅ **已实施 + 两轮审查修正（默认关闭，实验开关）**：`crew._solve_clustera` 对无状态题（category∈crypto/rev 白名单）同题 N∈[2,3] 路并行独立尝试，每路独立 Crew/Store 视图 + 预分配预算切片（`cluster_a_multiplier` 默认 1.0=总预算不增只换墙钟）+ 温度差异化 + 先到先赢(file lock)+黑板合并。**默认关闭**（config 不加 `cluster_a_concurrency`=走原串行、零回归）；激活=config.extra 加 `cluster_a_concurrency: 2~3`。已修（plan-cluster-a.md §9/§10）：提交状态从 lane 终态快照回传主 store（answers 不丢）、用量合并记账（usage 净增量口径，续跑不低计）、solve_attempts 归因、预检短路、并发钳制≤3（QA#26）、非法配置兜底、**轮粒度真取消**（`solve(cancel_event=…)`）、transcript 加跨实例锁。真机 A/B 留正式赛。 |
 | **800k 复测（arm C）** | ✅ SAMPLE-009 @800k 三臂（干净 Crew / solo / B1+闸门+收敛）全部 **0 候选 0 提交 budget_exhausted** → 编排/模型/调参均非瓶颈；**瓶颈=flag 发现（access-control 面）**。 |
 | **集群-B（同题多策略多尝试）** | ✅ **批次2+A+完整度补强 已落地、机理真机验证**：k 次串行尝试 + 策略/温度差异化（0.2/0.5/0.8）+ 黑板三段继承（结论事实 + 判错死路 + 待验候选值，800/400/300 限额）+ step_limit 归因 + `k` 支持动态（`"auto"` 按剩余 calls 池算）。**默认关闭**（config 不加 `clusterb_k` → k=1 = 旧版行为等价、零回归）；激活=config 加 `"clusterb_k": 3`（或 `"auto"`）。详见 `docs/plan-concurrency.md` §16。 |
 | **step_limit 修复** | ✅ 既有 bug：`_solve_once` 步数用满时 reason 误记 `budget_exhausted`（`step_limit→max_turns` 在 `agent_main._STOP_MAP` 本有映射却从没触发）。已在 `be5d035` 修。 |
@@ -23,7 +23,7 @@
 | **代码版本** | HEAD `14e5172`（含集群-B 补强 `e55560b`/`ebb6ba0` + 超时修复 + Dockerfile 三修）；v3 镜像同源 `5a7f8c5`（与 HEAD 的 `src/` 无差异）。 |
 | **遗留未提交** | 无（`llm.py` 已随 `a245b81` 提交；`agent-artifacts-m55-m56.zip` untracked，别动）。 |
 | **实例** | 0 个（已清空）。 |
-| **单测基线** | `tests/smoke.py` **124 passed / 0 failed**（含 `tests/smoke_clustera.py` 13 条集群-A 断言）；retry 自检 + 集群-B 离线 6 脚本全绿；`runs/_verify_clustera_step1.py` 全绿。 |
+| **单测基线** | `tests/smoke.py` **126 passed / 0 failed**（含 `tests/smoke_clustera.py` 15 条集群-A 断言）；retry 自检 + 集群-B 离线 6 脚本全绿；`runs/_verify_clustera_step1.py` 全绿。 |
 
 **一句话**：**v3 镜像已推送并匿名校验通过，只等用户在浏览器提交审核**；集群-B 已完成归因实测（k=3@511k 花 493,615 tok 未解出 vs k=1@511k 用 313,076 tok 达成 → 切分有害，v3 保持 k=1 默认关闭）；顺带修掉「LLM 读超时整题报废」缺陷并把 web 工具链（ffuf/SecLists/sqlmap）烤进镜像。失败根因仍是 flag 发现（access-control 面）。
 

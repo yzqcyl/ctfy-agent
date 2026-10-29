@@ -561,7 +561,7 @@ class Crew:
 
     def solve(self, challenge_id: str, *, attempt_caps: dict | None = None,
               prior_text: str = "", temperature: float | None = None,
-              keep_instance: bool | None = None) -> dict:
+              keep_instance: bool | None = None, cancel_event=None) -> dict:
         """跑一整轮协调+专家协作（= 集群-B 口径下的一次尝试）。
 
         默认参数（全 None/空）与旧行为**逐字等价**；集群-B 的编排入口见 solve_clusterb()。
@@ -569,6 +569,9 @@ class Crew:
           prior_text:   黑板继承文本（前几次尝试的事实/死路），只进首发 brief
           temperature:  本次尝试的决策温度（同时盖协调者与专家）
           keep_instance: True/False 强制保留/释放实例（None=按旧配置判定）
+          cancel_event: 集群-A 并行取消信号（threading.Event）；None=不取消。置位后本路在
+                        **下一轮开跑前**让出（reason=superseded），不再烧预算——软取消升级为
+                        轮粒度真取消。
         """
         challenge = self.store.require(challenge_id)
         spending = Budget(
@@ -695,6 +698,13 @@ class Crew:
             # 而不是把同一件事重说一遍。039 观测到 3 轮重派 plan 几乎相同，白白烧掉 26 万 token。
             strategy_log: dict[str, list[str]] = {}
             for rnd in range(start_rnd, rounds + 1):
+                if cancel_event is not None and cancel_event.is_set():
+                    # 集群-A 真取消：他路已解出，本路在下一轮开跑前让出，不再烧预算。
+                    reason = "superseded"
+                    self.store.append_transcript(
+                        challenge_id, {"role": "coordinator", "step": rnd, "note": "已取消（他路解出）"}
+                    )
+                    break
                 try:
                     _ckpt_save(ckpt_path, challenge_id=challenge_id, next_round=rnd,
                                messages=messages, reports=reports, ledger=ledger, plan=plan)
@@ -993,7 +1003,7 @@ class Crew:
         )
         # proof-of-exploitation 兜底：专家调 verify_exploit 通过后平台已记 solve，但那条回执不经过
         # 协调者的 submit 分支（没有 flag 可交）。收尾前用 get_my_solves 对一次事实，避免统计漏记。
-        if not submitted:
+        if not submitted and reason != "superseded":
             try:
                 if challenge_id in self.platform.my_solved_ids():
                     submitted = True
@@ -1252,6 +1262,7 @@ class Crew:
                     attempt_caps=caps[i],
                     temperature=spec.get("temperature"),
                     keep_instance=None,
+                    cancel_event=cancel,
                 )
                 state = _snapshot(lane_store)  # 趁引用还在抓终态（磁盘可能随后被慢路洗掉）
             except Exception as exc:  # noqa: BLE001 - 单路异常只废这一路，不拖垮其它路
@@ -1277,14 +1288,18 @@ class Crew:
         pairs.sort(key=lambda p: p[0])  # 归因按 lane 序
         results = [s for _, s, _ in pairs]
 
-        # ---- 用量合并：各路 usage 含同一份初值，求和后扣回 (n-1) 份（防「最后写者胜」低计）----
+        # ---- 用量合并（逐路净增量口径）----
+        # solve() 的 summary["usage"] = end_usage − start_usage = 本路**净增量**（不含初值）；
+        # summary["budget"] = end_usage = **含初值的累计**。两者口径不同，务必分开：
+        #   tokens：init + Σ usage（净增量直接累加，无需扣初值）
+        #   calls：init + Σ max(0, budget.calls − init_calls)（累计扣回初值 = 本路净增量）
         sum_pt = sum(int((s.get("usage") or {}).get("prompt_tokens") or 0) for s in results)
         sum_ct = sum(int((s.get("usage") or {}).get("completion_tokens") or 0) for s in results)
-        sum_calls = sum(int((s.get("budget") or {}).get("calls") or 0) for s in results)
-        dup = max(0, len(results) - 1)
-        merged_pt = max(init_pt, sum_pt - dup * init_pt)
-        merged_ct = max(init_ct, sum_ct - dup * init_ct)
-        merged_calls = max(init_calls, sum_calls - dup * init_calls)
+        merged_pt = init_pt + sum_pt
+        merged_ct = init_ct + sum_ct
+        merged_calls = init_calls + sum(
+            max(0, int((s.get("budget") or {}).get("calls") or 0) - init_calls) for s in results
+        )
         store.set_tokens(challenge_id, {
             "prompt_tokens": merged_pt, "completion_tokens": merged_ct,
             "total_tokens": merged_pt + merged_ct, "calls": merged_calls,

@@ -77,11 +77,13 @@ def case_cluster_a(tmp: Path) -> None:
         """solve 桩：solve_idx=第几个到达的路解出（-1=无人解出）；clobber=慢路整体 save 洗磁盘。"""
 
         def fake_solve(self, challenge_id, *, attempt_caps=None, prior_text="", temperature=None,
-                       keep_instance=None):
+                       keep_instance=None, cancel_event=None):
             time.sleep(0.03)  # 保证 3 路都已启动（过了软取消检查），观察点稳定
+            init_calls = int(self.store.require(challenge_id).tokens.get("calls") or 0)
             with lock:
                 i = len(calls)
-                calls.append({"caps": dict(attempt_caps or {}), "temperature": temperature})
+                calls.append({"caps": dict(attempt_caps or {}), "temperature": temperature,
+                              "cancel_event": cancel_event})
             pt, ct, ncalls = usage
             if i == solve_idx:
                 ch = self.store.require(challenge_id)  # 本路内存视图：模拟 mark_submitted 落状态
@@ -92,7 +94,7 @@ def case_cluster_a(tmp: Path) -> None:
                 return {"challenge_id": challenge_id, "submitted": True, "reason": "flag_accepted",
                         "steps": 5, "tokens_spent": pt + ct,
                         "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
-                        "budget": {"calls": ncalls, "total_tokens": pt + ct},
+                        "budget": {"calls": init_calls + ncalls, "total_tokens": pt + ct},
                         "facts": ["flag 在 output.txt"], "dead_ends": [], "candidates": ["flag{a1b2}"]}
             if clobber:
                 time.sleep(0.12)  # 比解出路慢：整体无锁 save，把磁盘上刚写的 flag 洗掉
@@ -100,7 +102,7 @@ def case_cluster_a(tmp: Path) -> None:
             return {"challenge_id": challenge_id, "submitted": False, "reason": "step_limit",
                     "steps": 3, "tokens_spent": pt + ct,
                     "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
-                    "budget": {"calls": ncalls, "total_tokens": pt + ct},
+                    "budget": {"calls": init_calls + ncalls, "total_tokens": pt + ct},
                     "facts": ["RSA e=65537"], "dead_ends": ["盲试小素数无效"], "candidates": ["flag{a1b2}"]}
 
         return fake_solve
@@ -121,6 +123,8 @@ def case_cluster_a(tmp: Path) -> None:
     assert len(calls) == 3, calls
     assert sorted(c["temperature"] for c in calls) == [0.2, 0.5, 0.8], calls
     _ok("clusterA: 3 路分发 + 温度差异化 0.2/0.5/0.8")
+    assert all(c.get("cancel_event") is not None for c in calls), calls
+    _ok("clusterA: cancel_event 已传入各路 solve（真取消信号在途）")
     assert all(c["caps"] == {"tokens": 170_333, "calls": 26} for c in calls), calls
     _ok("clusterA: 每路预分配切片 170333/26 均摊")
     assert summary.get("submitted") is True and summary.get("reason") == "flag_accepted", summary
@@ -170,6 +174,19 @@ def case_cluster_a(tmp: Path) -> None:
     assert store4.require("crypto-01").status == "stalled"
     assert summary4["cluster_a"]["solved"] is False and summary4.get("reason") == "step_limit", summary4
     _ok("clusterA: 未解出 → 主 store stalled")
+
+    # ---------- 场景 6：续跑（init>0）合并口径 — usage=净增量 / budget=累计 ----------
+    calls.clear()
+    crew8, store8, _c8 = _mk(tmp / "resume", cluster_a_concurrency=3)
+    seed = store8.require("crypto-01")
+    seed.tokens = {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80, "calls": 7}
+    store8.save()
+    _run(crew8, "crypto-01", _fake(solve_idx=-1))
+    ch8 = store8.require("crypto-01")
+    assert ch8.tokens.get("total_tokens") == 530, ch8.tokens  # 80 + 3×150 净增量
+    assert ch8.tokens.get("prompt_tokens") == 350 and ch8.tokens.get("completion_tokens") == 180, ch8.tokens
+    assert ch8.tokens.get("calls") == 37, ch8.tokens  # 7 + 3×10 净增量
+    _ok("clusterA: 续跑（init>0）用量合并口径正确（usage 净增量 / budget 累计）")
 
     # ---------- 场景 5：零回归（web / 未配置 / 非法值 → 串行） ----------
     calls.clear()

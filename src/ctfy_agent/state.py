@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -201,6 +202,10 @@ class Challenge:
 
 class Store:
     """一个 run 一个 state.json，原子写（tmp + replace），崩溃不留半截文件。"""
+
+    # 转录单行 append 的跨实例锁：集群-A 多路独立 Store 实例并发写同一 transcript 文件，
+    # 串行化「打开-写-关」防单行交错（诊断数据，非关键路径但顺手收紧）。
+    _transcript_lock = threading.Lock()
 
     def __init__(self, run_dir: Path):
         self.run_dir = Path(run_dir)
@@ -394,5 +399,7 @@ class Store:
 
     def append_transcript(self, challenge_id: str, record: dict) -> None:
         path = self.transcript_path(challenge_id)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"at": now(), **record}, ensure_ascii=False) + "\n")
+        line = json.dumps({"at": now(), **record}, ensure_ascii=False) + "\n"
+        with Store._transcript_lock:  # 多路并行 append 同一文件时串行化，防单行交错
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
