@@ -53,7 +53,8 @@ class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
 class GuardedRedirect(urllib.request.HTTPRedirectHandler):
     """每次跳转都重新校验目标，且禁止 https→http 降级。check 抛异常即拦截。
 
-    `capture`（可选）：跳转响应的头也会回调一次。很多站点把会话 cookie 种在
+    `capture`（可选）：每次跳转回调一次 `capture(req, code, headers)`——req 是拿到
+    3xx 的请求、code 是 3xx 状态码、headers 是 3xx 响应头。很多站点把会话 cookie 种在
     302 上（登录/注册成功 → Location: /portal/ + Set-Cookie），而 urllib 跟随跳转后
     调用方只看到最终响应头——不在这里捞就会把会话丢掉，表现为「登录成功却一直
     是未登录页」。tools_local 用它把 302 上的 Set-Cookie 存进自己的 jar。
@@ -75,7 +76,7 @@ class GuardedRedirect(urllib.request.HTTPRedirectHandler):
         self._check(newurl)
         if self._capture is not None and headers is not None:
             try:
-                self._capture(req, headers)
+                self._capture(req, code, headers)
             except Exception:  # noqa: BLE001 - 捞 cookie 失败不该击穿请求
                 pass
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)

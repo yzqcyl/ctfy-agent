@@ -147,15 +147,20 @@ def case_http_map_wiring(tmp: Path) -> None:
     crew.roles = {
         "coordinator": {"local": []},
         "ai": {"local": ["http_request", "http_map", "chat"]},
-        "web": {"local": ["http_request"]},
+        "web": {"local": ["http_request", "authdiff", "jsrecon", "sqli"]},
+        "misc": {"local": ["shell"]},
     }
     ai_names = {spec["function"]["name"] for spec in crew._role_specs("ai")}
     web_names = {spec["function"]["name"] for spec in crew._role_specs("web")}
+    misc_names = {spec["function"]["name"] for spec in crew._role_specs("misc")}
     assert "http_map" in ai_names, f"ai 白名单里有 http_map，但 _role_specs 没挂上：{sorted(ai_names)}"
     assert "http_map" not in web_names, f"web 没开 http_map 却挂上了（越权给工具）：{sorted(web_names)}"
+    for tool in ("authdiff", "jsrecon", "sqli"):
+        assert tool in web_names, f"web 白名单里有 {tool}，但 _role_specs 没挂上：{sorted(web_names)}"
+        assert tool not in misc_names, f"misc 没开 {tool} 却挂上了（越权给工具）：{sorted(misc_names)}"
     assert "report" in ai_names, "专家必须始终有 report（交付通道）"
 
-    # 配置漂移：真跑用的 config/agent.json 里 ai/web 必须真的开着 http_map
+    # 配置漂移：真跑用的 config/agent.json 里 ai/web 必须真的开着 http_map（P3 三工具同理）
     config = json.loads((ROOT / "config" / "agent.json").read_text(encoding="utf-8"))
     for role_name in ("ai", "web"):
         local = ((config.get("roles") or {}).get(role_name) or {}).get("local") or []
@@ -163,8 +168,11 @@ def case_http_map_wiring(tmp: Path) -> None:
             f"config/agent.json 的 roles.{role_name}.local 缺 http_map：模型将看不到这个工具"
             "（flash 三跑 0 次调用的直接原因）"
         )
+    web_local = ((config.get("roles") or {}).get("web") or {}).get("local") or []
+    for tool in ("authdiff", "jsrecon", "sqli"):
+        assert tool in web_local, f"config/agent.json 的 roles.web.local 缺 {tool}：模型将看不到这个工具"
 
-    label = "http_map 接线：_role_specs 挂载 + config/agent.json 白名单不漂移"
+    label = "http_map + P3 三工具接线：_role_specs 挂载 + config/agent.json 白名单不漂移"
     if callable(reporter):
         reporter(label)
     else:

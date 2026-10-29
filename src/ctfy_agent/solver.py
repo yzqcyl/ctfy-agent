@@ -15,6 +15,7 @@ import json
 import time
 from json import JSONDecodeError
 
+from .artifacts import DOWNLOAD_TOOLS, persist_download
 from .budget import Budget, BudgetExceeded
 from .companion import PlanTrack, parse_companion
 from .config import Config
@@ -65,6 +66,28 @@ _NO_PROGRESS_HINT = (
     "若确实已无方向，直接 report 交结论（写明卡点），不要再空转。"
 )
 _NO_PROGRESS_STOP = "[无进展刹车] 连续 {rounds} 步工具输出完全重复，判定原地打转，提前停止以节省预算。"
+
+
+# 时变字段：工具输出里的耗时/时间戳，剥离后才做 no-progress 哈希（审计修复）。
+# 否则「同样的失败输出」因 elapsed_ms 每次不同 → 哈希每次都变 → 刹车永不触发（039/043 实机形态）。
+_TIMEVARY_KEYS = frozenset({
+    "elapsed_ms", "ms", "duration", "ts", "timestamp",
+    "started_at", "finished_at", "created_at", "updated_at",
+})
+
+
+def _stable_output(text: str) -> str:
+    """剥离时变字段后的稳定内容，供 no-progress 判定哈希用。"""
+    raw = str(text).strip()
+    if raw.startswith("{"):
+        try:
+            data, _ = json.JSONDecoder().raw_decode(raw)
+        except (JSONDecodeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            data = {k: v for k, v in data.items() if str(k).lower() not in _TIMEVARY_KEYS}
+            return json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return raw
 
 
 def _group_messages(messages: list[dict]) -> tuple[list[dict], list[list[dict]]]:
@@ -509,6 +532,9 @@ class Solver:
             return None
         return self._register_instance(challenge_id, info)
 
+    def _traffic_enabled(self) -> bool:
+        return bool(self.config.extra.get("traffic_enabled", True))
+
     def _build_specs(self, local: LocalTools) -> list[dict]:
         return self.platform.openai_tools() + local.specs()
 
@@ -587,6 +613,22 @@ class Solver:
                     if item.status in ("new", "parsed"):
                         self.store.set_status(challenge_id, "instance_up")
                 self.store.save()
+            if name in DOWNLOAD_TOOLS:
+                # 附件落盘：长 JSON（源码/二进制 base64）若进上下文会被 shrink 掉中段，
+                # 模型永远看不到完整文件（SAMPLE-010/011 实测本因）。落盘后只回摘要。
+                text = persist_download(args, text, local._sandbox_dir())
+            verify_name = self.platform.try_resolve("verify_exploit")
+            if verify_name and name == verify_name:
+                # proof-of-exploitation 题没有 flag：平台侧 judge 判定通过后，本题记为解出。
+                # 判定不用回执文案猜，直接问 get_my_solves（确定性事实源）。
+                if challenge_id in self.platform.my_solved_ids():
+                    try:
+                        self.store.set_status(challenge_id, "submitted")
+                        self.store.save()
+                    except ValueError:
+                        pass
+                    return f"{text}\n[判定通过] verify_exploit 已验证，本题在平台记为解出，无需再找 flag。", True
+                return text, False
             return text, False
 
         if name in local.names():
@@ -605,7 +647,7 @@ class Solver:
         submit_name = self.platform.resolve("submit_flag")
         props = self.platform.prop_names(submit_name)
         instance_mode = "instance_id" in props
-        question_id = str(args.get("question_id") or self.config.extra.get("default_question_id") or "flag")
+        question_id = str(args.get("question_id") or self.store.require(challenge_id).next_question_id or "flag")
 
         payload = dict(args)
         payload["answer" if "answer" in props else "flag"] = answer
@@ -651,7 +693,15 @@ class Solver:
         if reservation == "limit":
             return f"[提交被拦截] 本题已达到提交上限 {self.config.submit_limit} 次。", False
 
-        result = self.platform.call_raw(submit_name, payload)
+        try:
+            result = self.platform.call_raw(submit_name, payload)
+        except Exception as exc:  # 网络异常：回滚预留，别让正确答案被幂等锁死（审计修复）
+            self.store.release_submit(challenge_id, answer)
+            return (
+                f"[提交异常] 网络错误，本次提交未送达平台（已回滚提交额度，可稍后重试）："
+                f"{type(exc).__name__}: {exc}",
+                False,
+            )
         text = render_call_result(result)
         if isinstance(result, dict) and result.get("isError"):
             text = f"[工具报错] {text}"
@@ -669,6 +719,108 @@ class Solver:
     # ---------- 主循环 ----------
 
     def solve(self, challenge_id: str, *, max_steps: int | None = None) -> dict:
+        """编排入口：k=1 时等价旧 solve（单次尝试）；config.extra.clusterb_k>1 时做多次独立尝试。"""
+        cfg = self.config.extra or {}
+        k = int(cfg.get("clusterb_k") or 1)
+        if k <= 1:
+            return self._solve_once(challenge_id, max_steps=max_steps)
+        return self._solve_clusterb(challenge_id, max_steps=max_steps, k=k, cfg=cfg)
+
+    def _solve_clusterb(self, challenge_id: str, *, max_steps: int | None, k: int, cfg: dict) -> dict:
+        """集群-B：同题 k 次独立尝试（串行）+ 极简事实黑板。默认关闭，由 config.extra.clusterb_k 激活。
+
+        - 每次尝试用 budget.Budget 的题级累计（磁盘继承）+ 尝试切片（caps_fn）
+        - 黑板只继承「结论事实」（FactsBoard.seed），不继承 ledger 的「方向证伪」判决
+        - status 终态化与 done 事件统一在全部尝试结束后收口（中间尝试 final=False）
+        """
+        from .retry import Orchestrator, AttemptOutcome
+
+        min_calls = int(cfg.get("clusterb_min_calls") or 4)
+        reserve = float(cfg.get("clusterb_reserve") or 0.12)
+        store = self.store
+        config = self.config
+        last_summary: dict | None = None
+
+        def caps_fn(remaining):
+            ch = store.require(challenge_id)
+            tok = ch.tokens or {}
+            used_tokens = int(tok.get("total_tokens") or 0)
+            used_calls = int(tok.get("calls") or 0)
+            rem = max(1, int(remaining))
+            t = int((config.max_tokens_per_challenge - used_tokens) * (1 - reserve) / rem) if config.max_tokens_per_challenge else 0
+            c = max(min_calls, int((config.max_llm_calls - used_calls) * (1 - reserve) / rem)) if config.max_llm_calls else 0
+            return {"tokens": max(0, t), "calls": max(0, c)}
+
+        def attempt_fn(cid, idx, caps, prompt, meta):
+            nonlocal last_summary
+            old_temp = getattr(self.llm, "temperature", None)
+            try:
+                summary = self._solve_once(
+                    cid, max_steps=max_steps, attempt_index=idx, caps=caps,
+                    prior_facts=meta.get("facts") or None, final=False,
+                    strategy=meta.get("strategy"),
+                )
+            finally:
+                if old_temp is not None:
+                    self.llm.temperature = old_temp
+            last_summary = summary
+            ch = store.require(cid)
+            ch.append_solve_attempt({
+                "index": idx,
+                "strategy": (meta.get("strategy") or {}).get("card_hint", ""),
+                "reason": summary.get("reason"),
+                "steps": summary.get("steps"),
+                "tokens_spent": summary.get("tokens_spent"),
+                "calls_spent": summary.get("calls_spent"),
+            })
+            store.save()
+            return AttemptOutcome(
+                reason=summary.get("reason") or "",
+                tail_action=summary.get("tail_action") or "",
+                tokens=summary.get("tokens_spent") or 0,
+                calls=summary.get("calls_spent") or 0,
+                facts=summary.get("facts") or [],
+            )
+
+        def precheck_fn(cid):
+            ch = store.require(cid)
+            if ch.status in ("submitted", "done") or ch.submitted_ok:
+                return True
+            return cid in self.platform.my_solved_ids()
+
+        orch = Orchestrator(attempt_fn, attempts_max=k, caps_fn=caps_fn, precheck_fn=precheck_fn)
+        report = orch.run_challenge(challenge_id)
+
+        ch = store.require(challenge_id)
+        if not report.solved and ch.status not in ("submitted", "done"):
+            try:
+                store.set_status(challenge_id, "stalled")
+            except ValueError:
+                pass
+        store.save()
+
+        base = dict(last_summary) if last_summary else {}
+        base["submitted"] = report.solved
+        base["status"] = ch.status
+        base["reason"] = "flag_accepted" if report.solved else base.get("reason", "budget_exhausted")
+        if report.attempts:
+            base["attempt_index"] = report.attempts[-1].index
+        base.setdefault("transcript", str(store.transcript_path(challenge_id)))
+        base.setdefault("steps", 0)
+        base["clusterb"] = {
+            "k": k,
+            "solved": report.solved,
+            "blocked": report.blocked,
+            "attempts": len(report.attempts),
+            "tokens_spent": report.tokens_spent,
+            "calls_spent": report.calls_spent,
+        }
+        return base
+
+    def _solve_once(self, challenge_id: str, *, max_steps: int | None = None,
+                    attempt_index: int = 0, caps: dict | None = None,
+                    prior_facts: list[str] | None = None, final: bool = True,
+                    strategy: dict | None = None) -> dict:
         # 缓存/jar 都是 Solver 实例级的：同一实例被复用解多道题时先清掉，
         # 防止 A 题的响应体或会话 cookie 被 B 题的同 host:port 请求静默命中（审计 #4 / B1）。
         self._http_cache.clear()
@@ -690,6 +842,8 @@ class Solver:
             self.llm.budget = spending
         start_usage = spending.snapshot()
         self.on_event("budget", start_usage)
+        if caps:
+            spending.set_attempt_caps(caps)  # 集群-B：本次尝试切片（缺省/空 = 不切片，行为同旧）
 
         # 一开始就超了：直接拒绝，一次请求都不发
         try:
@@ -728,6 +882,7 @@ class Solver:
             jar=self._cookie_jar,
             chats=self._chats,
             allow_chat=True,
+            traffic_enabled=self._traffic_enabled(),
         )
         if challenge.instance:
             local.allow_many(challenge.instance)
@@ -749,18 +904,23 @@ class Solver:
             {"role": "user", "content": self._initial_prompt(challenge, local)},
         ]
         self.store.append_transcript(challenge_id, {"role": "user", "content": messages[-1]["content"]})
+        if strategy and strategy.get("temperature") is not None and hasattr(self.llm, "temperature"):
+            self.llm.temperature = float(strategy["temperature"])  # 集群-B 差异化温度；由 attempt_fn 的 finally 恢复
 
         # 事实看板 + 工具结果瘦身（M5 成本实测后加）：头部 user 消息每轮重挂事实块，
         # 头部永不被滑窗丢掉，所以事实免疫压缩；工具结果进上下文前压到 ~1600 字符，
         # 完整原文仍在转录里（模型可 grep/offset 再取），省的正是每轮重复重发的历史。
         base_head = messages[1]["content"]
         facts = FactsBoard()
+        if prior_facts:
+            facts.seed(prior_facts)  # 集群-B：继承上一次尝试导出的结论事实（不继承推断/判决）
         evidence_flag = ""
         tool_chars = int((self.config.extra or {}).get("tool_text_chars", DEFAULT_TOOL_TEXT_CHARS))
 
         submitted = False
         steps_used = 0
         reason = "budget_exhausted"
+        tail_action = ""
         ledger = Ledger.from_config(self.config)
         plan = PlanTrack()
 
@@ -778,7 +938,7 @@ class Solver:
                 )
                 self.on_event("budget_exhausted", exc.snapshot)
                 steps_used = step - 1
-                reason = "budget_exhausted"
+                reason = "attempt_cap" if exc.attempt else "budget_exhausted"
                 break
             finally:
                 # 每步都把用量写盘，进程被强杀也不会丢账
@@ -855,6 +1015,7 @@ class Solver:
                         text, accepted = f"[平台工具错误] {exc}", False
                     except Exception as exc:  # 任何异常都要回灌给模型，别让循环挂掉
                         text, accepted = f"[执行异常] {type(exc).__name__}: {exc}", False
+                    tail_action = name  # 集群-B 归因：最后一步动作（verify/submit 接近目标 → near_miss）
 
                 self.store.append_transcript(
                     challenge_id, {"step": step, "role": "tool", "name": name, "args": args, "result": text[:2000]}
@@ -902,7 +1063,11 @@ class Solver:
 
             self.store.save()
 
-        if not submitted:
+        # 步数用满但未超预算且未解出 → step_limit（可重试），而非沿用初始值 budget_exhausted
+        if reason == "budget_exhausted" and steps_used >= budget:
+            reason = "step_limit"
+
+        if not submitted and final:
             if challenge.status not in ("submitted", "done"):
                 try:
                     self.store.set_status(challenge_id, "stalled")
@@ -921,15 +1086,20 @@ class Solver:
             "submitted": submitted,
             "steps": steps_used,
             "attempts": challenge.attempts,
+            "attempt_index": attempt_index,
             "reason": reason,
+            "tail_action": tail_action,
+            "facts": facts.as_list(),
             "budget": end_usage,
             "usage": usage,
             "tokens_spent": usage["total_tokens"],
+            "calls_spent": max(0, int(end_usage.get("calls") or 0) - int(start_usage.get("calls") or 0)),
             "transcript": str(self.store.transcript_path(challenge_id)),
             "ledger": ledger.stats(),
             "plan": plan.stats(),
         }
-        self.on_event("done", summary)
+        if final:
+            self.on_event("done", summary)
         return summary
 
     # ---------- 专家角色循环（多智能体协作用） ----------
@@ -960,7 +1130,7 @@ class Solver:
         local = LocalTools(
             self.store, challenge_id, allow_shell=allow_shell, allow_chat=allow_chat,
             verbose=self.config.debug, cache=self._http_cache, jar=self._cookie_jar,
-            chats=self._chats,
+            chats=self._chats, traffic_enabled=self._traffic_enabled(),
         )
         if challenge.instance:
             local.allow_many(challenge.instance)
@@ -1087,7 +1257,7 @@ class Solver:
                     )
                     break
 
-                gate = self._ledger_gate(ledger, name, args, role="solver")
+                gate = self._ledger_gate(ledger, name, args, role=role)
                 if gate:
                     text, accepted = gate, False
                 else:
@@ -1104,7 +1274,7 @@ class Solver:
                     challenge_id, {"role": role, "step": step, "tool": name, "args": args, "result": text[:2000]}
                 )
                 # 无进展信号：被账本拦下（重复调用）或输出摘要与之前完全一致 → 本步没产生新信息
-                digest = hashlib.sha1(str(text).encode("utf-8", "replace")).hexdigest()[:16]
+                digest = hashlib.sha1(_stable_output(str(text)).encode("utf-8", "replace")).hexdigest()[:16]
                 if not gate and digest not in seen_outputs:
                     seen_outputs.add(digest)
                     step_progress = True

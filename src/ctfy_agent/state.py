@@ -150,6 +150,7 @@ class Challenge:
     solves_count: int | None = None                 # 已解队伍数（难度与方向的客观参照）
     status: str = "new"
     attempts: int = 0
+    solve_attempts: list = field(default_factory=list)  # 集群-B 解题尝试记录（跨进程持久化，每项一次尝试的摘要）
     submitted_ok: bool = False
     instance: dict = field(default_factory=dict)
     instance_id: str = ""         # 平台实例 UUID（真实平台按它提交/停止）
@@ -157,6 +158,7 @@ class Challenge:
     tokens: dict = field(default_factory=dict)  # 累计用量（跨进程继承，费用刹车用）
     flags_tried: list[str] = field(default_factory=list)  # flag 的 sha256 前缀
     flag_value: str = ""          # 只在校验通过后记录
+    next_question_id: str = ""    # 多问题题：下一道待提交的 question_id（per-challenge 隔离，不写 config.extra）
     notes: list[str] = field(default_factory=list)
     tool_counts: dict = field(default_factory=dict)  # 写操作频控计数（start/stop 实例等）
     steps: int = 0
@@ -164,6 +166,10 @@ class Challenge:
 
     def touch(self) -> None:
         self.updated_at = now()
+
+    def append_solve_attempt(self, record: dict) -> None:
+        """登记一次解题尝试（集群-B 编排器的 AttemptRecord 落盘形态）。"""
+        self.solve_attempts.append(record)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -322,6 +328,23 @@ class Store:
             item.submitted_ok = True
             item.flag_value = flag
             item.status = "submitted"
+            item.touch()
+            self.save()
+
+    def release_submit(self, challenge_id: str, flag: str) -> None:
+        """回滚一次预留（提交在网络层失败、未送达平台时调用）。
+
+        背景（审计修复）：reserve_submit 在 call_raw 之前落账，网络异常会让 attempts 已扣、
+        flag 已入 flags_tried，重跑提交同一 flag 会被判 "duplicate"——正确答案被幂等永久锁死。
+        这里回滚预留，宁可让模型重试一次，也不锁死可能正确的答案。
+        """
+        with _lock_exclusive(self._lock_path()):
+            self._refresh_flags(challenge_id)
+            item = self.require(challenge_id)
+            digest = flag_hash(flag)
+            if digest in item.flags_tried:
+                item.flags_tried.remove(digest)
+                item.attempts = max(0, item.attempts - 1)
             item.touch()
             self.save()
 

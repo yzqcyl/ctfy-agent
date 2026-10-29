@@ -25,6 +25,8 @@ import json
 import re
 from urllib.parse import urlparse
 
+from .ledger import FLAG_RE
+
 # 进上下文的工具结果目标长度（字符）。完整原文在转录 JSONL 里，模型可用 grep/offset 再取。
 DEFAULT_TOOL_CHARS = 1600
 
@@ -36,7 +38,6 @@ KEY_LINE_RE = re.compile(
     r"<(?:input|textarea|select|option|button|form)|name=|type=.hidden|csrf)"
 )
 
-FLAG_RE = re.compile(r"FLAG\{[^}\s]{4,120}\}")
 PATH_RE = re.compile(r"/[A-Za-z0-9_\-]{2,}(?:/[A-Za-z0-9_\-.]+)+")
 HREF_RE = re.compile(r"""href=["'](/[^"']{2,80})["']""")
 FIELD_RE = re.compile(r"""name=["']([^"']{1,40})["']""")
@@ -251,6 +252,15 @@ class FactsBoard:
 
     def as_list(self) -> list[str]:
         return list(self._facts.values())
+
+    def seed(self, items: list[str]) -> None:
+        """预置外部传入的事实（集群-B 跨尝试继承：上一次尝试导出的 as_list()）。按文本去重。"""
+        seen = set(self._facts.values())
+        for text in items or []:
+            if text in seen:
+                continue
+            self._add(f"inherited:{len(self._facts)}", text)
+            seen.add(text)
 
 
 def with_facts(base: str, facts: str) -> str:

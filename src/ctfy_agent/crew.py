@@ -28,7 +28,7 @@ from .checkpoint import (
 )
 from .companion import PlanTrack, parse_companion
 from .config import Config
-from .ledger import Ledger
+from .ledger import FLAG_RE, Ledger
 from .llm import LLMError
 from .platform import CtfyPlatform
 from .solver import Solver, _compact_history, _untrusted, MAX_TOOL_TEXT
@@ -41,8 +41,12 @@ from .tools_local import (
     NOTE_SPEC,
     REPORT_SPEC,
     SHELL_SPEC,
+    TRAFFIC_SPEC,
 )
 from .tools_misc_ext import MISC_EXT_SPECS
+from .tools_webscan import FUZZ_SPEC
+from .tools_websec import AUTHDIFF_SPEC, JSRECON_SPEC
+from .tools_websql import SQLI_SPEC
 
 # ---------- 平台工具按功能分组（都是 MODEL_TOOLS 的子集） ----------
 
@@ -58,17 +62,26 @@ PLATFORM_SCOPE: dict[str, set[str]] = {
         "get_my_solves", "get_my_milestone_progress", "list_submissions", "get_scoreboard",
     },
     "instance": {"start_instance", "stop_instance", "renew_instance"},
-    "oracle": {"verify_answer"},
+    "oracle": {"verify_answer", "verify_exploit"},
     "submit": {"submit_answer", "submit_qa_answer"},
 }
 
 # 默认角色。config/agent.json 的 roles 键可覆盖（会进 extra）。
 DEFAULT_ROLES: dict[str, dict] = {
     "coordinator": {"max_steps": 8, "platform": ["read", "instance", "oracle", "submit"], "local": []},
-    "web": {"max_steps": 10, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer"], "local": ["http_request"]},
+    "web": {"max_steps": 10, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request"]},
     "rev": {"max_steps": 12, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell"]},
     "crypto": {"max_steps": 10, "allow_shell": True, "platform": ["read", "instance", "oracle"], "local": ["shell"]},
     "misc": {"max_steps": 8, "allow_shell": False, "platform": ["read", "instance"], "local": ["http_request"]},
+    # pwn/ai 与 config/agent.json 的 roles 键对齐：DEFAULT_ROLES 是「角色丢失时的兜底」，
+    # 缺了这两条，agent.json 一旦裁剪/丢失 pwn/ai，这两类题会无人可派（审计发现：
+    # agent.json 之外没有任何兜底来源）。工具面按 agent.json 的同名角色抄全，避免兜底退化。
+    "pwn": {"max_steps": 12, "allow_shell": True,
+            "platform": ["read", "instance"],
+            "local": ["shell", "elfpeek", "tcp", "tcp_batch", "netcheck"]},
+    "ai": {"max_steps": 12, "allow_shell": False,
+           "platform": ["read", "instance", "oracle"],
+           "local": ["http_request", "http_map", "chat"]},
 }
 
 # 结论交付规则：note 只落盘、不回传，report 才是唯一出口。
@@ -383,6 +396,9 @@ class Crew:
         specs = self.platform.openai_tools_for(self._role_platform_names(role))
         local = set((self.roles.get(role) or {}).get("local") or [])
         specs.append(NOTE_SPEC)
+        _cfg = getattr(self, "config", None)
+        if _cfg is None or _cfg.extra.get("traffic_enabled", True):
+            specs.append(TRAFFIC_SPEC)
         if "http_request" in local:
             specs.append(HTTP_SPEC)
         if "http_map" in local:
@@ -393,6 +409,14 @@ class Crew:
             specs.append(CHAT_SPEC)
         if "shell" in local:
             specs.append(SHELL_SPEC)
+        if "fuzz" in local:
+            specs.append(FUZZ_SPEC)  # P2：ffuf 封装，只有显式登记 local 的角色才看得见
+        if "authdiff" in local:
+            specs.append(AUTHDIFF_SPEC)  # P3：越权/鉴权对照
+        if "jsrecon" in local:
+            specs.append(JSRECON_SPEC)   # P3：JS 静态侦察
+        if "sqli" in local:
+            specs.append(SQLI_SPEC)      # P3：sqlmap 窄封装
         for spec in MISC_EXT_SPECS:
             if spec["function"]["name"] in local:
                 specs.append(spec)
@@ -735,13 +759,15 @@ class Crew:
                                 }
                                 current = str(
                                     args.get("question_id")
-                                    or self.config.extra.get("default_question_id")
+                                    or challenge.next_question_id
                                     or "flag"
                                 )
                                 rest = [qid for qid in all_qids if qid != current]
                                 if rest:
                                     # 下一条 submit 若不显式给 question_id，默认打向另一道未交的题
-                                    self.config.extra["default_question_id"] = rest[0]
+                                    # （per-challenge 落盘，别写共享 config——CLI 批量跑题会跨题污染，审计修复）
+                                    challenge.next_question_id = rest[0]
+                                    self.store.save()
                                 lines = [f"- 【问题 {qid}】{prompts.get(qid, '（门控/未解锁，需重新 get_challenge)')}" for qid in rest]
                                 text += (
                                     "\n\n[多问题] 平台回执 challenge_fully_solved=false：本题尚未全解，"
@@ -795,8 +821,10 @@ class Crew:
                 # 新动作落账后追加一条紧凑「已试过」清单；确定性、只加信息、不做硬拦截。
                 # 关键：即使 _compact_history 因超窗丢掉了旧 tool 块，这份摘要每轮从账本重灌，
                 # 协调者仍不会丢失「已做过」的方向（顺带覆盖了 P1-2 的要害半边）。
+                # include_refuted=True：同一份摘要再带上「已证伪/死路」方向（P0-1 dead_ends
+                # hook），协调者既能避开已试过、也能避开已证伪，不再重派死路。
                 if len(ledger.order) > attempts_before:
-                    digest = ledger.digest(max_entries=6, include_refuted=False)
+                    digest = ledger.digest(max_entries=6, include_refuted=True)
                     if digest:
                         messages.append({"role": "user", "content": digest})
                         self.store.append_transcript(
@@ -804,16 +832,19 @@ class Crew:
                         )
 
                 # 候选出现（v3 P0·候选闸门）：账本自动收录了工具输出里的 flag 形态 → 立即推去验证/提交。
-                if ledger.observations and challenge.attempts == 0 and not flag_nudged:
+                # 只推「flag 形态」的观测：report 的 evidence 溯源也会写进 observations（可能是
+                # 凭据/路径等非 flag 子串），非 flag 的观测推去 submit 会空烧次数还扣 attempts（审计修复）。
+                flag_cands = [o for o in ledger.observations if FLAG_RE.search(o.text)]
+                if flag_cands and challenge.attempts == 0 and not flag_nudged:
                     flag_nudged = True
                     messages.append({
                         "role": "user",
-                        "content": _FLAG_CANDIDATE_HINT.format(cand=ledger.observations[-1].text),
+                        "content": _FLAG_CANDIDATE_HINT.format(cand=flag_cands[-1].text),
                     })
                     self.store.append_transcript(
                         challenge_id,
                         {"role": "gate", "step": rnd,
-                         "note": f"候选出现注入（observations={len(ledger.observations)}）"},
+                         "note": f"候选出现注入（flag 形态 {len(flag_cands)}/{len(ledger.observations)}）"},
                     )
 
                 # A2 伴生文本：协调者的「推进」= 账本里出现新的派活目标。
@@ -879,6 +910,17 @@ class Crew:
         self.store.append_transcript(
             challenge_id, {"role": "ledger", "stats": ledger.stats(), "render": ledger.render()}
         )
+        # proof-of-exploitation 兜底：专家调 verify_exploit 通过后平台已记 solve，但那条回执不经过
+        # 协调者的 submit 分支（没有 flag 可交）。收尾前用 get_my_solves 对一次事实，避免统计漏记。
+        if not submitted:
+            try:
+                if challenge_id in self.platform.my_solved_ids():
+                    submitted = True
+                    reason = "exploit_verified"
+                    challenge.status = "submitted"
+            except Exception:  # noqa: BLE001 - 判定增强项，失败不影响主流程
+                pass
+
         summary = {
             "challenge_id": challenge_id,
             "status": challenge.status,

@@ -1,6 +1,6 @@
 {
   "ai": {
-    "model": "Kimi-K2.7",
+    "model": "DeepSeek-V4.1-Flash-1017",
     "max_steps": 12,
     "allow_shell": false,
     "max_tokens": 4096,

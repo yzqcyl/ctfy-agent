@@ -35,7 +35,17 @@ from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 
 from .httputil import GuardedRedirect, NoRedirect, build_opener, read_limited
+from .tools_domain_ext import DOMAIN_NAMES as _DOMAIN_NAMES, call_domain as _call_domain
 from .tools_misc_ext import MISC_EXT_SPECS, call_ext as _call_ext
+from .tools_webscan import FUZZ_MATCH_CODES_DEFAULT, FUZZ_SPEC, run_fuzz as _webscan_fuzz
+from .tools_websec import (
+    AUTHDIFF_SPEC,
+    JSRECON_SPEC,
+    run_authdiff as _websec_authdiff,
+    run_jsrecon as _websec_jsrecon,
+)
+from .tools_websql import SQLI_SPEC, run_sqli as _websql_sqli
+from .traffic import resolve as traffic_resolve
 
 MAX_BODY = 8000
 # http_request 单次返回的正文窗口（字符）。定 5000 而非 8000：solver 会把工具结果
@@ -203,6 +213,7 @@ MAX_BURST = 24
 BURST_TIMEOUT = 20
 BURST_TOTAL_TIMEOUT = 45
 BURST_READ_BYTES = 2048
+BURST_STORE_BYTES = 64 * 1024    # 流量库落盘用：比分组指纹（2048）读得更全，仍远小于 2MB 上限
 MAX_BURST_GROUPS = 12             # 分组详情最多展开这么多组，其余折叠（防 JSON 被 solver 截半）
 
 BURST_SPEC = {
@@ -323,6 +334,38 @@ NOTE_SPEC = {
     },
 }
 
+# 全量流量档案检索：补 http_request 只回 5000 字符窗口、diff 只能和最近一条比的缺口。
+# 一条工具三种用法（search/get/diff），10 步预算下模型学得会。
+TRAFFIC_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "traffic",
+        "description": (
+            "查本轮全量 HTTP 流量档案（http_request/http_burst/http_map 发出的每个请求与响应，含完整正文）。"
+            "op=search：按 query（大小写不敏感匹配 路径/URL/请求头/响应头/正文）、status、method、source 过滤，返回最近命中列表；"
+            "op=get：按 id 取某次交换的请求头+响应头+正文窗口（offset/limit 切片，响应窗 5000 字符）；"
+            "op=diff：对 id=a 与 id=b 两条响应正文做行级差异（added_lines/removed_lines）。"
+            "用于回答「哪些请求带过某个 cookie/参数」「某端点两种身份返回差在哪」这类跨请求问题。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["search", "get", "diff"], "default": "search",
+                       "description": "search=过滤列表；get=按 id 看详情；diff=两条正文差异"},
+                "query": {"type": "string", "description": "search：匹配关键词（路径/URL/头/正文，大小写不敏感）"},
+                "status": {"type": "string", "description": "search：状态码过滤，逗号分隔，如 \"200,302,401\""},
+                "method": {"type": "string", "description": "search：HTTP 方法过滤"},
+                "source": {"type": "string", "description": "search：来源工具过滤 http_request/http_burst/http_map"},
+                "id": {"type": "integer", "description": "get：要查看的交换 id"},
+                "a": {"type": "integer", "description": "diff：左操作数交换 id"},
+                "b": {"type": "integer", "description": "diff：右操作数交换 id"},
+                "offset": {"type": "integer", "default": 0, "description": "get：正文窗口起始偏移（字符）"},
+                "limit": {"type": "integer", "default": 10, "description": "search：最多返回条数；get：正文窗口长度"},
+            },
+        },
+    },
+}
+
 SHELL_SPEC = {
     "type": "function",
     "function": {
@@ -369,12 +412,24 @@ REPORT_SPEC = {
 
 
 class LocalTools:
-    def __init__(self, store, challenge_id: str, *, allow_shell: bool = False, verbose: bool = False, cache: dict | None = None, jar: dict | None = None, chats: dict | None = None, allow_chat: bool = True):
+    def __init__(self, store, challenge_id: str, *, allow_shell: bool = False, verbose: bool = False, cache: dict | None = None, jar: dict | None = None, chats: dict | None = None, allow_chat: bool = True, traffic_enabled: bool = True):
         self.store = store
         self.challenge_id = challenge_id
         self.allow_shell = allow_shell
         self.allow_chat = allow_chat
         self.verbose = verbose
+        # 流量库：best-effort 初始化，失败即 None（disabled），绝不影响解题。
+        # 测试里的 _Store() 假 store 既无 run_dir 也非路径——Path() 会抛 TypeError，这里一并吞掉。
+        self._traffic = None
+        if traffic_enabled:
+            try:
+                run_dir = getattr(self.store, "run_dir", None)
+                if run_dir is None:
+                    run_dir = Path(self.store)
+                inst = traffic_resolve(run_dir, challenge_id)
+                self._traffic = inst if inst.enabled else None
+            except Exception:
+                self._traffic = None
         # 本轮 body 缓存：key=(netloc, path?query) → {status, headers, payload, content_length, capped}
         # 由 Solver 统一持有并跨 delegate 共享（省掉重复抓取；桩机制省 token）。
         self.cache = cache if cache is not None else {}
@@ -391,6 +446,9 @@ class LocalTools:
         # 与 jar/cache 同级、由 Solver 持有并跨 delegate 共享——否则每轮 delegate 归零，
         # 多轮阶梯（Crescendo）根本无从谈起。
         self._chats: dict[tuple[str, str], dict] = chats if chats is not None else {}
+        # ffuf 可执行文件：None=运行时用 shutil.which 探测；测试可注入 argv 前缀（假 ffuf）
+        self._ffuf_bin = None
+        self._sqlmap_py = None  # 测试可指向假 sqlmap；None = 走 CTFY_SQLMAP / /opt/sqlmap/sqlmap.py
 
     # ---------- 合规：允许的目标 ----------
 
@@ -483,14 +541,39 @@ class LocalTools:
             "只允许攻击平台实例，禁止访问第三方站点。"
         )
 
-    # ---------- 规格 ----------
+    def _check_endpoint(self, host: str, port: int | None) -> None:
+        """TCP/连通性工具的目标校验：与 http_request 共用同一套实例白名单。"""
+        host = self._norm_host(host)
+        if not host:
+            raise ToolError("host 为空")
+        if not self.allowed_hosts and not self.allowed_endpoints:
+            raise ToolError(
+                "还没有登记任何可访问实例。先用 start_instance 启动题目实例，再用它返回的 host:port。"
+            )
+        if host in self.allowed_hosts:
+            return
+        if port is not None and f"{host}:{int(port)}" in self.allowed_endpoints:
+            return
+        raise ToolError(
+            f"合规拦截：{host}{':' + str(port) if port else ''} 不是平台为本题下发的实例端点。"
+            f"已登记主机：{', '.join(sorted(self.allowed_hosts)) or '(无)'}；"
+            f"已登记端点：{', '.join(sorted(self.allowed_endpoints)) or '(无)'}。"
+            "只允许攻击平台实例，禁止访问第三方站点。"
+        )
 
+    # ---------- 规格 ----------
     def specs(self) -> list[dict]:
         specs = [HTTP_SPEC, MAP_SPEC, NOTE_SPEC, BURST_SPEC]
+        if self._traffic is not None:
+            specs.append(TRAFFIC_SPEC)
         if self.allow_chat:
             specs.append(CHAT_SPEC)
         if self.allow_shell:
             specs.append(SHELL_SPEC)
+        specs.append(FUZZ_SPEC)  # ffuf 封装；按角色可见性由 crew._role_specs 的 local 名单过滤
+        specs.append(AUTHDIFF_SPEC)  # P3：越权/鉴权对照探针
+        specs.append(JSRECON_SPEC)   # P3：JS 静态侦察
+        specs.append(SQLI_SPEC)      # P3：sqlmap 窄封装
         specs.extend(MISC_EXT_SPECS)  # MISC 扩展工具（单一来源：tools_misc_ext.MISC_EXT_SPECS）
         return specs
 
@@ -530,6 +613,8 @@ class LocalTools:
             raise ToolError("shell 未开启：config/agent.json 里 allow_shell=false")
         if name not in self.names():
             raise ToolError(f"未知本地工具 {name}")
+        if name in _DOMAIN_NAMES:
+            return self._call_domain_tool(name, arguments)
         fn = getattr(self, name)
         sig = inspect.signature(fn)
         accepted: dict = {}
@@ -577,6 +662,19 @@ class LocalTools:
             "alg": alg, "secret": secret, "token": token,
             "claims": claims, "header": header, "remove": remove,
         })
+
+    # ---------- 领域扩展工具（pwn / crypto / reverse 共用地基） ----------
+
+    def _call_domain_tool(self, name: str, arguments: dict) -> str:
+        """tcp / tcp_batch / elfpeek / netcheck：先做沙盒路径锚定与实例端点合规校验。"""
+        if arguments.get("path") is not None:
+            arguments["path"] = self._resolve_path(str(arguments["path"]))
+        host = arguments.get("host")
+        if host is not None:
+            port = arguments.get("port")
+            numeric = str(port if port is not None else "").strip().isdigit()
+            self._check_endpoint(str(host), int(port) if numeric else None)
+        return _call_domain(name, arguments)
 
     @staticmethod
     def _parse_range(value: str, current: int) -> int:
@@ -648,11 +746,23 @@ class LocalTools:
                 else:
                     jar[name] = morsel.value
 
-    def _capture_redirect(self, req, headers) -> None:
+    def _capture_redirect(self, req, code, headers) -> None:
         """跳转响应的 Set-Cookie 也入 jar（登录/注册常 302 种会话，不捞就丢会话）。"""
         netloc = urlparse(getattr(req, "full_url", "") or "").netloc
         if netloc:
             self._capture_cookies(netloc, headers.items())
+
+    def _capture_redirect_and_record(self, req, code, headers) -> None:
+        """http_request 专用：捞 cookie 之外，把 3xx 中间跳也落流量库（审计 A7）。"""
+        self._capture_redirect(req, code, headers)
+        self._traffic_record(
+            source="http_request",
+            method=req.get_method() if hasattr(req, "get_method") else "GET",
+            url=getattr(req, "full_url", "") or "",
+            status=code,
+            resp_headers={str(k): str(v) for k, v in (headers.items() if headers else [])},
+            resp_body="",
+        )
 
     def _decorate_redirect(self, req) -> None:
         """跳转后的新请求补上 Cookie（urllib 复制原请求头时 jar 里还没有会话）。"""
@@ -716,11 +826,26 @@ class LocalTools:
             path_q = urlparse(url).path + (("?" + urlparse(url).query) if urlparse(url).query else "")
             # cookie 也进缓存 key：登录前/后的同名 URL 响应可能不同，不区分就会串会话
             effective_cookie = next((v for k, v in forwarded.items() if str(k).lower() == "cookie"), "") or ""
-            cache_key = (netloc, path_q, effective_cookie)
+            # 鉴权/自定义头也进 key（审计修复）：X-Role:admin 与无头请求若共用缓存，
+            # 头绕过/鉴权题会拿到假阳/假阴的旧响应；UA/Accept 等无关头不进来，避免缓存命中率塌掉。
+            hdr_sig = tuple(sorted(
+                (str(k).lower(), str(v)) for k, v in forwarded.items()
+                if str(k).lower() == "authorization" or str(k).lower().startswith("x-")
+            ))
+            cache_key = (netloc, path_q, effective_cookie, hdr_sig)
             hit = self.cache.get(cache_key)
             # diff 要「这次真实响应」当右侧：跳过缓存读（cache_key 仍留着事后落盘）。
             # follow_redirect=false 同理：要看到原始 3xx+Location，不能拿缓存的落地页顶替。
             if hit is not None and not diff and follow:
+                _hit_hdrs = hit.get("headers") or {}
+                self._traffic_record(
+                    source="http_request", method=method, url=url, status=hit.get("status"),
+                    req_headers=forwarded, req_body=body or "", resp_headers=_hit_hdrs,
+                    resp_body=hit.get("payload") or "",
+                    mime=_hit_hdrs.get("content-type") or "",
+                    truncated=(1 if len(hit.get("payload") or "") >= MAX_GREP_BYTES else 0),
+                    cache_hit=1,
+                )
                 if not grep and not offset:
                     # 完全重复读：返回桩而不是再次塞全文进上下文（省 token 的真正来源）
                     return self._render_cache_stub(hit)
@@ -738,7 +863,7 @@ class LocalTools:
         # 恒读满 2MB：小响应读到 EOF 即止（无额外成本），大响应保留中/尾供 offset 切片。
         # capture：跳转响应上的 Set-Cookie 也要入 jar（登录/注册常 302 种会话）。
         if follow:
-            opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect, decorate=self._decorate_redirect))
+            opener = build_opener(GuardedRedirect(self._check_target, capture=self._capture_redirect_and_record, decorate=self._decorate_redirect))
         else:
             opener = build_opener(NoRedirect())
         status = 0
@@ -770,13 +895,30 @@ class LocalTools:
                 self._capture_cookies(netloc, exc.headers.items())
                 content_length = exc.headers.get("Content-Length")
         except urllib.error.URLError as exc:
+            self._traffic_record(
+                source="http_request", method=method, url=url, req_headers=forwarded,
+                req_body=body, error=f"{type(exc).__name__}: {exc.reason}",
+            )
             raise ToolError(f"请求失败 {url}: {exc.reason}") from None
         except OSError as exc:
             # 连接被重置/中断/读超时等（http.client 会直接抛 ConnectionAbortedError 之类，
             # 不走 URLError），统一转成 ToolError 回给模型，别让整轮崩掉。
+            self._traffic_record(
+                source="http_request", method=method, url=url, req_headers=forwarded,
+                req_body=body, error=f"{type(exc).__name__}: {exc}",
+            )
             raise ToolError(f"请求失败 {url}: {exc}") from None
         # ToolError 从 GuardedRedirect 的 _check_target 抛出来，原样上抛
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+        self._traffic_record(
+            source="http_request", method=method, url=url, status=status,
+            req_headers=forwarded,
+            req_body=body if body else (data.decode("utf-8", "replace") if data else ""),
+            resp_headers=interesting, resp_body=payload,
+            mime=interesting.get("content-type") or "",
+            ms=elapsed_ms, truncated=(1 if len(payload) >= MAX_GREP_BYTES else 0),
+        )
 
         # 基线必须在上面的 _cache_put 之前取：否则刚抓到的这一份会变成「最近一条」，自己和自己比。
         baseline = self._diff_baseline(netloc, urlparse(url).path) if diff else None
@@ -935,6 +1077,99 @@ class LocalTools:
         out["body"] = window
         return json.dumps(out, ensure_ascii=False)
 
+    # ---------- 流量档案（检索） ----------
+
+    def _traffic_record(self, **kwargs) -> None:
+        """best-effort 落一条交换；流量库关闭或异常都静默，绝不影响解题。"""
+        if self._traffic is None:
+            return
+        try:
+            self._traffic.record(**kwargs)
+        except Exception:
+            pass
+
+    def traffic(self, op: str = "search", query: str = "", status: str = "", method: str = "",
+                source: str = "", id: int = 0, a: int = 0, b: int = 0, offset: int = 0,
+                limit: int = 10) -> str:
+        """查流量档案（search/get/diff 三态，见 TRAFFIC_SPEC）。"""
+        if self._traffic is None:
+            return json.dumps({"error": "流量库未启用（traffic_enabled=false）"}, ensure_ascii=False)
+
+        def _i(v, name: str, default: int) -> int:
+            # 非法整数转成 ToolError 而非 ValueError（审计 A10：否则白烧一步「执行异常」）
+            if v in (None, "", False):
+                return default
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                raise ToolError(f"traffic 参数 {name} 必须是整数，收到 {v!r}") from None
+
+        op = (op or "search").strip().lower()
+        if op == "get":
+            out = self._traffic.get(_i(id, "id", 0), offset=_i(offset, "offset", 0),
+                                    limit=_i(limit, "limit", 0))
+        elif op == "diff":
+            out = self._traffic.diff(_i(a, "a", 0), _i(b, "b", 0))
+        else:
+            out = self._traffic.search(query=query, status=status, method=method, source=source,
+                                       limit=_i(limit, "limit", 10))
+        return json.dumps(out, ensure_ascii=False)
+
+    # ---------- 目录/参数发现（ffuf 封装） ----------
+    # 实现在 tools_webscan.py（纯 stdlib、可注入假 ffuf 单测）；这里只做契约适配：
+    # 注入目标白名单校验与流量落库回调，命令行开关一律由模块内部硬编码。
+
+    def _fuzz_record(self, url: str, status) -> None:
+        """命中落流量库（source=fuzz）；失败不影响扫描结果。"""
+        self._traffic_record(source="fuzz", method="GET", url=url, status=status)
+
+    def fuzz(self, mode: str = "dir", base: str = "", url: str = "", wordlist: str = "common",
+             words: list | None = None, ext: str = "",
+             match_codes: str = FUZZ_MATCH_CODES_DEFAULT,
+             filter_size: int = 0, max_results: int = 40, timeout_s: int = 45) -> str:
+        """用内置字典做路径/参数发现（见 tools_webscan.FUZZ_SPEC）。"""
+        return _webscan_fuzz(
+            mode=mode, base=base, url=url, wordlist=wordlist, words=words, ext=ext,
+            match_codes=match_codes, filter_size=filter_size, max_results=max_results,
+            timeout_s=timeout_s,
+            check_target=self._check_target,
+            record=self._fuzz_record,
+            work_dir=self._sandbox_dir(),
+            ffuf_bin=self._ffuf_bin,
+        )
+
+    # ---------- 越权对照 / JS 侦察（P3） ----------
+    # 实现在 tools_websec.py（纯 stdlib、可单测）；这里只做契约适配与抓取/白名单注入。
+
+    def authdiff(self, url: str = "", method: str = "GET", body: str = "",
+                 headers: dict | None = None, variants: str = "anon,bypass") -> str:
+        """越权/鉴权对照探针（见 tools_websec.AUTHDIFF_SPEC）。"""
+        netloc = urlparse(url).netloc if url else ""
+        return _websec_authdiff(
+            url=url, method=method, body=body, headers=headers, variants=variants,
+            cookie_present=bool(netloc and self._cookie_header(netloc)),
+            check_target=self._check_target, fetch=self._sec_fetch,
+        )
+
+    def jsrecon(self, url: str = "") -> str:
+        """JS 静态侦察（见 tools_websec.JSRECON_SPEC）。"""
+        def _fetch(u, **kwargs):  # noqa: ANN001 - 回调适配，签名与 run_jsrecon 一致
+            return self._sec_fetch(u, source="jsrecon", **kwargs)
+
+        return _websec_jsrecon(url=url, check_target=self._check_target, fetch=_fetch)
+
+    def _sqli_record(self, **kwargs) -> None:
+        self._traffic_record(source="sqli", **kwargs)
+
+    def sqli(self, url: str = "", data: str = "", param: str = "", technique: str = "BEUSTQ",
+             level: int = 1, risk: int = 1, timeout_s: int = 60) -> str:
+        """SQL 注入自动化（见 tools_websql.SQLI_SPEC）。"""
+        return _websql_sqli(
+            url=url, data=data, param=param, technique=technique, level=level, risk=risk,
+            timeout_s=timeout_s, check_target=self._check_target,
+            record=self._sqli_record, work_dir=self._sandbox_dir(), sqlmap_py=self._sqlmap_py,
+        )
+
     # ---------- 并发/批量请求（竞态 & 枚举） ----------
 
     def http_burst(self, url: str, method: str = "POST", body: str = "", headers: dict | None = None,
@@ -1028,13 +1263,14 @@ class LocalTools:
             try:
                 conn.request(method, path, body=b.encode("utf-8") if b else None, headers=req_hdrs)
                 resp = conn.getresponse()
-                raw = resp.read(BURST_READ_BYTES)
+                raw = resp.read(BURST_STORE_BYTES)
                 results[i] = {
                     "i": i,
                     "status": resp.status,
                     "ms": round((time.perf_counter() - t0) * 1000, 1),
                     "body": raw.decode("utf-8", "replace"),
                     "set_cookie": resp.headers.get_all("Set-Cookie") or [],
+                    "mime": resp.getheader("Content-Type") or "",
                 }
             except Exception as exc:  # noqa: BLE001
                 results[i] = {"i": i, "error": f"{type(exc).__name__}: {exc}"}
@@ -1054,6 +1290,27 @@ class LocalTools:
             for sc in (r or {}).get("set_cookie") or []:
                 self._capture_cookies(netloc, [("Set-Cookie", sc)])
 
+        # 全部结果落流量库（主线程写，规避 SQLite 并发写；失败也记，死路证据）。
+        # 补上实际发送的 Cookie（worker 里加了但没回传，审计 A8），与线上请求头一致。
+        rec_hdrs = dict(hdrs)
+        if auto_cookie:
+            rec_hdrs["Cookie"] = auto_cookie
+        for idx, (u, b) in enumerate(targets):
+            r = results[idx] or {}
+            if "error" in r:
+                self._traffic_record(source="http_burst", method=method, url=u,
+                                     req_headers=rec_hdrs, req_body=b, error=r["error"])
+            else:
+                sc = r.get("set_cookie") or []
+                body_text = r.get("body") or ""
+                self._traffic_record(
+                    source="http_burst", method=method, url=u, status=r.get("status"),
+                    req_headers=rec_hdrs, req_body=b,
+                    resp_headers={"Set-Cookie": "; ".join(sc)} if sc else {},
+                    resp_body=body_text, mime=r.get("mime") or "", ms=r.get("ms"),
+                    truncated=(1 if len(body_text) >= BURST_STORE_BYTES else 0),
+                )
+
         # 按响应正文分组（正文即指纹：错误提示 vs 成功页的分界通常在前几行）
         ok = failed = 0
         status_counter: dict[int, int] = {}
@@ -1067,7 +1324,7 @@ class LocalTools:
             ok += 1
             status_counter[r["status"]] = status_counter.get(r["status"], 0) + 1
             times.append(r["ms"])
-            g = groups.setdefault(r["body"], {"count": 0, "i": [], "status": r["status"], "head": r["body"][:120]})
+            g = groups.setdefault(r["body"][:BURST_READ_BYTES], {"count": 0, "i": [], "status": r["status"], "head": r["body"][:120]})
             g["count"] += 1
             g["i"].append(r["i"])
 
@@ -1108,37 +1365,77 @@ class LocalTools:
 
     # ---------- http_map：站点结构 / 端点探测（窄工具，替代反复 grep 与猜路径） ----------
 
-    def _map_fetch(self, url: str, timeout: float = MAP_TIMEOUT) -> tuple[int, str, str]:
-        """抓一页（带 cookie jar、重定向 Set-Cookie 捕获），返回 (status, content_type, text)。"""
+    def _map_fetch(self, url: str, timeout: float = MAP_TIMEOUT, *, method: str = "GET",
+                   body: str = "", extra_headers: dict | None = None, use_jar: bool = True,
+                   source: str = "http_map") -> tuple[int, str, str]:
+        """抓一页（带 cookie jar、重定向 Set-Cookie 捕获），返回 (status, content_type, text)。
+
+        P3 起兼作 authdiff/jsrecon 的通用抓取器：method/body/extra_headers/use_jar 可覆盖，
+        source 决定流量库里的来源标识；默认行为与 http_map 完全一致。
+        """
         self._check_target(url)
         netloc = urlparse(url).netloc
         headers = {"Accept-Encoding": "identity", "User-Agent": "ctfy-agent/0.2"}
-        cookie = self._cookie_header(netloc)
-        if cookie:
-            headers["Cookie"] = cookie
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        for key, value in (extra_headers or {}).items():
+            headers[str(key)] = str(value)
+        if use_jar:
+            cookie = self._cookie_header(netloc)
+            if cookie and not any(str(k).lower() == "cookie" for k in headers):
+                headers["Cookie"] = cookie
+        data = body.encode("utf-8") if body else None
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # 审查 A1：use_jar=False（authdiff 的匿名变体）必须与 jar 完全隔离——跳转后不补
+        # Cookie（decorate 置空）、响应的 Set-Cookie 也不回写 jar（capture/抓取置空）。
+        # 否则「去掉 Cookie 重放」在带跳转的端点上会被重新认证，匿名可读判定失真。
         opener = build_opener(
-            GuardedRedirect(self._check_target, capture=self._capture_redirect, decorate=self._decorate_redirect)
+            GuardedRedirect(
+                self._check_target,
+                capture=self._capture_redirect if use_jar else None,
+                decorate=self._decorate_redirect if use_jar else None,
+            )
         )
         try:
             with opener.open(request, timeout=timeout) as response:
                 raw = read_limited(response, MAX_GREP_BYTES)
-                self._capture_cookies(netloc, response.headers.items())
-                return (response.status, response.headers.get("Content-Type") or "",
-                        raw.decode("utf-8", "replace"))
+                if use_jar:
+                    self._capture_cookies(netloc, response.headers.items())
+                status = response.status
+                ctype = response.headers.get("Content-Type") or ""
+                text = raw.decode("utf-8", "replace")
+                self._traffic_record(source=source, method=method, url=url, status=status,
+                                     req_headers=headers, req_body=body,
+                                     resp_headers={"Content-Type": ctype} if ctype else {},
+                                     resp_body=text, mime=ctype)
+                return (status, ctype, text)
         except urllib.error.HTTPError as exc:
             try:
                 raw = read_limited(exc, MAX_GREP_BYTES)
             except Exception:  # noqa: BLE001
                 raw = b""
-            if exc.headers:
+            if use_jar and exc.headers:
                 self._capture_cookies(netloc, exc.headers.items())
             ctype = (exc.headers.get("Content-Type") if exc.headers else "") or ""
-            return exc.code, ctype, raw.decode("utf-8", "replace")
+            text = raw.decode("utf-8", "replace")
+            self._traffic_record(source=source, method=method, url=url, status=exc.code,
+                                 req_headers=headers, req_body=body,
+                                 resp_headers={"Content-Type": ctype} if ctype else {},
+                                 resp_body=text, mime=ctype)
+            return exc.code, ctype, text
         except urllib.error.URLError as exc:
+            self._traffic_record(source=source, method=method, url=url, req_headers=headers,
+                                 error=f"{type(exc).__name__}: {exc.reason}")
             raise ToolError(f"请求失败 {url}: {exc.reason}") from None
         except OSError as exc:
+            self._traffic_record(source=source, method=method, url=url, req_headers=headers,
+                                 error=f"{type(exc).__name__}: {exc}")
             raise ToolError(f"请求失败 {url}: {exc}") from None
+
+    def _sec_fetch(self, url: str, *, method: str = "GET", body: str = "",
+                   extra_headers: dict | None = None, use_jar: bool = True,
+                   source: str = "authdiff") -> tuple[int, str, str]:
+        """authdiff / jsrecon 的抓取回调：复用 _map_fetch 的白名单、重定向护栏与落库。"""
+        return self._map_fetch(url, method=method, body=body, extra_headers=extra_headers,
+                               use_jar=use_jar, source=source)
 
     @staticmethod
     def _map_path(target: str, base_url: str) -> str:

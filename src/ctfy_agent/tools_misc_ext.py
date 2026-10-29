@@ -33,6 +33,8 @@ import zipfile
 from pathlib import Path
 from urllib.parse import unquote
 
+from .ledger import FLAG_RE
+
 TOOL_TEXT_MAX = 6000
 MAX_LAYERS = 8
 UNPACK_MAX_BYTES = 64 * 1024 * 1024
@@ -42,7 +44,6 @@ HEXPEEK_WIDTH = 16
 # decode_blob 输入上限：模型上下文本身 <128KB，256KB 已留足余量，仅防御病态输入（审计 C2）。
 DECODE_MAX_CHARS = 256 * 1024
 
-FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,24}\{[^}\r\n]{2,120}\}")
 _PRINTABLE = set(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
 
 
@@ -702,6 +703,17 @@ JWT_SPEC = {
 
 MISC_EXT_SPECS = [DECODE_SPEC, UNPACK_SPEC, HEXPEEK_SPEC, JWT_SPEC]
 NAMES = {"decode_blob", "unpack_archive", "hexpeek", "jwt_forge"}
+
+# 领域扩展（TCP 交互 / ELF 解析 / 连通性诊断）挂同一注册点：
+# crew._role_specs 已有「按角色 local 名单过滤 MISC_EXT_SPECS」的门禁循环，
+# 因此新增工具不需要改 crew.py；工具的可见性由 config 里各角色的 local 列表决定。
+try:
+    from .tools_domain_ext import DOMAIN_SPECS as _DOMAIN_SPECS
+
+    MISC_EXT_SPECS = [*MISC_EXT_SPECS, *_DOMAIN_SPECS]
+    NAMES = NAMES | {s["function"]["name"] for s in _DOMAIN_SPECS}
+except Exception:  # noqa: BLE001 - 领域扩展缺失不应阻断 misc 基础工具
+    pass
 
 _IMPL = {
     "decode_blob": decode_blob,

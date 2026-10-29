@@ -2274,7 +2274,7 @@ def case_a3_method_cards(tmp: Path) -> None:
 
 
 def case_web_tool_whitelist(tmp: Path) -> None:
-    """裁工具 28→13 的护栏：web 角色平台工具面 == 9 个白名单；删掉的不进 web、不丢出全局。
+    """裁工具 28→13 的护栏：web 角色平台工具面 == 10 个白名单；删掉的不进 web、不丢出全局。
 
     证据来源：review-token-analysis.md —— 035 全程只调 http_request/report，15 个拟删工具零调用；
     web 系统提示词（[0 取材]）只点名白名单里的工具，删干净不会造成「提示词让调、工具面没有」。
@@ -2284,7 +2284,8 @@ def case_web_tool_whitelist(tmp: Path) -> None:
 
     keep = ["get_challenge", "list_challenge_attachments", "download_challenge_attachment",
             "list_hints", "view_hint", "start_instance",
-            "list_instance_attachments", "download_instance_attachment", "verify_answer"]
+            "list_instance_attachments", "download_instance_attachment", "verify_answer",
+            "verify_exploit"]
     removed = ["get_me", "list_competitions", "get_competition", "list_competition_challenges",
                "search_challenges", "list_instances", "get_instance", "get_instance_status",
                "get_instance_traffic", "get_my_solves", "get_my_milestone_progress", "list_submissions",
@@ -2301,7 +2302,7 @@ def case_web_tool_whitelist(tmp: Path) -> None:
         assert t in all_scoped, f"{t} 被误删出了 PLATFORM_SCOPE"
         assert t not in set(web["platform"]), f"{t} 不该还在 web 平台工具面"
 
-    # 机制级：给定全 24 个工具名的 stub，web 解析结果恰好是 9 个
+    # 机制级：给定全 24 个工具名的 stub，web 解析结果恰好是 10 个
     class _Stub:
         @staticmethod
         def tool_names():
@@ -2312,7 +2313,85 @@ def case_web_tool_whitelist(tmp: Path) -> None:
     crew.platform = _Stub()
     assert crew._role_platform_names("web") == set(keep)
 
-    ok("裁工具护栏：web 平台工具面 == 9 白名单；删掉的 15 个既不进 web 也未丢出全局")
+    ok("裁工具护栏：web 平台工具面 == 10 白名单；删掉的 15 个既不进 web 也未丢出全局")
+
+
+def case_default_roles_cover_all(tmp: Path) -> None:
+    """DEFAULT_ROLES 必须覆盖 config/agent.json 的全部角色键（pwn/ai 曾缺失）。
+
+    背景（审计发现）：DEFAULT_ROLES 是「agent.json 的 roles 丢失/裁剪时的兜底」。
+    它此前只有 coordinator/web/rev/crypto/misc，pwn/ai 完全依赖 agent.json——
+    配置里没有这两个角色时，pwn/ai 题既无法指派专家，delegate 的 enum 里也没有它们。
+    """
+    from ctfy_agent.config import load  # noqa: PLC0415
+    from ctfy_agent.crew import DEFAULT_ROLES, Crew  # noqa: PLC0415
+
+    # 1) 键覆盖：agent.json 里有几个角色，兜底就必须有几个（防再漂移）
+    live_roles = set((load().extra.get("roles") or {}).keys())
+    missing = live_roles - set(DEFAULT_ROLES)
+    assert not missing, f"DEFAULT_ROLES 缺角色兜底：{sorted(missing)}（agent.json 丢了就无人可派）"
+
+    # 2) 兜底内容可用：pwn/ai 的 local/platform/max_steps 不能空（否则解析出零工具专家）
+    for role in ("pwn", "ai"):
+        spec = DEFAULT_ROLES[role]
+        assert spec.get("local"), f"DEFAULT_ROLES[{role!r}].local 为空"
+        assert spec.get("platform"), f"DEFAULT_ROLES[{role!r}].platform 为空"
+        assert spec.get("max_steps"), f"DEFAULT_ROLES[{role!r}].max_steps 缺失"
+
+    # 3) 机制级：agent.json 只给 coordinator 时，pwn/ai 仍从兜底派活且工具面正确
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp)
+        config.extra["roles"] = {"coordinator": {}}   # 模拟 agent.json 缺 pwn/ai
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store = Store(tmp / "roles").load()
+        crew = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM([]))
+        assert {"pwn", "ai"} <= set(crew.roles), sorted(crew.roles)
+
+        pwn_names = {s["function"]["name"] for s in crew._role_specs("pwn")}
+        assert "shell" in pwn_names, pwn_names
+        assert "tcp" in pwn_names, pwn_names          # 来自 tools_domain_ext 的 DOMAIN_SPECS
+        assert "report" in pwn_names, pwn_names
+
+        ai_names = {s["function"]["name"] for s in crew._role_specs("ai")}
+        assert "chat" in ai_names, ai_names
+        assert "http_request" in ai_names, ai_names
+        assert "report" in ai_names, ai_names
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    ok("DEFAULT_ROLES 覆盖全部角色：pwn/ai 在 agent.json 缺失时仍可兜底派活")
+
+
+def case_role_system_coverage(tmp: Path) -> None:
+    """每个专家角色都必须有可用的 system 提示词（rev/crypto 曾只有 3 行兜底）。
+
+    背景（审计发现）：rev/crypto 在 config/agent.json 里没有 system 字段，
+    走 crew._role_system 的 3 行兜底——没有步骤规划、工具选择、失败换路规则，
+    与 pwn（12 步 playbook）/misc（10 步 playbook）严重不对等。
+
+    本用例只锁「6 个专家角色都有非空 system」+「rev/crypto 带证据/交付纪律」。
+    注意：web 的 report 字面由 case_web_playbook 单独约束（它靠 HANDOFF_RULE 自动追加），
+    这里不重复管理。
+    """
+    from ctfy_agent.config import load  # noqa: PLC0415
+
+    roles = load().extra.get("roles") or {}
+    for role in ("web", "ai", "pwn", "rev", "crypto", "misc"):
+        spec = roles.get(role) or {}
+        system = str(spec.get("system") or "").strip()
+        assert system, f"config/agent.json 的 roles.{role}.system 缺失或为空"
+
+    # rev/crypto 是本次补齐的：必须带证据与交付纪律，且长度像 playbook 而非兜底
+    for role in ("rev", "crypto"):
+        system = str((roles.get(role) or {}).get("system") or "")
+        assert "evidence" in system.lower(), f"roles.{role}.system 缺 evidence 纪律"
+        assert "report" in system, f"roles.{role}.system 缺 report 交付规则"
+        assert len(system) >= 500, f"roles.{role}.system 过短（{len(system)}），像兜底不像 playbook"
+
+    ok("角色 system 全覆盖：6 个专家角色都有 playbook；rev/crypto 带证据与交付纪律")
 
 
 def case_competition_resolve(tmp: Path) -> None:
@@ -2634,6 +2713,98 @@ def case_coordinator_digest(tmp: Path) -> None:
             "已试过（确定性账本" in str(m.get("content", "")) for m in coordinator.received[1]
         ), "第二轮上下文里没有账本摘要"
         ok("P0-2：协调者每轮派活后收到「已试过」账本摘要（进上下文 + 落转录）")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def case_dead_ends_digest(tmp: Path) -> None:
+    """E1 回归：专家触发「方向证伪」后，协调者每轮摘要带「禁止再试」死路（dead_ends 端到端持久化）。
+
+    覆盖 include_refuted=True 端到端生效：
+    - 专家两次同方向探测全失败（http_request 打到关闭端口 /login）→ 账本证伪该方向；
+    - 专家上下文即时收到「假设轮换」；
+    - 协调者随后每轮「已试过」摘要都带「禁止再试」（第 1 轮证伪后 + 第 2 轮旧死路仍在）。
+    """
+    from ctfy_agent.crew import Crew  # noqa: PLC0415
+
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp)
+        config.extra["ledger_refute_after"] = 2  # 2 个不同候选全失败即证伪（默认 12，测试提速）
+        config.extra["auto_start_instance"] = False
+        config.extra["roles"] = {
+            "web": {
+                "max_steps": 6,
+                "platform": ["read"],
+                "local": ["http_request"],
+                "model": "web-script",
+            },
+        }
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store = Store(tmp / "deadends").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        # 挂一个关闭端口实例：http_request 到它必「请求失败」，确定性驱动证伪，无网络依赖
+        ch = store.require("web-01")
+        ch.instance = {"host": "127.0.0.1", "port": 1}
+        store.save()
+
+        coordinator = fake_llm.ScriptedLLM(
+            [
+                {
+                    "content": "PLAN: 派 web 打 /login\nREFLECTION: -\n",
+                    "tool_calls": [tool_call("delegate", {"role": "web", "objective": "试 /login 凭据"})],
+                },
+                {
+                    "content": "PLAN: 派 web 换方向\nREFLECTION: -\n",
+                    "tool_calls": [tool_call("delegate", {"role": "web", "objective": "换思路再探"})],
+                },
+                {"content": "PLAN: 收工\nREFLECTION: -\n", "tool_calls": [tool_call("done", {})]},
+            ]
+        )
+        # 第 1 轮：两个不同候选打同一 /login → 同簇两次失败 → 证伪（refute_after=2）
+        # 第 2 轮：再来一次 /login（簇已证伪，只加失败不产生新证伪）→ 验证旧死路仍在摘要
+        web = fake_llm.ScriptedLLM(
+            [
+                {"content": "", "tool_calls": [
+                    tool_call("http_request", {"url": "http://127.0.0.1:1/login?user=alice", "method": "GET"})
+                ]},
+                {"content": "", "tool_calls": [
+                    tool_call("http_request", {"url": "http://127.0.0.1:1/login?user=bob", "method": "GET"})
+                ]},
+                {"content": "", "tool_calls": [tool_call("report", {"text": "打不通", "evidence": ""})]},
+                {"content": "", "tool_calls": [
+                    tool_call("http_request", {"url": "http://127.0.0.1:1/login?user=carol", "method": "GET"})
+                ]},
+                {"content": "", "tool_calls": [tool_call("report", {"text": "仍打不通", "evidence": ""})]},
+            ]
+        )
+
+        def factory(model=None):
+            return web if model == "web-script" else coordinator
+
+        crew = Crew(config, platform, store, factory)
+        crew.solve("web-01")
+
+        recs = [
+            json.loads(ln)
+            for ln in store.transcript_path("web-01").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        # 协调者每轮「已试过」摘要里都带「禁止再试」死路（证伪当轮 + 后续轮旧死路仍在）
+        digest_recs = [
+            r for r in recs
+            if r.get("role") == "ledger" and "已试过（确定性账本" in str(r.get("content", ""))
+        ]
+        assert len(digest_recs) >= 2, digest_recs
+        assert all("禁止再试" in str(r.get("content", "")) for r in digest_recs), digest_recs
+        # 专家侧在证伪当轮收到即时「假设轮换」注入
+        assert any(
+            r.get("role") == "web" and "禁止再试" in str(r.get("ledger", "")) for r in recs
+        ), "专家上下文没有「假设轮换」注入"
+        ok("E1：证伪后协调者摘要带「禁止再试」死路（跨轮持久）+ 专家侧即时轮换注入")
     finally:
         server.shutdown()
         server.server_close()
@@ -3160,6 +3331,664 @@ def case_http_burst(tmp: Path) -> None:
         server.server_close()
 
 
+def case_traffic_store(tmp: Path) -> None:
+    """P1：全量流量库 —— 落盘、检索、get/diff、死路入库、去重、剪枝、持久化。"""
+    import sqlite3  # noqa: PLC0415
+    import ctfy_agent.traffic as tmod  # noqa: PLC0415
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # noqa: D102
+            pass
+
+        def _send(self, body: str, status: int = 200, ctype: str = "application/json") -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Type", ctype)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):  # noqa: N802
+            path, _, qs = self.path.partition("?")
+            if path == "/api/user":
+                q = dict(item.split("=", 1) for item in qs.split("&") if "=" in item)
+                uid = q.get("id") or "1"
+                self._send(f'{{"id": {uid}, "name": "alice-{uid}", "flag": "FLAG{{user-{uid}}}"}}')
+            elif path == "/error":
+                self._send('{"err": true}', status=500)
+            else:
+                self._send('{"fresh": true}')
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = Store(tmp / "trafficcase").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        local = LocalTools(store, "web-01", cache={})
+        local.allow_instance("127.0.0.1", port)
+        local.allow_instance("127.0.0.1", 1)  # 放行一个必然关闭的端口，制造真实连接失败
+        base = f"http://127.0.0.1:{port}"
+
+        # 0) 工具面挂上了 traffic
+        assert "traffic" in local.names(), local.names()
+
+        # 1) 两次 GET 同 path 不同 query
+        local.http_request(base + "/api/user?id=1")
+        local.http_request(base + "/api/user?id=2")
+        # 2) 连接失败 → 死路证据入库
+        try:
+            local.http_request("http://127.0.0.1:1/nope")
+        except ToolError:
+            pass
+        # 3) 500 响应入库
+        local.http_request(base + "/error")
+        # 4) burst 批量
+        local.http_burst(base + "/api/user?id={v}", method="GET", values=["10", "11"])
+        # 5) map crawl
+        local.http_map(base + "/api/user?id=1")
+
+        db = tmp / "trafficcase" / "traffic" / "web-01.sqlite"
+        assert db.is_file(), f"流量库没建：{db}"
+        con = sqlite3.connect(str(db))
+        rows = con.execute("SELECT source, status, error FROM exchanges ORDER BY id").fetchall()
+        sources = [r[0] for r in rows]
+        assert sources.count("http_request") >= 3, rows
+        assert "http_burst" in sources, rows
+        assert "http_map" in sources, rows
+        assert any(r[2] for r in rows), "连接失败的死路证据没入库"
+        assert any(r[1] == 500 for r in rows), "500 响应没入库"
+
+        # 6) search 命中正文里的 flag
+        out = json.loads(local.traffic(op="search", query="FLAG"))
+        assert out["total"] >= 1, out
+        # 6b) 头检索（审计 A1）：请求头自定义值 + 响应头 content-type 都能搜到
+        local.http_request(base + "/api/user?id=5", headers={"X-Probe": "alice-probe-42"})
+        hdr_req = json.loads(local.traffic(op="search", query="alice-probe-42"))
+        assert hdr_req["total"] >= 1, hdr_req
+        hdr_resp = json.loads(local.traffic(op="search", query="application/json"))
+        assert hdr_resp["total"] >= 1, hdr_resp
+        # 7) 按状态码过滤
+        out500 = json.loads(local.traffic(op="search", status="500"))
+        assert any(s["status"] == 500 for s in out500["shown"]), out500
+        # 8) get 详情 + 窗口切片
+        any_id = out["shown"][0]["id"]
+        detail = json.loads(local.traffic(op="get", id=any_id))
+        assert detail["id"] == any_id and "body" in detail and "req_headers" in detail, detail
+        # 9) diff 两条 /api/user 响应
+        uid_rows = con.execute(
+            "SELECT id FROM exchanges WHERE path='/api/user' AND status=200 ORDER BY id LIMIT 2"
+        ).fetchall()
+        assert len(uid_rows) >= 2, uid_rows
+        d = json.loads(local.traffic(op="diff", a=uid_rows[0][0], b=uid_rows[1][0]))
+        assert d["added_lines"] >= 1 and d["removed_lines"] >= 1, d
+        con.close()
+
+        # 10) 持久化：新建 LocalTools 实例仍查得到
+        local2 = LocalTools(store, "web-01", cache={})
+        local2.allow_instance("127.0.0.1", port)
+        out2 = json.loads(local2.traffic(op="search", query="FLAG"))
+        assert out2["total"] >= 1, out2
+
+        # 11) 剪枝单元（行数 + blob 体积，直接驱动 TrafficStore，无 HTTP/节流依赖）
+        old_max = tmod.TRAFFIC_MAX_ROWS
+        old_blob = tmod.TRAFFIC_MAX_BLOB_BYTES
+        old_min = tmod.TRAFFIC_MIN_ROWS
+        try:
+            ts = tmod.resolve(tmp / "pruneunit", "web-01")
+            with ts._lock:
+                ts._conn.execute("DELETE FROM exchanges")
+                ts._conn.commit()
+            for i in range(6):
+                # 正文必须不同：内容寻址去重会让相同正文只占 1 个 blob，测不到体积剪枝
+                ts.record(source="http_request", method="GET", url=f"http://x/r{i}",
+                          status=200, resp_body=f"R{i}-" + "B" * 10000)
+            # 行剪枝：>MAX_ROWS 删最老（审计 A3：分批 DELETE 不越变量数上限）
+            tmod.TRAFFIC_MAX_ROWS = 4
+            ts._maybe_prune()
+            with ts._lock:
+                cnt = ts._conn.execute("SELECT COUNT(*) FROM exchanges").fetchone()[0]
+            assert cnt <= 4, cnt
+            # blob 剪枝：正文超限时删行 + GC 孤儿（审计 A2：无孤儿也要能降下来）
+            tmod.TRAFFIC_MIN_ROWS = 1
+            tmod.TRAFFIC_MAX_BLOB_BYTES = 15000
+            ts._maybe_prune()
+            with ts._lock:
+                cnt2 = ts._conn.execute("SELECT COUNT(*) FROM exchanges").fetchone()[0]
+            assert cnt2 == 1, cnt2
+            assert ts._blob_bytes_on_disk() <= 15000, ts._blob_bytes_on_disk()
+        finally:
+            tmod.TRAFFIC_MAX_ROWS = old_max
+            tmod.TRAFFIC_MAX_BLOB_BYTES = old_blob
+            tmod.TRAFFIC_MIN_ROWS = old_min
+        ok("P1 流量库：落盘/检索/get/diff/头检索/死路入库/去重/剪枝/持久化")
+    finally:
+        server.shutdown()
+
+
+def case_traffic_disabled(tmp: Path) -> None:
+    """P1：traffic_enabled=false → 不建库、不挂工具、http_request 行为不变（审计 E1）。"""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # noqa: D102
+            pass
+
+        def do_GET(self):  # noqa: N802
+            data = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = Store(tmp / "trafficoff").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        local = LocalTools(store, "web-01", cache={}, traffic_enabled=False)
+        local.allow_instance("127.0.0.1", port)
+        assert "traffic" not in local.names(), local.names()
+        out = json.loads(local.traffic(op="search"))
+        assert "未启用" in out.get("error", ""), out
+        # 关闭时 http_request 仍正常工作，且不建库
+        body = json.loads(local.http_request(f"http://127.0.0.1:{port}/ok"))
+        assert body["status"] == 200, body
+        assert not (tmp / "trafficoff" / "traffic").exists(), "关闭时不该建库"
+        ok("P1 流量库：traffic_enabled=false 不建库、不挂工具、请求照常")
+    finally:
+        server.shutdown()
+
+
+def case_fuzz_contract(tmp: Path) -> None:
+    """P2：fuzz 工具契约 —— 注册/SPEC/空参秒失败/白名单/坏参数，全程不调子进程。
+
+    外包契约测试会用空参调一次（clean 里只有无默认值的参数），fuzz 全部带默认值，
+    所以走的是「空参 → 立刻 ToolError」这条快路径，不会在 CI 里真跑 45 秒 ffuf。
+    """
+    store = Store(tmp / "fuzzcontract").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    local = LocalTools(store, "web-01", cache={})
+    local.allow_instance("127.0.0.1", 1)  # 放行一个必然关闭的端口，专测参数校验分支
+
+    import inspect  # noqa: PLC0415
+
+    assert "fuzz" in local.names(), local.names()
+    spec = next(s for s in local.specs() if s["function"]["name"] == "fuzz")
+    props = set((spec["function"].get("parameters") or {}).get("properties") or {})
+    for need in ("mode", "base", "url", "wordlist", "words", "ext",
+                 "match_codes", "filter_size", "max_results", "timeout_s"):
+        assert need in props, f"fuzz SPEC 缺参数 {need}：{sorted(props)}"
+    assert set(props) == set(inspect.signature(LocalTools.fuzz).parameters) - {"self"}, "SPEC 与同名方法参数不一致"
+
+    bad_cases = [
+        {},                                                   # 空参：dir 模式缺 base
+        {"base": "http://example.com/"},                      # 未登记实例：白名单拦截
+        {"mode": "shell", "base": "http://127.0.0.1:1"},      # 非法 mode
+        {"base": "http://127.0.0.1:1", "match_codes": "abc"}, # 非法状态码
+        {"base": "http://127.0.0.1:1", "match_codes": "200-100"},  # 反向区间（左>右）
+        {"base": "http://127.0.0.1:1", "wordlist": "../../etc/passwd"},  # 字典穿越
+        {"base": "http://127.0.0.1:1", "timeout_s": "not-int"},          # 非整数
+    ]
+    for args in bad_cases:
+        try:
+            local.call("fuzz", args)
+        except ToolError:
+            continue
+        raise AssertionError(f"fuzz 未拒绝非法入参：{args}")
+    ok("P2 fuzz 契约：注册/SPEC 对齐/空参秒失败/白名单/坏参数全拦")
+
+
+def case_fuzz_functional(tmp: Path) -> None:
+    """P2：fuzz 流程用「假 ffuf」本地跑通（无需真 ffuf，CI 与开发机都能覆盖）。
+
+    覆盖：dir/param 目标拼接、命令行开关白名单（-ac/-mc/-fs/-e 是否按预期出现）、
+    JSON 解析与裁剪、命中写入流量库（source=fuzz）、空结果提示、二进制失败路径。
+    """
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+    import sys as _sys  # noqa: PLC0415
+
+    from ctfy_agent import tools_webscan as wmod  # noqa: PLC0415
+
+    work = tmp / "fuzzfunc"
+    work.mkdir(parents=True, exist_ok=True)
+    stub = work / "fake_ffuf.py"
+    stub.write_text(
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "out = argv[argv.index('-o') + 1]\n"
+        "open(os.environ['FUZZ_STUB_LOG'], 'w', encoding='utf-8').write('\\n'.join(argv))\n"
+        "res = json.loads(os.environ.get('FUZZ_STUB_RESULTS') or '[]')\n"
+        "json.dump({'results': res}, open(out, 'w', encoding='utf-8'), ensure_ascii=False)\n",
+        encoding="utf-8",
+    )
+    log = work / "argv.txt"
+
+    old_dir = wmod.WORDLIST_DIR
+    wmod.WORDLIST_DIR = work / "wl"
+    (work / "wl").mkdir(parents=True, exist_ok=True)
+    (work / "wl" / "common.txt").write_text("admin\nlogin\nhidden\n", encoding="utf-8")
+
+    store = Store(tmp / "fuzzfunc_store").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    local = LocalTools(store, "web-01", cache={})
+    local.allow_instance("127.0.0.1", 2)
+    local._ffuf_bin = [_sys.executable, str(stub)]
+    os.environ["FUZZ_STUB_LOG"] = str(log)
+    try:
+        # 1) dir 模式：两条命中 → 解析/裁剪/落库
+        os.environ["FUZZ_STUB_RESULTS"] = json.dumps([
+            # 审计 E2：admin 命中带 url 字段（模拟 -e 扩展名场景），落库应优先用 url 而非拼装
+            {"input": {"FUZZ": "admin"}, "status": 200, "length": 123, "words": 9,
+             "url": "http://127.0.0.1:2/admin.php"},
+            # login 命中无 url 字段 → 退回 target.replace 拼装
+            {"input": {"FUZZ": "login"}, "status": 401, "length": 45, "words": 4},
+        ])
+        out = json.loads(local.call("fuzz", {"mode": "dir", "base": "http://127.0.0.1:2"}))
+        assert out["matched"] == 2 and out["shown"] == 2, out
+        assert [h["w"] for h in out["hits"]] == ["admin", "login"], out
+        assert out["hits"][0]["status"] == 200 and out["hits"][0]["len"] == 123, out
+        assert out["wordlist"] == "common" and out["scanned"] == 3, out
+        assert len(local.call("fuzz", {"mode": "dir", "base": "http://127.0.0.1:2"})) <= 6000
+
+        argv = log.read_text(encoding="utf-8").splitlines()
+        joined = " ".join(argv)
+        for flag in ("-s", "-noninteractive", "-ac", "-of", "json", "-mc", "-u", "-w", "-maxtime"):
+            assert flag in argv or flag in joined, f"ffuf 命令行缺 {flag}：{argv}"
+        assert "http://127.0.0.1:2/FUZZ" in argv, argv
+        # 越权开关绝不能被模型影响出来
+        assert "-x" not in argv and "-request" not in argv and "-recursion" not in argv, argv
+
+        # 2) -fs / -e 只在模型点名时出现
+        local.call("fuzz", {"mode": "dir", "base": "http://127.0.0.1:2",
+                            "filter_size": 1234, "ext": "php,bak"})
+        argv2 = log.read_text(encoding="utf-8").splitlines()
+        assert "-fs" in argv2 and "1234" in argv2, argv2
+        assert "-e" in argv2 and ".php,.bak" in argv2, argv2  # 审计 A1：逐项都要带点
+
+        # 2b) match_codes 支持范围语法（ffuf 原生默认含 200-299/405/500）
+        local.call("fuzz", {"mode": "dir", "base": "http://127.0.0.1:2", "match_codes": "200-299,405"})
+        argv_codes = log.read_text(encoding="utf-8").splitlines()
+        assert "200-299,405" in argv_codes, argv_codes
+
+        # 3) param 模式：无 ? 时自动追加 ?FUZZ=1
+        local.call("fuzz", {"mode": "param", "url": "http://127.0.0.1:2/api"})
+        argv3 = log.read_text(encoding="utf-8").splitlines()
+        assert "http://127.0.0.1:2/api?FUZZ=1" in argv3, argv3
+
+        # 4) 命中已写入 P1 流量库（source=fuzz）：
+        #    有 url 字段的 admin 命中用 ffuf 真实 url（带 .php）；无 url 字段的 login 退回拼装
+        con = _sqlite3.connect(str(tmp / "fuzzfunc_store" / "traffic" / "web-01.sqlite"))
+        rows = con.execute("SELECT url, status FROM exchanges WHERE source='fuzz' ORDER BY id").fetchall()
+        con.close()
+        assert len(rows) >= 2, rows
+        assert any(r[0] == "http://127.0.0.1:2/admin.php" and r[1] == 200 for r in rows), rows
+        assert any(r[0] == "http://127.0.0.1:2/login" and r[1] == 401 for r in rows), rows
+
+        # 5) 自定义 words 的临时字典落在沙盒内且用完即删（审计 B4/E4）
+        os.environ["FUZZ_STUB_RESULTS"] = json.dumps([
+            {"input": {"FUZZ": "admin"}, "status": 200, "length": 1, "words": 1},
+        ])
+        local.call("fuzz", {"mode": "dir", "base": "http://127.0.0.1:2", "words": ["admin", "login"]})
+        argvw = log.read_text(encoding="utf-8").splitlines()
+        wpath = Path(argvw[argvw.index("-w") + 1])
+        sandbox = store.run_dir / "sandbox" / "web-01"
+        assert wpath.parent == sandbox, f"words 临时字典落在沙盒外：{wpath}"
+        assert not wpath.exists(), f"words 临时字典未清理：{wpath}"
+
+        # 6) 空结果 → 明确提示软 404/换字典，而不是静默空
+        os.environ["FUZZ_STUB_RESULTS"] = "[]"
+        empty = json.loads(local.call("fuzz", {"mode": "dir", "base": "http://127.0.0.1:2"}))
+        assert empty["matched"] == 0 and "软 404" in empty.get("note", ""), empty
+
+        # 7) 子进程失败（二进制不存在）→ ToolError，不吐半截 JSON
+        os.environ["FUZZ_STUB_RESULTS"] = "[]"
+        local._ffuf_bin = [_sys.executable, str(work / "nope.py")]
+        # 清掉沙盒里上次残留，确认失败路径不靠旧产物
+        for p in sandbox.glob(".fuzz_*.json"):
+            p.unlink()
+        try:
+            local.call("fuzz", {"mode": "dir", "base": "http://127.0.0.1:2"})
+        except ToolError:
+            pass
+        else:
+            raise AssertionError("ffuf 子进程失败时应抛 ToolError")
+
+        # 审计 E2：临时产物（JSON 与 words 字典）都落在沙盒目录，用完即删
+        assert not list(sandbox.glob(".fuzz_*.json")), "临时 JSON 未清理"
+        assert not list(sandbox.glob(".fuzz_words_*.txt")), "words 临时字典未清理"
+    finally:
+        wmod.WORDLIST_DIR = old_dir
+        os.environ.pop("FUZZ_STUB_LOG", None)
+        os.environ.pop("FUZZ_STUB_RESULTS", None)
+    ok("P2 fuzz 流程：目标拼接/开关白名单/解析裁剪/流量库落库/空结果提示/失败路径")
+
+
+def case_websec_contract(tmp: Path) -> None:
+    """P3：authdiff/jsrecon 契约 —— 注册/SPEC 对齐/空参秒失败/白名单/坏参数，全程不发请求。"""
+    store = Store(tmp / "webseccontract").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    local = LocalTools(store, "web-01", cache={})
+    local.allow_instance("127.0.0.1", 1)  # 放行必然关闭的端口，专测参数校验分支
+
+    import inspect  # noqa: PLC0415
+
+    for name in ("authdiff", "jsrecon"):
+        assert name in local.names(), local.names()
+        spec = next(s for s in local.specs() if s["function"]["name"] == name)
+        props = set((spec["function"].get("parameters") or {}).get("properties") or {})
+        params = set(inspect.signature(getattr(LocalTools, name)).parameters) - {"self"}
+        assert props == params, f"{name} SPEC 与同名方法参数不一致：{sorted(props)} vs {sorted(params)}"
+
+    bad_cases = [
+        ("authdiff", {}),                                                    # 空参：缺 url
+        ("authdiff", {"url": "http://example.com/panel"}),                   # 未登记实例
+        ("authdiff", {"url": "ftp://127.0.0.1:1/x"}),                        # 非 http(s)
+        ("authdiff", {"url": "http://127.0.0.1:1/x", "method": "TRACE"}),    # 非法 method
+        ("authdiff", {"url": "http://127.0.0.1:1/x", "variants": "all"}),    # 非法变体
+        ("authdiff", {"url": "http://127.0.0.1:1/x",
+                      "headers": {"X-Test": "a\r\nb"}}),                      # CRLF 注入
+        ("authdiff", {"url": "http://127.0.0.1:1/x",
+                      "headers": {f"h{i}": "v" for i in range(9)}}),          # 头数超限
+        ("jsrecon", {}),                                                     # 空参
+        ("jsrecon", {"url": "http://example.com/"}),                         # 未登记实例
+        ("jsrecon", {"url": "ftp://127.0.0.1:1/"}),                          # 非 http(s)
+    ]
+    for name, args in bad_cases:
+        try:
+            local.call(name, args)
+        except ToolError:
+            continue
+        raise AssertionError(f"{name} 未拒绝非法入参：{args}")
+    ok("P3 websec 契约：注册/SPEC 对齐/空参秒失败/白名单/坏参数全拦")
+
+
+def case_websec_functional(tmp: Path) -> None:
+    """P3：authdiff 三态对照 + jsrecon 抽取，跑本地假站点（含会话/绕过头/路径变形）。"""
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
+    app_js = (
+        'fetch("/api/admin/users", { method: "POST" });\n'
+        'axios.get("/api/internal/flag");\n'
+        'const conf = { params: { uid: 1, role: "admin" } };\n'
+        'const secrets = { api_key: "sk-test-1234567890" };\n'
+        'const routes = [{ path: "/admin", component: X }];\n'
+        '// TODO: remove /debug/flag before release\n'
+        '//# sourceMappingURL=/app.js.map\n'
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # noqa: D102
+            pass
+
+        def _send(self, code, body, ctype="text/html; charset=utf-8"):
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):  # noqa: N802
+            path = self.path.split("?")[0]
+            cookie = self.headers.get("Cookie") or ""
+            xff = self.headers.get("X-Forwarded-For")
+            if path == "/":
+                self._send(200, '<html><script src="/app.js"></script>'
+                                '<script>var y=fetch("/api/ping")</script></html>')
+            elif path == "/app.js":
+                self._send(200, app_js, "application/javascript")
+            elif path == "/admin":
+                # 无视会话（匿名也能读）；带 XFF 时内容不同 → 模拟「信任代理头」
+                self._send(200, "ADMIN BYPASS PANEL" if xff else "SECRET PANEL")
+            elif path == "/panel":
+                self._send(200, "PANEL BODY OK") if "sid=" in cookie else self._send(401, "login required")
+            elif path == "/open":
+                # 302 → /panel：测 anon 变体跳转后不得被重新认证（审查 A1）
+                self.send_response(302)
+                self.send_header("Location", "/panel")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif path == "/poison":
+                # 匿名响应的 Set-Cookie 不得污染 jar（审查 A1 的另一半）
+                self.send_response(200)
+                self.send_header("Set-Cookie", "sid=poisoned")
+                self.send_header("Content-Length", "6")
+                self.end_headers()
+                self.wfile.write(b"poison")
+            elif path == "/sub/page.html":
+                self._send(200, '<html><script src="app.js"></script></html>')
+            elif path == "/sub/app.js":
+                self._send(200, 'fetch("/api/CORRECT");', "application/javascript")
+            elif path.startswith("/api/"):
+                self._send(200, '{"ok":true}')
+            else:
+                self._send(404, "not found")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = Store(tmp / "websecfunc").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        local = LocalTools(store, "web-01", cache={})
+        local.allow_instance("127.0.0.1", port)
+        base = f"http://127.0.0.1:{port}"
+
+        # 1) 无会话：/admin 不要求登录 → 结论必须打折（不能误报成「越权」）
+        out = json.loads(local.call("authdiff", {"url": base + "/admin", "variants": "anon"}))
+        assert "不需要登录" in " ".join(out["verdicts"]), out
+
+        # 2) 有会话：/panel 匿名被拒 → 鉴权生效
+        local._jar[f"127.0.0.1:{port}"] = {"sid": "good"}
+        out2 = json.loads(local.call("authdiff", {"url": base + "/panel", "variants": "anon"}))
+        assert [r["label"] for r in out2["rows"]][:2] == ["authed", "anon"], out2
+        anon_row = next(r for r in out2["rows"] if r["label"] == "anon")
+        assert anon_row["status"] == 401 and not anon_row.get("same"), out2
+        assert any("鉴权生效" in v for v in out2["verdicts"]), out2
+
+        # 3) 绕过头 + 路径变形都能被测出来
+        out3 = json.loads(local.call("authdiff", {"url": base + "/admin", "variants": "bypass,path"}))
+        assert any("绕过头生效" in v for v in out3["verdicts"]), out3
+        assert any("路径变形生效" in v for v in out3["verdicts"]), out3
+
+        # 4) 每个变体都落流量库（source=authdiff）
+        con = _sqlite3.connect(str(tmp / "websecfunc" / "traffic" / "web-01.sqlite"))
+        rows = con.execute("SELECT url,status FROM exchanges WHERE source='authdiff'").fetchall()
+        con.close()
+        assert len(rows) >= 5, rows
+        assert any(r[1] == 401 for r in rows), rows
+
+        # 5) jsrecon 抽取 API/参数/密钥/sourceMap/注释，且输出不超限
+        recon = json.loads(local.call("jsrecon", {"url": base + "/"}))
+        assert recon["bundles"] and recon["bundles"][0]["status"] == 200, recon
+        api = " ".join(recon["api"])
+        assert "/api/admin/users" in api and "/api/internal/flag" in api, recon
+        assert "uid" in recon["params"] and "role" in recon["params"], recon
+        assert any("sk-test" in s for s in recon["secrets"]), recon
+        assert any("/app.js.map" in m for m in recon["sourcemaps"]), recon
+        assert any("TODO" in c for c in recon["comments"]), recon
+        assert len(json.dumps(recon, ensure_ascii=False)) <= 6000, recon
+
+        # 6) E1 回归：anon 变体遇 302 不得被重新认证（修前 _decorate_redirect 会补回会话 Cookie）
+        out6 = json.loads(local.call("authdiff", {"url": base + "/open", "variants": "anon"}))
+        anon6 = next(r for r in out6["rows"] if r["label"] == "anon")
+        assert anon6["status"] == 401, out6
+        assert any("鉴权生效" in v for v in out6["verdicts"]), out6
+
+        # 6b) E1 回归：匿名请求的 Set-Cookie 不得污染 jar
+        local._sec_fetch(base + "/poison", use_jar=False)
+        assert local._jar[f"127.0.0.1:{port}"].get("sid") == "good", local._jar
+
+        # 7) E2 回归：相对路径 script src 相对页面解析（修前会拍平到站点根抓错文件）
+        recon2 = json.loads(local.call("jsrecon", {"url": base + "/sub/page.html"}))
+        assert recon2["bundles"] and recon2["bundles"][0]["url"].endswith("/sub/app.js"), recon2
+        api2 = " ".join(recon2["api"])
+        assert "/api/CORRECT" in api2 and "/api/WRONG-ROOT-PATH" not in api2, recon2
+    finally:
+        server.shutdown()
+    ok("P3 websec 流程：authdiff 三态/绕过头/路径变形/落库 + jsrecon 抽取 + A1/A2 回归")
+
+
+_SQLMAP_STUB = '''import json, os, sys, time
+
+log = os.environ.get("SQLI_STUB_LOG")
+if log:
+    with open(log, "w", encoding="utf-8") as fh:
+        json.dump(sys.argv, fh, ensure_ascii=False)
+mode = os.environ.get("SQLI_STUB_MODE", "hit")
+if mode == "sleep":
+    time.sleep(60)
+if mode == "clean":
+    print("[INFO] testing connection to the target URL")
+    print("[CRITICAL] all tested parameters do not appear to be injectable.")
+    sys.exit(0)
+if mode == "multi":
+    print("[INFO] testing connection to the target URL")
+    print("sqlmap identified the following injection point(s) with a total of 51 HTTP(s) requests:")
+    print("---")
+    print("Parameter: id (GET)")
+    print("    Type: boolean-based blind")
+    print("    Title: AND boolean-based blind - WHERE or HAVING clause")
+    print("    Payload: id=1 AND 1=1")
+    print("---")
+    print("[WARNING] GET parameter 'cat' does not seem to be injectable")
+    print("back-end DBMS: MySQL >= 5.0")
+    sys.exit(0)
+print("[INFO] testing connection to the target URL")
+print("sqlmap identified the following injection point(s) with a total of 42 HTTP(s) requests:")
+print("---")
+print("Parameter: id (GET)")
+print("    Type: boolean-based blind")
+print("    Title: AND boolean-based blind - WHERE or HAVING clause")
+print("    Payload: id=1 AND 1=1")
+print("---")
+print("back-end DBMS: MySQL >= 5.0")
+'''
+
+
+def case_sqli_contract(tmp: Path) -> None:
+    """P3：sqli 契约 —— 注册/SPEC 对齐/空参秒失败/白名单/参数校验/缺二进制干净报错。"""
+    import inspect  # noqa: PLC0415
+
+    store = Store(tmp / "sqlicontract").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    local = LocalTools(store, "web-01", cache={})
+    local.allow_instance("127.0.0.1", 1)
+    local._sqlmap_py = str(tmp / "no_such_sqlmap.py")  # 强制走「缺 sqlmap」分支，各环境一致
+
+    assert "sqli" in local.names(), local.names()
+    spec = next(s for s in local.specs() if s["function"]["name"] == "sqli")
+    props = set((spec["function"].get("parameters") or {}).get("properties") or {})
+    params = set(inspect.signature(LocalTools.sqli).parameters) - {"self"}
+    assert props == params, f"sqli SPEC 与参数不一致：{sorted(props)} vs {sorted(params)}"
+
+    bad = [
+        {},                                                            # 空参：缺 url
+        {"url": "http://example.com/?id=1"},                           # 未登记实例
+        {"url": "ftp://127.0.0.1:1/?id=1"},                            # 非 http(s)
+        {"url": "http://127.0.0.1:1/?id=1", "technique": "BZ"},         # 非法技术字符
+        {"url": "http://127.0.0.1:1/?id=1", "level": "abc"},            # 非整数
+        {"url": "http://127.0.0.1:1/a b?id=1"},                        # url 含空白
+    ]
+    for args in bad:
+        try:
+            local.call("sqli", args)
+        except ToolError:
+            continue
+        raise AssertionError(f"sqli 未拒绝非法入参：{args}")
+
+    try:
+        local.call("sqli", {"url": "http://127.0.0.1:1/?id=1"})
+    except ToolError as exc:  # 合法参数但缺 sqlmap 本体：要给替代路线，不能抛栈
+        assert "sqlmap" in str(exc) and "http_request" in str(exc), exc
+    else:
+        raise AssertionError("缺 sqlmap 时应报 ToolError")
+    ok("P3 sqli 契约：注册/SPEC 对齐/空参秒失败/白名单/参数校验/缺二进制干净报错")
+
+
+def case_sqli_functional(tmp: Path) -> None:
+    """P3：sqli 流程 —— 假 sqlmap 验证参数拼装/结论解析/技术集规范化/超时/落库。"""
+    import sqlite3 as _sqlite3  # noqa: PLC0415
+
+    stub = tmp / "fake_sqlmap.py"
+    stub.write_text(_SQLMAP_STUB, encoding="utf-8")
+    log = tmp / "sqli_argv.json"
+
+    store = Store(tmp / "sqlifunc").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    local = LocalTools(store, "web-01", cache={})
+    local.allow_instance("127.0.0.1", 1)
+    local._sqlmap_py = str(stub)
+
+    old_log, old_mode = os.environ.get("SQLI_STUB_LOG"), os.environ.get("SQLI_STUB_MODE")
+    os.environ["SQLI_STUB_LOG"] = str(log)
+    try:
+        os.environ["SQLI_STUB_MODE"] = "hit"
+        out = json.loads(local.call("sqli", {
+            "url": "http://127.0.0.1:1/item?id=1", "technique": "beu", "level": 2, "risk": 5,
+        }))
+        assert out["injectable"] is True and out["dbms"].startswith("MySQL"), out
+        assert out["params"] == {"technique": "BEU", "level": 2, "risk": 2}, out  # 小写→大写、risk 夹到 2
+        assert out["findings"][0]["payload"] == "id=1 AND 1=1", out
+        argv = json.loads(log.read_text(encoding="utf-8"))
+        assert "-u" in argv and "http://127.0.0.1:1/item?id=1" in argv, argv
+        for flag in ("--batch", "--disable-coloring", "--technique=BEU", "--level=2",
+                     "--risk=2", "--timeout=10", "--retries=0", "--max-redirects=0", "--output-dir"):
+            assert flag in argv, (flag, argv)
+        danger = ("--os-shell", "--os-pwn", "--file-read", "--file-write", "--proxy", "--tor")
+        assert not any(arg.startswith(danger) for arg in argv), argv
+
+        # data / param 拼装
+        local.call("sqli", {"url": "http://127.0.0.1:1/login",
+                            "data": "user=1&pass=2", "param": "user"})
+        argv2 = json.loads(log.read_text(encoding="utf-8"))
+        assert "--data" in argv2 and "user=1&pass=2" in argv2, argv2
+        assert "-p" in argv2 and "user" in argv2, argv2
+
+        # 不可注入 → 给下一步建议（换 technique=T）
+        os.environ["SQLI_STUB_MODE"] = "clean"
+        clean = json.loads(local.call("sqli", {"url": "http://127.0.0.1:1/x?id=1"}))
+        assert clean["injectable"] is False and "technique=T" in clean["next"], clean
+
+        # E3 回归：多参数——逐参告警不得把整体结论重置成不可注入（修前被误判）
+        os.environ["SQLI_STUB_MODE"] = "multi"
+        multi = json.loads(local.call("sqli", {"url": "http://127.0.0.1:1/multi?id=1&cat=2"}))
+        assert multi["injectable"] is True and multi["findings"], multi
+
+        # 超时 → stopped_early，不抛栈（stub 睡 60s，预算 5s）
+        os.environ["SQLI_STUB_MODE"] = "sleep"
+        slow = json.loads(local.call("sqli", {"url": "http://127.0.0.1:1/x?id=1", "timeout_s": 5}))
+        assert slow.get("stopped_early") is True, slow
+
+        con = _sqlite3.connect(str(tmp / "sqlifunc" / "traffic" / "web-01.sqlite"))
+        rows = con.execute("SELECT url FROM exchanges WHERE source='sqli'").fetchall()
+        con.close()
+        assert len(rows) >= 3, rows
+
+        # E5 回归：traffic 工具对 source=sqli（status 为 NULL）的 search/get 不得崩
+        tsearch = json.loads(local.call("traffic", {"op": "search", "source": "sqli", "limit": 20}))
+        assert isinstance(tsearch.get("shown"), list) and tsearch["shown"], tsearch
+        tget = json.loads(local.call("traffic", {"op": "get", "id": tsearch["shown"][0]["id"]}))
+        assert tget.get("source") == "sqli", tget
+    finally:
+        for key, val in (("SQLI_STUB_LOG", old_log), ("SQLI_STUB_MODE", old_mode)):
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+    ok("P3 sqli 流程：参数拼装/技术集规范化/level·risk 夹取/结论解析/不可注入/超时/落库")
+
+
 def main() -> int:
     tmp = Path(os.environ.get("TEMP", ".")) / "ctfy_agent_smoke"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -3207,6 +4036,8 @@ def main() -> int:
         ("web_playbook", case_web_playbook),
         ("a3_method_cards", case_a3_method_cards),
         ("web_tool_whitelist", case_web_tool_whitelist),
+        ("default_roles_cover_all", case_default_roles_cover_all),
+        ("role_system_coverage", case_role_system_coverage),
         ("competition_resolve", case_competition_resolve),
         ("competition_mismatch_repair", case_competition_mismatch_repair),
         ("misc_contract", case_misc_contract),
@@ -3214,6 +4045,7 @@ def main() -> int:
         ("checkpoint", case_checkpoint),
         ("checkpoint_resume", case_checkpoint_resume),
         ("coordinator_digest", case_coordinator_digest),
+        ("dead_ends_digest", case_dead_ends_digest),
         ("bench_stats", case_bench_stats),
         ("agent_e2e", case_agent_e2e),
         ("agent_dry_run", case_agent_dry_run),
@@ -3226,6 +4058,14 @@ def main() -> int:
         ("jwt_forge", case_jwt_forge),
         ("http_p0", case_http_p0),
         ("http_burst", case_http_burst),
+        ("traffic_store", case_traffic_store),
+        ("traffic_disabled", case_traffic_disabled),
+        ("fuzz_contract", case_fuzz_contract),
+        ("fuzz_functional", case_fuzz_functional),
+        ("websec_contract", case_websec_contract),
+        ("websec_functional", case_websec_functional),
+        ("sqli_contract", case_sqli_contract),
+        ("sqli_functional", case_sqli_functional),
         ("ai_chat", case_ai_chat),
         ("ai_contract", case_ai_contract),
         ("ai_wiring", case_ai_wiring),

@@ -14,6 +14,130 @@ RUN apt-get update \
         curl grep coreutils ca-certificates bash passwd \
     && rm -rf /var/lib/apt/lists/*
 
+# ---------- P2：web 工具链（构建期安装；运行期无网络，所以必须烤进镜像） ----------
+# ffuf：目录/参数发现，web 角色的 fuzz 工具调用它（模型不直接跑命令行）。
+# 版本 + 精确字节数 + sha256 三钉死：字节数取自该 release 的 asset 元数据，
+# sha256 取自官方 ffuf_2.1.0_checksums.txt（同 release）。传输截断、内容被换、
+# 或 asset 被替换都会在构建期直接失败。
+ARG FFUF_VERSION=2.1.0
+ARG FFUF_BYTES=3478614
+ARG FFUF_SHA256=fc2c82736c14dcbea4daf3d3cf3878c1c4773008ba45c2bc0fceba7d17b40bb5
+# CI 只构建 linux/amd64；换架构必须显式改这里，而不是静默装一个跑不起来的二进制
+RUN test "$(dpkg --print-architecture)" = "amd64"
+RUN set -eux; \
+    curl -fsSL -o /tmp/ffuf.tgz \
+      "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_amd64.tar.gz"; \
+    test "$(stat -c%s /tmp/ffuf.tgz)" = "${FFUF_BYTES}"; \
+    if [ -n "${FFUF_SHA256}" ]; then echo "${FFUF_SHA256}  /tmp/ffuf.tgz" | sha256sum -c -; fi; \
+    echo "ffuf tarball sha256: $(sha256sum /tmp/ffuf.tgz | cut -d' ' -f1)"; \
+    tar -xzf /tmp/ffuf.tgz -C /usr/local/bin ffuf; \
+    chmod 755 /usr/local/bin/ffuf; \
+    rm -f /tmp/ffuf.tgz; \
+    ffuf -V
+
+# SecLists 字典：只取三张小表（约 441KB）。commit + 精确字节数双钉死；
+# /opt 下 root 只读、644，运行用户 uid 10001 可读不可改（模型污染不了字典）。
+ARG SECLISTS_SHA=758fecf4925900dd1bd0a3cba39551d6b4f2da8c
+RUN set -eux; \
+    mkdir -p /opt/wordlists; \
+    base="https://raw.githubusercontent.com/danielmiessler/SecLists/${SECLISTS_SHA}/Discovery/Web-Content"; \
+    fetch() { curl -fsSL -o "/opt/wordlists/$1" "$base/$2"; test "$(stat -c%s "/opt/wordlists/$1")" = "$3"; }; \
+    fetch common.txt common.txt 38536; \
+    fetch params.txt burp-parameter-names.txt 54157; \
+    fetch small.txt raft-small-words.txt 348619; \
+    chmod 644 /opt/wordlists/*.txt; \
+    wc -l /opt/wordlists/*.txt
+
+# sqlmap：盲注（尤其时间盲注）手工极痛，web 角色的 sqli 工具调用它。
+# 纯 Python 源码包（sdist），不走 pip：装到 /opt/sqlmap、root 只读，不进 site-packages，
+# 因此不违反「src/ 只允许 stdlib」的自扫（自扫只看 src/ctfy_agent）。
+# 版本 + sha256 钉死；构建日志打印自检输出，跑不起来就直接构建失败。
+ARG SQLMAP_VERSION=1.10.10
+ARG SQLMAP_SHA256=9dece8eb15e410ee10114d88d200f54a383f549b565c0147b647081ab805e399
+RUN set -eux; \
+    curl -fsSL -o /tmp/sqlmap.tar.gz \
+      "https://files.pythonhosted.org/packages/16/a6/4c613b9fea8a9388261d30ab8240bb158331de9ffcaf8b9727e022e50eb0/sqlmap-${SQLMAP_VERSION}.tar.gz"; \
+    echo "${SQLMAP_SHA256}  /tmp/sqlmap.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/sqlmap; \
+    tar -xzf /tmp/sqlmap.tar.gz -C /opt/sqlmap --strip-components=1; \
+    rm -rf /opt/sqlmap/doc /opt/sqlmap/extra /opt/sqlmap/tests /opt/sqlmap/.github /tmp/sqlmap.tar.gz; \
+    chmod -R a+rX /opt/sqlmap; \
+    du -sh /opt/sqlmap; \
+    python /opt/sqlmap/sqlmap.py --version
+
+# 构建期自检：用真实 ffuf 打本机 http.server（验证 fuzz 的 -w/-u/-of json/-ac/-maxtime
+# 形状与 JSON 可解析），并用真 sqlmap 打同站点验证「injectable 判定」能产出；末尾的
+# 跳转探针只打印 decoy_hits（观察 sqlmap 对 302 的姿态，不 fail）。
+RUN set -eux; \
+    cd /tmp; \
+    python -m http.server 18080 --bind 127.0.0.1 >/dev/null 2>&1 & \
+    srv=$!; sleep 1; \
+    printf 'admin\nlogin\nindex.html\n' > /tmp/w.txt; \
+    ffuf -s -noninteractive -ac -of json -o /tmp/o.json \
+         -w /tmp/w.txt -u http://127.0.0.1:18080/FUZZ \
+         -t 10 -timeout 5 -maxtime 20 -mc 200,301,302,401,403 || true; \
+    sm=$(timeout 90 python /opt/sqlmap/sqlmap.py -u "http://127.0.0.1:18080/?id=1" \
+           --batch --disable-coloring --level=1 --risk=1 --technique=B \
+           --timeout=3 --retries=0 --output-dir=/tmp/sqlmap-out 2>&1 || true); \
+    kill "$srv" 2>/dev/null || true; \
+    echo "$sm" | tail -4; \
+    echo "$sm" | grep -qi "injectable" || { echo "sqlmap 自检失败：没产出 injectable 判定（Python 3.12 兼容或联网问题）" >&2; exit 1; }; \
+    cat > /tmp/redirprobe.py <<'PY'
+import http.server
+import subprocess
+import sys
+import threading
+
+HITS = []
+
+
+class Redir(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header("Location", "http://127.0.0.1:18099/decoy")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+class Decoy(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        HITS.append(self.path)
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
+def serve(port, handler):
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+serve(18098, Redir)
+serve(18099, Decoy)
+proc = subprocess.run(
+    [sys.executable, "/opt/sqlmap/sqlmap.py", "-u", "http://127.0.0.1:18098/?id=1",
+     "--batch", "--disable-coloring", "--flush-session", "--level=1", "--risk=1",
+     "--technique=B", "--timeout=3", "--retries=0", "--threads=1",
+     "--max-redirects=3", "--output-dir=/tmp/sqlmap-probe"],
+    capture_output=True, text=True,
+)
+tail = "\n".join((proc.stdout or "").splitlines()[-6:])
+print("REDIRECT-PROBE decoy_hits=%d  (0 = sqlmap 未跟随 302；>0 = 跟随了，A4 暴露面成立)" % len(HITS))
+print("REDIRECT-PROBE tail:")
+print(tail)
+PY
+    python /tmp/redirprobe.py; \
+    test -s /tmp/o.json; \
+    python -c "import json;d=json.load(open('/tmp/o.json'));assert isinstance(d.get('results'),list),'ffuf JSON 结构异常';print('ffuf selftest ok, results=',len(d['results']))"; \
+    rm -rf /tmp/o.json /tmp/w.txt /tmp/redirprobe.py /tmp/sqlmap-out /tmp/sqlmap-probe /root/.sqlmap
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     PYTHONUTF8=1 \

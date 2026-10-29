@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import json
+import time
 from json import JSONDecodeError
 
 from .mcp_client import McpHttpClient, mcp_tool_to_openai, render_call_result, split_tool_name
@@ -287,6 +288,42 @@ class CtfyPlatform:
             return None
 
     # ---------- 便捷方法 ----------
+
+    def my_solved_ids(self) -> set:
+        """平台侧「我已解出」的题 id 集合（确定性事实源，供 proof-of-exploitation 判定回传）。
+
+        `get_my_solves` 返回 [{"challenge_id": "...", "solved_at": ...}]；失败时返回空集合，
+        绝不让判定回传把主流程拖垮。带 10 s 缓存：同一轮里 solver 与 crew 都会问。
+        """
+        now = time.time()
+        cached = getattr(self, "_solved_cache", None)
+        if cached and now - cached[0] < 10.0:
+            return cached[1]
+        solved: set = set()
+        # get_my_solves 不是语义动作（不在 DEFAULT_TOOLS/KIND_WORDS 里），按真实工具名直接找
+        name = self.tool_map.get("my_solves") or "get_my_solves"
+        if name not in self._by_name:
+            name = ""
+        if name:
+            try:
+                text = self.call_text(name, {})
+                data = self._as_json(text)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            cid = item.get("challenge_id") or item.get("id")
+                            if cid:
+                                solved.add(str(cid))
+                elif isinstance(data, dict):
+                    for item in data.get("solves") or data.get("items") or data.get("result") or []:
+                        if isinstance(item, dict):
+                            cid = item.get("challenge_id") or item.get("id")
+                            if cid:
+                                solved.add(str(cid))
+            except Exception:  # noqa: BLE001 - 判定增强项，失败就当没解出
+                solved = set()
+        self._solved_cache = (now, solved)
+        return solved
 
     def whoami(self):
         return self._json_or_text("whoami", {})

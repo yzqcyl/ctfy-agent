@@ -41,7 +41,10 @@ FAILURE_MARKERS = (
     "拒绝", "失败", "错误", "不存在", "无效",
 )
 
-FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^}\s]{4,}\}")
+# flag 形态统一正则（ctxcompress / tools_misc_ext 从这里 import，勿再各写一份）。
+# 约束：内容排除冒号 `:`（防 `body{color:red}` 等压缩 CSS/选择器被当 flag 收割，实测误报源）、
+# 长度 4-120（防超长 HTML 属性误报）；前缀放开到 [A-Za-z0-9_]{2,} 以兼容 flag/FLAG/ctf/TPCTF 等平台前缀。
+FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^}\s:]{4,120}\}")
 
 # 「声称有发现」的强断言词（M4：这类结论必须能溯源到逐字证据）。
 # 只收强断言词，避免把「没找到 / 都是 401」这类否定结论也要求证据（失败题无证据属正常）。
@@ -50,10 +53,19 @@ CLAIM_MARKERS = (
     "found", "obtained", "bypassed", "leaked", "logged in", "valid credential",
 )
 
-# 否定式前缀：先摘掉再看断言词，否则「未拿到凭据」「没找到」会被误判成「声称有发现」
+# 否定式前缀：先摘掉再看断言词，否则「未拿到凭据」「没找到」会被误判成「声称有发现」。
+# 审计修复：补「没能/没法/不能」等否定前缀 + 把 CLAIM_MARKERS 的「成功登录/凭证有效」等词同步进第二组，
+# 否则「未能成功登录」「没能绕过 WAF」会漏摘否定、被判成「声称有发现」。
 _NEG_CLAIM_RE = re.compile(
-    r"(未|没|没有|无|未能|无法|not|no|never|failed to|unable to|did not|didn't|couldn't)\s*"
-    r"(找到|发现|拿到|取得|绕过|泄露|获得|确认|found|obtained|bypassed|leaked|confirmed)",
+    r"(未|没|没有|无|未能|没能|没法|不能|无法|not|no|never|cannot|can't|failed to|unable to|did not|didn't|couldn't)\s*"
+    r"(找到|发现|拿到|取得|绕过|泄露|获得|确认|成功登录|登录成功|凭证有效|"
+    r"found|obtained|bypassed|leaked|confirmed|logged in|valid credential)",
+    re.IGNORECASE,
+)
+
+# 后置否定：「密码是错的」「口令无效」——断言词后紧跟否定词，同样不该要求证据（审计修复：实证误伤句）
+_NEG_CLAIM_POST_RE = re.compile(
+    r"(密码是|口令是|凭证是|password is|credential is)\s*(错的|错误|无效|无效的|不对|incorrect|wrong|invalid)",
     re.IGNORECASE,
 )
 
@@ -119,6 +131,37 @@ def normalize_body(body) -> str:
     return " ".join(text.split())
 
 
+# 「决定响应内容」的请求头：会话态 cookie、鉴权头、自定义 X-* 头（如 X-Role:admin 头绕过）。
+# User-Agent/Accept/Accept-Encoding 等不影响服务端业务逻辑的头不进键，避免去重键过度敏感。
+_HEADER_KEYS_SENSITIVE = frozenset({
+    "cookie", "authorization", "proxy-authorization", "x-api-key", "x-auth-token",
+})
+
+
+def _header_fingerprint(headers) -> str:
+    """提取决定结果的头指纹；无关头忽略。审计修复：normalize_args 原不读 headers，
+    导致「登录前/后同 URL」被误拦并断言「重试不会改变结果」（与 cookie jar 的语义相反）。"""
+    if not headers:
+        return ""
+    if isinstance(headers, dict):
+        items = list(headers.items())
+    elif isinstance(headers, (list, tuple)):
+        items = [(k, v) for k, v in headers if k is not None]
+    else:
+        return ""
+    picked = []
+    for k, v in items:
+        kl = str(k).lower().strip()
+        if not kl:
+            continue
+        if kl in _HEADER_KEYS_SENSITIVE or kl.startswith("x-"):
+            picked.append((kl, " ".join(str(v).split())))
+    if not picked:
+        return ""
+    picked.sort()
+    return json.dumps(picked, ensure_ascii=False, separators=(",", ":"))
+
+
 def normalize_args(tool: str, args: dict | None) -> dict:
     """按工具语义抽出「决定结果」的参数，丢弃无关噪声（headers/timeout 等）。"""
     args = args or {}
@@ -129,6 +172,11 @@ def normalize_args(tool: str, args: dict | None) -> dict:
         body = normalize_body(args.get("body") or args.get("data") or args.get("body_b64"))
         if body:
             out["body"] = body
+        # 会话态/鉴权/自定义头进键（审计修复）：否则「登录前/后同 URL 重读」被误拦，
+        # 拦截文案还断言「重试不会改变结果」——与 cookie jar 自动续期的语义相反。
+        hdr = _header_fingerprint(args.get("headers"))
+        if hdr:
+            out["headers"] = hdr
         for key in ("grep", "offset", "limit"):
             if args.get(key) not in (None, ""):
                 out[key] = _norm_scalar(args.get(key))
@@ -242,17 +290,74 @@ def _http_status(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+# 结构化工具的成功信号：这次调用「拿到了新信息」的判定字段（存在且为真/正数/非空即成功）。
+# 背景（实测）：http_burst 输出恒含字面键 "failed"（tools_local summary）、fuzz 命中天然含
+# 401/403/404、sqli 发现注入时 findings 的 type 是 sqlmap 的 "error-based"、authdiff 的 baseline
+# 天然是 401——纯子串匹配会把成功调用全记成失败，12 次后整个工具方向被「证伪」并注入「禁止再试」，
+# 模型被自己账本禁用武器。
+_STRUCTURED_SUCCESS: dict[str, tuple[str, ...]] = {
+    "http_burst": ("ok",),      # ok>0 至少一个请求成功
+    "fuzz": ("matched",),       # matched>0 找到至少一个端点（含 401/403 也是新信息）
+    "sqli": ("injectable",),    # injectable=True 发现注入点
+    "http_map": ("links", "api_hints", "hits"),  # 爬到了链接/接口/探测命中（probe 命中 401 也算发现端点）
+    "jsrecon": ("api", "secrets"),               # 抽到了 API 面/密钥
+    "traffic": ("total", "shown"),               # 检索到了流量记录（记录含 403 不代表检索失败）
+}
+
+# 需要特判「成功信号」的结构化工具（见 _structured_success 的 authdiff 分支）
+_STRUCTURED_TOOLS = frozenset(_STRUCTURED_SUCCESS) | {"authdiff"}
+
+
+def _structured_success(tool: str, data: dict) -> bool:
+    if tool == "authdiff":
+        # authdiff 成功 = 发现鉴权不一致：rows 里有「非 same 且非 error」的变体。
+        # baseline 401 是它的正常输入，别因为 "401" 把「发现了匿名可读/绕过头」判成失败。
+        rows = data.get("rows")
+        if isinstance(rows, list):
+            return any(
+                isinstance(r, dict) and not r.get("same") and "error" not in r
+                for r in rows
+            )
+        return False
+    for key in _STRUCTURED_SUCCESS.get(tool, ()):
+        val = data.get(key)
+        if isinstance(val, bool):
+            if val:
+                return True
+        elif isinstance(val, (int, float)) and not isinstance(val, bool):
+            if val > 0:
+                return True
+        elif isinstance(val, (list, dict, str)) and val:
+            return True
+    return False
+
+
 def looks_failed(text: str, tool: str = "") -> bool:
     """这次调用是否「没拿到新信息」。
 
     http_request 优先看结构化 status（200 的 JS 包里出现 "error" 字样不算失败——
-    实测按纯文本匹配会误判 4 次）；其它工具才退回关键字匹配。
+    实测按纯文本匹配会误判 4 次）；http_burst/fuzz/sqli 按语义字段判成败；其它工具才退回关键字匹配。
     """
     if tool == "http_request":
         status = _http_status(text)
         if status is not None:
             return not (200 <= status < 400)
-    lowered = _norm_scalar(text).lower()
+    if tool == "chat":
+        # chat 返回纯文本（head + [reply] + 内容）：拿到非空回复就算成功，即使内容是「拒绝/denied」。
+        # 多轮诱导题前几轮必拒，判失败会把 chat 方向证伪禁用（审计修复）。
+        if "[reply]" in text and "(空回复)" not in text:
+            return False
+    norm = _norm_scalar(text).strip()
+    # 结构化工具：能解出 JSON 且命中「成功信号」就判成功（消除把成功记成失败的误报）；
+    # 未命中则回退关键字匹配，不引入新的误判。
+    if tool in _STRUCTURED_TOOLS and norm.startswith("{"):
+        try:
+            data, _ = json.JSONDecoder().raw_decode(norm)
+        except (JSONDecodeError, ValueError):
+            data = None
+        if isinstance(data, dict) and _structured_success(tool, data):
+            return False
+    lowered = norm.lower()
     return any(marker in lowered for marker in FAILURE_MARKERS)
 
 
@@ -266,6 +371,7 @@ def claims_discovery(text: str) -> bool:
     M4 只约束这类结论；否定型结论（「都是 401 / 没找到」）不要求证据。
     """
     raw = _NEG_CLAIM_RE.sub("", _norm_scalar(text))
+    raw = _NEG_CLAIM_POST_RE.sub("", raw)
     if FLAG_RE.search(raw):
         return True
     lowered = raw.lower()
