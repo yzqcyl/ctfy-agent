@@ -74,7 +74,7 @@ Copy-Item .env.example .env ; notepad .env
 | 单轮上限 | `4096` tokens | `max_tokens` |
 | 每题步数 | `12` 步 | `max_steps` / `AGENT_MAX_STEPS` |
 
-换模型只改一行配置；`llm.py` 走的是 OpenAI 兼容协议，任何同协议端点都能接。
+本地 CLI 换模型只改一行配置；`llm.py` 走的是 OpenAI 兼容协议，任何同协议端点都能接。**比赛容器例外**：平台契约只允许一个模型（角色级 `model` 会被入口剥掉，见 HANDOFF §5 环境变量）。
 费用与用量：`solve` 结束会打印本次 token 消耗，`runs/<run>/transcripts/*.jsonl` 留有完整对话。
 
 ## 费用上限（硬刹车）

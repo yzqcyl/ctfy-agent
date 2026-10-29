@@ -62,7 +62,7 @@
 | `allow_shell` | bool | 否(默认 False) | 放行本地 `shell`（`_delegate` → `run_role(allow_shell=…)`） |
 | `platform` | list[str] | 否 | 平台工具功能组名或直接工具名（见 §5.1）；经 `_role_platform_names`（L428）展开并 ∩ 平台上真实存在的工具 |
 | `local` | list[str] | 否 | 本地工具名（见 §5.2）；经 `_role_specs`（L436）白名单过滤后才给模型看 |
-| `model` | str | 否 | 该角色专项模型覆盖；`_delegate` L489 `llm_factory(spec.get("model"))` |
+| `model` | — | ❌ **禁用** | 角色级模型覆盖。容器入口 `_build_config` 会 pop 掉它（`agent_main.py:227-230`），`llm_factory` 也忽略该参数：**平台契约规定一次运行只有一个模型、一个出资方**（§8.0 契约红线 1）。写了无效，且在评审眼里就是违规倾向。 |
 | `max_tokens` | int | 否 | 该角色单次输出上限；`_apply_llm_spec` L395 |
 | `temperature` | float | 否 | 该角色温度；`_apply_llm_spec` L400 |
 | `system` | str | 否 | 自定义系统提示词覆盖；`_role_system` L518 会自动补 4 条纪律（§6） |
@@ -188,6 +188,14 @@ XXX_SPEC = {
 ---
 
 ## 8. 红线与禁忌（违反 = 打回）
+
+### 8.0 平台契约红线（三条，来自 agent 赛道契约原文，优先级高于一切工程偏好）
+
+1. **单模型**：一次运行只允许一个 provider 的一个模型，所有槽位必须同值（Claude-Code 兼容客户端的 `ANTHROPIC_MODEL` / `..._DEFAULT_OPUS_MODEL` / `..._SONNET_MODEL` / `..._HAIKU_MODEL` / `SMALL_FAST_MODEL` / `SUBAGENT_MODEL` 都填同一个）。**禁止**任何「按角色 / tier 解析换更强模型」的设计——那条路是绕过出资方。已有的合规实现**别去拆**：`_build_config` pop 掉角色 `model`（`agent_main.py:227-230`）+ `llm_factory` 忽略入参（`487-498`）+ `LLM_FLAVOR != "openai"` 直接 refused（`424-431`）。
+2. **网络只有三处**：平台、模型网关、靶标（`internet_policy=deny`、`tcp_access=tls_sni`）。**自带 key 也出不了网**；禁止设计依赖外部 API / 在线服务的能力（CyberChef web、pcapfix web、PacketTotal 之类一律不可用）。
+3. **不得用自有或他人账户垫付**：`LLM_API_KEY` 可能为空，那是「没有人给这次运行出资」的真实状态，**必须大声失败**（`agent_main.py:432-439` 写 refused rollup），**绝不回退到自己的 key**；镜像内不得内嵌任何 key。
+
+### 8.1 工程红线
 
 1. **不要改已有方向的提示词内容**（尤其 web/crypto/rev 的调教）——除非单独批准（HANDOFF §8 禁忌 8）。新方向只加 `elif` 分支或 agent.json 覆盖，别动别人的 base。
 2. **不要新建「交付通道」**：结论只走 `report`；flag 不要写进 `note`（污染协调者上下文）。

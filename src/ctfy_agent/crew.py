@@ -6,7 +6,9 @@
 各自用受限的工具面做实事，做完用 report 交结论。它们：
   - 共享同一份 Store（笔记、实例、提交状态）；
   - 共享同一个 Budget（token / 调用次数 / 金额三层刹车跨角色累计）；
-  - 各角色可用不同模型（config.extra["roles"] 里 model 覆盖，缺省用全局模型）。
+  - **共用一个模型**：平台契约规定一次运行只允许一个模型、一个出资方。容器入口
+    `agent_main._build_config` 会 pop 掉各角色的 `model` 覆盖，`llm_factory` 也忽略
+    model 参数——「多模型名 / tier 路由」是误导，禁止依赖。
 
 协调者只会三个动作：delegate（派活）/ submit（提交）/ note + done（收尾）。
 它不直接碰 http / shell，专家不碰提交——分工同时也就是权限边界。
@@ -306,6 +308,9 @@ COORDINATOR_PROMPT = """你是 CTF 解题**协调者**。你不亲自探测，�
   一次只派一个 objective（一个具体动作或一个待验证的判断），并用 done_when 写清「做到什么程度算完成」；
   done_when 必须可观察（例：「拿到 /api/login 的 200 响应体并给出其中字段」），不要写「查清楚 / 深入分析」。
  - 路由判据：题面或 tags 出现 asi / prompt_injection / agent / LLM / 助手 / bot / 聊天 / RAG 这类信号 → 派 ai 专家。
+   题面或指纹出现 AI 框架名（Ollama / ComfyUI / Gradio / Dify / n8n / Langflow / vLLM / Open WebUI / LiteLLM / MCP / 向量库）也派 ai：
+   这类题打框架实现漏洞（SSRF / 路径穿越 / 插件装 RCE / 无鉴权），一次把整条链交给 ai
+   （http_map 定型组件 → 已知洞或结构类 → 利用 → 取服务端文件里的 flag），别当普通 web 题拆着派。
    其中「载体是对话」（有聊天端点、要诱导助手开口拿值）必派 ai；
    若 agent_defense 题其实是静态陷阱页（只要求翻页面/爬站取 flag），派 web 也可以——防御方法卡会照样进它的题目背景。
    传统 web 漏洞（注入、越权、逻辑、上传）仍派 web。
@@ -406,7 +411,8 @@ class Crew:
         self.config = config
         self.platform = platform
         self.store = store
-        # llm_factory(model_override) -> DeepSeekLLM；各角色可换模型
+        # llm_factory(model_override) -> DeepSeekLLM；容器入口忽略 model_override（单模型契约），
+        # 保留该参数只为本地 CLI 兼容。
         self.llm_factory = llm_factory
         self.on_event = on_event or (lambda kind, payload=None: None)
         # 深合并：config 只覆盖某角色的部分键时，未写的键沿用默认值（浅合并会把整条默认吞掉，审计 B2）

@@ -34,7 +34,9 @@ from ctfy_agent.tools_local import LocalTools, ToolError  # noqa: E402
 from smoke_ai_chat import case_ai_chat  # noqa: E402
 from smoke_http_session import case_http_302_cookie  # noqa: E402
 from smoke_context import case_context_compress  # noqa: E402
-from smoke_webmap import case_http_map, case_http_map_wiring  # noqa: E402
+from smoke_webmap import (  # noqa: E402
+    case_http_map, case_http_map_fingerprint, case_http_map_wiring,
+)
 from smoke_brake import case_no_progress_brake  # noqa: E402
 from smoke_gate import case_done_gate, case_convergence_stalled  # noqa: E402
 from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
@@ -3037,7 +3039,7 @@ def case_agent_seed(tmp: Path) -> None:
     # G6：非 "flag" 的题目 id 要传给 _submit 的默认值；F2：submit_limit 计入门控题
     assert config.extra.get("default_question_id") == "q1", config.extra
     assert config.submit_limit == 6, config.submit_limit          # (1 明题 + 2 门控) * 2
-    # 归一化：角色 model 被剥掉（网关会改），max_tokens 统一到容器默认
+    # 归一化：角色 model 被剥掉（契约：单模型；网关也会按 LLM_MODEL 改写），max_tokens 统一到容器默认
     for spec in (config.extra.get("roles") or {}).values():
         if isinstance(spec, dict):
             assert "model" not in spec, spec
@@ -3993,6 +3995,72 @@ def case_sqli_functional(tmp: Path) -> None:
     ok("P3 sqli 流程：参数拼装/技术集规范化/level·risk 夹取/结论解析/不可注入/超时/落库")
 
 
+def case_ai_direction_dod(tmp: Path) -> None:
+    """AI 安全方向按 extending-agent.md §9 Definition-of-Done 收口（见 docs/ai-plan.md §11）。
+
+    钉四处：角色字段齐全不越权（§3）｜专属提示词不重复写 4 纪律、_role_system 自动补（§6）｜
+    _role_specs("ai") 只暴露方向工具、无 shell（§5/§9.6）｜delegate 枚举自动含 ai（§7）。
+    """
+    from ctfy_agent.crew import Crew, DEFAULT_ROLES  # noqa: PLC0415
+    from ctfy_agent.method_cards import AI_CARDS  # noqa: PLC0415
+
+    class _StubPlatform:
+        def tool_names(self):
+            return {"get_me", "get_challenge", "start_instance", "verify_answer",
+                    "verify_exploit", "submit_answer"}
+
+        def openai_tools_for(self, names):
+            return [{"function": {"name": n}} for n in sorted(names)]
+
+    class _StubConfig:
+        extra = {"traffic_enabled": False}
+
+    config = json.loads((HERE.parent / "config" / "agent.json").read_text(encoding="utf-8"))
+    ai_cfg = config["roles"]["ai"]
+    default_ai = DEFAULT_ROLES["ai"]
+
+    # 1) 角色契约（§3）：字段齐全 + 不越权
+    effective = {**default_ai, **ai_cfg}
+    assert isinstance(effective.get("max_steps"), int) and effective["max_steps"] > 0, effective
+    assert effective.get("platform"), "ai 需平台只读/实例/oracle 组"
+    local = list(effective.get("local") or [])
+    assert "shell" not in local, "ai 方向 local 面不允许 shell（收口）"
+    assert effective.get("allow_shell") is False, "ai 方向 allow_shell 应为 False"
+
+    # 2) 提示词契约（§6）：专属覆盖 + 纪律自动补、不重复写
+    system = ai_cfg.get("system", "")
+    assert len(system) > 400, "ai 应是专属提示词（ASI + AI 基建打法），不是通用兜底"
+    assert "AI 基础设施" in system and "五阶段" in system
+    for literal in ("PLAN", "REFLECTION", "report", "evidence"):
+        assert literal not in system, f"自定义提示词不应重写纪律字面量 {literal!r}（§6）"
+    composed = Crew._role_system("ai", system)
+    assert "PLAN:" in composed and "REFLECTION:" in composed, "应自动补伴生文本纪律"
+    assert "evidence" in composed, "应自动补证据纪律"
+    assert "report" in composed, "应自动补交付规则"
+    assert "不可达纪律" in composed, "应无条件追加不可达纪律"
+
+    # 3) 工具面收口（§5/§9.6）+ 协调者可派（§7）
+    crew = Crew.__new__(Crew)
+    crew.platform = _StubPlatform()
+    crew.roles = {"coordinator": {"max_steps": 8, "platform": [], "local": []},
+                  "ai": effective, "web": DEFAULT_ROLES["web"]}
+    crew.config = _StubConfig()
+    ai_names = {spec["function"]["name"] for spec in crew._role_specs("ai")}
+    for expected in ("http_request", "http_map", "chat", "report", "note"):
+        assert expected in ai_names, f"ai 角色应能调 {expected}：{sorted(ai_names)}"
+    assert "shell" not in ai_names, "ai 的 _role_specs 不应暴露 shell"
+
+    delegates = [t for t in crew._coordinator_tools() if t["function"]["name"] == "delegate"]
+    assert delegates, "协调者工具面缺 delegate"
+    enum = delegates[0]["function"]["parameters"]["properties"]["role"]["enum"]
+    assert "ai" in enum, f"delegate 枚举应自动含 ai：{enum}"
+
+    # 4) 方法卡（M7）
+    assert len(AI_CARDS) == 20, f"AI 卡应 20 张（含基建 2 张），实有 {len(AI_CARDS)}"
+
+    ok("AI 安全方向 §9 DOB：角色契约 + 提示词纪律自动补 + 工具面收口 + delegate 枚举 + 方法卡")
+
+
 def main() -> int:
     tmp = Path(os.environ.get("TEMP", ".")) / "ctfy_agent_smoke"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -4080,6 +4148,8 @@ def main() -> int:
         ("no_progress_brake", case_no_progress_brake),
         ("http_map", case_http_map),
         ("http_map_wiring", case_http_map_wiring),
+        ("http_map_fingerprint", case_http_map_fingerprint),
+        ("ai_direction_dod", case_ai_direction_dod),
         ("misc_ext", case_misc_ext),
         ("done_gate", case_done_gate),
         ("convergence_stalled", case_convergence_stalled),

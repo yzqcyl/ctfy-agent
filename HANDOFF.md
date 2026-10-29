@@ -53,17 +53,17 @@
 | `src/ctfy_agent/ledger.py` | 确定性账本 + 证据校验 | `normalize_args`、`attempt_key`、`looks_failed`、`claims_discovery`、`Ledger`、`verify_evidence`、`digest` |
 | `src/ctfy_agent/companion.py` | PLAN/REFLECTION 有状态伴生文本 | `parse_companion`、`PlanTrack`（推进信号只认账本新增尝试） |
 | `src/ctfy_agent/ctxcompress.py` | 工具结果瘦身 + 关键事实常驻 + 两级滑窗 | v2 新增 |
-| `src/ctfy_agent/tools_local.py` | 本地工具 http_request/shell/note/report + `jwt_forge`/`http_burst`/`http_map` | `http_map` = crawl 站点成图（链接/表单/字段/接口线索）+ probe 常见端点 |
+| `src/ctfy_agent/tools_local.py` | 本地工具 http_request/shell/note/report + `jwt_forge`/`http_burst`/`http_map` | `http_map` = crawl 站点成图（链接/表单/字段/接口线索）+ probe 常见端点 + **AI 栈组件指纹**（M7：Ollama/ComfyUI/Gradio/Open WebUI/Dify/vLLM/Chroma 命中即报 component+版本+打法；来源 ctf-ai-infra 技能卡，MIT） |
 | `src/ctfy_agent/tools_misc_ext.py` | misc 外包：decode_blob / unpack_archive / hexpeek | 纯 stdlib |
 | `src/ctfy_agent/platform.py` | MCP 客户端 | 97 个工具暴露；`MODEL_TOOLS` = 单 agent 真白名单 |
 | `src/ctfy_agent/llm.py` | OpenAI 兼容客户端（urllib，非流式） | 只有 `/chat/completions`，**不认 anthropic flavor** |
 | `config/agent.json` | 角色/模型/预算 | coordinator+web=Kimi-K2.7、rev=Kimi-K3、ai=Kimi-K3、crypto=DeepSeek-V4-Pro-0813、misc=GLM-Z1-AirX；`max_tokens_per_challenge=800000`、`max_llm_calls=80`。**容器里角色 model 会被 `agent_main._build_config` 覆盖为 `LLM_MODEL`** |
-| `tests/smoke.py` | 离线回归（总入口，跑完打印 `N passed, N failed`） | **v2 提交版 83/83**；当前工作区 **86/86**（新增 `http_map`、`http_map_wiring`、`no_progress_brake`）。改动后必须保持全绿 |
+| `tests/smoke.py` | 离线回归（总入口，跑完打印 `N passed, N failed`） | **v2 提交版 83/83**；当前工作区 **128/128**（并行任务同期也在加用例，以实跑为准）。改动后必须保持全绿。内联 `case_ai_direction_dod`（AI 方向 §9 DOB 验收） |
 | `tests/smoke_context.py` | 上下文压缩/事实/滑窗/证据逐字性 12 组断言 | 并行会话有改动 |
 | `tests/smoke_http_session.py` | 302 上 Set-Cookie 入 jar 回归 | — |
-| `tests/smoke_webmap.py` | `http_map` 站点成图/probe/白名单 + 角色挂载接线 | 专抓「工具存在但没下发给模型」这类漏接线 |
+| `tests/smoke_webmap.py` | `http_map` 站点成图/probe/白名单 + 角色挂载接线 | 专抓「工具存在但没下发给模型」这类漏接线；`case_http_map_fingerprint` 钉组件定型与防误报 |
 | `tests/smoke_brake.py` | 无进展刹车：输出重复 3 步提示、5 步止损；内容有变化不误伤 | 039/043 退化循环的回归 |
-| `src/ctfy_agent/method_cards.py` | 题型方法卡 | web 50 题词表 + AI 17 张 + 80 个 AI tag |
+| `src/ctfy_agent/method_cards.py` | 题型方法卡 | web 50 题词表 + AI 20 张（含 M7 基建定型卡 + 七类结构洞卡）+ AI tag 词表（M7 新增 14 个 AI 基建 tag） |
 | `roles/` + `tests/fixtures/` | 角色提示词与离线夹具 | `roles/misc.json` **不会被框架读**，必须并入 config |
 | `docs/submit-image-runbook.md` | **提交镜像的操作手册**（digest、4 步、快照命令） | 提交前必读 |
 | `docs/b1-adapter-plan.md` | B1 方案 + 平台源码硬事实 + 容器内 G1–G8 | — |
@@ -157,7 +157,7 @@
 - **task.json**（schema_version=2）：`run_mode` ∈ instance|qa|defence|engagement|awd；含 `challenge/competition_id/questions/gated_questions/scope/rules_of_engagement/deliverable/platform_url/max_turns/result{path,stdout_fallback}/target_instance`。
 - **环境变量**：`CTFY_PLATFORM_URL`、`CTFY_TOKEN`、`CTFY_EVAL_CHALLENGE_ID`、`CTFY_EVAL_COMPETITION_ID`、`CTFY_EVAL_MAX_TURNS`（缺失=无预算）、`CTFY_WORK_DIR`、`CTFY_EVAL_DRY_RUN`。**`CTFY_MCP_URL`/`CTFY_TARGET_URL` 在用户镜像里不存在**——MCP 地址从 `$CTFY_WORK_DIR/mcp.json` 或 `CTFY_PLATFORM_URL + /api/v1/mcp/` 拼。
 - **LLM 网关**：`LLM_FLAVOR`(openai|anthropic) + `LLM_API_KEY/LLM_BASE_URL/LLM_MODEL`。**`LLM_API_KEY` 为空必须大声失败，禁止回退自有 key**。
-- **赛事硬约束**（实测）：`internet_policy=deny`（容器无外网）、`max_instances_per_team_effective=1`、3 段 session（11/15、11/21、11/22 各 10:00–20:00 CST）、同分先解出者靠前。
+- **赛事硬约束**（实测）：`internet_policy=deny`（容器无外网）、**单模型**（一次运行只允许一个 provider 的一个模型，所有槽位同值；角色级 `model` 被入口剥掉，禁止 tier 解析绕行）、`max_instances_per_team_effective=1`、3 段 session（11/15、11/21、11/22 各 10:00–20:00 CST）、同分先解出者靠前。
 - 竞赛 id：`TPCTF`=`c0d8b4e3dd3b42c095d63d7dfa66431f`；练习库：CTFARENA=`4394a10aa5d24f97a1ec3301ca718a45`、CYBENCH=`d35cc057773c44f79eec192b54551327`、AGENTBENCH=`9f613f261b68469b9c4da805197983b2`、AGENT-DEFENSE=`d4917609895644e1bcf92b3c9b3bc70f`、SAMPLE=`e4e78ff318dc4844beac13f9ea7409aa`。
 
 ---
