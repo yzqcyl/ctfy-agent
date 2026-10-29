@@ -164,6 +164,8 @@ k = clamp(1..3,
 
 共用调度器+黑板；B 挖深度、A 拖广度。按已核实证据 **B > A**；A 作无状态题堆积时的补充。
 
+> **2026-11 实施后**：集群-A 已落地（无状态题同题 N 路并行，`crew._solve_clustera`），**默认关闭**（`cluster_a_concurrency` 未设=走原串行，零回归）；真机 A/B 留正式赛。方案与验收见 `docs/plan-cluster-a.md`。
+
 ## 15. 已核实内部事实索引（供实现对照）
 
 `config.py:32/34/35/39/40/41`（submit 3 / instance_ops 5 / oracle 50 / token 300k / calls 20 / ctx 16k）、
