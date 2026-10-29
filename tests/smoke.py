@@ -41,6 +41,8 @@ from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
 from smoke_case_misc import case_misc_ext  # noqa: E402
+from smoke_clusterb_crew import case_clusterb_crew  # noqa: E402
+from smoke_llm_retry import case_llm_timeout_retry  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -4079,6 +4081,8 @@ def main() -> int:
         ("misc_ext", case_misc_ext),
         ("done_gate", case_done_gate),
         ("convergence_stalled", case_convergence_stalled),
+        ("clusterb_crew", case_clusterb_crew),
+        ("llm_timeout_retry", case_llm_timeout_retry),
     ]
     for name, case in cases:
         try:

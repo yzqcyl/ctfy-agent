@@ -55,7 +55,7 @@ class DeepSeekLLM:
 
     # ---------- 传输 ----------
 
-    def _post(self, path: str, payload: dict, retries: int = 3):
+    def _post(self, path: str, payload: dict, retries: int = 3, timeout_retries: int = 1):
         url = f"{self.base_url}{path}"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -64,6 +64,7 @@ class DeepSeekLLM:
             "Accept": "application/json",
         }
         attempt = 0
+        timeouts = 0
         while True:
             request = urllib.request.Request(url, data=body, headers=headers, method="POST")
             try:
@@ -91,6 +92,21 @@ class DeepSeekLLM:
                     raise error from None
             except urllib.error.URLError as exc:
                 error = LLMError(f"无法连接 {url}: {exc.reason}", retryable=True)
+                if attempt >= retries:
+                    raise error from None
+            except TimeoutError as exc:
+                # 读响应体超时抛的是裸 TimeoutError（不是 URLError 的子类），此前未捕获 →
+                # 穿透 crew.solve（只接 LLMError/BudgetExceeded）→ 整题报废（实测 SAMPLE-007 三次）。
+                # 归一成可重试 LLMError；超时重试单独限额（默认 1 次），避免 300s×4 的长时间挂死。
+                timeouts += 1
+                error = LLMError(
+                    f"读超时（{self.timeout:.0f}s，第 {timeouts} 次）：{url}（{exc}）", retryable=True
+                )
+                if timeouts > timeout_retries:
+                    raise error from None
+            except OSError as exc:
+                # 连接被重置等裸 OSError 同理：聊天补全无副作用，退避重试是安全的
+                error = LLMError(f"网络错误 {type(exc).__name__}: {exc}", retryable=True)
                 if attempt >= retries:
                     raise error from None
             except JSONDecodeError as exc:

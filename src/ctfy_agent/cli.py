@@ -59,6 +59,8 @@ def make_llm(config: Config, model: str | None = None, budget=None) -> DeepSeekL
         max_tokens=config.max_tokens,
         debug=config.debug,
         budget=budget,
+        # 读超时跟题级 timeout 走（默认 120s；本机实测长输出会超过 120s → raw TimeoutError）
+        timeout=config.timeout,
     )
 
 
@@ -454,7 +456,8 @@ def cmd_crew(args) -> int:
 
     crew = Crew(config, platform, store, lambda model=None: make_llm(config, model=model), on_event=on_event)
     try:
-        summary = crew.solve(args.challenge_id)
+        # 集群-B：k<=1 时与 crew.solve 逐字等价；k>1 时才做多次尝试编排
+        summary = crew.solve_clusterb(args.challenge_id)
     except LLMError as exc:
         print(f"模型调用失败：{exc}", file=sys.stderr)
         return EXIT["llm"]
@@ -511,7 +514,8 @@ def cmd_auto(args) -> int:
             remaining = total_cap - spent["tokens"]
             if remaining > 0:
                 config.max_tokens_per_challenge = min(per_challenge, remaining)
-        return crew.solve(challenge_id)
+        # 集群-B：k<=1 时与 crew.solve 等价；batch 场景默认不启用（config 不写 clusterb_k）
+        return crew.solve_clusterb(challenge_id)
 
     spent = {"tokens": 0}
     original_solve = solve_one

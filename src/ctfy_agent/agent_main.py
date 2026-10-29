@@ -77,6 +77,15 @@ def _as_int(value, default):
         return default
 
 
+def _as_float(value, default):
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------- rollup ----------
 
 
@@ -209,6 +218,9 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     )
     config.submit_limit = max(3, (len(questions) + gated) * 2)
     config.runs_dir = str(work_dir / "runs")
+    # 读超时：长上下文+长输出的单次生成实测能挂满 300s（120s 默认太紧）。容器侧抬到 240s；
+    # 配合 llm._post 把 TimeoutError 归一成可重试 LLMError，单次超时不再击穿整题。
+    config.timeout = _as_float(env.get("AGENT_TIMEOUT"), 240.0)
 
     # 归一化角色 profile：网关会按 LLM_MODEL 改写 model（多模型名是误导），
     # 且 agent.json 里 web 的 max_tokens=4096 会截断思考块——统一到容器默认值。
@@ -480,12 +492,16 @@ def run_agent(
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
                 debug=config.debug,
+                # 读超时用题级 timeout（默认 120s）：长上下文+长输出的单次生成可能超过 120s，
+                # 不传就会退回 llm 默认值，偶发 raw TimeoutError 直接击穿整题（实测 3.3min 崩两次）。
+                timeout=config.timeout,
             )
 
     # 9) 跑 Crew
     try:
         crew = Crew(config, platform, store, llm_factory)
-        summary = crew.solve(challenge_id)
+        # 集群-B 编排入口：config 不加 clusterb_k 时 k=1，与 crew.solve 逐字等价（零回归）
+        summary = crew.solve_clusterb(challenge_id)
     except Exception as exc:  # noqa: BLE001 - 任何解题异常都不许毁掉 result.json
         _write_rollup(
             result_path,

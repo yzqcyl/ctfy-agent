@@ -229,6 +229,34 @@ def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: 
     return "协调结束。", True, False
 
 
+def _ledger_facts(ledger, limit: int = 12) -> list[str]:
+    """集群-B 黑板：从账本挑「结论级事实」给下一次尝试继承。
+
+    只取 observations（工具输出里的可溯源事实/候选值），不取派活记录与判决理由：
+    派活是协调者的措辞，继承它会让下一次尝试复读上一次的路线。
+    """
+    out: list[str] = []
+    for obs in list(getattr(ledger, "observations", []) or [])[-limit:]:
+        text = " ".join(str(getattr(obs, "text", "") or "").split())[:200]
+        if text:
+            out.append(text)
+    return out
+
+
+def _ledger_dead_ends(ledger, limit: int = 8) -> list[str]:
+    """集群-B 黑板：已证伪方向（判错死路）——下一次尝试别再走。"""
+    out: list[str] = []
+    try:
+        refuted = list(ledger.refuted())
+    except Exception:  # noqa: BLE001 - 黑板是增强项，取不到就当没有
+        return out
+    for hyp in refuted[-limit:]:
+        cluster = str(getattr(hyp, "cluster", "") or "").strip()
+        if cluster:
+            out.append("已证伪方向：" + cluster[:160])
+    return out
+
+
 def _convergence_stalled(stats: dict, last_open: int, last_refuted: int,
                          stalls: int) -> tuple[int, int, int]:
     """假设收敛信号：零证据 + 零新证伪 + 假设数只增 → stalls 累加，否则清零。
@@ -381,6 +409,8 @@ class Crew:
         self._specialists: dict[str, object] = {}
         # 多问题/门控题的只读快照（run 开始时拉一次，供简报与提交后判定复用）
         self._question_info: dict = {}
+        # 集群-B：本次尝试的决策温度（None=不改各角色自带温度，行为同旧）；由 _delegate 盖到专家上
+        self._attempt_temperature: float | None = None
 
     # ---------- 工具面 ----------
 
@@ -448,6 +478,9 @@ class Crew:
         llm = self.llm_factory(spec.get("model"))
         llm.budget = solver.llm.budget  # 与协调者共享同一份预算
         _apply_llm_spec(llm, spec)
+        if self._attempt_temperature is not None and hasattr(llm, "temperature"):
+            # 集群-B：专家与协调者同一次尝试用同一档决策温度（覆盖角色默认值）
+            llm.temperature = float(self._attempt_temperature)
 
         self.on_event("delegate", {"role": role, "task": task})
         result = solver.run_role(
@@ -511,7 +544,17 @@ class Crew:
 
     # ---------- 协调主循环 ----------
 
-    def solve(self, challenge_id: str) -> dict:
+    def solve(self, challenge_id: str, *, attempt_caps: dict | None = None,
+              prior_text: str = "", temperature: float | None = None,
+              keep_instance: bool | None = None) -> dict:
+        """跑一整轮协调+专家协作（= 集群-B 口径下的一次尝试）。
+
+        默认参数（全 None/空）与旧行为**逐字等价**；集群-B 的编排入口见 solve_clusterb()。
+          attempt_caps: 本次尝试的 token/calls 切片（None=不切片，同旧）
+          prior_text:   黑板继承文本（前几次尝试的事实/死路），只进首发 brief
+          temperature:  本次尝试的决策温度（同时盖协调者与专家）
+          keep_instance: True/False 强制保留/释放实例（None=按旧配置判定）
+        """
         challenge = self.store.require(challenge_id)
         spending = Budget(
             max_tokens=self.config.max_tokens_per_challenge,
@@ -521,6 +564,9 @@ class Crew:
             price_output=self.config.price_output_per_mtok,
             label=challenge_id,
         ).load(challenge.tokens)
+        if attempt_caps:
+            # 集群-B：本次尝试切片（空/None = 不切片，行为同旧）。必须在首个 spending.check() 之前设。
+            spending.set_attempt_caps(attempt_caps)
         start_usage = spending.snapshot()
 
         # 一开始就超了：直接拒绝，不起实例、不发请求（与 Solver.solve 对齐，审计 B8）
@@ -547,6 +593,9 @@ class Crew:
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "tokens_spent": 0,
                 "transcript": str(self.store.transcript_path(challenge_id)),
+                # 集群-B：切片用尽 ≠ 题级预算耗尽；后者才该让编排器停手
+                "reason": "attempt_cap" if getattr(exc, "attempt", False) else "budget_exhausted",
+                "facts": [], "dead_ends": [], "tail_action": "",
             }
             self.on_event("done", summary)
             return summary
@@ -555,6 +604,10 @@ class Crew:
         coordinator = self.llm_factory(coordinator_spec.get("model"))
         coordinator.budget = spending
         _apply_llm_spec(coordinator, coordinator_spec)
+        # 集群-B：按尝试策略改决策温度；None 时完全不动（旧行为）
+        if temperature is not None and hasattr(coordinator, "temperature"):
+            coordinator.temperature = float(temperature)
+        self._attempt_temperature = temperature
         solver = Solver(self.config, self.platform, coordinator, self.store, on_event=self.on_event)
         solver.llm.budget = spending
 
@@ -568,6 +621,11 @@ class Crew:
         # 多问题/门控题：CLI/MCP 路径没有容器的 task.json，这里补一次只读 get_challenge
         self._question_info = self._fetch_challenge(challenge_id, solver)
         brief = self._brief(challenge)
+        if prior_text:
+            # 集群-B 黑板继承：只把「结论事实 + 判错死路」前置到首发 brief，
+            # 不继承上次轨迹/判决（避免锚定与假证伪）。空串=旧行为。
+            brief = prior_text.strip() + "\n\n" + brief
+            self.store.append_transcript(challenge_id, {"role": "clusterb", "content": prior_text.strip()})
         messages = [
             {"role": "system", "content": COORDINATOR_PROMPT},
             {"role": "user", "content": brief},
@@ -632,7 +690,8 @@ class Crew:
                     messages = _compact_history(messages, self.config.max_context_tokens)
                     response = coordinator.chat(messages, tools=self._coordinator_tools())
                 except BudgetExceeded as exc:
-                    reason = "budget_exhausted"
+                    # 集群-B：attempt_cap（切片用尽、题级还有配额）≠ budget_exhausted（题级真耗尽）
+                    reason = "attempt_cap" if getattr(exc, "attempt", False) else "budget_exhausted"
                     self.store.append_transcript(challenge_id, {"role": "coordinator", "step": rnd, "note": f"预算耗尽：{exc}"})
                     break
                 except LLMError as exc:
@@ -876,13 +935,18 @@ class Crew:
                 # 轮数耗尽（for 自然结束、没有任何 break）：区别于「模型主动停手」的 no_more_actions
                 reason = "step_limit"
         finally:
+            self._attempt_temperature = None  # 集群-B：温度只作用于本次尝试，绝不外泄到下一次
             # 团队实例配额只有 1 个：无论成败都释放，否则下一题起不来（审计 B7/B20）。
             # 成功提交后是否保留实例由 keep_instance_on_success 决定（默认释放：运行内已拿到 verdict）。
-            keep = (
-                self.config.extra.get("keep_instance_on_success")
-                if submitted
-                else self.config.extra.get("keep_instance_on_fail")
-            )
+            if keep_instance is not None:
+                # 集群-B：中间尝试强制保留实例——配额 1，重起一次既慢又常被上游限流。
+                keep = keep_instance
+            else:
+                keep = (
+                    self.config.extra.get("keep_instance_on_success")
+                    if submitted
+                    else self.config.extra.get("keep_instance_on_fail")
+                )
             if challenge.instance_id and not keep:
                 try:
                     self.platform.stop_instance(challenge.instance_id)
@@ -935,9 +999,138 @@ class Crew:
             "transcript": str(self.store.transcript_path(challenge_id)),
             "ledger": ledger.stats(),
             "plan": plan.stats(),
+            # 集群-B：导出给黑板继承（只有结论事实/判错死路，不含轨迹与判决理由）
+            "facts": _ledger_facts(ledger),
+            "dead_ends": _ledger_dead_ends(ledger),
+            "tail_action": (ledger.order[-1].tool if ledger.order else ""),
         }
         self.on_event("done", summary)
         return summary
+
+    # ---------- 集群-B：整题多次尝试 ----------
+
+    def solve_clusterb(self, challenge_id: str) -> dict:
+        """集群-B 编排入口：同题 k 次独立 crew 尝试（串行）+ 黑板继承。
+
+        容器/生产路径的唯一入口（agent_main → 这里）。语义：
+          - k<=1（config 不加 clusterb_k）= 直接 solve()，与旧版**逐字等价**（零回归）；
+          - 每次尝试 = 一次完整 crew.solve（协调者+专家），题级预算按
+            `(题级剩余) × (1-reserve) ÷ 剩余尝试数` 切片（与 solver._solve_clusterb 同口径）；
+          - 尝试间只继承「结论事实 + 判错死路」（retry.Blackboard），不继承轨迹/判决；
+          - 中间尝试保留实例（配额只有 1，重起慢且常被上游限流），最后一次交回默认判定；
+          - 每次尝试落 state.solve_attempts（index/strategy/reason/tokens/calls 归因）。
+        早停：解出 / 题级预算耗尽（stopped）/ 环境能力硬缺口（hopeless）都立即收手。
+        """
+        cfg = self.config.extra or {}
+        try:
+            k = int(cfg.get("clusterb_k") or 1)
+        except (TypeError, ValueError):
+            k = 1
+        if k <= 1:
+            return self.solve(challenge_id)
+
+        from .retry import AttemptOutcome, Orchestrator  # noqa: PLC0415 - 避免顶层循环依赖
+
+        min_calls = int(cfg.get("clusterb_min_calls") or 4)
+        reserve = float(cfg.get("clusterb_reserve") or 0.12)
+        store = self.store
+        config = self.config
+        last: dict = {}
+        prev_calls = 0
+
+        def caps_fn(remaining: int) -> dict:
+            ch = store.require(challenge_id)
+            tok = ch.tokens or {}
+            used_tokens = int(tok.get("total_tokens") or 0)
+            used_calls = int(tok.get("calls") or 0)
+            rem = max(1, int(remaining))
+            tokens = (
+                int((config.max_tokens_per_challenge - used_tokens) * (1 - reserve) / rem)
+                if config.max_tokens_per_challenge else 0
+            )
+            calls = (
+                max(min_calls, int((config.max_llm_calls - used_calls) * (1 - reserve) / rem))
+                if config.max_llm_calls else 0
+            )
+            return {"tokens": max(0, tokens), "calls": max(0, calls)}
+
+        def precheck_fn(cid: str) -> bool:
+            ch = store.require(cid)
+            if ch.status in ("submitted", "done") or getattr(ch, "submitted_ok", False):
+                return True
+            try:
+                return cid in self.platform.my_solved_ids()
+            except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不该拦住解题
+                return False
+
+        def attempt_fn(cid, idx, caps, prompt, meta):
+            nonlocal last, prev_calls
+            strategy = meta.get("strategy") or {}
+            summary = self.solve(
+                cid,
+                attempt_caps=caps,
+                prior_text=prompt,
+                temperature=strategy.get("temperature"),
+                keep_instance=(True if idx < k - 1 else None),
+            )
+            last = summary
+            ch = store.require(cid)
+            calls_now = int((summary.get("budget") or {}).get("calls") or 0)
+            calls_delta = max(0, calls_now - prev_calls)
+            prev_calls = calls_now
+            ch.append_solve_attempt({
+                "index": idx,
+                "strategy": strategy.get("card_hint", ""),
+                "temperature": strategy.get("temperature"),
+                "reason": summary.get("reason"),
+                "steps": summary.get("steps"),
+                "tokens_spent": summary.get("tokens_spent"),
+                "calls_spent": calls_delta,
+            })
+            store.save()
+            return AttemptOutcome(
+                reason=summary.get("reason") or "",
+                tail_action=summary.get("tail_action") or "",
+                tokens=summary.get("tokens_spent") or 0,
+                calls=calls_delta,
+                facts=summary.get("facts") or [],
+                dead_ends=summary.get("dead_ends") or [],
+            )
+
+        report = Orchestrator(
+            attempt_fn, attempts_max=k, caps_fn=caps_fn, precheck_fn=precheck_fn
+        ).run_challenge(challenge_id)
+
+        ch = store.require(challenge_id)
+        if not report.solved and ch.status not in ("submitted", "done"):
+            try:
+                store.set_status(challenge_id, "stalled")
+            except ValueError:
+                pass
+        store.save()
+
+        base = dict(last) if last else {
+            "challenge_id": challenge_id,
+            "status": ch.status,
+            "submitted": False,
+            "reason": "attempt_cap",
+            "steps": 0,
+            "tokens_spent": 0,
+            "facts": [],
+            "dead_ends": [],
+        }
+        base["submitted"] = bool(report.solved) or bool(base.get("submitted"))
+        base["clusterb"] = {
+            "k": k,
+            "solved": bool(report.solved),
+            "blocked": report.blocked,
+            "attempts": len(report.attempts),
+            "tokens_spent": report.tokens_spent,
+            "calls_spent": report.calls_spent,
+            "strategies": [rec.strategy.get("card_hint", "") for rec in report.attempts],
+            "temperatures": [rec.strategy.get("temperature") for rec in report.attempts],
+        }
+        return base
 
     def _fetch_challenge(self, challenge_id: str, solver) -> dict:
         """只读拉一次 get_challenge 取多问题/门控信息；失败返回 {}（增强项，绝不击穿主流程）。"""
