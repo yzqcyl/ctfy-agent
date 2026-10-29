@@ -1,5 +1,37 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
+## ✅ v3 已构建、匿名可拉取（2026-10-29）——**提交用这个**
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v3` |
+| digest | `sha256:e658b9f6a466209813d1278bfa379b38e0275cf5fe0f0d8f41459f423bbf8a56` |
+| 构建 | GitHub Actions run `40837543846`（branch `v3`、sha `5a7f8c5`）→ 全绿 |
+| 代码基线 | commit `5a7f8c5`：集群-B 接线（`clusterb_k` 默认不启用）+ LLM 读超时修复 + P2 web 工具链（ffuf / SecLists / sqlmap） |
+| 非 root | ✅ `Config.User="app"`（uid 10001、`HOME=/home/app`、`PYTHONPATH=/ctfy/src`） |
+| 入口 | `Entrypoint=["python","-m","ctfy_agent","agent"]`、`WorkingDir=/ctfy`、`Cmd=None` |
+| 体积 | 16 层，匿名传输 59.1 MB（解压 149.4 MB，平台上限 400 MB） |
+| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v3`） |
+| CI 契约 | ✅ 五条路径全 `exit 0`（dry_run / no_task / bad_run_mode / no_creds / no_mcp） |
+| 构建内自检 | ✅ ffuf（`ffuf selftest ok`）、sqlmap（产出 injectable 判定）、302 跳转探针（`decoy_hits=0`） |
+| `latest` | 已随本次构建指向 v3（`ctfy-agent:latest` / `ctfy-agent-pub:latest`）——提交仍请**显式填 `:v3`** |
+
+### 与 v2.1 的差异（净改进，无行为回归）
+
+- `config/agent.json` 不加 `clusterb_k` → k=1 路径与 v2.1 逐字等价（10-29 实测：k=3@511k 花 493,615 tok 未解出，k=1@511k 用 313,076 tok 达成，见 `docs/clusterb-p1-result.md`）。
+- 新增 LLM 读超时兜底：单次模型挂起不再让整题报废（`llm.py` 把裸 `TimeoutError` 归一为可重试 `LLMError` + 1 次重试；容器默认读超时 120→240s）。
+- 新增 web 工具链：ffuf 2.1.0 + SecLists 三张表 + sqlmap 1.10.10（版本/字节数/sha256 全钉死，构建期实测跑通）。
+
+### 下一步（浏览器，人工）
+
+1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v3`
+2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
+3. 提交审核 → 通过后用「测评我的 Agent」跑一遍
+
+---
+
+## 历史：`v2.1`（非 root 修复版，已被 v3 取代）
+
 ## ⚠️ 2026-10-27 平台实测：`:v2` 被「协议检查」拒绝（以 root 运行）
 
 平台「注册并检查」对 `ghcr.io/yzqcyl/ctfy-agent-pub:v2` 的判定：
@@ -26,7 +58,7 @@ USER app
 2. 页面「配置本次测评」→ 镜像地址改成 `ghcr.io/yzqcyl/ctfy-agent-pub:v2.1` → 点「重新检查」
 3. 五项全绿（注册 / 协议检查 / 试运行 / 审核）后再提交审核
 
-## ✅ v2.1 已构建并校验（2026-10-27 23:37 +08:00）
+## 历史：`v2.1` 已构建并校验（2026-10-27 23:37 +08:00）——已被 v3 取代
 
 | 项 | 值 |
 |---|---|
@@ -44,7 +76,7 @@ USER app
 
 **下一步（人工）**：平台「配置本次测评」→ 镜像地址改为 `ghcr.io/yzqcyl/ctfy-agent-pub:v2.1` → 点「重新检查」→ 五项全绿后提交审核。
 
-## ✅ v2 已冻结，提交这个
+## 历史：`v2` 已冻结（已被 v3 取代，勿再提交）
 
 ```
 ghcr.io/yzqcyl/ctfy-agent-pub:v2
@@ -78,7 +110,7 @@ digest sha256:a68ebe6e619b95191cc5168c9e35f2e92788970cfca823093ba8d1100d66ec4b
 
 v1 未被移动（已核验 digest 不变），但它**不含**上面的新工具。保留仅为留档。
 
-> ⚠️ `:latest` 现在指向 v2 的 digest（workflow 同时推 `v2` 和 `latest`）。提交时请**显式填 `:v2`**，别用 `latest`。
+> ⚠️ 历史段落，已失效：`:latest` 现在指向 **v3**（两个包都是）。提交时请显式填 `:v3`，别用 `latest`。
 
 ## 平台页面操作单（4 步，必须浏览器）
 
