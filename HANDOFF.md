@@ -16,13 +16,13 @@
 | **模型 A/B 对照** | ✅ 结论：**换更强模型不涨分**（同题 Pro 0/3 vs K2.7 0/3，速度 2.27×，覆盖面反而更窄）。 |
 | **并行求解器可行性** | ✅ 已评估（报告 §12）：**模型路线已被证伪，多策略并行未被测量**，且必须先解决"预算 ×N"与"环境失败乘 N"两个硬前提。**建议先不做。** |
 | **800k 复测（arm C）** | ✅ SAMPLE-009 @800k 三臂（干净 Crew / solo / B1+闸门+收敛）全部 **0 候选 0 提交 budget_exhausted** → 编排/模型/调参均非瓶颈；**瓶颈=flag 发现（access-control 面）**。 |
-| **集群-B（同题多策略多尝试）** | ✅ **批次2+A 已落地、机理真机验证**：k 次串行尝试 + 策略/温度差异化（0.2/0.5/0.8）+ 黑板继承（结论事实 + 判错死路）+ step_limit 归因。**默认关闭**（config 不加 `clusterb_k` → k=1 = 旧版行为等价、零回归）；激活=config 加 `clusterb_k=3`。详见 `docs/plan-concurrency.md` §16。 |
+| **集群-B（同题多策略多尝试）** | ✅ **批次2+A+完整度补强 已落地、机理真机验证**：k 次串行尝试 + 策略/温度差异化（0.2/0.5/0.8）+ 黑板三段继承（结论事实 + 判错死路 + 待验候选值，800/400/300 限额）+ step_limit 归因 + `k` 支持动态（`"auto"` 按剩余 calls 池算）。**默认关闭**（config 不加 `clusterb_k` → k=1 = 旧版行为等价、零回归）；激活=config 加 `"clusterb_k": 3`（或 `"auto"`）。详见 `docs/plan-concurrency.md` §16。 |
 | **step_limit 修复** | ✅ 既有 bug：`_solve_once` 步数用满时 reason 误记 `budget_exhausted`（`step_limit→max_turns` 在 `agent_main._STOP_MAP` 本有映射却从没触发）。已在 `be5d035` 修。 |
 | **A/B 实测** | ✅ SAMPLE-001 k=1 等价回归解出（88.9k token）；SAMPLE-008 k=3 三次尝试（~186k/次）机制正确但未解出（judge 期望答案形式未知=单点未知题，多策略无互补）。**k=3 > k=1 收益未实证**，留正式赛。 |
 | **代码版本** | HEAD `09c9296`（A 之后）；回滚点 `be5d035`（批次2+step_limit，A 前）。v2 镜像同源 `1aeee61` 不变。 |
 | **遗留未提交** | `src/ctfy_agent/llm.py`（`LLM_ENABLE_THINKING=0` 关 DashScope 思考模式，并行 session 遗留，`.env` 未设=未激活）；`agent-artifacts-m55-m56.zip`（untracked，别动）。 |
 | **实例** | 0 个（已清空）。 |
-| **单测基线** | `tests/smoke.py` 全绿；集群-B 离线 6 脚本（`retry.py` 自检 + `runs/_verify_clusterb_step{1..4}.py` + `runs/_clusterb_fixtures.py`）全绿。 |
+| **单测基线** | `tests/smoke.py` **110 passed / 0 failed**；集群-B 离线 6 脚本（`retry.py` 自检 + `runs/_verify_clusterb_step{1..4}.py` + `runs/_clusterb_fixtures.py`）全绿。 |
 
 **一句话**：v2 镜像待用户提交；v3 上已落地「集群-B（同题多策略多尝试 + 黑板继承）」并真机验证机理、默认关闭零回归，但 k=3 > k=1 的解题收益未实证（SAMPLE 题单缺理想 near_miss 题），留正式赛再验；顺带修了 step_limit 误记 bug。失败根因仍是 flag 发现（access-control 面）。
 

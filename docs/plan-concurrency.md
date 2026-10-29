@@ -203,3 +203,17 @@ k = clamp(1..3,
 - 集群-B 机制（k 次尝试 / 策略温度差异化 / 黑板事实+死路继承 / step_limit 归因）离线 6 脚本 + 真机全绿。
 - 未实证 k=3 > k=1 的解题收益：SAMPLE 题单缺理想 near_miss 对照题；008 属「单点未知」不适用多策略互补，收益实证留待正式赛真实题。
 - 回滚点：git commit `be5d035`（A 之前）。
+
+### 16.6 完整度补强（2026-11，三补一不做）
+
+对照 §2–§13 逐条审查后补齐三处，另**刻意不补一处**（有实测依据）：
+
+| 项 | 补强内容 | 落点 |
+|---|---|---|
+| §10 动态 k | 新增 `retry.resolve_k()`：不写 `clusterb_k`→k=1（零回归）；`"auto"`/`true`→按**题级剩余 calls 池**动态算（`decide_k`）；显式数字→原样尊重。solver 与 crew 两条路径同口径接线 | `retry.py` / `solver.solve` / `crew.solve_clusterb` |
+| §7 候选值第三段 | 新增 `retry.extract_candidates()`（只收花括号形态、去重、最多 6 条）；`_solve_once` 与 `crew.solve` 各自从 ledger observations 提取 → summary `candidates` → 黑板 `merge` → 下次注入「可优先验」。crew 路径经 `prior_text` 自动带出，solver 路径新增 `prior_candidates` 参数 | `retry.py` / `solver.py` / `crew.py` |
+| §7 字符限额 | 黑板三段注入按 800/400/300 截断（超限以 `…` 收尾），防跨尝试累积撑爆首发 brief | `retry.Blackboard.inject` |
+| §3 hopeless | **刻意不做**：设计判据（VPN/Linux-only/引号/DoS）是**语义判断**，无法机械接线；且 008 实测证明「实例启动失败=上游限流**瞬时可重试**」（attempt#1 限流、attempt#2/3 却成功写穿越文件），机械标 `env_bound` 会**提前放弃本可重试的题**。现状是保守多试一次，不是 bug | — |
+
+剩余仍属未实现（**均为集群-A / 调度层，非本模块**）：§2 三阶段 P1 广扫/P3 收口、§8 无状态题并行、§11 `AGENT_CONCURRENCY` env 开关。
+验收：`smoke.py` 110/110 + 集群-B 离线 6 脚本（retry 自检新增 resolve_k/candidates/限额共 13 条断言）全绿。

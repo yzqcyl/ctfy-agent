@@ -257,6 +257,17 @@ def _ledger_dead_ends(ledger, limit: int = 8) -> list[str]:
     return out
 
 
+def _ledger_candidates(ledger, limit: int = 6) -> list[str]:
+    """集群-B 黑板：本次尝试里「看起来像 flag」但还没验过的候选值（花括号形态）。
+
+    只做形态筛选，不判真——判真交给下一次尝试的 verify/submit。
+    """
+    from .retry import extract_candidates  # noqa: PLC0415 - 延迟导入，避免顶层循环依赖
+
+    texts = [getattr(o, "text", "") for o in (getattr(ledger, "observations", None) or [])]
+    return extract_candidates(texts, limit=limit)
+
+
 def _convergence_stalled(stats: dict, last_open: int, last_refuted: int,
                          stalls: int) -> tuple[int, int, int]:
     """假设收敛信号：零证据 + 零新证伪 + 假设数只增 → stalls 累加，否则清零。
@@ -1002,6 +1013,7 @@ class Crew:
             # 集群-B：导出给黑板继承（只有结论事实/判错死路，不含轨迹与判决理由）
             "facts": _ledger_facts(ledger),
             "dead_ends": _ledger_dead_ends(ledger),
+            "candidates": _ledger_candidates(ledger),
             "tail_action": (ledger.order[-1].tool if ledger.order else ""),
         }
         self.on_event("done", summary)
@@ -1022,14 +1034,17 @@ class Crew:
         早停：解出 / 题级预算耗尽（stopped）/ 环境能力硬缺口（hopeless）都立即收手。
         """
         cfg = self.config.extra or {}
-        try:
-            k = int(cfg.get("clusterb_k") or 1)
-        except (TypeError, ValueError):
-            k = 1
+        from .retry import AttemptOutcome, Orchestrator, resolve_k  # noqa: PLC0415 - 避免顶层循环依赖
+
+        ch = self.store.require(challenge_id)
+        used = ch.tokens or {}
+        k = resolve_k(
+            cfg,
+            tokens_pool=max(0, int(self.config.max_tokens_per_challenge) - int(used.get("total_tokens") or 0)),
+            calls_pool=max(0, int(self.config.max_llm_calls) - int(used.get("calls") or 0)),
+        )
         if k <= 1:
             return self.solve(challenge_id)
-
-        from .retry import AttemptOutcome, Orchestrator  # noqa: PLC0415 - 避免顶层循环依赖
 
         min_calls = int(cfg.get("clusterb_min_calls") or 4)
         reserve = float(cfg.get("clusterb_reserve") or 0.12)
@@ -1095,6 +1110,7 @@ class Crew:
                 calls=calls_delta,
                 facts=summary.get("facts") or [],
                 dead_ends=summary.get("dead_ends") or [],
+                candidates=summary.get("candidates") or [],
             )
 
         report = Orchestrator(

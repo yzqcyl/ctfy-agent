@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------- 常量 ---------------------------------------------------------------------------
@@ -121,11 +122,46 @@ class Blackboard:
                 self.candidates.append(c)
 
     def inject(self) -> str:
+        # 三段各自限长（设计 §7：800/400/300 字符），防止跨尝试累积把首发 brief 撑爆
         return "\n".join([
-            "[前次尝试已确认事实] " + ("；".join(self.facts) if self.facts else "（无）"),
-            "[前次尝试的死路（勿重复）] " + ("；".join(self.dead_ends) if self.dead_ends else "（无）"),
-            "[待验候选值] " + ("；".join(self.candidates) if self.candidates else "（无）"),
+            "[前次尝试已确认事实] " + _clip_join(self.facts, FACTS_MAX_CHARS),
+            "[前次尝试的死路（勿重复）] " + _clip_join(self.dead_ends, DEAD_ENDS_MAX_CHARS),
+            "[待验候选值] " + _clip_join(self.candidates, CANDIDATES_MAX_CHARS),
         ])
+
+
+# --------------------------------------------------------------------------- 黑板三段工具 ---------------------------------------------------------------------------
+
+# 黑板三段注入的字符上限（设计 §7：事实 ≤800 / 死路 ≤400 / 候选 ≤300）
+FACTS_MAX_CHARS = 800
+DEAD_ENDS_MAX_CHARS = 400
+CANDIDATES_MAX_CHARS = 300
+
+# 「像 flag」的花括号形态：flag{...} / CTF{...} / 任意前缀{...}。只收括号形式，裸长串噪声太大。
+_CAND_RE = re.compile(r"[A-Za-z0-9_]{0,24}\{[^{}\s]{3,120}\}")
+
+
+def _clip_join(items, limit: int) -> str:
+    """把列表拼成一段并限长；空列表渲染为「（无）」。"""
+    if not items:
+        return "（无）"
+    text = "；".join(str(x) for x in items)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def extract_candidates(texts, limit: int = 6) -> list:
+    """从工具输出文本里挑「看起来像 flag」的候选值（花括号形态），供黑板第三段。
+
+    只做形态筛选，不做判真——判真由下一次尝试的 verify/submit 决定。
+    """
+    out: list = []
+    for t in texts or []:
+        for m in _CAND_RE.findall(str(t)):
+            if m not in out:
+                out.append(m[:160])
+    return out[-limit:]
 
 
 # --------------------------------------------------------------------------- 动态 k ---------------------------------------------------------------------------
@@ -144,6 +180,32 @@ def decide_k(tokens_pool: int, calls_pool: int, *, min_calls: int = 4, reserve: 
     effective_calls = int(calls_pool * (1 - reserve))
     k = min(k, max(1, effective_calls // max(1, min_calls)))
     return max(1, k)
+
+
+def resolve_k(cfg: dict, *, tokens_pool: int, calls_pool: int) -> int:
+    """解析集群-B 的 k。
+
+    语义：
+      - 不写 `clusterb_k`（或写 0/空）→ **k=1**（旧版行为，零回归）；
+      - `clusterb_k = "auto"` / `true` → 按**题级剩余预算**动态算（`decide_k`，calls 是主约束）；
+      - 显式数字 → 尊重配置，原样返回（失败兜底 1）。
+    """
+    cfg = cfg or {}
+    raw = cfg.get("clusterb_k")
+    if raw is None or raw == "" or raw == 0 or raw is False:
+        return 1
+    if raw is True or (isinstance(raw, str) and raw.strip().lower() == "auto"):
+        return decide_k(
+            int(tokens_pool or 0),
+            int(calls_pool or 0),
+            min_calls=int(cfg.get("clusterb_min_calls") or 4),
+            reserve=float(cfg.get("clusterb_reserve") or 0.12),
+            attempts_max=int(cfg.get("clusterb_k_max") or 3),
+        )
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
 
 
 # --------------------------------------------------------------------------- 编排器 ---------------------------------------------------------------------------
@@ -181,7 +243,8 @@ class Orchestrator:
             caps = self.caps_fn(k - idx) if self.caps_fn else None   # 切片由外部按「题级剩余」算
             meta = {"strategy": STRATEGY_SPECS[idx % len(STRATEGY_SPECS)],
                     "facts": list(bb.facts),                          # 黑板事实随 meta 下传（供 FactsBoard.seed）
-                    "dead_ends": list(bb.dead_ends)}                  # 黑板死路随 meta 下传（供 _solve_once 注入勿重复）
+                    "dead_ends": list(bb.dead_ends),                  # 黑板死路随 meta 下传（供 _solve_once 注入勿重复）
+                    "candidates": list(bb.candidates)}                # 黑板候选值随 meta 下传（供优先验证）
             prompt = bb.inject() if idx > 0 else ""                   # 纯文本注入（供其他渲染方；首尝试只看题面）
             out = self.attempt_fn(cid, idx, caps, prompt, meta)
 
@@ -286,6 +349,48 @@ def _self_test() -> int:
     check("classify hopeless(env_bound)", classify_failure("no_more_actions", "tcp", ("env_bound",)) == "hopeless")
     check("decide_k 受 calls 池约束 k≤2", decide_k(300_000, 20, min_calls=6, attempts_max=3) == 2,
           decide_k(300_000, 20, min_calls=6, attempts_max=3))
+
+    # ---- resolve_k：不写=1（零回归）/ auto=动态 / 显式=尊重 / 非法=兜底 ----
+    check("resolve_k 未配置 → 1（零回归）", resolve_k({}, tokens_pool=800_000, calls_pool=80) == 1)
+    check("resolve_k 显式 3 → 3", resolve_k({"clusterb_k": 3}, tokens_pool=800_000, calls_pool=80) == 3)
+    check("resolve_k 非法值 → 1", resolve_k({"clusterb_k": "abc"}, tokens_pool=800_000, calls_pool=80) == 1)
+    auto_k = resolve_k({"clusterb_k": "auto", "clusterb_min_calls": 6}, tokens_pool=800_000, calls_pool=20)
+    check("resolve_k auto 走 decide_k（calls 池 20/min6 → 2）", auto_k == 2, auto_k)
+    check("resolve_k auto 与 decide_k 同口径",
+          resolve_k({"clusterb_k": "auto"}, tokens_pool=300_000, calls_pool=20)
+          == decide_k(300_000, 20, min_calls=4, reserve=0.12, attempts_max=3))
+
+    # ---- 候选值提取（花括号形态，去重） ----
+    got = extract_candidates(["返回 flag{abc123} 和 flag{abc123}", "另一个 CTF{x_y}"])
+    check("extract_candidates 提花括号 flag", "flag{abc123}" in got and "CTF{x_y}" in got, got)
+    check("extract_candidates 去重", len(got) == len(set(got)), got)
+    check("extract_candidates 不收裸长串", extract_candidates(["token deadbeefdeadbeef"]) == [])
+
+    # ---- 黑板三段注入：候选值段可见 + 三段各自限额 ----
+    bb = Blackboard()
+    bb.merge(AttemptOutcome(reason="attempt_cap", facts=["f1"], dead_ends=["d1"], candidates=["flag{a}"]))
+    inj = bb.inject()
+    check("黑板注入含候选值段", "[待验候选值] flag{a}" in inj, inj)
+
+    bb = Blackboard()
+    bb.facts = ["F" * 200] * 10
+    bb.dead_ends = ["D" * 200] * 10
+    bb.candidates = ["C" * 200] * 10
+    inj = bb.inject()
+    check("黑板三段限额生效（800/400/300）",
+          len(inj) <= FACTS_MAX_CHARS + DEAD_ENDS_MAX_CHARS + CANDIDATES_MAX_CHARS + 64, len(inj))
+    check("超限段以省略号收尾", "…" in inj)
+
+    # ---- meta 契约：四键齐 ----
+    seen_meta = {}
+
+    def spy_meta(cid, idx, caps, prompt, meta):
+        seen_meta[idx] = sorted(meta.keys())
+        return AttemptOutcome(reason="flag_accepted")
+
+    Orchestrator(spy_meta, attempts_max=1).run_challenge("meta")
+    check("meta 含 strategy/facts/dead_ends/candidates 四键",
+          seen_meta.get(0) == ["candidates", "dead_ends", "facts", "strategy"], seen_meta)
 
     print("\n%s" % ("ALL PASS" if ok else "SOME FAILED"))
     return 0 if ok else 1

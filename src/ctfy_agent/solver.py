@@ -719,9 +719,17 @@ class Solver:
     # ---------- 主循环 ----------
 
     def solve(self, challenge_id: str, *, max_steps: int | None = None) -> dict:
-        """编排入口：k=1 时等价旧 solve（单次尝试）；config.extra.clusterb_k>1 时做多次独立尝试。"""
+        """编排入口：k=1 时等价旧 solve（单次尝试）；config.extra.clusterb_k>1/auto 时做多次独立尝试。"""
+        from .retry import resolve_k  # noqa: PLC0415 - 与 _solve_clusterb 同处延迟导入，避免顶层耦合
+
         cfg = self.config.extra or {}
-        k = int(cfg.get("clusterb_k") or 1)
+        ch = self.store.require(challenge_id)
+        used = ch.tokens or {}
+        k = resolve_k(
+            cfg,
+            tokens_pool=max(0, int(self.config.max_tokens_per_challenge) - int(used.get("total_tokens") or 0)),
+            calls_pool=max(0, int(self.config.max_llm_calls) - int(used.get("calls") or 0)),
+        )
         if k <= 1:
             return self._solve_once(challenge_id, max_steps=max_steps)
         return self._solve_clusterb(challenge_id, max_steps=max_steps, k=k, cfg=cfg)
@@ -759,6 +767,7 @@ class Solver:
                     cid, max_steps=max_steps, attempt_index=idx, caps=caps,
                     prior_facts=meta.get("facts") or None,
                     prior_dead_ends=meta.get("dead_ends") or None,
+                    prior_candidates=meta.get("candidates") or None,
                     final=False, strategy=meta.get("strategy"),
                 )
             finally:
@@ -782,6 +791,7 @@ class Solver:
                 calls=summary.get("calls_spent") or 0,
                 facts=summary.get("facts") or [],
                 dead_ends=summary.get("dead_ends") or [],
+                candidates=summary.get("candidates") or [],
             )
 
         def precheck_fn(cid):
@@ -823,6 +833,7 @@ class Solver:
                     attempt_index: int = 0, caps: dict | None = None,
                     prior_facts: list[str] | None = None,
                     prior_dead_ends: list[str] | None = None,
+                    prior_candidates: list[str] | None = None,
                     final: bool = True, strategy: dict | None = None) -> dict:
         # 缓存/jar 都是 Solver 实例级的：同一实例被复用解多道题时先清掉，
         # 防止 A 题的响应体或会话 cookie 被 B 题的同 host:port 请求静默命中（审计 #4 / B1）。
@@ -920,6 +931,10 @@ class Solver:
         if prior_dead_ends:
             base_head += "\n\n## 前次尝试已判错的答案（勿重复验证/提交，换思路）\n" + "\n".join(
                 "- " + " ".join(str(d).split()) for d in prior_dead_ends
+            )
+        if prior_candidates:
+            base_head += "\n\n## 前次尝试留下但尚未验证的候选值（可优先验，勿重复穷举）\n" + "\n".join(
+                "- " + " ".join(str(c).split()) for c in prior_candidates
             )
         evidence_flag = ""
         tool_chars = int((self.config.extra or {}).get("tool_text_chars", DEFAULT_TOOL_TEXT_CHARS))
@@ -1094,6 +1109,11 @@ class Solver:
             key: max(0, int(end_usage.get(key) or 0) - int(start_usage.get(key) or 0))
             for key in ("prompt_tokens", "completion_tokens", "total_tokens")
         }
+        from .retry import extract_candidates  # noqa: PLC0415 - 延迟导入，保持 solver 对 retry 的弱耦合
+
+        candidates = extract_candidates(
+            [getattr(o, "text", "") for o in (getattr(ledger, "observations", None) or [])]
+        )
         summary = {
             "challenge_id": challenge_id,
             "status": challenge.status,
@@ -1105,6 +1125,7 @@ class Solver:
             "tail_action": tail_action,
             "facts": facts.as_list(),
             "dead_ends": dead_ends,
+            "candidates": candidates,
             "budget": end_usage,
             "usage": usage,
             "tokens_spent": usage["total_tokens"],
