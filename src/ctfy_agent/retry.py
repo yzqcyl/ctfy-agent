@@ -209,6 +209,22 @@ def resolve_k(cfg: dict, *, tokens_pool: int, calls_pool: int) -> int:
         return 1
 
 
+# --------------------------------------------------------------------------- 集群-A：并行预分配 ---------------------------------------------------------------------------
+
+def preallocate_caps(total_tokens: int, total_calls: int, n: int, *,
+                     min_calls: int = 4, multiplier: float = 1.0, reserve: float = 0.0) -> list[dict]:
+    """集群-A：把题级剩余预算**均摊**成 n 份逐路切片（并行各路同时起步，看不到别人已用多少）。
+
+    与串行集群-B 的 compute_attempt_caps 区别：不随「剩余尝试数」递减，而是一开始平分 n 份。
+    multiplier：总预算放大倍数（1.0=总预算不增，约等于串行 k 次的总量，只换墙钟；>1 才真加预算）。
+    """
+    n = max(1, int(n))
+    mult = max(0.0, float(multiplier)) * (1.0 - max(0.0, min(1.0, float(reserve))))
+    cap_tokens = int(max(0, int(total_tokens or 0)) * mult / n)
+    cap_calls = max(int(min_calls or 0), int(max(0, int(total_calls or 0)) * mult / n))
+    return [{"tokens": max(0, cap_tokens), "calls": max(0, cap_calls)} for _ in range(n)]
+
+
 # --------------------------------------------------------------------------- 编排器 ---------------------------------------------------------------------------
 
 class Orchestrator:
@@ -360,6 +376,14 @@ def _self_test() -> int:
     check("resolve_k auto 与 decide_k 同口径",
           resolve_k({"clusterb_k": "auto"}, tokens_pool=300_000, calls_pool=20)
           == decide_k(300_000, 20, min_calls=4, reserve=0.12, attempts_max=3))
+
+    # ---- 集群-A：并行预分配 ----
+    check("preallocate_caps 均摊", preallocate_caps(511_000, 80, 3) == [{"tokens": 170_333, "calls": 26}] * 3,
+          preallocate_caps(511_000, 80, 3))
+    check("preallocate_caps multiplier 放大",
+          preallocate_caps(511_000, 80, 3, multiplier=2.0)[0]["tokens"] == 340_666)
+    check("preallocate_caps reserve 后置扣减",
+          preallocate_caps(511_000, 80, 2, reserve=0.5)[0]["tokens"] == 127_750)
 
     # ---- 候选值提取（花括号形态，去重） ----
     got = extract_candidates(["返回 flag{abc123} 和 flag{abc123}", "另一个 CTF{x_y}"])

@@ -1041,6 +1041,10 @@ class Crew:
         早停：解出 / 题级预算耗尽（stopped）/ 环境能力硬缺口（hopeless）都立即收手。
         """
         cfg = self.config.extra or {}
+        # 集群-A：无状态题同题并行（与集群-B 串行互斥；A 拖广度 / B 挖深度）
+        n_a = int(cfg.get("cluster_a_concurrency") or 0)
+        if n_a >= 2 and self._is_stateless(challenge_id, cfg):
+            return self._solve_clustera(challenge_id, n_a, cfg)
         from .retry import AttemptOutcome, Orchestrator, resolve_k  # noqa: PLC0415 - 避免顶层循环依赖
 
         ch = self.store.require(challenge_id)
@@ -1152,6 +1156,95 @@ class Crew:
             "calls_spent": report.calls_spent,
             "strategies": [rec.strategy.get("card_hint", "") for rec in report.attempts],
             "temperatures": [rec.strategy.get("temperature") for rec in report.attempts],
+        }
+        return base
+
+    # ---------- 集群-A：无状态题同题并行 ----------
+
+    @staticmethod
+    def _stateless_categories(cfg: dict) -> set[str]:
+        raw = (cfg or {}).get("cluster_a_categories") or "crypto,rev"
+        return {s.strip().lower() for s in str(raw).split(",") if s.strip()}
+
+    def _is_stateless(self, challenge_id: str, cfg: dict) -> bool:
+        """无状态题判定：category 命中白名单（crypto/rev 附件题，不 start_instance）。未知/缺失→保守串行。"""
+        ch = self.store.get(challenge_id)
+        cat = (ch.category if ch else "") or ""
+        return bool(cat) and cat.lower() in self._stateless_categories(cfg)
+
+    def _solve_clustera(self, challenge_id: str, n: int, cfg: dict) -> dict:
+        """集群-A：无状态题 n 路并行独立尝试，先到先赢仲裁（结果层），黑板只合并不串行。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        from .retry import STRATEGY_SPECS, preallocate_caps
+
+        ch = self.store.require(challenge_id)
+        used = ch.tokens or {}
+        caps = preallocate_caps(
+            max(0, int(self.config.max_tokens_per_challenge) - int(used.get("total_tokens") or 0)),
+            max(0, int(self.config.max_llm_calls) - int(used.get("calls") or 0)),
+            n,
+            min_calls=int(cfg.get("cluster_a_min_calls") or 4),
+            multiplier=float(cfg.get("cluster_a_multiplier") or 1.0),
+            reserve=float(cfg.get("cluster_a_reserve") or 0.0),
+        )
+        cancel = threading.Event()  # 结果层软取消：任一路解出即标记，不硬杀线程（solve 无细粒度检查点）
+
+        def lane(i: int) -> tuple[int, dict]:
+            if cancel.is_set():
+                return i, {"challenge_id": challenge_id, "reason": "superseded", "submitted": False,
+                           "steps": 0, "tokens_spent": 0, "facts": [], "dead_ends": [], "candidates": []}
+            spec = STRATEGY_SPECS[i % len(STRATEGY_SPECS)]
+            # 每路独立内存视图 + 独立 Crew：规避 _attempt_temperature 等实例字段与 store 中间 save 的并行竞态；
+            # 仅通过 state.lock（submit 文件锁，state.py）在磁盘层协调先到先赢。
+            lane_store = Store(self.store.run_dir).load()
+            lane_crew = Crew(self.config, self.platform, lane_store, self.llm_factory)
+            lane_crew.on_event = self.on_event
+            try:
+                summary = lane_crew.solve(
+                    challenge_id,
+                    attempt_caps=caps[i],
+                    temperature=spec.get("temperature"),
+                    keep_instance=None,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单路异常只废这一路，不拖垮其它路
+                summary = {"challenge_id": challenge_id, "reason": f"lane_error:{type(exc).__name__}",
+                           "submitted": False, "steps": 0, "tokens_spent": 0,
+                           "facts": [], "dead_ends": [], "candidates": [], "_exc": str(exc)[:300]}
+            if summary.get("submitted") or summary.get("reason") in ("flag_accepted", "exploit_verified"):
+                cancel.set()
+            return i, summary
+
+        results: list[dict] = []
+        with ThreadPoolExecutor(max_workers=max(1, n)) as ex:
+            futures = [ex.submit(lane, i) for i in range(n)]
+            for fut in as_completed(futures):
+                try:
+                    _, summary = fut.result()
+                except Exception as exc:  # noqa: BLE001 - future 本身崩了兜成一条失败记录
+                    summary = {"challenge_id": challenge_id, "reason": f"lane_future:{type(exc).__name__}",
+                               "submitted": False, "steps": 0, "tokens_spent": 0,
+                               "facts": [], "dead_ends": [], "candidates": []}
+                results.append(summary)
+
+        # 仲裁：优先已解出（submitted/flag_accepted），否则选步数最多（信息量最大）的一路作 base
+        solved = [s for s in results if s.get("submitted") or s.get("reason") in ("flag_accepted", "exploit_verified")]
+        base = dict((solved or sorted(results, key=lambda s: int(s.get("steps") or 0), reverse=True))[0])
+
+        # 黑板合并（去重保序），并回落盘
+        merges = {k: list(dict.fromkeys(f for s in results for f in (s.get(k) or [])))
+                  for k in ("facts", "dead_ends", "candidates")}
+        base.update(merges)
+        base["cluster_a"] = {
+            "n": n,
+            "solved": bool(solved),
+            "attempts": len(results),
+            "strategies": [STRATEGY_SPECS[i % len(STRATEGY_SPECS)].get("card_hint", "") for i in range(n)],
+            "temperatures": [STRATEGY_SPECS[i % len(STRATEGY_SPECS)].get("temperature") for i in range(n)],
+            "caps": caps,
+            "tokens_spent": sum(int(s.get("tokens_spent") or 0) for s in results),
+            "calls_spent": sum(int((s.get("budget") or {}).get("calls") or 0) for s in results),
         }
         return base
 
