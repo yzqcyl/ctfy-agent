@@ -217,11 +217,15 @@ def preallocate_caps(total_tokens: int, total_calls: int, n: int, *,
 
     与串行集群-B 的 compute_attempt_caps 区别：不随「剩余尝试数」递减，而是一开始平分 n 份。
     multiplier：总预算放大倍数（1.0=总预算不增，约等于串行 k 次的总量，只换墙钟；>1 才真加预算）。
+    池语义对齐 Budget：某维度池为 0 = 该维度**不限** → 切片也置 0（不设限，与集群-B caps_fn 同口径）；
+    min_calls 下限只在池 > 0 时应用，否则会把「不限」错切成每路 4 次。
     """
     n = max(1, int(n))
     mult = max(0.0, float(multiplier)) * (1.0 - max(0.0, min(1.0, float(reserve))))
-    cap_tokens = int(max(0, int(total_tokens or 0)) * mult / n)
-    cap_calls = max(int(min_calls or 0), int(max(0, int(total_calls or 0)) * mult / n))
+    pool_tokens = max(0, int(total_tokens or 0))
+    pool_calls = max(0, int(total_calls or 0))
+    cap_tokens = int(pool_tokens * mult / n) if pool_tokens else 0
+    cap_calls = max(int(min_calls or 0), int(pool_calls * mult / n)) if pool_calls else 0
     return [{"tokens": max(0, cap_tokens), "calls": max(0, cap_calls)} for _ in range(n)]
 
 
@@ -384,6 +388,8 @@ def _self_test() -> int:
           preallocate_caps(511_000, 80, 3, multiplier=2.0)[0]["tokens"] == 340_666)
     check("preallocate_caps reserve 后置扣减",
           preallocate_caps(511_000, 80, 2, reserve=0.5)[0]["tokens"] == 127_750)
+    check("preallocate_caps 池 0=不限（calls 不切）", preallocate_caps(511_000, 0, 3)[0]["calls"] == 0)
+    check("preallocate_caps 池 0=不限（tokens 不切）", preallocate_caps(0, 80, 3)[0]["tokens"] == 0)
 
     # ---- 候选值提取（花括号形态，去重） ----
     got = extract_candidates(["返回 flag{abc123} 和 flag{abc123}", "另一个 CTF{x_y}"])

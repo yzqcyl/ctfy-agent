@@ -42,6 +42,7 @@ from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
 from smoke_case_misc import case_misc_ext  # noqa: E402
 from smoke_clusterb_crew import case_clusterb_crew, case_clusterb_facts_reflow  # noqa: E402
+from smoke_clustera import case_cluster_a  # noqa: E402
 from smoke_llm_retry import case_llm_timeout_retry  # noqa: E402
 
 PASSED: list[str] = []
@@ -4084,6 +4085,7 @@ def main() -> int:
         ("convergence_stalled", case_convergence_stalled),
         ("clusterb_crew", case_clusterb_crew),
         ("clusterb_facts_reflow", case_clusterb_facts_reflow),
+        ("cluster_a_crew", case_cluster_a),
         ("llm_timeout_retry", case_llm_timeout_retry),
     ]
     for name, case in cases:

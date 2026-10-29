@@ -1032,6 +1032,7 @@ class Crew:
         """集群-B 编排入口：同题 k 次独立 crew 尝试（串行）+ 黑板继承。
 
         容器/生产路径的唯一入口（agent_main → 这里）。语义：
+          - 无状态题（category 白名单）+ cluster_a_concurrency≥2 → 集群-A 并行（A/B 互斥，A 优先）；
           - k<=1（config 不加 clusterb_k）= 直接 solve()，与旧版**逐字等价**（零回归）；
           - 每次尝试 = 一次完整 crew.solve（协调者+专家），题级预算按
             `(题级剩余) × (1-reserve) ÷ 剩余尝试数` 切片（与 solver._solve_clusterb 同口径）；
@@ -1041,8 +1042,12 @@ class Crew:
         早停：解出 / 题级预算耗尽（stopped）/ 环境能力硬缺口（hopeless）都立即收手。
         """
         cfg = self.config.extra or {}
-        # 集群-A：无状态题同题并行（与集群-B 串行互斥；A 拖广度 / B 挖深度）
-        n_a = int(cfg.get("cluster_a_concurrency") or 0)
+        # 集群-A：无状态题同题并行（与集群-B 串行互斥；A 拖广度 / B 挖深度，见 docs/plan-cluster-a.md）
+        try:
+            n_a = int(cfg.get("cluster_a_concurrency") or 0)
+        except (TypeError, ValueError):
+            n_a = 0  # 非法值兜底串行（与 resolve_k 对 clusterb_k 的宽容一致，不炸编排入口）
+        n_a = min(n_a, 3)  # 平台规则 QA#26：agent 自主并发 ≤ 3（并发数只是建议，超配自动收敛）
         if n_a >= 2 and self._is_stateless(challenge_id, cfg):
             return self._solve_clustera(challenge_id, n_a, cfg)
         from .retry import AttemptOutcome, Orchestrator, resolve_k  # noqa: PLC0415 - 避免顶层循环依赖
@@ -1173,17 +1178,43 @@ class Crew:
         return bool(cat) and cat.lower() in self._stateless_categories(cfg)
 
     def _solve_clustera(self, challenge_id: str, n: int, cfg: dict) -> dict:
-        """集群-A：无状态题 n 路并行独立尝试，先到先赢仲裁（结果层），黑板只合并不串行。"""
+        """集群-A：无状态题 n 路并行独立尝试，先到先赢仲裁（结果层），黑板只合并不串行。
+
+        审查修正（2026-11 二轮，tests/smoke_clustera.py 覆盖）：
+          - 预检短路：已解出（store 状态 / 平台 my_solved_ids）不烧任何并行路；
+          - 每路收尾**捕获该路 store 终态快照**（flag/提交状态/flags_tried/计数），收口并入主 store
+            ——提交状态原来只活在 winning lane 的内存里，而慢路的无锁整体 save 会把磁盘上
+            刚写下的 flag 洗掉，从磁盘恢复不可靠，必须走内存快照合并；
+          - 用量合并记账：各路 usage = 同一份初值 + 本路增量，求和后扣回 (n-1)×初值再回写主 store
+            ——否则磁盘「最后写者胜」只记一路，低计 (n-1) 路费用；
+          - 归因落盘 solve_attempts（每路一条，对齐集群-B）；未解出置 stalled；
+          - 收口一次性 store.save()：并行期间任何一路的中间脏写都被这次权威写覆盖。
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
         from .retry import STRATEGY_SPECS, preallocate_caps
 
-        ch = self.store.require(challenge_id)
+        store = self.store
+        ch = store.require(challenge_id)
+
+        # 预检：已解出（本 run 的 store 状态或平台提交记录）就不烧任何路（对齐集群-B precheck_fn）
+        if ch.status in ("submitted", "done") or getattr(ch, "submitted_ok", False):
+            return self._presolved_summary(challenge_id, ch)
+        try:
+            if challenge_id in self.platform.my_solved_ids():
+                ch.status = "submitted"  # 与 solve() 的 exploit_verified 兜底同口径
+                return self._presolved_summary(challenge_id, ch)
+        except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不拦解题
+            pass
+
         used = ch.tokens or {}
+        init_pt = int(used.get("prompt_tokens") or 0)
+        init_ct = int(used.get("completion_tokens") or 0)
+        init_calls = int(used.get("calls") or 0)
         caps = preallocate_caps(
             max(0, int(self.config.max_tokens_per_challenge) - int(used.get("total_tokens") or 0)),
-            max(0, int(self.config.max_llm_calls) - int(used.get("calls") or 0)),
+            max(0, int(self.config.max_llm_calls) - init_calls),
             n,
             min_calls=int(cfg.get("cluster_a_min_calls") or 4),
             multiplier=float(cfg.get("cluster_a_multiplier") or 1.0),
@@ -1191,14 +1222,28 @@ class Crew:
         )
         cancel = threading.Event()  # 结果层软取消：任一路解出即标记，不硬杀线程（solve 无细粒度检查点）
 
-        def lane(i: int) -> tuple[int, dict]:
+        def _snapshot(lane_store) -> dict:
+            item = lane_store.get(challenge_id)
+            if item is None:
+                return {}
+            return {
+                "flag_value": item.flag_value or "",
+                "submitted_ok": bool(item.submitted_ok),
+                "status": item.status,
+                "flags_tried": list(item.flags_tried),
+                "attempts": int(item.attempts or 0),
+                "oracle_calls": int(item.oracle_calls or 0),
+                "tool_counts": dict(item.tool_counts or {}),
+            }
+
+        def lane(i: int) -> tuple[int, dict, dict]:
             if cancel.is_set():
                 return i, {"challenge_id": challenge_id, "reason": "superseded", "submitted": False,
-                           "steps": 0, "tokens_spent": 0, "facts": [], "dead_ends": [], "candidates": []}
+                           "steps": 0, "tokens_spent": 0, "facts": [], "dead_ends": [], "candidates": []}, {}
             spec = STRATEGY_SPECS[i % len(STRATEGY_SPECS)]
             # 每路独立内存视图 + 独立 Crew：规避 _attempt_temperature 等实例字段与 store 中间 save 的并行竞态；
-            # 仅通过 state.lock（submit 文件锁，state.py）在磁盘层协调先到先赢。
-            lane_store = Store(self.store.run_dir).load()
+            # submit 先到先赢在磁盘层由 state.lock 协调（reserve/mark_submitted，state.py）。
+            lane_store = Store(store.run_dir).load()
             lane_crew = Crew(self.config, self.platform, lane_store, self.llm_factory)
             lane_crew.on_event = self.on_event
             try:
@@ -1208,45 +1253,127 @@ class Crew:
                     temperature=spec.get("temperature"),
                     keep_instance=None,
                 )
+                state = _snapshot(lane_store)  # 趁引用还在抓终态（磁盘可能随后被慢路洗掉）
             except Exception as exc:  # noqa: BLE001 - 单路异常只废这一路，不拖垮其它路
                 summary = {"challenge_id": challenge_id, "reason": f"lane_error:{type(exc).__name__}",
                            "submitted": False, "steps": 0, "tokens_spent": 0,
                            "facts": [], "dead_ends": [], "candidates": [], "_exc": str(exc)[:300]}
+                state = {}
             if summary.get("submitted") or summary.get("reason") in ("flag_accepted", "exploit_verified"):
                 cancel.set()
-            return i, summary
+            return i, summary, state
 
-        results: list[dict] = []
+        pairs: list[tuple[int, dict, dict]] = []
         with ThreadPoolExecutor(max_workers=max(1, n)) as ex:
             futures = [ex.submit(lane, i) for i in range(n)]
             for fut in as_completed(futures):
                 try:
-                    _, summary = fut.result()
+                    pairs.append(fut.result())
                 except Exception as exc:  # noqa: BLE001 - future 本身崩了兜成一条失败记录
-                    summary = {"challenge_id": challenge_id, "reason": f"lane_future:{type(exc).__name__}",
-                               "submitted": False, "steps": 0, "tokens_spent": 0,
-                               "facts": [], "dead_ends": [], "candidates": []}
-                results.append(summary)
+                    pairs.append((len(pairs),
+                                  {"challenge_id": challenge_id, "reason": f"lane_future:{type(exc).__name__}",
+                                   "submitted": False, "steps": 0, "tokens_spent": 0,
+                                   "facts": [], "dead_ends": [], "candidates": []}, {}))
+        pairs.sort(key=lambda p: p[0])  # 归因按 lane 序
+        results = [s for _, s, _ in pairs]
 
-        # 仲裁：优先已解出（submitted/flag_accepted），否则选步数最多（信息量最大）的一路作 base
+        # ---- 用量合并：各路 usage 含同一份初值，求和后扣回 (n-1) 份（防「最后写者胜」低计）----
+        sum_pt = sum(int((s.get("usage") or {}).get("prompt_tokens") or 0) for s in results)
+        sum_ct = sum(int((s.get("usage") or {}).get("completion_tokens") or 0) for s in results)
+        sum_calls = sum(int((s.get("budget") or {}).get("calls") or 0) for s in results)
+        dup = max(0, len(results) - 1)
+        merged_pt = max(init_pt, sum_pt - dup * init_pt)
+        merged_ct = max(init_ct, sum_ct - dup * init_ct)
+        merged_calls = max(init_calls, sum_calls - dup * init_calls)
+        store.set_tokens(challenge_id, {
+            "prompt_tokens": merged_pt, "completion_tokens": merged_ct,
+            "total_tokens": merged_pt + merged_ct, "calls": merged_calls,
+        })
+
+        # ---- 各路终态并入主 store（只升不降：flag/提交状态/计数取并集或最大值）----
+        dst = store.get(challenge_id)
+        for state in (st for _, _, st in pairs):
+            if not state or dst is None:
+                continue
+            if state["flag_value"] and not dst.flag_value:
+                dst.flag_value = state["flag_value"]
+            if state["submitted_ok"]:
+                dst.submitted_ok = True
+            if state["status"] in ("submitted", "done") and dst.status not in ("submitted", "done"):
+                dst.status = state["status"]
+            dst.flags_tried = list(dict.fromkeys([*dst.flags_tried, *state["flags_tried"]]))
+            dst.attempts = max(dst.attempts, state["attempts"])
+            dst.oracle_calls = max(dst.oracle_calls, state["oracle_calls"])
+            for key, cnt in state["tool_counts"].items():
+                dst.tool_counts[key] = max(dst.tool_counts.get(key, 0), int(cnt))
+
+        # ---- 仲裁：优先已解出，否则选步数最多（信息量最大）的一路作 base ----
         solved = [s for s in results if s.get("submitted") or s.get("reason") in ("flag_accepted", "exploit_verified")]
+        merged_ok = bool(dst is not None and getattr(dst, "submitted_ok", False))
         base = dict((solved or sorted(results, key=lambda s: int(s.get("steps") or 0), reverse=True))[0])
+        base.update({k: list(dict.fromkeys(f for s in results for f in (s.get(k) or [])))
+                     for k in ("facts", "dead_ends", "candidates")})
+        base["submitted"] = bool(solved) or merged_ok  # 提交状态以合并后的主 store 为准
+        base["usage"] = {"prompt_tokens": merged_pt, "completion_tokens": merged_ct,
+                         "total_tokens": merged_pt + merged_ct}
+        base["budget"] = {**(base.get("budget") or {}),
+                          "calls": merged_calls, "total_tokens": merged_pt + merged_ct}
+        base["tokens_spent"] = merged_pt + merged_ct
 
-        # 黑板合并（去重保序），并回落盘
-        merges = {k: list(dict.fromkeys(f for s in results for f in (s.get(k) or [])))
-                  for k in ("facts", "dead_ends", "candidates")}
-        base.update(merges)
+        # ---- 归因落盘（每路一条）+ 终态 + 权威单次 save ----
+        ch = store.require(challenge_id)
+        for i, s, _state in pairs:
+            ch.append_solve_attempt({
+                "index": i,
+                "strategy": STRATEGY_SPECS[i % len(STRATEGY_SPECS)].get("card_hint", ""),
+                "temperature": STRATEGY_SPECS[i % len(STRATEGY_SPECS)].get("temperature"),
+                "reason": s.get("reason"),
+                "steps": s.get("steps"),
+                "tokens_spent": s.get("tokens_spent"),
+                "calls_spent": max(0, int((s.get("budget") or {}).get("calls") or 0) - init_calls),
+            })
+        if not (solved or merged_ok) and ch.status not in ("submitted", "done"):
+            try:
+                store.set_status(challenge_id, "stalled")
+            except ValueError:
+                pass
+        base["status"] = ch.status
         base["cluster_a"] = {
             "n": n,
-            "solved": bool(solved),
+            "solved": bool(solved or merged_ok),
             "attempts": len(results),
             "strategies": [STRATEGY_SPECS[i % len(STRATEGY_SPECS)].get("card_hint", "") for i in range(n)],
             "temperatures": [STRATEGY_SPECS[i % len(STRATEGY_SPECS)].get("temperature") for i in range(n)],
             "caps": caps,
-            "tokens_spent": sum(int(s.get("tokens_spent") or 0) for s in results),
-            "calls_spent": sum(int((s.get("budget") or {}).get("calls") or 0) for s in results),
+            "tokens_spent": merged_pt + merged_ct,
+            "calls_spent": max(0, merged_calls - init_calls),
         }
+        store.save()  # 收口权威写：覆盖并行期间任何一路的中间脏写
+        self.on_event("done", base)
         return base
+
+    def _presolved_summary(self, challenge_id: str, ch) -> dict:
+        """集群-A 预检命中（已解出）时的零成本收口汇总，语义对齐 solve() 的 already_solved 分支。"""
+        summary = {
+            "challenge_id": challenge_id,
+            "status": ch.status,
+            "submitted": True,
+            "steps": 0,
+            "attempts": int(ch.attempts or 0),
+            "reason": "already_solved",
+            "budget": dict(ch.tokens or {}),
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "tokens_spent": 0,
+            "transcript": str(self.store.transcript_path(challenge_id)),
+            "facts": [],
+            "dead_ends": [],
+            "candidates": [],
+            "cluster_a": {"n": 0, "solved": True, "attempts": 0, "precheck": True,
+                          "strategies": [], "temperatures": [], "caps": [],
+                          "tokens_spent": 0, "calls_spent": 0},
+        }
+        self.on_event("done", summary)
+        return summary
 
     def _fetch_challenge(self, challenge_id: str, solver) -> dict:
         """只读拉一次 get_challenge 取多问题/门控信息；失败返回 {}（增强项，绝不击穿主流程）。"""
