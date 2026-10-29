@@ -49,18 +49,31 @@ RUN set -eux; \
     wc -l /opt/wordlists/*.txt
 
 # sqlmap：盲注（尤其时间盲注）手工极痛，web 角色的 sqli 工具调用它。
-# 纯 Python 源码包（sdist），不走 pip：装到 /opt/sqlmap、root 只读，不进 site-packages，
-# 因此不违反「src/ 只允许 stdlib」的自扫（自扫只看 src/ctfy_agent）。
-# 版本 + sha256 钉死；构建日志打印自检输出，跑不起来就直接构建失败。
+# 源码树装到 /opt/sqlmap、root 只读，不进 site-packages，因此不违反「src/ 只允许 stdlib」的自扫。
+#
+# ⚠️ 为什么用 GitHub 归档 + raw 单文件两次下载：sqlmap 仓库把 sqlmap.py 写进了
+# .gitattributes 的 export-ignore，所以 **GitHub 归档和 PyPI sdist 里都没有顶层 sqlmap.py**
+# （实测 CI run 40836261029：PyPI 包解出 18M 却报 `No such file '/opt/sqlmap/sqlmap.py'`）。
+# 归档给 lib/data/plugins/tamper 等运行期依赖，sqlmap.py 单独从 raw 取。
+# 两个下载各自钉死字节数 + sha256；任一不符或跑不起来就让构建失败。
 ARG SQLMAP_VERSION=1.10.10
-ARG SQLMAP_SHA256=9dece8eb15e410ee10114d88d200f54a383f549b565c0147b647081ab805e399
+ARG SQLMAP_TAR_BYTES=8373244
+ARG SQLMAP_TAR_SHA256=7dd690c62fb1ae58bd8555b91012896863c47fc245dc6d39ba300362a3368d17
+ARG SQLMAP_MAIN_BYTES=30040
+ARG SQLMAP_MAIN_SHA256=311eb1962efd1ceb1b26a6086b639f8e85f287888717c5eb7dbd28af63cdb56b
 RUN set -eux; \
     curl -fsSL -o /tmp/sqlmap.tar.gz \
-      "https://files.pythonhosted.org/packages/16/a6/4c613b9fea8a9388261d30ab8240bb158331de9ffcaf8b9727e022e50eb0/sqlmap-${SQLMAP_VERSION}.tar.gz"; \
-    echo "${SQLMAP_SHA256}  /tmp/sqlmap.tar.gz" | sha256sum -c -; \
+      "https://github.com/sqlmapproject/sqlmap/archive/refs/tags/${SQLMAP_VERSION}.tar.gz"; \
+    test "$(stat -c%s /tmp/sqlmap.tar.gz)" = "${SQLMAP_TAR_BYTES}"; \
+    echo "${SQLMAP_TAR_SHA256}  /tmp/sqlmap.tar.gz" | sha256sum -c -; \
     mkdir -p /opt/sqlmap; \
     tar -xzf /tmp/sqlmap.tar.gz -C /opt/sqlmap --strip-components=1; \
-    rm -rf /opt/sqlmap/doc /opt/sqlmap/extra /opt/sqlmap/tests /opt/sqlmap/.github /tmp/sqlmap.tar.gz; \
+    curl -fsSL -o /opt/sqlmap/sqlmap.py \
+      "https://raw.githubusercontent.com/sqlmapproject/sqlmap/${SQLMAP_VERSION}/sqlmap.py"; \
+    test "$(stat -c%s /opt/sqlmap/sqlmap.py)" = "${SQLMAP_MAIN_BYTES}"; \
+    echo "${SQLMAP_MAIN_SHA256}  /opt/sqlmap/sqlmap.py" | sha256sum -c -; \
+    rm -rf /opt/sqlmap/doc /opt/sqlmap/extra /opt/sqlmap/tests /opt/sqlmap/.github \
+           /opt/sqlmap/.gitignore /opt/sqlmap/.gitattributes /tmp/sqlmap.tar.gz; \
     chmod -R a+rX /opt/sqlmap; \
     du -sh /opt/sqlmap; \
     python /opt/sqlmap/sqlmap.py --version
