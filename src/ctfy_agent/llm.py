@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -113,6 +114,12 @@ class DeepSeekLLM:
             "max_tokens": self.max_tokens,
             "stream": False,
         }
+        # 思考模式开关：百炼（DashScope）默认开启，重推理步骤会把 max_tokens 全烧在
+        # reasoning_content 上，导致 content 为空、finish=length，白丢一步。
+        # .env 置 LLM_ENABLE_THINKING=0 显式关闭；不设置则完全保持端点默认行为
+        # （回滚到 Paratera 等不认识该字段的网关时，删掉 .env 里那行即可）。
+        if os.environ.get("LLM_ENABLE_THINKING", "").strip().lower() in ("0", "false", "no", "off"):
+            payload["enable_thinking"] = False
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
