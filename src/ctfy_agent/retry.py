@@ -180,7 +180,8 @@ class Orchestrator:
         for idx in range(k):
             caps = self.caps_fn(k - idx) if self.caps_fn else None   # 切片由外部按「题级剩余」算
             meta = {"strategy": STRATEGY_SPECS[idx % len(STRATEGY_SPECS)],
-                    "facts": list(bb.facts)}                          # 黑板事实随 meta 下传（供 FactsBoard.seed）
+                    "facts": list(bb.facts),                          # 黑板事实随 meta 下传（供 FactsBoard.seed）
+                    "dead_ends": list(bb.dead_ends)}                  # 黑板死路随 meta 下传（供 _solve_once 注入勿重复）
             prompt = bb.inject() if idx > 0 else ""                   # 纯文本注入（供其他渲染方；首尝试只看题面）
             out = self.attempt_fn(cid, idx, caps, prompt, meta)
 
@@ -260,7 +261,7 @@ def _self_test() -> int:
     spy2 = []
 
     def spy_nm(cid, idx, caps, prompt, meta):
-        spy2.append((idx, prompt, list(meta["facts"])))
+        spy2.append((idx, prompt, list(meta["facts"]), list(meta.get("dead_ends") or [])))
         return fake_attempt(cid, idx, caps, prompt, meta)
 
     r = Orchestrator(spy_nm, attempts_max=3).run_challenge("near_miss")
@@ -270,6 +271,7 @@ def _self_test() -> int:
     check("attempt#1 无黑板注入(prompt 空)", spy2[0][1] == "")
     check("attempt#2 prompt 含死路", "盲打" in spy2[1][1], spy2[1][1])
     check("attempt#2 meta.facts 含第1次事实", any("存在 /kb" in f for f in spy2[1][2]), spy2[1][2])
+    check("attempt#2 meta.dead_ends 含第1次死路", any("盲打" in d for d in spy2[1][3]), spy2[1][3])
 
     r = orch.run_challenge("hopeless")
     check("hopeless 拦下（1 次）", len(r.attempts) == 1 and r.blocked == "hopeless" and not r.solved, r)

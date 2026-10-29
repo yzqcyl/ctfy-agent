@@ -170,3 +170,36 @@ k = clamp(1..3,
 `platform.py:20,22`（verify 白试 / reset 按 instance_id）、`crew.py:65,518`（oracle 组 / Budget max_calls）、
 `solver.py:574,1062`（instance_ops 拦截 / token 落盘）、`state.py:156,361`（oracle_calls / bump_oracle）、
 `ledger.py:347`（多轮诱导证伪坑）。
+
+## 16. 实测记录（2026-11 真机回归 + A/B，SAMPLE 题单）
+
+> 实现落地后的真机验证，含一处既有 bug 修复 + 一处能力增强（A）的实测证据。
+
+### 16.1 等价回归（SAMPLE-001，k=1 默认 = 旧版等价）
+- `flag_accepted`，6 步解出，88,863 token / 6 calls。
+- 记账正确：`calls_spent=6`、`attempt_used_tokens=88863`；无 `clusterb`/`attempt_cap` 语义泄漏。
+- 结论：k=1 默认路径与旧版逐一等价，未写坏核心路径。
+
+### 16.2 修复：step_limit 误记 budget_exhausted（既有 bug）
+- 现象：`_solve_once`（原 `solve`）步数用满时 `reason` 漏成初始值 `budget_exhausted`（无 `step_limit` 赋值；`step_limit` 只存在于 `run_role`）。
+- 影响：`agent_main._STOP_MAP` 里 `step_limit→max_turns` 本就存在却从未触发，「步数用满」长期被误记为「预算耗尽 cut_off」；集群-B 依赖 reason 判「停 vs 换策略」，被此 bug 卡成 1 次尝试即 `blocked:budget` 早停。
+- 修复：`solver.py` 循环后 `if reason == "budget_exhausted" and steps_used >= budget: reason = "step_limit"`（L1067）。
+
+### 16.3 能力增强 A：黑板继承「死路」dead_ends
+- 动机：首轮 A/B 暴露黑板只继承结论事实、不继承 verify/submit 判错答案 → 第 2/3 次重复试错。
+- 链路：`_solve_once` 采集 `verify_answer/submit_answer` 且 `looks_accepted(text) is False` 的答案 → summary `dead_ends` → `AttemptOutcome.dead_ends` → 黑板 `merge` → 下次 `meta.dead_ends` → `_solve_once(prior_dead_ends)` 注入「勿重复」提示。
+- 精度：仅 `looks_accepted is False`（裸布尔/JSON `correct:false`）才记死路；网络错误（404/isError）经 `looks_accepted` 返回 `None` 而不误记。
+
+### 16.4 A/B（SAMPLE-008，k=3）三次结果
+| # | 策略 | 温度 | reason | 步数 |
+|---|---|---|---|---|
+| 0 | 默认 playbook | 0.2 | step_limit | 12 |
+| 1 | 次优卡换工具面 | 0.5 | step_limit | 12 |
+| 2 | 反推视角 | 0.8 | step_limit | 12 |
+- 3 次都「路径穿越写盘成功」却未解出：judge 期望的 `persist` 答案形式题面未明示（单点未知），多策略无互补；另叠加 `start_instance` 限流、`submit_answer` 404/`false` 等平台通道波动。
+- 总成本：三次累计 ~559k token（实测均值 ~186k/次）。
+
+### 16.5 结论与限制
+- 集群-B 机制（k 次尝试 / 策略温度差异化 / 黑板事实+死路继承 / step_limit 归因）离线 6 脚本 + 真机全绿。
+- 未实证 k=3 > k=1 的解题收益：SAMPLE 题单缺理想 near_miss 对照题；008 属「单点未知」不适用多策略互补，收益实证留待正式赛真实题。
+- 回滚点：git commit `be5d035`（A 之前）。

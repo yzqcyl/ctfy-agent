@@ -757,8 +757,9 @@ class Solver:
             try:
                 summary = self._solve_once(
                     cid, max_steps=max_steps, attempt_index=idx, caps=caps,
-                    prior_facts=meta.get("facts") or None, final=False,
-                    strategy=meta.get("strategy"),
+                    prior_facts=meta.get("facts") or None,
+                    prior_dead_ends=meta.get("dead_ends") or None,
+                    final=False, strategy=meta.get("strategy"),
                 )
             finally:
                 if old_temp is not None:
@@ -780,6 +781,7 @@ class Solver:
                 tokens=summary.get("tokens_spent") or 0,
                 calls=summary.get("calls_spent") or 0,
                 facts=summary.get("facts") or [],
+                dead_ends=summary.get("dead_ends") or [],
             )
 
         def precheck_fn(cid):
@@ -819,8 +821,9 @@ class Solver:
 
     def _solve_once(self, challenge_id: str, *, max_steps: int | None = None,
                     attempt_index: int = 0, caps: dict | None = None,
-                    prior_facts: list[str] | None = None, final: bool = True,
-                    strategy: dict | None = None) -> dict:
+                    prior_facts: list[str] | None = None,
+                    prior_dead_ends: list[str] | None = None,
+                    final: bool = True, strategy: dict | None = None) -> dict:
         # 缓存/jar 都是 Solver 实例级的：同一实例被复用解多道题时先清掉，
         # 防止 A 题的响应体或会话 cookie 被 B 题的同 host:port 请求静默命中（审计 #4 / B1）。
         self._http_cache.clear()
@@ -914,6 +917,10 @@ class Solver:
         facts = FactsBoard()
         if prior_facts:
             facts.seed(prior_facts)  # 集群-B：继承上一次尝试导出的结论事实（不继承推断/判决）
+        if prior_dead_ends:
+            base_head += "\n\n## 前次尝试已判错的答案（勿重复验证/提交，换思路）\n" + "\n".join(
+                "- " + " ".join(str(d).split()) for d in prior_dead_ends
+            )
         evidence_flag = ""
         tool_chars = int((self.config.extra or {}).get("tool_text_chars", DEFAULT_TOOL_TEXT_CHARS))
 
@@ -921,6 +928,7 @@ class Solver:
         steps_used = 0
         reason = "budget_exhausted"
         tail_action = ""
+        dead_ends: list[str] = []          # 集群-B：本次尝试 verify/submit 判定为假的答案（供下次避免重复）
         ledger = Ledger.from_config(self.config)
         plan = PlanTrack()
 
@@ -1016,6 +1024,12 @@ class Solver:
                     except Exception as exc:  # 任何异常都要回灌给模型，别让循环挂掉
                         text, accepted = f"[执行异常] {type(exc).__name__}: {exc}", False
                     tail_action = name  # 集群-B 归因：最后一步动作（verify/submit 接近目标 → near_miss）
+                    if name in (submit_name, "verify_answer") and not accepted:
+                        _ans = str(args.get("answer") or args.get("flag") or args.get("value") or "").strip()
+                        if _ans and looks_accepted(text) is False:
+                            _de = f"{name}: {_ans}"
+                            if _de not in dead_ends:
+                                dead_ends.append(_de)
 
                 self.store.append_transcript(
                     challenge_id, {"step": step, "role": "tool", "name": name, "args": args, "result": text[:2000]}
@@ -1090,6 +1104,7 @@ class Solver:
             "reason": reason,
             "tail_action": tail_action,
             "facts": facts.as_list(),
+            "dead_ends": dead_ends,
             "budget": end_usage,
             "usage": usage,
             "tokens_spent": usage["total_tokens"],
