@@ -133,7 +133,11 @@ print("REDIRECT-PROBE decoy_hits=%d  (0 = sqlmap 未跟随 302；>0 = 跟随了�
 print("REDIRECT-PROBE tail:")
 print(tail)
 PY
-    python /tmp/redirprobe.py; \
+
+# 构建期自检第二步（必须独立 RUN）：上面 `cat > … <<'PY'` 的 heredoc 在 `PY` 处就结束了
+# 所在 RUN 指令——若把 `python /tmp/redirprobe.py` 继续接在同一段里，Dockerfile 解析器会把
+# 它当成新指令（实测 CI 报 "unknown instruction: python"，run 40835923318）。
+RUN python /tmp/redirprobe.py; \
     test -s /tmp/o.json; \
     python -c "import json;d=json.load(open('/tmp/o.json'));assert isinstance(d.get('results'),list),'ffuf JSON 结构异常';print('ffuf selftest ok, results=',len(d['results']))"; \
     rm -rf /tmp/o.json /tmp/w.txt /tmp/redirprobe.py /tmp/sqlmap-out /tmp/sqlmap-probe /root/.sqlmap
