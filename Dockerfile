@@ -72,7 +72,7 @@ RUN set -eux; \
       "https://raw.githubusercontent.com/sqlmapproject/sqlmap/${SQLMAP_VERSION}/sqlmap.py"; \
     test "$(stat -c%s /opt/sqlmap/sqlmap.py)" = "${SQLMAP_MAIN_BYTES}"; \
     echo "${SQLMAP_MAIN_SHA256}  /opt/sqlmap/sqlmap.py" | sha256sum -c -; \
-    rm -rf /opt/sqlmap/doc /opt/sqlmap/extra /opt/sqlmap/tests /opt/sqlmap/.github \
+    rm -rf /opt/sqlmap/doc /opt/sqlmap/tests /opt/sqlmap/.github \
            /opt/sqlmap/.gitignore /opt/sqlmap/.gitattributes /tmp/sqlmap.tar.gz; \
     chmod -R a+rX /opt/sqlmap; \
     du -sh /opt/sqlmap; \
