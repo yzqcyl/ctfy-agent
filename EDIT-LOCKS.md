@@ -12,7 +12,6 @@
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
 | docs/plan-p2v-validation-and-alignment.md | Y（镜像/验证线） | 10-30 19:00 | 方案已批；按门推进时更新，门 C 后释放 |
-| config/agent.json + roles/{ai,misc}.json + roles/{ai,misc}.system.txt | Y（镜像/验证线，用户已批「提示词补丁」） | 10-31 03:30 | **提示词补丁**：web/ai 引导 greps 多搜与 fresh 重取；misc/rev/crypto/pwn/web 引导 write_file 落盘脚本；零漂移契约三源同步（config ↔ roles.json ↔ system.txt） |
 
 ## 已释放
 
@@ -28,6 +27,8 @@
 | docs/spec-o2-o3-tools.md | Y（镜像/验证线） | 10-30 21:50–22:00 | O2 收窄规格 + O3 关闭记录（第 2 项交付） |
 | docs/note-zhipu-model-choice.md | Y（镜像/验证线） | 10-30 22:00–22:10 | 正式赛模型选型备忘（第 3 项交付） |
 | src/ctfy_agent/ledger.py + tests/smoke_evidence.py | Y（镜像/验证线） | 10-30 22:40–23:10 | **agent 打磨**：M4 证据归一修复（嵌套 JSON 内层证据被误杀 → 真实回放 10/14 转接受；smoke.py 144 通过）；**未提交**，门 A 统一提交 |
+| config/agent.json + roles/{ai,misc}.json + roles/{ai,misc}.system.txt | Y（镜像/验证线） | 10-31 03:30–03:50 | **提示词补丁**：web/ai 引导 greps 多搜与 fresh 重取；misc/rev/crypto/pwn/web 引导 write_file 落盘脚本；三源零漂移自检通过、全量 28/28（已提交 504b2e1） |
+| docs/bigbank-report-2026-10-31.md + docs/bigbank-results-2026-10-31.csv | Y（镜像/验证线） | 10-31 06:00–06:30 | **大规模综合测试报告**：132 题实跑，77 解出（58.3%）；重叠 35 题 28.6%→48.6%；含环境限制与复现命令 |
 | runs/_agent_forensics.py, runs/_rej_diag.py | Y（镜像/验证线） | 10-30 22:20–23:00 | 行为取证 / 拒收诊断工具（离线，零实例零 token） |
 | docs/audit-agent-2026-10-30.md | Y（镜像/验证线） | 10-30 23:10–23:55 | 本轮 agent 诊断与修复记录（C/A/B 三节 + 口径修正 + 门 A 待办） |
 | runs/_timeline.py, runs/_err_infra.py, runs/_subset_score.py, runs/_access_scan.py | Y（镜像/验证线） | 10-30 23:25–23:50 | 单题时间线 / 预算去向与错误分类 / 可达性口径 诊断脚本（离线、零 token） |
