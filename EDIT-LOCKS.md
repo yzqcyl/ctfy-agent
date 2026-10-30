@@ -12,6 +12,7 @@
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
 | docs/plan-p2v-validation-and-alignment.md | Y（镜像/验证线） | 10-30 19:00 | 方案已批；按门推进时更新，门 C 后释放 |
+| config/agent.json + roles/{ai,misc}.json + roles/{ai,misc}.system.txt | Y（镜像/验证线，用户已批「提示词补丁」） | 10-31 03:30 | **提示词补丁**：web/ai 引导 greps 多搜与 fresh 重取；misc/rev/crypto/pwn/web 引导 write_file 落盘脚本；零漂移契约三源同步（config ↔ roles.json ↔ system.txt） |
 
 ## 已释放
 
