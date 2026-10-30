@@ -9,7 +9,7 @@
 
 两层证明：
   - case_ai_contract（结构）：roles/ai.json 与活配置零漂移、Crew 吃下 ai 角色、
-    平台工具面 == 9 白名单且无提交权、本地工具面有 chat 无 shell、
+    平台工具面 == 10 白名单（含 verify_exploit）且无提交权、本地工具面有 chat/shell/decode_blob、
     提示词不吞框架三规则、协调者提示词带路由判据。
   - case_ai_wiring（行为）：真跑一遍 Crew——协调者 delegate(ai) → 专家跑 run_role
     （allow_chat 经 M1 接线生效）→ 两轮 chat 从 mock 靶子拿到秘密（多轮才泄露）
@@ -35,6 +35,8 @@ AI_PLATFORM_WHITELIST = {
     "get_challenge", "list_challenge_attachments", "download_challenge_attachment",
     "list_hints", "view_hint", "start_instance",
     "list_instance_attachments", "download_instance_attachment", "verify_answer",
+    # [web-ai-gap 2026-10-30] checker 型 AI 题自校验通道（不必绕协调者）
+    "verify_exploit",
 }
 
 
@@ -92,11 +94,11 @@ def case_ai_contract(tmp: Path) -> None:
     # 3) 关键行为条款漂移守卫（对照 roles/ai.system.txt 逐条钉住）
     for needle in (
         "阶梯", "引用靶子上一句", "session", "reset", "技法", "反劫持",
-        "原样摘录", "FLAG{...}", "上限 12 步",
+        "原样摘录", "FLAG{...}", "上限 14 步",
     ):
         assert needle in raw_prompt, f"ai 提示词缺关键条款: {needle}"
-    # 步数预算与配置一致（提示词写死了 12，config 也必须是 12，否则两处漂移）
-    assert int(spec["max_steps"]) == 12, spec["max_steps"]
+    # 步数预算与配置一致（提示词写死了 14，config 也必须是 14，否则两处漂移）
+    assert int(spec["max_steps"]) == 14, spec["max_steps"]
 
     server, url = fake_llm.start_fake_mcp()
     try:
@@ -132,13 +134,11 @@ def case_ai_contract(tmp: Path) -> None:
         assert not (AI_PLATFORM_WHITELIST & {"submit_flag", "submit_answer"}), "ai 不应有提交工具"
         assert "submit" not in (spec.get("platform") or []), spec["platform"]
 
-        # 7) 本地工具面：chat 在、shell 不在（AI 题不需要 shell，裁掉缩小 schema）
+        # 7) 本地工具面：chat + http_request + shell + decode_blob（M6 补齐：AI 题要构造载荷/上传/解码）
         face = {s["function"]["name"] for s in crew._role_specs("ai")}
-        assert {"chat", "http_request", "note", "report"} <= face, face
-        assert "shell" not in face, face
-        assert "decode_blob" not in face and "hexpeek" not in face, face
+        assert {"chat", "http_request", "note", "report", "shell", "decode_blob"} <= face, face
         assert "submit_flag" not in face and "submit_answer" not in face, face
-        assert crew.roles["ai"].get("allow_shell") is False, "ai 必须 allow_shell=false"
+        assert crew.roles["ai"].get("allow_shell") is True, "ai 必须 allow_shell=true（M6：载荷构造用 python3/curl）"
 
         # 7b) 动态路由通道：协调者简报必须同时出现 ai 角色与 ASI tags（静态提示词之外的第二通道）
         from ctfy_agent.state import Challenge  # noqa: PLC0415
@@ -179,7 +179,8 @@ def case_ai_contract(tmp: Path) -> None:
         covered = set().union(*(set(keys) for keys, _ in AI_CARDS))
         missing = AI_TAGS - covered - {"agentic_ai"}
         assert not missing, f"这些 AI tag 没有卡片覆盖（新增陷阱时必须补卡）：{sorted(missing)}"
-        assert len(AI_CARDS) == 18, f"AI 卡应为 10 张 ASI + 1 张载荷清单 + 7 张防御族，实有 {len(AI_CARDS)}"
+        assert len(AI_CARDS) == 20, (f"AI 卡应为 10 张 ASI + 1 张载荷清单 + 7 张防御族 "
+                                     f"+ 2 张 AI 基建（指纹定型 + 七类结构洞），实有 {len(AI_CARDS)}")
 
         all_keys = covered | set().union(*(set(keys) for keys, _ in CARDS)) | set(IGNORED_TAGS)
         exempt = {"agentic_ai"}  # 族标签：全族共有的粗粒度标签，无专属打法
@@ -227,7 +228,7 @@ def case_ai_contract(tmp: Path) -> None:
         plain_ai = Solver._method_hint(Challenge(id="y", category="ai", tags=["some_unknown_tag"]))
         assert plain_ai == "", plain_ai
 
-        _ok("AI/M2 契约：ai 零漂移接入（9 工具白名单 / 无提交权 / chat 进 shell 出 / 三规则 / 路由判据 / 17 卡覆盖 + 三池对账）")
+        _ok("AI/M2 契约：ai 零漂移接入（10 工具白名单含 verify_exploit / 无提交权 / chat+shell+decode_blob / 三规则 / 路由判据 / 20 卡覆盖 + 三池对账）")
     finally:
         server.shutdown()
         server.server_close()

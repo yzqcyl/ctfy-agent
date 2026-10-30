@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from json import JSONDecodeError
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -382,6 +383,50 @@ def _fold_ws(text: str) -> str:
     return " ".join(_norm_scalar(text).split())
 
 
+def _fold_key(text: str) -> str:
+    """比较键：NFKC（全角→半角）+ 空白折叠。只做表示层归一，不改字符内容。"""
+    return _fold_ws(unicodedata.normalize("NFKC", _norm_scalar(text)))
+
+
+def _decoded_strings(raw: str, max_layers: int = 3) -> list[str]:
+    """解出 raw 里嵌套 JSON 的**内层字符串**（模型看到的常是解码后的内容）。
+
+    report.evidence 常被模型从响应体 JSON 的内层字段逐字复制，而账本存的是带转义的外层
+    原文（如 `\"body\": \"{\\\"data\\\":...}\"`），字面比对必然落空——v0 批 14 次 report 被拒
+    里有 10 次属此（docs/audit-agent-2026-10-30 取证）。这里只做表示层归一：解出的字符串
+    仍必须与 evidence 连续逐字一致，不是语义匹配。
+    """
+    out: list[str] = []
+    frontier = [_norm_scalar(raw)]
+    for _ in range(max(1, int(max_layers))):
+        nxt: list[str] = []
+        for text in frontier:
+            t = text.lstrip()
+            if not t.startswith(("{", "[")):
+                continue
+            try:
+                data = json.loads(t)
+            except (JSONDecodeError, ValueError):
+                continue
+            stack = [data]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, str):
+                    if 8 <= len(cur) <= 200_000:
+                        out.append(cur)
+                        if cur.lstrip().startswith(("{", "[")):
+                            nxt.append(cur)
+                elif isinstance(cur, dict):
+                    stack.extend(str(k) for k in cur)
+                    stack.extend(cur.values())
+                elif isinstance(cur, list):
+                    stack.extend(cur)
+        frontier = nxt
+        if not frontier:
+            break
+    return out
+
+
 # ---------- 数据对象 ----------
 
 
@@ -537,19 +582,27 @@ class Ledger:
         """M4：evidence 必须是**某一次工具输出内的逐字连续子串**。
 
         命中则返回来源 label（可写进 observation 溯源），否则 None。
-        只放宽空白折叠（模型复制大段 JSON 时常改缩进/换行），字符内容必须连续存在。
+        比较前只做三件表示层归一（都不改字符内容/顺序）：
+          1. 空白折叠（模型复制大段 JSON 时常改缩进/换行）；
+          2. NFKC（全角括号/标点 → 半角）；
+          3. **解出嵌套 JSON 的内层字符串**再比——模型逐字复制的常是解码后的响应体字段，
+             而账本原文带转义（`\\\"body\\\": \\\"{...}\\\"`），不归一必然误杀
+             （v0 实测 14 次拒收里 10 次属此；修复依据见 docs/audit-agent-2026-10-30.md）。
         """
         raw_evidence = _norm_scalar(evidence).strip()
         if len(raw_evidence) < 4:
             return None
-        folded = _fold_ws(raw_evidence)
+        folded = _fold_key(raw_evidence)
         for item in reversed(self.order):
             if not item.raw:
                 continue
             if raw_evidence in item.raw:
                 return item.label
-            if folded and folded in _fold_ws(item.raw):
+            if folded and folded in _fold_key(item.raw):
                 return item.label
+            for inner in _decoded_strings(item.raw):
+                if raw_evidence in inner or (folded and folded in _fold_key(inner)):
+                    return item.label
         return None
 
     # ---- 假设轮换 ----
@@ -566,8 +619,12 @@ class Ledger:
         self._newly_refuted = []
         return fresh
 
-    def recent_sources(self, k: int = 5, snippet: int = 120) -> str:
-        """给「被拒的 report」回显可选证据来源：label + 真实输出片段（原样复制即可）。"""
+    def recent_sources(self, k: int = 5, snippet: int = 240) -> str:
+        """给「被拒的 report」回显可选证据来源：label + 真实输出片段（原样复制即可）。
+
+        snippet 取 240：实测被拒 evidence 中位长度 >120，片段太短会让模型复制时被迫拼接
+        （v0 批有 191 字符的 evidence 因片段只有 120 字符而拼错）。
+        """
         lines: list[str] = []
         for item in list(reversed(self.order)):
             if len(lines) >= k:

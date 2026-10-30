@@ -73,17 +73,31 @@ def case_cluster_a(tmp: Path) -> None:
     calls: list[dict] = []
     lock = threading.Lock()
 
-    def _fake(solve_idx: int, clobber: bool = False, usage=(100, 50, 10)):
-        """solve 桩：solve_idx=第几个到达的路解出（-1=无人解出）；clobber=慢路整体 save 洗磁盘。"""
+    def _fake(solve_idx: int, clobber: bool = False, usage=(100, 50, 10), lanes: int = 3):
+        """solve 桩：solve_idx=第几个到达的路解出；clobber=慢路整体 save 洗磁盘。
+
+        并发确定性：lane() 入口有 `if cancel.is_set(): 判 superseded 零用量` 的软取消检查，
+        若解出路先返回并置位 cancel，**迟到的 lane 线程会在入口被挡掉**，用量少并一路
+        （实测全套跑偶发 300/20 vs 期望 450/30，单跑必过 —— 竞态在测试对线程调度的依赖）。
+        这里加一道栅栏：每路进桩即计数，解出路等所有 `lanes` 路都进桩后才返回，
+        确保没有路在入口被 cancel 挡掉；顺序（谁先解出/clobber 更慢）仍由原有 sleep 控制。
+        """
+        gate = {"n": 0}
+        gate_cv = threading.Condition()
 
         def fake_solve(self, challenge_id, *, attempt_caps=None, prior_text="", temperature=None,
                        keep_instance=None, cancel_event=None):
-            time.sleep(0.03)  # 保证 3 路都已启动（过了软取消检查），观察点稳定
             init_calls = int(self.store.require(challenge_id).tokens.get("calls") or 0)
             with lock:
                 i = len(calls)
                 calls.append({"caps": dict(attempt_caps or {}), "temperature": temperature,
                               "cancel_event": cancel_event})
+            with gate_cv:
+                gate["n"] += 1
+                gate_cv.notify_all()
+                if not gate_cv.wait_for(lambda: gate["n"] >= lanes, timeout=15):
+                    raise RuntimeError("lane 栅栏超时：%d/%d 路未进桩" % (gate["n"], lanes))
+            time.sleep(0.05)  # 栅栏后留一点错开，保证「先到先赢」顺序稳定
             pt, ct, ncalls = usage
             if i == solve_idx:
                 ch = self.store.require(challenge_id)  # 本路内存视图：模拟 mark_submitted 落状态
@@ -97,8 +111,11 @@ def case_cluster_a(tmp: Path) -> None:
                         "budget": {"calls": init_calls + ncalls, "total_tokens": pt + ct},
                         "facts": ["flag 在 output.txt"], "dead_ends": [], "candidates": ["flag{a1b2}"]}
             if clobber:
-                time.sleep(0.12)  # 比解出路慢：整体无锁 save，把磁盘上刚写的 flag 洗掉
-                self.store.save()
+                time.sleep(0.6)  # 比解出路慢：整体无锁 save，把磁盘上刚写的 flag 洗掉
+                try:
+                    self.store.save()  # 并发下偶发锁/权限异常：洗盘是测试意图，失败不该让该路 usage 归零
+                except Exception:  # noqa: BLE001
+                    pass
             return {"challenge_id": challenge_id, "submitted": False, "reason": "step_limit",
                     "steps": 3, "tokens_spent": pt + ct,
                     "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
@@ -191,16 +208,18 @@ def case_cluster_a(tmp: Path) -> None:
     # ---------- 场景 5：零回归（web / 未配置 / 非法值 → 串行） ----------
     calls.clear()
     crew5, _s5, _c5 = _mk(tmp / "reg", cluster_a_concurrency=3)
-    summary5 = _run(crew5, "web-01", _fake(solve_idx=-1))
+    summary5 = _run(crew5, "web-01", _fake(solve_idx=-1, lanes=1))
     assert len(calls) == 1 and calls[0]["caps"] == {} and calls[0]["temperature"] is None, calls
     assert "cluster_a" not in summary5 and "clusterb" not in summary5, summary5
     _ok("clusterA: 零回归 web 题走串行（1 次、无切片、无 cluster_a 段）")
 
     calls.clear()
     crew6, _s6, _c6 = _mk(tmp / "reg2")
-    summary6 = _run(crew6, "crypto-01", _fake(solve_idx=-1))
+    summary6 = _run(crew6, "crypto-01", _fake(solve_idx=-1, lanes=1))
     assert len(calls) == 1 and "cluster_a" not in summary6, (calls, summary6)
     crew7, _s7, _c7 = _mk(tmp / "reg3", cluster_a_concurrency="auto")
-    summary7 = _run(crew7, "crypto-01", _fake(solve_idx=-1))
+    # "auto" 不是有效并发值 → n_a=0 走串行；2 次调用来自集群-B 的两次串行 attempt，
+    # 因此栅栏按 1 路（串行）计，不能等第 2 次（第 1 次不返回它就不会开始）。
+    summary7 = _run(crew7, "crypto-01", _fake(solve_idx=-1, lanes=1))
     assert len(calls) == 2 and "cluster_a" not in summary7, (calls, summary7)
     _ok("clusterA: 未配置/非法值兜底串行不炸")

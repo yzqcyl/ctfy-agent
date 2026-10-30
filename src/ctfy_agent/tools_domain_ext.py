@@ -17,9 +17,13 @@
 """
 from __future__ import annotations
 
+import marshal  # [rev-toolbox] bytecode 视图：.pyc / PyInstaller 的 marshal 载荷
+import math  # [crypto-toolbox] isqrt/gcd（纯 stdlib 大数算法）
 import socket
 import struct
 import time
+import types  # [rev-toolbox] bytecode 视图：CodeType 判定
+import zlib  # [rev-toolbox] bytecode 视图：PyInstaller/PYZ 的 zlib 载荷
 from pathlib import Path
 
 TOOL_TEXT_MAX = 6000
@@ -358,14 +362,25 @@ class _Elf:
         return sec
 
 
-def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60) -> str:
-    """ELF 静态探测：info / sections / symbols / strings / gadgets。"""
+# >>> [rev-toolbox 2026-10-30] elfpeek 升级：新增 disasm / bytecode 视图；gadgets v2；strings 支持 utf16。
+# 详细说明与验收见 docs/rev-toolbox-plan.md。capstone 为可选引擎（镜像 v4 起内置），缺失时走 stdlib 退化路径。
+def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60,
+            offset: int = 0, length: int = 128, count: int = 40, arch: str = "",
+            extract: str = "", func: str = "", utf16: bool = False, filt: str = "",
+            symbol: str = "", search: str = "") -> str:
+    """ELF / 字节码静态探测：info / sections / symbols / strings / gadgets / disasm / bytecode。"""
     p = Path(path)
     if not p.exists():
         raise DomainToolError("文件不存在：%s（先用 download_*_attachment 落盘到沙盒）" % path)
     data = p.read_bytes()
-    elf = _Elf(data)
     view = (view or "info").strip().lower()
+    if view == "bytecode":  # [rev-toolbox] .pyc / PyInstaller 不是 ELF，先分流再构造 _Elf
+        return _view_bytecode(p, data, extract=extract, func=func)
+    if view == "strings" and utf16:  # [rev-toolbox] 宽字符扫描不要求 ELF（任意文件可扫）
+        wide = _strings_utf16(data, int(min_len), int(limit))
+        return _clip("UTF-16 宽字符串 %d 条：\n%s\n（ASCII 串用 utf16=false；找不到时可能不是宽字符编码）" % (
+            len(wide), "\n".join(wide) if wide else "（无）"))
+    elf = _Elf(data)
     if view == "info":
         sec = elf.security()
         lines = [
@@ -374,6 +389,7 @@ def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60) ->
                 elf.e_machine, elf.e_entry, elf.e_shnum, len(data)),
             "类型：%s（PIE=%s）" % (sec["类型"], sec["PIE"]),
             "缓解措施：NX=%s  canary=%s  RELRO=%s" % (sec["NX"], sec["canary"], sec["RELRO"]),
+            _entry_line(elf),  # [rev-toolbox] 入口所在段（UPX/壳的快速线索）
         ]
         secs = elf.sections()
         names = [s[0] for s in secs if s[0]]
@@ -399,17 +415,1309 @@ def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60) ->
         found = elf.strings(int(min_len), int(limit))
         return _clip("字符串 %d 条（优先含 flag/pass/key 等）：\n%s" % (len(found), "\n".join(found)))
     if view == "gadgets":
-        pats = {
-            "pop rdi; ret": b"\x5f\xc3", "pop rsi; ret": b"\x5e\xc3",
-            "pop rdx; ret": b"\x5a\xc3", "pop rax; ret": b"\x58\xc3",
-            "syscall; ret": b"\x0f\x05\xc3", "/bin/sh": b"/bin/sh\x00",
-        }
-        rows = []
-        for name, pat in pats.items():
-            pos = data.find(pat)
-            rows.append("%-16s %s" % (name, ("0x%x" % pos) if pos >= 0 else "未找到"))
-        return _clip("gadget/常量扫描：\n" + "\n".join(rows))
-    raise DomainToolError("view 只支持 info/sections/symbols/strings/gadgets，收到 %r" % view)
+        # [rev-toolbox] v2：capstone 真实指令边界枚举；无 capstone/非 x86 时退回原 5 模式首现扫描
+        return _view_gadgets(data, elf, filt=filt, limit=int(limit))
+    if view == "disasm":  # [rev-toolbox] 反汇编视图（capstone 引擎，stdlib 字节视图退化）
+        return _view_disasm(data, elf, offset=int(offset or 0), length=int(length or 128),
+                            count=int(count or 40), arch=arch)
+    if view == "lookup":  # [pwn-toolbox] 符号/字符串精确查询（ret2libc 辅助）
+        return _view_lookup(data, elf, symbol=symbol, search=search)
+    raise DomainToolError("view 只支持 info/sections/symbols/strings/gadgets/disasm/bytecode/lookup，收到 %r" % view)
+
+
+# >>> [rev-toolbox 2026-10-30] ===== rev 方向工具箱 v2 实现 =====
+# 本段（含文中 [rev-toolbox] 行内标记）均为 toolbox 会话新增；并行会话合并时按标记识别。
+# 依赖策略：capstone 为可选引擎（镜像 v4 起内置）；缺失时所有功能走 stdlib 退化路径，不抛错。
+
+
+def _phdrs(elf):
+    """[(p_type, p_flags, p_offset, p_vaddr, p_filesz)]——只取 CTF 常用字段。"""
+    out = []
+    for i in range(elf.e_phnum):
+        off = elf.e_phoff + i * elf.e_phentsize
+        if off + elf.e_phentsize > len(elf.data):
+            break
+        if elf.is64:
+            p_type, p_flags = struct.unpack_from(elf.endian + "II", elf.data, off)
+            p_offset, p_vaddr, _pa, p_filesz = struct.unpack_from(elf.endian + "QQQQ", elf.data, off + 8)
+        else:
+            (p_type, p_offset, p_vaddr, _pa, p_filesz, _msz, p_flags, _al) = struct.unpack_from(
+                elf.endian + "IIIIIIII", elf.data, off)
+        out.append((p_type, p_flags, p_offset, p_vaddr, p_filesz))
+    return out
+
+
+def _off_to_vaddr(elf, off):
+    for p_type, _fl, p_offset, p_vaddr, p_filesz in _phdrs(elf):
+        if p_type == 1 and p_offset <= off < p_offset + max(p_filesz, 1):
+            return p_vaddr + (off - p_offset)
+    return None
+
+
+def _entry_line(elf):
+    """info 视图补充：入口落在哪个 PT_LOAD（UPX/加壳的快速线索）。"""
+    for p_type, p_flags, p_offset, p_vaddr, p_filesz in _phdrs(elf):
+        if p_type == 1 and p_vaddr <= elf.e_entry < p_vaddr + max(p_filesz, 1):
+            return "入口段：PT_LOAD vaddr 0x%x..0x%x（文件 0x%x..0x%x，%s）" % (
+                p_vaddr, p_vaddr + p_filesz, p_offset, p_offset + p_filesz,
+                "可执行" if p_flags & 1 else "不可执行——入口在非执行段，注意 UPX/壳")
+    return "入口 0x%x 未落在任何 PT_LOAD（可能加壳/手工构造）" % elf.e_entry
+
+
+def _capstone_for(elf, arch=""):
+    """[rev-toolbox] capstone 可选引擎：不可用返回 None，由调用方走退化路径。
+
+    用 importlib 动态加载而非静态 import：case_stdlib_only 静态扫描禁止第三方
+    import（v3 镜像无 pip）；capstone 到 v4 镜像才内置。缺失时永不 ImportError。
+    """
+    try:
+        import importlib
+
+        capstone = importlib.import_module("capstone")
+    except Exception:
+        return None
+    a = (arch or "").strip().lower()
+    if a in ("x86", "i386", "32"):
+        return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    if a in ("x64", "x86-64", "amd64"):
+        return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    if a in ("arm64", "aarch64"):
+        return capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_LITTLE_ENDIAN)
+    if a == "arm":
+        return capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM)
+    if elf.is64 and elf.e_machine == 62:
+        return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    if elf.e_machine == 3:
+        return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    if elf.e_machine == 183:
+        return capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_LITTLE_ENDIAN)
+    if elf.e_machine == 40:
+        return capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM)
+    return None
+
+
+def _nearest_symbol(syms, addr):
+    best_nm, best_va = "", -1
+    for nm, value, _t in syms:
+        if value and value <= addr and value > best_va:
+            best_nm, best_va = nm, value
+    if best_nm and 0 <= addr - best_va < 0x10000:
+        return "<%s+0x%x>" % (best_nm, addr - best_va)
+    return ""
+
+
+def _view_disasm(data, elf, offset=0, length=128, count=40, arch=""):
+    """[rev-toolbox] 反汇编视图：capstone 引擎；无引擎退化为字节视图（不抛错）。"""
+    length = max(16, min(int(length or 128), 4096))
+    count = max(10, min(int(count or 40), 200))
+    target = max(0, int(offset or 0))
+    if target >= len(data):  # [rev-toolbox] 超界先报错，再做段吸附
+        raise DomainToolError("offset=0x%x 超出文件长度 0x%x（先 sections 视图看范围）" % (target, len(data)))
+    note = ""
+    exe = [(off, sz) for t, fl, off, _va, sz in _phdrs(elf) if t == 1 and (fl & 1)]
+    loads = [(off, sz) for t, _fl, off, _va, sz in _phdrs(elf) if t == 1]
+    if not any(o <= target < o + max(s, 1) for o, s in exe):
+        pool = exe or loads
+        if pool:
+            near = min(pool, key=lambda o_s: abs(o_s[0] - target))[0]
+            note = "（offset=0x%x 不在可执行段，已吸附到 0x%x；段范围见 info/sections）" % (target, near)
+            target = near
+    va = _off_to_vaddr(elf, target)
+    md = _capstone_for(elf, arch)
+    if md is None:
+        chunk = data[target:target + length]
+        lines = [
+            "本环境无 capstone（v4 镜像起内置）——退化为字节视图；优先走 symbols/strings 推理，"
+            "或用 python3 按已知指令编码人工核对：",
+            "文件偏移 0x%x 起 %d 字节（vaddr %s）：%s" % (
+                target, len(chunk), hex(va) if va is not None else "?", _hex_preview(chunk, 256)),
+        ]
+        if note:
+            lines.insert(0, note)
+        return _clip("\n".join(lines))
+    lines = [note] if note else []
+    lines.append("反汇编 文件偏移 0x%x，%d 字节，vaddr %s%s" % (
+        target, length, hex(va) if va is not None else "?",
+        "（PIE：运行时地址=基址+此地址）" if elf.security()["PIE"] else ""))
+    syms = elf.symbols()
+    n = 0
+    for insn in md.disasm(data[target:target + length], va if va is not None else target):
+        tag = _nearest_symbol(syms, insn.address)
+        lines.append("%08x  %-20s %-8s %s%s" % (
+            insn.address, insn.bytes.hex()[:20], insn.mnemonic, insn.op_str,
+            ("  ; %s" % tag) if tag else ""))
+        n += 1
+        if n >= count:
+            break
+    if n == 0:
+        lines.append("（0 条可解码指令：偏移可能落在数据区或指令中间，换 offset 或先看 sections/symbols）")
+    return _clip("\n".join(lines))
+
+
+_GADGET_PATS = {  # [rev-toolbox] 原 gadgets 盲扫模式，保留为退化路径（行为原样迁移）
+    "pop rdi; ret": b"\x5f\xc3", "pop rsi; ret": b"\x5e\xc3",
+    "pop rdx; ret": b"\x5a\xc3", "pop rax; ret": b"\x58\xc3",
+    "syscall; ret": b"\x0f\x05\xc3", "/bin/sh": b"/bin/sh\x00",
+}
+
+_GADGET_TOKEN_MAP = {
+    "rdi": "pop rdi", "rsi": "pop rsi", "rdx": "pop rdx", "rax": "pop rax",
+    "syscall": "syscall", "int80": "int 0x80", "leave": "leave",
+}
+
+
+def _gadgets_pattern_fallback(data, elf):
+    rows = []
+    for name, pat in _GADGET_PATS.items():
+        pos = data.find(pat)
+        va = _off_to_vaddr(elf, pos) if pos >= 0 else None
+        rows.append("%-16s %s%s" % (name, ("0x%x" % pos) if pos >= 0 else "未找到",
+                                    ("（vaddr 0x%x）" % va) if va is not None else ""))
+    return rows
+
+
+def _view_gadgets(data, elf, filt="", limit=60):
+    """[rev-toolbox] gadgets v2：capstone 真实指令边界枚举（深度≤5）；退化时保持旧盲扫行为。"""
+    tokens = [t.strip().lower() for t in (filt or "rdi|rsi|rdx|syscall|binsh").split("|") if t.strip()]
+    md = _capstone_for(elf)
+    if md is None or elf.e_machine not in (3, 62):
+        rows = _gadgets_pattern_fallback(data, elf)
+        return _clip("gadget/常量扫描（无 capstone 或非 x86，退化为固定模式首现扫描）：\n" + "\n".join(rows))
+    want = {t: _GADGET_TOKEN_MAP.get(t, t) for t in tokens if t != "binsh"}
+    hits = {}
+    found_per = {t: 0 for t in want}
+    deadline = time.monotonic() + 4.0
+    segs = [(off, _off_to_vaddr(elf, off) or off, sz)
+            for t, fl, off, va, sz in _phdrs(elf) if t == 1 and (fl & 1)]
+    done = False
+    for seg_off, seg_va, seg_sz in segs:
+        blob = data[seg_off:seg_off + seg_sz]
+        rets = [i for i in range(len(blob)) if blob[i] == 0xC3]
+        if len(rets) > 2000:
+            rets = rets[:2000]
+        for r in rets:
+            if done or time.monotonic() > deadline:
+                break
+            for start in range(max(0, r - 20), r):
+                try:
+                    insns = list(md.disasm(blob[start:r + 1], seg_va + start))
+                except Exception:
+                    continue
+                if not insns or len(insns) > 5:
+                    continue
+                if sum(i.size for i in insns) != (r + 1 - start) or insns[-1].mnemonic != "ret":
+                    continue
+                chain = " ; ".join((i.mnemonic + (" " + i.op_str if i.op_str else "")) for i in insns)
+                for t, needle in want.items():
+                    if needle in chain and found_per[t] < 5:
+                        found_per[t] += 1
+                        if chain not in hits:
+                            hits[chain] = (seg_off + start, seg_va + start)
+                if want and all(v >= 5 for v in found_per.values()):
+                    done = True
+                    break
+        if done or time.monotonic() > deadline:
+            break
+    rows = ["gadget 枚举（capstone 真实指令边界，深度≤5，只扫可执行段；filter 可换关键字）%s" % (
+        "（超时截断，结果不全）" if time.monotonic() > deadline else "")]
+    for t, needle in want.items():
+        got = [(c, a) for c, a in hits.items() if needle in c][:5]
+        if got:
+            for chain, (fo, va) in got:
+                rows.append("%-40s 0x%-8x vaddr 0x%x" % (chain[:40], fo, va))
+        else:
+            rows.append("%-40s 未找到" % needle)
+    if "binsh" in tokens:
+        pos, bins = 0, []
+        while len(bins) < 5:
+            pos = data.find(b"/bin/sh\x00", pos)
+            if pos < 0:
+                break
+            va = _off_to_vaddr(elf, pos)
+            bins.append("0x%x%s" % (pos, ("（vaddr 0x%x）" % va) if va is not None else ""))
+            pos += 1
+        rows.append("%-40s %s" % ("/bin/sh", ", ".join(bins) if bins else "未找到"))
+    if elf.security()["PIE"]:
+        rows.append("（PIE：vaddr 为链接地址，利用时加运行基址）")
+    return _clip("\n".join(rows))
+
+
+def _strings_utf16(data, min_len=4, limit=60):
+    """[rev-toolbox] UTF-16 LE/BE 宽字符串扫描。"""
+    found = []
+
+    def scan(shift):
+        out, cur = [], bytearray()
+        i = shift
+        while i + 1 < len(data):
+            lo, hi = data[i], data[i + 1]
+            if hi == 0 and 32 <= lo < 127:
+                cur.append(lo)
+            else:
+                if len(cur) >= min_len:
+                    out.append(cur.decode("latin-1"))
+                cur = bytearray()
+            i += 2
+        if len(cur) >= min_len:
+            out.append(cur.decode("latin-1"))
+        return out
+
+    found.extend(scan(0))  # LE：低字节在前、高字节 0
+    found.extend(scan(1))  # BE
+    found.sort(key=len, reverse=True)
+    return found[:limit]
+
+
+# ---------- [rev-toolbox] bytecode：.pyc / PyInstaller ----------
+
+_PYI_COOKIE = b"MEI\x0c\x0b\x0a\x0b\x0e"
+
+
+def _walk_codes(code):
+    out = [code]
+    for k in code.co_consts:
+        if isinstance(k, types.CodeType):
+            out.extend(_walk_codes(k))
+    return out
+
+
+def _render_code(code, func=""):
+    """把 code 对象渲染成：常量池（关键词优先）+ co_names + dis 片段。"""
+    import dis as _dis
+    target = code
+    if func:
+        found = [c for c in _walk_codes(code) if c.co_name == func]
+        if not found:
+            names = ", ".join(sorted({c.co_name for c in _walk_codes(code)}))[:400]
+            raise DomainToolError("没找到函数 %r；可用对象：%s" % (func, names))
+        target = found[0]
+    strs = []
+    for k in target.co_consts:
+        if isinstance(k, str) and len(k) >= 3:
+            strs.append(k[:80])
+        elif isinstance(k, int) and abs(k) > 32:
+            strs.append("int:%d" % k)
+        elif isinstance(k, bytes) and len(k) >= 3:
+            strs.append("bytes:%r" % k[:60])
+    keys = ("flag", "pass", "key", "secret", "token", "check", "correct", "wrong", "success", "admin")
+    strs.sort(key=lambda s: not any(k in s.lower() for k in keys))
+    names = ", ".join(target.co_names[:40])
+    lines = [
+        "对象：%s  变量：%s" % (target.co_name, list(target.co_varnames[:8])),
+        "co_names：%s" % (names if names else "(空)"),
+    ]
+    if strs:
+        lines.append("常量池（前 30，关键词优先）：%s" % " | ".join(strs[:30]))
+    try:
+        txt = _dis.Bytecode(target).dis()
+    except Exception as exc:  # pragma: no cover - 罕见版本不兼容
+        lines.append("dis 失败（%s）；常量池与 co_names 仍可用" % exc)
+        return lines
+    lines.append("dis（前 60 行）：")
+    lines.append("\n".join(txt.splitlines()[:60]))
+    return lines
+
+
+def _pyi_parse(data):
+    pos = data.rfind(_PYI_COOKIE)
+    if pos < 0:
+        return None, "文件里没有 PyInstaller cookie（MEI\\x0c0b0a0b0e）：不是 PyInstaller 打包，或 bootloader 版本过老"
+    cookie = data[pos:pos + 88]
+    if len(cookie) < 24:
+        return None, "PyInstaller cookie 截断（文件过小）"
+    _magic, pkg_len, toc_off, toc_len, pyvers = struct.unpack_from("<8sIIII", cookie, 0)
+    cookie_size = 88 if len(cookie) >= 88 else 24
+    pkg_start = pos + cookie_size - pkg_len
+    if pkg_start < 0 or pkg_start + toc_off + toc_len > len(data):
+        return None, "CArchive 目录越界（pkg_len=%d toc=%d+%d）——版本可能不认识" % (pkg_len, toc_off, toc_len)
+    toc = data[pkg_start + toc_off:pkg_start + toc_off + toc_len]
+    entries = []
+    i = 0
+    while i + 18 <= len(toc):
+        entrylen, entrypos, csize, usize, cmprs, typ = struct.unpack_from("<IIIIBc", toc, i)
+        if entrylen < 18:
+            break
+        name = toc[i + 18:i + entrylen].split(b"\x00")[0].decode("utf-8", "replace")
+        entries.append((name, entrypos, csize, usize, cmprs, typ))
+        i += entrylen
+    return (pkg_start, pyvers, entries), None
+
+
+def _pyz_parse(blob):
+    if blob[:4] != b"PYZ\x00":
+        return None, "不是 PYZ 归档（魔数 %s）" % blob[:4].hex()
+    if len(blob) < 16:
+        return None, "PYZ 太小"
+    toc_pos = struct.unpack_from("!I", blob, len(blob) - 4)[0]
+    try:
+        toc = marshal.loads(blob[toc_pos:])
+    except Exception as exc:
+        return None, "PYZ TOC marshal 失败（%s）" % exc
+    items = toc.items() if isinstance(toc, dict) else (toc if isinstance(toc, list) else [])
+    entries = []
+    for name, val in items:
+        try:
+            mtyp, off = val
+            entries.append((str(name), int(off), mtyp))
+        except Exception:
+            continue
+    return entries, None
+
+
+def _view_pyinstaller(p, data, extract="", func=""):
+    parsed, err = _pyi_parse(data)
+    if parsed is None:
+        raise DomainToolError(err)
+    pkg_start, pyvers, entries = parsed
+    tmap = {b"s": "py源码", b"m": "py模块", b"M": "包", b"z": "PYZ", b"b": "二进制", b"x": "数据"}
+    if not extract:
+        rows = ["PyInstaller CArchive（pyvers=%d，%d 条目）。提取：extract=<名字>；PYZ 内模块：extract=pyz:<模块名>" % (
+            pyvers, len(entries))]
+        for name, pos, csize, usize, cmprs, typ in entries[:80]:
+            rows.append("  %-44s %-6s %8d→%8d %s" % (
+                name[:44], tmap.get(typ, typ.decode("latin-1", "replace")), csize, usize,
+                "zlib" if cmprs else ""))
+        if len(entries) > 80:
+            rows.append("…（共 %d 条，先看前 80；binary/dll 一般无用，找 m/M/z/s 条目）" % len(entries))
+        return _clip("\n".join(rows))
+    if extract.startswith("pyz:"):
+        zent = [e for e in entries if e[5] == b"z"]
+        if not zent:
+            raise DomainToolError("归档里没有 PYZ（z）条目")
+        name, pos, csize, usize, cmprs, _typ = zent[0]
+        blob = data[pkg_start + pos:pkg_start + pos + csize]
+        if cmprs:
+            blob = zlib.decompress(blob)
+        pyz_entries, perr = _pyz_parse(blob)
+        if pyz_entries is None:
+            raise DomainToolError(perr)
+        want = extract[4:]
+        hit = [e for e in pyz_entries if e[0] == want or e[0].endswith("." + want)]
+        if not hit:
+            raise DomainToolError("PYZ 里没有 %r；前 40 个：%s" % (want, ", ".join(e[0] for e in pyz_entries[:40])))
+        mod, off, _mtyp = hit[0]
+        ln = struct.unpack_from("!I", blob, off)[0]
+        raw = blob[off + 4:off + 4 + ln]
+        code = marshal.loads(zlib.decompress(raw))
+        lines = ["PYZ 模块 %s：" % mod]
+        lines.extend(_render_code(code, func=func))
+        return _clip("\n".join(lines))
+    hit = [e for e in entries if e[0] == extract or e[0].endswith("/" + extract)]
+    if not hit:
+        raise DomainToolError("没有条目 %r（不带 extract 先列目录）" % extract)
+    name, pos, csize, usize, cmprs, typ = hit[0]
+    blob = data[pkg_start + pos:pkg_start + pos + csize]
+    if cmprs:
+        try:
+            blob = zlib.decompress(blob)
+        except Exception as exc:
+            raise DomainToolError("条目 %s 解压失败（%s）" % (name, exc))
+    if typ == b"s":
+        return _clip("条目 %s（源码，%d 字节）：\n%s" % (name, len(blob), blob.decode("utf-8", "replace")[:4000]))
+    if typ in (b"m", b"M"):
+        try:
+            code = marshal.loads(blob)
+        except Exception as exc:
+            raise DomainToolError("条目 %s marshal 失败（%s）；前 64 字节：%s" % (name, exc, _hex_preview(blob[:64], 64)))
+        lines = ["条目 %s（%s，解压 %d 字节）：" % (name, tmap.get(typ, "?"), len(blob))]
+        lines.extend(_render_code(code, func=func))
+        return _clip("\n".join(lines))
+    outdir = p.parent / (p.name + ".extract")
+    outdir.mkdir(parents=True, exist_ok=True)
+    safe = name.replace("/", "_").replace("\\", "_")[-80:] or "blob.bin"
+    out = outdir / safe
+    out.write_bytes(blob)
+    return _clip("条目 %s 已解压落盘：%s（%d 字节）\n前 64 字节：%s\n（若为 ELF：elfpeek path=%s view=info 接着看）" % (
+        name, out, len(blob), _hex_preview(blob[:64], 64), out))
+
+
+def _view_pyc(p, data, func=""):
+    magic_ok = False
+    try:
+        import importlib.util as _ilu
+        magic_ok = data[:4] == _ilu.MAGIC_NUMBER
+    except Exception:
+        pass
+    body = None
+    hlen = 0
+    for hdr in (16, 12, 8):
+        try:
+            obj = marshal.loads(data[hdr:])
+        except Exception:
+            continue
+        if isinstance(obj, types.CodeType):
+            body, hlen = obj, hdr
+            break
+    if body is None:
+        raise DomainToolError("不是可解析的 .pyc（marshal 全部失败）。前 16 字节：%s（判型见 hexpeek）" % _hex_preview(data[:16], 16))
+    lines = [".pyc（头部 %d 字节；与本解释器 magic %s）" % (hlen, "一致" if magic_ok else "不一致→dis 仅作参考，常量池/co_names 仍可信")]
+    lines.extend(_render_code(body, func=func))
+    return _clip("\n".join(lines))
+
+
+def _view_bytecode(p, data, extract="", func=""):
+    """[rev-toolbox] bytecode 视图：.pyc / PyInstaller（含 ELF bootloader 的 PyInstaller）。"""
+    if data[:4] == b"\x7fELF":
+        if data.rfind(_PYI_COOKIE) >= 0:
+            return _view_pyinstaller(p, data, extract=extract, func=func)
+        raise DomainToolError("这是普通 ELF，bytecode 只处理 .pyc / PyInstaller；ELF 请用 info/disasm/symbols")
+    if data[:2] == b"MZ":
+        return _view_pyinstaller(p, data, extract=extract, func=func)
+    return _view_pyc(p, data, func=func)
+
+
+# <<< [rev-toolbox 2026-10-30] ===== rev 工具箱 v2 实现结束 =====
+
+
+# >>> [pwn-toolbox 2026-10-30] ===== pwn 方向工具箱 v1：pwngen / pwnfind / elfpeek lookup =====
+# 动机：pwn 方向历史 14 试 0 解。三大缺口——偏移探测靠模型手搓 python（还会撞 shell 引号守卫，
+# SAMPLE-013 的教训）、ROP/ret2libc 缺符号与字符串偏移查询、payload 组装无专用通道。
+# 本段全部纯 stdlib；工具经 DOMAIN_SPECS 自动注册（tools_misc_ext 聚合 + tools_local.call
+# 按 _DOMAIN_NAMES 动态路由），不改 crew.py / tools_local.py。
+
+
+_CYC_CACHE: dict[tuple[int, int], str] = {}
+
+
+def _cyclic_seq(n: int = 4, alphabet: str = "") -> str:
+    """De Bruijn 序列 B(k, n)：任意长度 n 的连续子串唯一（pwntools cyclic 同款算法/字母表）。"""
+    if n < 3:  # [toolbox-fix 2026-10-30] n<3 时 3 字节针无唯一性，pwnfind 必错
+        raise DomainToolError("n 需 ≥3（默认 4）")
+    alph = "abcdefghijklmnopqrstuvwxyz"
+    if alphabet:
+        # [toolbox-fix 2026-10-30] 只保留单字节字符，防止后续 encode("latin-1") 裸崩
+        uniq = "".join(sorted(c for c in set(str(alphabet)) if 0 <= ord(c) <= 255))
+        if len(uniq) >= 2:
+            alph = uniq
+    k = len(alph)
+    if k ** n > 2_000_000:  # [pwn-toolbox] n>4 时 k^n 爆炸（26^6=3.1 亿），只允许小字母表
+        raise DomainToolError("n=%d 字母表 %d 太大（%d 种组合）；用 n=4（默认）或缩小 alphabet" % (n, k, k ** n))
+    key = (alph, n)  # [toolbox-fix 2026-10-30] 缓存键必须含字母表本体：同长度不同字母表会串号
+    if key not in _CYC_CACHE:
+        a = [0] * (k * n)
+        seq: list[int] = []
+
+        def db(t: int, p: int) -> None:
+            if t > n:
+                if n % p == 0:
+                    seq.extend(a[1:p + 1])
+            else:
+                a[t] = a[t - p]
+                db(t + 1, p)
+                for j in range(a[t - p] + 1, k):
+                    a[t] = j
+                    db(t + 1, t)
+
+        db(1, 1)
+        _CYC_CACHE[key] = "".join(alph[i] for i in seq)
+    return _CYC_CACHE[key]
+
+
+def _latin1(text, what: str) -> bytes:  # [toolbox-fix 2026-10-30] 统一入口，防 UnicodeEncodeError 裸崩
+    try:
+        return str(text).encode("latin-1")
+    except UnicodeEncodeError:
+        raise DomainToolError("%s 含多字节字符（>255）；改用 hex= 传原始字节" % what)
+
+
+def pwngen(op: str = "cyclic", size: int = 256, n: int = 4, alphabet: str = "",
+           parts: list | None = None, path: str = "") -> str:
+    """[pwn-toolbox] payload 组装器：cyclic 模式串 / parts 拼装（绕开 shell 引号守卫）。"""
+    op = (op or "cyclic").strip().lower()
+    n = _to_int(n, 4, "n")  # [toolbox-fix 2026-10-30]
+    if op == "cyclic":
+        size = max(1, min(_to_int(size, 256, "size"), 8192))
+        out = _cyclic_seq(n, alphabet).encode("latin-1")[:size]
+        info = (
+            "De Bruijn 模式串 %d 字节（n=%d，任意连续 %d 字节唯一）。"
+            "发给服务触发覆盖后，把回显/寄存器里的 3~8 字节交给 pwnfind（同 n/alphabet）反查偏移。"
+            % (len(out), n, n)
+        )
+        lines = [info, "payload（hex_mode=false 直接发文本）：%s" % _ascii_preview(out, 4000)]
+        if path:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(out)
+            lines.append("已落盘：%s" % p)
+        return _clip("\n".join(lines))
+    if op == "build":
+        blob = bytearray()
+        desc = []
+        for i, part in enumerate(parts or []):
+            if not isinstance(part, dict):
+                raise DomainToolError("parts[%d] 必须是对象，键取 hex/raw/cyclic/pad/int" % i)
+            if "hex" in part:
+                try:
+                    b = bytes.fromhex(str(part["hex"]).replace(" ", "").replace("\n", ""))
+                except ValueError as exc:
+                    raise DomainToolError("parts[%d].hex 不是合法 hex：%s" % (i, exc))
+                desc.append("hex%dB" % len(b))
+            elif "raw" in part:
+                b = _latin1(part["raw"], "parts[%d].raw" % i)  # [toolbox-fix 2026-10-30]
+                desc.append("raw%dB" % len(b))
+            elif "cyclic" in part:
+                try:  # [toolbox-fix 2026-10-30] 防非整数裸崩
+                    cnt = max(1, min(int(part["cyclic"]), 8192))
+                except (TypeError, ValueError):
+                    raise DomainToolError("parts[%d].cyclic 需要整数，收到 %r" % (i, part["cyclic"]))
+                b = _cyclic_seq(n, alphabet).encode("latin-1")[:cnt]
+                desc.append("cyclic%dB" % len(b))
+            elif "pad" in part:
+                ch = (str(part["pad"]) or "A")[:1] or "A"
+                try:  # [toolbox-fix 2026-10-30]
+                    cnt = max(1, min(int(part.get("count") or 1), 65536))
+                except (TypeError, ValueError):
+                    raise DomainToolError("parts[%d].count 需要整数，收到 %r" % (i, part.get("count")))
+                b = (ch * cnt).encode("latin-1")
+                desc.append("pad%r×%d" % (ch, cnt))
+            elif "int" in part:
+                try:  # [toolbox-fix 2026-10-30]
+                    width = int(part.get("width") or 8)
+                except (TypeError, ValueError):
+                    raise DomainToolError("parts[%d].width 需要整数（2/4/8），收到 %r" % (i, part.get("width")))
+                if width not in (2, 4, 8):
+                    raise DomainToolError("parts[%d].width 只支持 2/4/8，收到 %r" % (i, width))
+                try:
+                    v = int(part["int"]) & ((1 << (width * 8)) - 1)
+                except (TypeError, ValueError) as exc:
+                    raise DomainToolError("parts[%d].int 非法：%s" % (i, exc))
+                b = v.to_bytes(width, "little")
+                desc.append("int 0x%x→p%dLE" % (v, width * 8))
+            else:
+                raise DomainToolError("parts[%d] 缺键：hex/raw/cyclic/pad(count)/int(width)" % i)
+            blob += b
+        out = bytes(blob)
+        if len(out) > 131072:
+            raise DomainToolError("payload 过大（%d > 131072），分段生成" % len(out))
+        lines = ["payload 组装：%s → 共 %d 字节" % (" + ".join(desc) or "(空)", len(out)),
+                 "hex=%s" % out.hex(),
+                 "ascii=%s" % _ascii_preview(out, 200)]
+        if path:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(out)
+            lines.append("已落盘：%s（tcp 用 hex_mode=true 发上面 hex；大 payload 分段）" % p)
+        return _clip("\n".join(lines))
+    raise DomainToolError("op 只支持 cyclic/build，收到 %r" % op)
+
+
+def pwnfind(value: str = "", hex: str = "", n: int = 4, alphabet: str = "") -> str:
+    """[pwn-toolbox] 把崩溃回显的 3~8 字节反查为 cyclic 模式偏移（=覆盖返回地址的填充长度）。"""
+    raw = b""
+    if hex:
+        try:
+            raw = bytes.fromhex(str(hex).replace(" ", ""))
+        except ValueError as exc:
+            raise DomainToolError("hex 不是合法 hex：%s" % exc)
+    elif value:
+        raw = _latin1(value, "value")  # [toolbox-fix 2026-10-30]
+    if not raw:
+        raise DomainToolError("给 value=<回显文本> 或 hex=<回显 hex>（3~8 字节）")
+    if not (3 <= len(raw) <= 8):
+        raise DomainToolError("需要 3~8 字节（32 位常用 4，64 位常用 6~8），收到 %d 字节" % len(raw))
+    seq = _cyclic_seq(_to_int(n, 4, "n"), alphabet).encode("latin-1")  # [toolbox-fix 2026-10-30] 与 pwngen 完全同 n
+    off = seq.find(raw)
+    if off >= 0:
+        return (
+            "命中：偏移 %d（0x%x）。含义：填充 %d 字节后即是返回地址/PC，"
+            "下一步 pwngen op=build（pad %d 字节 + 链）组装最终 payload。" % (off, off, off, off)
+        )
+    rev = raw[::-1]
+    off_r = seq.find(rev)
+    if off_r >= 0:
+        return "命中（字节序反转=小端读取）：偏移 %d（0x%x）。填充长度 = %d。" % (off_r, off_r, off_r)
+    raise DomainToolError(
+        "未找到 %r：① 确认 n/alphabet 与 pwngen 一致；② 回显若倒序，把字节倒过来再查；"
+        "③ 若回显是地址/乱码而非模式串字节，说明覆盖的不是返回地址，换长度或换入口重试" % raw)
+
+
+def _vaddr_to_off(elf, vaddr):
+    for p_type, _fl, p_offset, p_vaddr, p_filesz in _phdrs(elf):
+        if p_type == 1 and p_vaddr <= vaddr < p_vaddr + max(p_filesz, 1):
+            return p_offset + (vaddr - p_vaddr)
+    return None
+
+
+def _view_lookup(data, elf, symbol="", search=""):
+    """[pwn-toolbox] elfpeek view=lookup：符号/字符串精确偏移 + libc 版本识别。"""
+    lines = []
+    if symbol:
+        sym = symbol.strip()
+        hits = [(nm, value) for nm, value, _t in elf.symbols() if nm == sym]
+        if hits:
+            for nm, value in hits:
+                off = _vaddr_to_off(elf, value)
+                lines.append("符号 %-20s vaddr 0x%-10x %s" % (
+                    nm[:20], value,
+                    ("文件偏移 0x%x" % off) if off is not None else "（不在文件段内：可能是导入符号，运行期解析）"))
+        else:
+            near = [nm for nm, _v, _t in elf.symbols() if sym.lower() in nm.lower()][:10]
+            lines.append("符号 %s 未命中%s" % (sym, ("；相近：%s" % ", ".join(near)) if near else "（符号表为空或被 strip）"))
+    if search:
+        needle = _latin1(search, "search")  # [toolbox-fix 2026-10-30]
+        pos, found = 0, []
+        while len(found) < 10:
+            pos = data.find(needle, pos)
+            if pos < 0:
+                break
+            va = _off_to_vaddr(elf, pos)
+            found.append("文件0x%x%s" % (pos, ("/vaddr0x%x" % va) if va is not None else ""))
+            pos += 1
+        lines.append("字符串 %r：%s" % (search, ", ".join(found) if found else "未找到"))
+    if not symbol and not search:
+        lines.append("lookup 需要 symbol=<符号名> 或 search=<字符串>（可同时给）")
+    vpos = data.find(b"GNU C Library")
+    if vpos >= 0:
+        head = max(data.rfind(b"\n", 0, vpos), data.rfind(b"\x00", 0, vpos)) + 1
+        ends = [x for x in (data.find(b"\n", vpos), data.find(b"\x00", vpos)) if x >= 0]
+        tail = min(ends) if ends else len(data)
+        ver = data[head:tail].decode("latin-1", "replace").strip()
+        lines.append("libc 版本：%s" % ver[:120])
+    has_sys = any(nm == "system" for nm, _v, _t in elf.symbols())
+    if has_sys and data.find(b"/bin/sh") >= 0:
+        lines.append("ret2libc 要素齐：泄漏运行基址后 system=基址+（上面 vaddr−最小 PT_LOAD vaddr），"
+                     "字符串偏移同理；无泄漏先打 puts/write@plt 输出 GOT")
+    return _clip("\n".join(lines))
+
+
+# <<< [pwn-toolbox 2026-10-30] ===== pwn 工具箱 v1 实现结束 =====
+
+
+# >>> [crypto-toolbox 2026-10-30] ===== crypto 方向工具箱 v1：rsatool / aesblock / prng =====
+# 动机：crypto 历史 47 试 10 解（21%），瓶颈不是思路而是算力/原语——镜像无 gmpy2/sympy/z3/pycryptodome，
+# 模型只能每次手写大数算法与 AES，步数烧光。本段用纯 stdlib 提供 CTF 高频原语，工具经 DOMAIN_SPECS
+# 自动注册（同 pwn/rev），不改 crew.py / tools_local.py。
+
+
+def _int_of(value) -> int:
+    """解析大整数：支持十进制、0x 十六进制、带空白的文本。"""
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().replace(" ", "").replace("_", "")
+    if not text:
+        raise DomainToolError("整数参数为空")
+    try:
+        return int(text, 0)
+    except ValueError:
+        try:
+            return int(text, 16)
+        except ValueError:
+            raise DomainToolError("不是合法整数：%r" % text[:40])
+
+
+def _to_int(value, default: int, what: str) -> int:  # [toolbox-fix 2026-10-30] 整数参数统一入口：None/空→默认值，垃圾→DomainToolError（顺带支持 0x 前缀）
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return _int_of(value)
+    except DomainToolError:
+        raise DomainToolError("参数 %s 需要整数（支持 0x 前缀），收到 %r" % (what, value))
+
+
+def _hexbytes(text, what: str) -> bytes:  # [toolbox-fix 2026-10-30] hex 参数统一入口，防 ValueError 裸崩
+    try:
+        return bytes.fromhex(str(text or "").replace(" ", ""))
+    except ValueError as exc:
+        raise DomainToolError("%s 不是合法 hex：%s" % (what, exc))
+
+
+def _bytes_of(n: int) -> bytes:
+    if n < 0:
+        raise DomainToolError("不支持负数转字节")
+    if n == 0:
+        return b"\x00"
+    return n.to_bytes((n.bit_length() + 7) // 8, "big")
+
+
+def _render_int_result(label: str, value: int, extra=None) -> str:
+    raw = _bytes_of(value)
+    printable = "".join(chr(b) if 32 <= b < 127 else "." for b in raw[:200])
+    lines = ["%s = %d" % (label, value), "  hex=%s" % raw.hex()[:400], "  ascii=%s" % printable]
+    if extra:
+        lines.extend(extra)
+    return _clip("\n".join(lines))
+
+
+def _iroot(n: int, k: int):
+    """整数 k 次根（floor）；精确时返回 (root, True)。"""
+    if n < 0:
+        raise DomainToolError("负数开方不支持")
+    if k < 2:
+        raise DomainToolError("k 需 ≥2")
+    if n < 2:
+        return n, True
+    x = 1 << ((n.bit_length() + k - 1) // k)
+    while True:
+        y = ((k - 1) * x + n // x ** (k - 1)) // k
+        if y >= x:
+            break
+        x = y
+    while pow(x + 1, k) <= n:
+        x += 1
+    while pow(x, k) > n:
+        x -= 1
+    return x, pow(x, k) == n
+
+
+def _egcd(a: int, b: int):
+    if b == 0:
+        return a, 1, 0
+    g, x1, y1 = _egcd(b, a % b)
+    return g, y1, x1 - (a // b) * y1
+
+
+def _modinv(a: int, m: int) -> int:
+    g, x, _ = _egcd(a % m, m)
+    if g != 1:
+        raise DomainToolError("modinv 不存在（gcd=%d）" % g)
+    return x % m
+
+
+def _crt(residues, moduli):
+    """中国剩余定理：返回 (x, M)；moduli 两两互素。"""
+    x, m = 0, 1
+    for r, mod in zip(residues, moduli):
+        g, inv, _ = _egcd(m % mod, mod)
+        if g != 1:
+            raise DomainToolError("CRT 模数不互素（gcd=%d）" % g)
+        t = ((r - x) % mod) * inv % mod
+        x += m * t
+        m *= mod
+    return x % m, m
+
+
+def _primes_upto(limit: int):
+    sieve = bytearray([1]) * (limit + 1)
+    sieve[0] = sieve[1] = 0
+    for i in range(2, int(limit ** 0.5) + 1):
+        if sieve[i]:
+            sieve[i * i::i] = bytearray(len(sieve[i * i::i]))
+    return [i for i in range(2, limit + 1) if sieve[i]]
+
+
+def _fermat_factor(n: int, limit: int = 200000):
+    if n % 2 == 0:
+        return 2, n // 2
+    a = math.isqrt(n)
+    if a * a < n:
+        a += 1
+    for _ in range(max(1, limit)):
+        b2 = a * a - n
+        b = math.isqrt(b2)
+        if b * b == b2:
+            return a - b, a + b
+        a += 1
+    return None
+
+
+def _pollard_pm1(n: int, bound: int = 10000):
+    a = 2
+    for p in _primes_upto(bound):
+        pk = p
+        while pk * p <= bound:
+            pk *= p
+        a = pow(a, pk, n)
+        g = math.gcd(a - 1, n)
+        if 1 < g < n:
+            return g, n // g
+    return None
+
+
+def _pollard_rho(n: int, limit: int = 200000):
+    if n % 2 == 0:
+        return 2, n // 2
+    if n % 3 == 0:
+        return 3, n // 3
+    for c in (1, 3, 5, 7, 11, 13):
+        x, y, d = 2, 2, 1
+        for _ in range(max(1, limit)):
+            x = (x * x + c) % n
+            y = (y * y + c) % n
+            y = (y * y + c) % n
+            d = math.gcd(abs(x - y), n)
+            if 1 < d < n:
+                return d, n // d
+            if d == n:
+                break
+    return None
+
+
+def _wiener(n: int, e: int):
+    """Wiener 攻击：d 很小时用 e/n 连分数收敛子求 phi → 分解。"""
+    def cf(num, den, max_terms=200):
+        terms = []
+        while den and len(terms) < max_terms:
+            terms.append(num // den)
+            num, den = den, num % den
+        return terms
+
+    terms = cf(e, n)
+    # 收敛子递推：h_i = a_i*h_{i-1} + h_{i-2}，h_{-2}=0,h_{-1}=1；k_{-2}=1,k_{-1}=0（k_0=1）
+    num_hp, num_hc = 0, 1
+    den_hp, den_hc = 1, 0
+    for t in terms:
+        num_hp, num_hc = num_hc, t * num_hc + num_hp
+        den_hp, den_hc = den_hc, t * den_hc + den_hp
+        k, d = num_hc, den_hc
+        if k == 0 or d == 0:
+            continue
+        if (e * d - 1) % k:
+            continue
+        phi = (e * d - 1) // k
+        s = n - phi + 1
+        disc = s * s - 4 * n
+        if disc < 0:
+            continue
+        r = math.isqrt(disc)
+        if r * r != disc:
+            continue
+        p, q = (s + r) // 2, (s - r) // 2
+        if p * q == n:
+            return p, q, d
+    return None
+
+
+def rsatool(op: str = "factor", n: str = "", e: str = "", c: str = "",
+            e1: str = "", e2: str = "", c1: str = "", c2: str = "",
+            ns=None, cs=None, B: int = 10000, limit: int = 200000) -> str:
+    """[crypto-toolbox] RSA 攻击集（纯 stdlib）：small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor。"""
+    op = (op or "factor").strip().lower()
+    B = _to_int(B, 10000, "B")        # [toolbox-fix 2026-10-30] 防非整数裸崩
+    limit = _to_int(limit, 200000, "limit")  # [toolbox-fix 2026-10-30]
+    if op == "small_e":
+        ee, cc = _int_of(e), _int_of(c)
+        m, exact = _iroot(cc, ee)
+        if not exact:
+            raise DomainToolError("c 不是 %d 次幂（小 e 开方失败）；试试 hastad/common_modulus" % ee)
+        return _render_int_result("m", m)
+    if op == "common_modulus":
+        nn = _int_of(n)
+        a1, a2, b1, b2 = _int_of(e1), _int_of(e2), _int_of(c1), _int_of(c2)
+        g, s, t = _egcd(a1, a2)
+        if g != 1:
+            raise DomainToolError("gcd(e1,e2)=%d≠1：不是标准共模场景" % g)
+
+        def _pow_signed(base: int, exp: int, mod: int) -> int:
+            if exp >= 0:
+                return pow(base, exp, mod)
+            return pow(_modinv(base, mod), -exp, mod)
+
+        m = _pow_signed(b1, s, nn) * _pow_signed(b2, t, nn) % nn
+        return _render_int_result("m", m)
+    if op == "wiener":
+        got = _wiener(_int_of(n), _int_of(e))
+        if not got:
+            raise DomainToolError("Wiener 未命中（d 不小或参数不对）")
+        p, q, d = got
+        return _clip("\n".join([
+            "Wiener 命中：d = %d" % d, "p = %d" % p, "q = %d" % q,
+            "（p*q==n：%s）" % (p * q == _int_of(n)),
+        ]))
+    if op == "fermat":
+        got = _fermat_factor(_int_of(n), int(limit or 200000))
+        if not got:
+            raise DomainToolError("Fermat 在 %d 次内未分解（p,q 不够接近；换 pollard_rho/pollard_pm1）" % limit)
+        p, q = got
+        return _clip("Fermat 分解：\np = %d\nq = %d\n（p*q==n：%s）" % (p, q, p * q == _int_of(n)))
+    if op == "pollard_pm1":
+        got = _pollard_pm1(_int_of(n), int(B or 10000))
+        if not got:
+            raise DomainToolError("p-1 在 B=%d 内不平滑；加大 B 或换 pollard_rho" % B)
+        p, q = got
+        return _clip("p-1 分解：\np = %d\nq = %d" % (p, q))
+    if op == "pollard_rho":
+        got = _pollard_rho(_int_of(n), int(limit or 200000))
+        if not got:
+            raise DomainToolError("rho 在 %d 次内未分解；加大 limit 或换 fermat/p-1" % limit)
+        p, q = got
+        return _clip("rho 分解：\np = %d\nq = %d" % (p, q))
+    if op == "hastad":
+        mods = [_int_of(x) for x in (ns or [])]
+        ciphers = [_int_of(x) for x in (cs or [])]
+        ee = _int_of(e)
+        if len(mods) != len(ciphers) or not mods:
+            raise DomainToolError("hastad 需要 ns 与 cs 等长非空")
+        if len(mods) < ee:
+            raise DomainToolError("Håstad 需要至少 e=%d 组（当前 %d）" % (ee, len(mods)))
+        x, _m = _crt(ciphers, mods)
+        m, exact = _iroot(x, ee)
+        if not exact:
+            raise DomainToolError("CRT 组合后不是 %d 次幂（可能明文超出或组数不足）" % ee)
+        return _render_int_result("m", m)
+    if op == "crt":
+        residues = [_int_of(x) for x in (cs or [])]
+        mods = [_int_of(x) for x in (ns or [])]
+        if len(residues) != len(mods) or not mods:
+            raise DomainToolError("crt 需要 ns 与 cs 等长非空")
+        x, m = _crt(residues, mods)
+        return _render_int_result("x", x, ["模 M = %d" % m])
+    if op == "factor":
+        nn = _int_of(n)
+        for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53):
+            if nn % p == 0:
+                return _clip("小因子：\np = %d\nq = %d" % (p, nn // p))
+        for fn, arg in ((_fermat_factor, min(int(limit or 200000), 50000)),
+                        (_pollard_pm1, int(B or 10000)),
+                        (_pollard_rho, int(limit or 200000))):
+            got = fn(nn, arg)
+            if got:
+                return _clip("分解成功（%s）：\np = %d\nq = %d" % (fn.__name__, got[0], got[1]))
+        raise DomainToolError("常规弱点均未分解；考虑格攻击/Coppersmith（本工具不做）")
+    raise DomainToolError("op 只支持 small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor")
+
+
+# ---------- [crypto-toolbox] AES（纯 stdlib，块/模式原语） ----------
+
+_AES_SBOX = (
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+)
+_AES_RCON = (0x8d, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36)
+# [crypto-toolbox] 逆 S 盒（由正表反推，避免再抄 256 项）
+_AES_INV_SBOX = [0] * 256
+for _i, _v in enumerate(_AES_SBOX):
+    _AES_INV_SBOX[_v] = _i
+
+
+def _aes_mul(a: int, b: int) -> int:
+    r = 0
+    for _ in range(8):
+        if b & 1:
+            r ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return r
+
+
+def _aes_expand(key: bytes):
+    nk = len(key) // 4
+    if nk not in (4, 6, 8) or len(key) != nk * 4:
+        raise DomainToolError("AES key 需 16/24/32 字节，收到 %d" % len(key))
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nr + 1)):
+        temp = list(w[i - 1])
+        if i % nk == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [_AES_SBOX[b] for b in temp]
+            temp[0] ^= _AES_RCON[i // nk]
+        elif nk > 6 and i % nk == 4:
+            temp = [_AES_SBOX[b] for b in temp]
+        w.append([w[i - nk][j] ^ temp[j] for j in range(4)])
+    return [bytes(sum(w[4 * i:4 * i + 4], [])) for i in range(nr + 1)], nr
+
+
+def _aes_add_rk(s, rk):
+    for i in range(16):
+        s[i] ^= rk[i]
+
+
+def _aes_shift_rows(s):
+    out = [0] * 16
+    for r in range(4):
+        for c in range(4):
+            out[r + 4 * c] = s[r + 4 * ((c + r) % 4)]
+    return out
+
+
+def _aes_inv_shift_rows(s):
+    out = [0] * 16
+    for r in range(4):
+        for c in range(4):
+            out[r + 4 * c] = s[r + 4 * ((c - r) % 4)]
+    return out
+
+
+def _aes_sub(s):
+    return [_AES_SBOX[b] for b in s]
+
+
+def _aes_inv_sub(s):
+    inv = _AES_INV_SBOX
+    return [inv[b] for b in s]
+
+
+def _aes_mix(s):
+    out = list(s)
+    for c in range(4):
+        a0, a1, a2, a3 = s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]
+        out[4 * c] = _aes_mul(a0, 2) ^ _aes_mul(a1, 3) ^ a2 ^ a3
+        out[4 * c + 1] = a0 ^ _aes_mul(a1, 2) ^ _aes_mul(a2, 3) ^ a3
+        out[4 * c + 2] = a0 ^ a1 ^ _aes_mul(a2, 2) ^ _aes_mul(a3, 3)
+        out[4 * c + 3] = _aes_mul(a0, 3) ^ a1 ^ a2 ^ _aes_mul(a3, 2)
+    return out
+
+
+def _aes_inv_mix(s):
+    out = list(s)
+    for c in range(4):
+        a0, a1, a2, a3 = s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]
+        out[4 * c] = _aes_mul(a0, 14) ^ _aes_mul(a1, 11) ^ _aes_mul(a2, 13) ^ _aes_mul(a3, 9)
+        out[4 * c + 1] = _aes_mul(a0, 9) ^ _aes_mul(a1, 14) ^ _aes_mul(a2, 11) ^ _aes_mul(a3, 13)
+        out[4 * c + 2] = _aes_mul(a0, 13) ^ _aes_mul(a1, 9) ^ _aes_mul(a2, 14) ^ _aes_mul(a3, 11)
+        out[4 * c + 3] = _aes_mul(a0, 11) ^ _aes_mul(a1, 13) ^ _aes_mul(a2, 9) ^ _aes_mul(a3, 14)
+    return out
+
+
+def _aes_encrypt_block(block: bytes, key: bytes) -> bytes:
+    rks, nr = _aes_expand(key)
+    s = list(block)
+    _aes_add_rk(s, rks[0])
+    for rnd in range(1, nr):
+        s = _aes_sub(s)
+        s = _aes_shift_rows(s)
+        s = _aes_mix(s)
+        _aes_add_rk(s, rks[rnd])
+    s = _aes_sub(s)
+    s = _aes_shift_rows(s)
+    _aes_add_rk(s, rks[nr])
+    return bytes(s)
+
+
+def _aes_decrypt_block(block: bytes, key: bytes) -> bytes:
+    rks, nr = _aes_expand(key)
+    s = list(block)
+    _aes_add_rk(s, rks[nr])
+    for rnd in range(nr - 1, 0, -1):
+        s = _aes_inv_shift_rows(s)
+        s = _aes_inv_sub(s)
+        _aes_add_rk(s, rks[rnd])
+        s = _aes_inv_mix(s)
+    s = _aes_inv_shift_rows(s)
+    s = _aes_inv_sub(s)
+    _aes_add_rk(s, rks[0])
+    return bytes(s)
+
+
+def _aes_chunks(data: bytes, what: str):
+    if len(data) % 16:
+        raise DomainToolError("%s 长度 %d 不是 16 的倍数（先 pkcs7_pad）" % (what, len(data)))
+    return [data[i:i + 16] for i in range(0, len(data), 16)]
+
+
+def _aes_xor(a: bytes, b: bytes) -> bytes:
+    if len(a) != len(b):
+        raise DomainToolError("异或长度不等（%d vs %d）" % (len(a), len(b)))
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
+def aesblock(op: str = "ecb_encrypt", key: str = "", data: str = "", iv: str = "",
+             nonce: str = "", counter: int = 0, known: str = "", target: str = "") -> str:
+    """[crypto-toolbox] AES 纯 stdlib 原语：ECB/CBC/CTR、异或、CBC bit-flip、PKCS7。"""
+    op = (op or "ecb_encrypt").strip().lower()
+    key_b = _hexbytes(key, "key")  # [toolbox-fix 2026-10-30] 统一入口：坏 hex 报 ToolError 而非裸崩
+    data_b = _hexbytes(data, "data")
+    if op in ("pkcs7_pad", "pkcs7_unpad"):
+        blk = 16
+        if op == "pkcs7_pad":
+            pad = blk - len(data_b) % blk
+            out = data_b + bytes([pad]) * pad
+            return "PKCS7 填充后 %d 字节：\nhex=%s" % (len(out), out.hex())
+        if not data_b or len(data_b) % blk:
+            raise DomainToolError("unpad 输入长度需为 16 倍数且非空")
+        pad = data_b[-1]
+        if not (1 <= pad <= blk) or data_b[-pad:] != bytes([pad]) * pad:
+            raise DomainToolError("PKCS7 填充非法（末字节 %d）" % pad)
+        out = data_b[:-pad]
+        return "去填充后 %d 字节：\nhex=%s\nascii=%s" % (len(out), out.hex(), _ascii_preview(out, 200))
+    if op == "xor":
+        other = _hexbytes(iv, "iv")  # [toolbox-fix 2026-10-30]
+        out = _aes_xor(data_b, other)
+        return "异或结果 %d 字节：\nhex=%s\nascii=%s" % (len(out), out.hex(), _ascii_preview(out, 200))
+    if op == "bitflip":
+        iv_b = _hexbytes(iv, "iv")  # [toolbox-fix 2026-10-30]
+        kn, tg = (known or ""), (target or "")
+        if not kn or len(kn) != len(tg) or len(kn) > len(iv_b):
+            raise DomainToolError("bitflip 需要 known/target 等长且 ≤ iv 长度：iv=%d known=%d target=%d"
+                                  % (len(iv_b), len(kn), len(tg)))
+        if max((ord(c) for c in kn + tg), default=0) > 255:  # [toolbox-fix 2026-10-30] 多字节字符会让 bytearray 赋值裸崩
+            raise DomainToolError("bitflip 的 known/target 只支持单字节字符（0-255）；用 python 处理多字节")
+        out = bytearray(iv_b)
+        n = len(kn)
+        for i in range(n):
+            out[i] ^= ord(kn[i]) ^ ord(tg[i])
+        return _clip("CBC bit-flip：把前块（IV/密文块）改为\nhex=%s\n已知明文 %r → 目标 %r"
+                     % (bytes(out).hex(), kn, tg))
+    if not key_b:
+        raise DomainToolError("需要 key（hex，16/24/32 字节）")
+    if op == "ecb_encrypt":
+        out = b"".join(_aes_encrypt_block(c, key_b) for c in _aes_chunks(data_b, "data"))
+    elif op == "ecb_decrypt":
+        out = b"".join(_aes_decrypt_block(c, key_b) for c in _aes_chunks(data_b, "data"))
+    elif op == "cbc_encrypt":
+        iv_b = _hexbytes(iv, "iv")  # [toolbox-fix 2026-10-30]
+        if len(iv_b) != 16:
+            raise DomainToolError("CBC 需要 16 字节 IV（hex）")
+        prev, chunks = iv_b, []
+        for c in _aes_chunks(data_b, "data"):
+            prev = _aes_encrypt_block(_aes_xor(c, prev), key_b)
+            chunks.append(prev)
+        out = b"".join(chunks)
+    elif op == "cbc_decrypt":
+        iv_b = _hexbytes(iv, "iv")  # [toolbox-fix 2026-10-30]
+        if len(iv_b) != 16:
+            raise DomainToolError("CBC 需要 16 字节 IV（hex）")
+        prev, chunks = iv_b, []
+        for c in _aes_chunks(data_b, "data"):
+            chunks.append(_aes_xor(_aes_decrypt_block(c, key_b), prev))
+            prev = c
+        out = b"".join(chunks)
+    elif op == "ctr":
+        nonce_b = _hexbytes(nonce, "nonce")  # [toolbox-fix 2026-10-30]
+        if len(nonce_b) > 16:
+            raise DomainToolError("nonce 最长 16 字节")
+        base = int.from_bytes(nonce_b, "big") if nonce_b else 0
+        chunks, n = [], _to_int(counter, 0, "counter")  # [toolbox-fix 2026-10-30]
+        for c in _aes_chunks(data_b, "data"):
+            # [toolbox-fix 2026-10-30] 2^128 溢出掩码，防 OverflowError 裸崩
+            ks = _aes_encrypt_block(((base + n) & ((1 << 128) - 1)).to_bytes(16, "big"), key_b)
+            chunks.append(_aes_xor(c, ks))
+            n += 1
+        out = b"".join(chunks)
+    else:
+        raise DomainToolError("op 只支持 ecb_encrypt/ecb_decrypt/cbc_encrypt/cbc_decrypt/ctr/xor/bitflip/pkcs7_pad/pkcs7_unpad")
+    return _clip("%s 输出 %d 字节：\nhex=%s\nascii=%s" % (op, len(out), out.hex(), _ascii_preview(out, 200)))
+
+
+# ---------- [crypto-toolbox] MT19937 / LCG 状态恢复 ----------
+
+_MT_N, _MT_M = 624, 397
+_MT_MATRIX_A, _MT_UPPER, _MT_LOWER = 0x9908B0DF, 0x80000000, 0x7FFFFFFF
+
+
+class _MT19937:
+    def __init__(self, seed: int | None = None):
+        self.mt = [0] * _MT_N
+        self.idx = _MT_N
+        if seed is not None:
+            self.seed(seed)
+
+    def seed(self, s: int) -> None:
+        self.mt[0] = s & 0xFFFFFFFF
+        for i in range(1, _MT_N):
+            self.mt[i] = (1812433253 * (self.mt[i - 1] ^ (self.mt[i - 1] >> 30)) + i) & 0xFFFFFFFF
+        self.idx = _MT_N
+
+    def _gen(self) -> None:
+        for i in range(_MT_N):
+            y = (self.mt[i] & _MT_UPPER) | (self.mt[(i + 1) % _MT_N] & _MT_LOWER)
+            self.mt[i] = self.mt[(i + _MT_M) % _MT_N] ^ (y >> 1)
+            if y & 1:
+                self.mt[i] ^= _MT_MATRIX_A
+        self.idx = 0
+
+    def next(self) -> int:
+        if self.idx >= _MT_N:
+            self._gen()
+        y = self.mt[self.idx]
+        self.idx += 1
+        y ^= y >> 11
+        y ^= (y << 7) & 0x9D2C5680
+        y ^= (y << 15) & 0xEFC60000
+        y ^= y >> 18
+        return y & 0xFFFFFFFF
+
+
+def _mt_unshift_right(y: int, shift: int) -> int:
+    x = 0
+    for i in range(31, -1, -1):
+        bit = (y >> i) & 1
+        if i + shift < 32:
+            bit ^= (x >> (i + shift)) & 1
+        x |= bit << i
+    return x
+
+
+def _mt_unshift_left(y: int, shift: int, mask: int) -> int:
+    x = 0
+    for i in range(32):
+        bit = (y >> i) & 1
+        if i - shift >= 0:
+            bit ^= ((x >> (i - shift)) & 1) & ((mask >> i) & 1)
+        x |= bit << i
+    return x
+
+
+def _mt_untemper(y: int) -> int:
+    y = _mt_unshift_right(y, 18)
+    y = _mt_unshift_left(y, 15, 0xEFC60000)
+    y = _mt_unshift_left(y, 7, 0x9D2C5680)
+    y = _mt_unshift_right(y, 11)
+    return y & 0xFFFFFFFF
+
+
+def prng(op: str = "mt_predict", seed: int = 0, count: int = 10, outputs=None,
+         m: int = 0) -> str:
+    """[crypto-toolbox] PRNG 状态恢复：MT19937 预测 / LCG 参数恢复与预测。"""
+    op = (op or "mt_predict").strip().lower()
+    vals = [_int_of(x) for x in (outputs or [])]
+    cnt = max(1, min(_to_int(count, 10, "count"), 2000))  # [toolbox-fix 2026-10-30]
+    if op == "mt_seed":
+        gen = _MT19937(_to_int(seed, 0, "seed"))  # [toolbox-fix 2026-10-30]
+        outs = [gen.next() for _ in range(cnt)]
+        # [toolbox-fix 2026-10-30] 大 count 会生成 20KB 文本直灌上下文，必须 _clip（平台 6000 字符契约）
+        return _clip("MT19937(seed=%d) 前 %d 个输出：\n%s" % (seed, cnt, ", ".join(str(v) for v in outs)))
+    if op == "mt_predict":
+        if len(vals) < 624:
+            raise DomainToolError("MT19937 状态恢复需要 ≥624 个连续 32-bit 输出（当前 %d）" % len(vals))
+        gen = _MT19937()
+        gen.mt = [_mt_untemper(v & 0xFFFFFFFF) for v in vals[:624]]
+        gen.idx = 624
+        outs = [gen.next() for _ in range(cnt)]
+        return _clip("恢复状态成功（%d 个输出），后续 %d 个预测值：\n%s" % (len(vals), cnt, ", ".join(str(v) for v in outs)))
+    if op == "lcg_recover":
+        if len(vals) < 5:
+            raise DomainToolError("LCG 参数恢复需要 ≥5 个连续输出（当前 %d）" % len(vals))
+        mod = _to_int(m, 0, "m")  # [toolbox-fix 2026-10-30]
+        notes = []
+        if not mod:
+            ds = [vals[i + 1] - vals[i] for i in range(len(vals) - 1)]
+            cands = []
+            for i in range(len(ds) - 2):
+                k = ds[i + 2] * ds[i] - ds[i + 1] * ds[i + 1]
+                if k:
+                    cands.append(abs(k))
+            if not cands:
+                raise DomainToolError("无法从输出推出模数；请显式给 m=")
+            mod = 0
+            for c in cands:
+                mod = math.gcd(mod, c)
+            notes.append("（由差值 GCD 推测模数，可能含多余因子；不对请给 m=）")
+        a = (vals[2] - vals[1]) * _modinv((vals[1] - vals[0]) % mod, mod) % mod
+        c = (vals[1] - a * vals[0]) % mod
+        ok = all((a * vals[i] + c) % mod == vals[i + 1] % mod for i in range(len(vals) - 1))
+        if not ok:
+            raise DomainToolError("恢复的 a,c 无法复现序列（模数可能不对；给 m=）")
+        gen_vals = []
+        x = vals[-1]
+        for _ in range(cnt):
+            x = (a * x + c) % mod
+            gen_vals.append(x)
+        head = "LCG 恢复成功：m = %d" % mod + "".join(notes)
+        return _clip("\n".join([
+            head, "a = %d\nc = %d" % (a, c),
+            "校验通过；后续 %d 个预测值：\n%s" % (cnt, ", ".join(str(v) for v in gen_vals)),
+        ]))
+    raise DomainToolError("op 只支持 mt_seed/mt_predict/lcg_recover")
 
 
 # ---------------------------------------------------------------- 连通性诊断
@@ -515,26 +1823,43 @@ TCP_BATCH_SPEC = {
     },
 }
 
+# >>> [rev-toolbox 2026-10-30] elfpeek 规格升级：disasm / bytecode / gadgets v2 / utf16
 ELFPEEK_SPEC = {
     "type": "function",
     "function": {
         "name": "elfpeek",
         "description": (
-            "纯 stdlib 的 ELF 静态探测（容器里没有 objdump/file）。"
-            "view=info 看架构/入口/PIE/NX/canary/RELRO 与节名；sections/symbols/strings/gadgets 分别看节表、符号、字符串、常用 ROP gadget 偏移。"
+            "纯 stdlib（镜像 v4 起含 capstone 引擎）的 ELF/字节码静态探测（容器里没有 objdump/file）。"
+            "view=info 看架构/入口/PIE/NX/canary/RELRO/入口段；sections/symbols 看节表与符号；"
+            "strings 看字符串（utf16=true 扫宽字符串）；"
+            "disasm 反汇编（offset/length/count/arch，无 capstone 自动退化字节视图）；"
+            "gadgets 枚举 ROP 链（filter=rdi|rsi|rdx|syscall|binsh）；"
+            "bytecode 处理 .pyc / PyInstaller（先不带 extract 列目录，再 extract=<名字>，PYZ 用 extract=pyz:<模块名>，func=只看某函数）；"
+            "lookup 精确查符号/字符串偏移（ret2libc：symbol=system、search=/bin/sh，附 libc 版本行）。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "沙盒内文件路径（相对沙盒根）"},
-                "view": {"type": "string", "enum": ["info", "sections", "symbols", "strings", "gadgets"]},
+                "view": {"type": "string", "enum": ["info", "sections", "symbols", "strings", "gadgets", "disasm", "bytecode", "lookup"]},
                 "min_len": {"type": "integer", "description": "strings 视图的最小串长（默认 4）"},
                 "limit": {"type": "integer", "description": "最多输出条目数（默认 60）"},
+                "offset": {"type": "integer", "description": "disasm：起始文件偏移（默认吸附到可执行段起点）"},
+                "length": {"type": "integer", "description": "disasm：反汇编字节数（默认 128，上限 4096）"},
+                "count": {"type": "integer", "description": "disasm：最多指令条数（默认 40，上限 200）"},
+                "arch": {"type": "string", "description": "disasm：覆盖架构 x86/x64/arm/arm64（默认按 ELF 头自动判）"},
+                "filter": {"type": "string", "description": "gadgets：'|' 分隔关键字，如 rdi|rsi|rdx|syscall|binsh"},
+                "extract": {"type": "string", "description": "bytecode：PyInstaller 条目名（PYZ 内模块用 pyz:模块名）"},
+                "func": {"type": "string", "description": "bytecode：只反汇编指定函数名（不带则看模块级）"},
+                "utf16": {"type": "boolean", "description": "strings：扫 UTF-16 宽字符串"},
+                "symbol": {"type": "string", "description": "lookup：精确符号名（如 system；无命中给相近清单）"},
+                "search": {"type": "string", "description": "lookup：要查的字符串（如 /bin/sh），返回全部出现偏移"},
             },
             "required": ["path"],
         },
     },
 }
+# <<< [rev-toolbox 2026-10-30]
 
 NETCHECK_SPEC = {
     "type": "function",
@@ -556,7 +1881,142 @@ NETCHECK_SPEC = {
     },
 }
 
-DOMAIN_SPECS = [TCP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC]
+# >>> [pwn-toolbox 2026-10-30] pwngen / pwnfind 规格（经 DOMAIN_SPECS 自动注册，无需改 crew）
+PWNGEN_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "pwngen",
+        "description": (
+            "纯 stdlib 的 pwn payload 组装器（不要在 shell 里手搓 python 拼串，引号守卫会拦）。"
+            "op=cyclic 生成 De Bruijn 模式串（发超长触发覆盖，回显交给 pwnfind 反查精确偏移）；"
+            "op=build 用 parts 数组拼 payload：{hex:\"4142\"} / {raw:\"...\"} / {pad:\"A\",count:64} / "
+            "{int:0x401000,width:8}（小端 p64）/ {cyclic:128}；path= 落盘到沙盒。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["cyclic", "build"], "description": "cyclic=模式串；build=拼装"},
+                "size": {"type": "integer", "description": "cyclic：字节数（默认 256，上限 8192）"},
+                "n": {"type": "integer", "description": "模式串子序列长度（默认 4；32 位用 4，64 位常用 8）"},
+                "alphabet": {"type": "string", "description": "自定义字母表（默认 a-z；pwnfind 需一致）"},
+                "parts": {"type": "array", "items": {"type": "object"}, "description": "build：部件数组"},
+                "path": {"type": "string", "description": "可选：落盘到沙盒内此路径"},
+            },
+            "required": ["op"],
+        },
+    },
+}
+
+PWNFIND_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "pwnfind",
+        "description": (
+            "把崩溃回显/覆盖返回地址的 3~8 字节反查成 cyclic 模式偏移（= 覆盖返回地址前的填充长度）。"
+            "给 value=<回显文本> 或 hex=<回显 hex>；自动尝试字节序反转。n/alphabet 要与 pwngen 一致。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "value": {"type": "string", "description": "回显的文本字节（如 '6Aa7'）"},
+                "hex": {"type": "string", "description": "回显的 hex 字节（如 '36616137'）"},
+                "n": {"type": "integer", "description": "与 pwngen 相同的 n（默认 4）"},
+                "alphabet": {"type": "string", "description": "与 pwngen 相同的字母表（默认 a-z）"},
+            },
+        },
+    },
+}
+# <<< [pwn-toolbox 2026-10-30]
+
+# >>> [crypto-toolbox 2026-10-30] rsatool / aesblock / prng 规格（同 pwn：经 DOMAIN_SPECS 自动注册）
+RSATOOL_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "rsatool",
+        "description": (
+            "纯 stdlib 的 RSA 攻击集。op=small_e（c 开 e 次根）、common_modulus（同 n 两组 e1/c1/e2/c2）、"
+            "wiener（d 小，连分数）、fermat（p,q 接近）、pollard_pm1（p-1 平滑，B 给上界）、"
+            "pollard_rho（通用分解，limit 次）、hastad（低指数广播：ns/cs 数组 + e）、crt（模方程）、"
+            "factor（小因子/fermat/p-1/rho 自动轮试）。大整数支持 0x 前缀。命中给明文 hex/ascii。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string",
+                       "enum": ["small_e", "common_modulus", "wiener", "fermat", "pollard_pm1",
+                                "pollard_rho", "hastad", "crt", "factor"]},
+                "n": {"type": "string", "description": "RSA 模数"},
+                "e": {"type": "string", "description": "公钥指数"},
+                "c": {"type": "string", "description": "密文"},
+                "e1": {"type": "string", "description": "common_modulus：e1"},
+                "e2": {"type": "string", "description": "common_modulus：e2"},
+                "c1": {"type": "string", "description": "common_modulus：c1"},
+                "c2": {"type": "string", "description": "common_modulus：c2"},
+                "ns": {"type": "array", "items": {"type": "string"}, "description": "hastad/crt：模数数组"},
+                "cs": {"type": "array", "items": {"type": "string"}, "description": "hastad/crt：密文/余数数组"},
+                "B": {"type": "integer", "description": "p-1 平滑界（默认 10000）"},
+                "limit": {"type": "integer", "description": "fermat/rho 迭代上限（默认 200000）"},
+            },
+            "required": ["op"],
+        },
+    },
+}
+
+AESBLOCK_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "aesblock",
+        "description": (
+            "纯 stdlib AES 原语（无 pycryptodome 也能打分组密码题）。op=ecb_encrypt/ecb_decrypt/"
+            "cbc_encrypt/cbc_decrypt/ctr（key, data, iv/nonce, counter 均为 hex）、xor（data 与 iv 两块异或）、"
+            "bitflip（CBC 已知明文前块翻转：给 iv/known/target 同长，返回新前块 hex）、pkcs7_pad/pkcs7_unpad。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string",
+                       "enum": ["ecb_encrypt", "ecb_decrypt", "cbc_encrypt", "cbc_decrypt", "ctr",
+                                "xor", "bitflip", "pkcs7_pad", "pkcs7_unpad"]},
+                "key": {"type": "string", "description": "key（hex，16/24/32 字节）"},
+                "data": {"type": "string", "description": "数据（hex）"},
+                "iv": {"type": "string", "description": "CBC IV（hex，16 字节）/ xor 第二操作数 / bitflip 原前块"},
+                "nonce": {"type": "string", "description": "CTR 起始块（hex）"},
+                "counter": {"type": "integer", "description": "CTR 起始计数（默认 0）"},
+                "known": {"type": "string", "description": "bitflip：已知明文（单块内文本）"},
+                "target": {"type": "string", "description": "bitflip：目标明文（同长）"},
+            },
+            "required": ["op"],
+        },
+    },
+}
+
+PRNG_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "prng",
+        "description": (
+            "纯 stdlib PRNG 状态恢复/预测。op=mt_seed（seed 给前 count 个 32-bit 输出，校验用）、"
+            "mt_predict（给 ≥624 个连续输出 → 恢复状态并预测后续 count 个）、"
+            "lcg_recover（给 ≥5 个连续输出，可选 m → 恢复 a/c/m 并预测后续）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["mt_seed", "mt_predict", "lcg_recover"]},
+                "seed": {"type": "integer", "description": "mt_seed：种子"},
+                "count": {"type": "integer", "description": "预测/生成个数（默认 10，上限 200）"},
+                "outputs": {"type": "array", "items": {"type": "integer"},
+                            "description": "已观测的连续输出列表"},
+                "m": {"type": "integer", "description": "LCG 模数（不给则试推）"},
+            },
+            "required": ["op"],
+        },
+    },
+}
+# <<< [crypto-toolbox 2026-10-30]
+
+DOMAIN_SPECS = [TCP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC, PWNGEN_SPEC, PWNFIND_SPEC,
+                RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC]
 
 DOMAIN_NAMES = {s["function"]["name"] for s in DOMAIN_SPECS}
 
@@ -587,8 +2047,65 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
                 sni=str(args.get("sni") or ""),
             )
         if name == "elfpeek":
-            return elfpeek(str(args.get("path", "")), view=str(args.get("view") or "info"),
-                           min_len=int(args.get("min_len", 4)), limit=int(args.get("limit", 60)))
+            # [rev-toolbox] 新增 disasm/bytecode/gadgets-v2/utf16 参数透传
+            # [toolbox-fix 2026-10-30] 整数参数改走 _to_int：垃圾值报 ToolError（顺带支持 "0x40" 这类 hex 字符串 offset）
+            return elfpeek(
+                str(args.get("path", "")), view=str(args.get("view") or "info"),
+                min_len=_to_int(args.get("min_len"), 4, "min_len"),
+                limit=_to_int(args.get("limit"), 60, "limit"),
+                offset=_to_int(args.get("offset"), 0, "offset"),
+                length=_to_int(args.get("length"), 128, "length"),
+                count=_to_int(args.get("count"), 40, "count"),
+                arch=str(args.get("arch") or ""),
+                extract=str(args.get("extract") or ""),
+                func=str(args.get("func") or ""),
+                utf16=bool(args.get("utf16", False)),
+                filt=str(args.get("filter") or ""),
+                symbol=str(args.get("symbol") or ""),
+                search=str(args.get("search") or ""),
+            )
+        if name == "pwngen":  # [pwn-toolbox]（[toolbox-fix 2026-10-30] size/n 传原值，函数内 _to_int）
+            return pwngen(
+                op=str(args.get("op") or "cyclic"),
+                size=args.get("size") if args.get("size") is not None else 256,
+                n=args.get("n") if args.get("n") is not None else 4,
+                alphabet=str(args.get("alphabet") or ""),
+                parts=args.get("parts") if isinstance(args.get("parts"), list) else None,
+                path=str(args.get("path") or ""),
+            )
+        if name == "pwnfind":  # [pwn-toolbox]
+            return pwnfind(
+                value=str(args.get("value") or ""), hex=str(args.get("hex") or ""),
+                n=args.get("n") if args.get("n") is not None else 4,
+                alphabet=str(args.get("alphabet") or ""),
+            )
+        if name == "rsatool":  # [crypto-toolbox]
+            return rsatool(
+                op=str(args.get("op") or "factor"),
+                n=str(args.get("n") or ""), e=str(args.get("e") or ""), c=str(args.get("c") or ""),
+                e1=str(args.get("e1") or ""), e2=str(args.get("e2") or ""),
+                c1=str(args.get("c1") or ""), c2=str(args.get("c2") or ""),
+                ns=args.get("ns") if isinstance(args.get("ns"), list) else None,
+                cs=args.get("cs") if isinstance(args.get("cs"), list) else None,
+                B=args.get("B") if args.get("B") is not None else 10000,
+                limit=args.get("limit") if args.get("limit") is not None else 200000,
+            )
+        if name == "aesblock":  # [crypto-toolbox]
+            return aesblock(
+                op=str(args.get("op") or "ecb_encrypt"),
+                key=str(args.get("key") or ""), data=str(args.get("data") or ""),
+                iv=str(args.get("iv") or ""), nonce=str(args.get("nonce") or ""),
+                counter=args.get("counter") if args.get("counter") is not None else 0,
+                known=str(args.get("known") or ""), target=str(args.get("target") or ""),
+            )
+        if name == "prng":  # [crypto-toolbox]
+            return prng(
+                op=str(args.get("op") or "mt_predict"),
+                seed=args.get("seed") if args.get("seed") is not None else 0,
+                count=args.get("count") if args.get("count") is not None else 10,
+                outputs=args.get("outputs") if isinstance(args.get("outputs"), list) else None,
+                m=args.get("m") if args.get("m") is not None else 0,
+            )
         if name == "netcheck":
             port = args.get("port")
             return netcheck(str(args.get("host", "")), int(port) if port else None,

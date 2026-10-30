@@ -21,6 +21,7 @@ import re
 from json import JSONDecodeError
 
 from .budget import Budget, BudgetExceeded
+from .progress import BudgetPhase
 from .checkpoint import (
     discard as _ckpt_discard,
     load as _ckpt_load,
@@ -68,6 +69,81 @@ PLATFORM_SCOPE: dict[str, set[str]] = {
     "submit": {"submit_answer", "submit_qa_answer"},
 }
 
+# 按域编排档位（P2-2）：只调**编排参数**（协调者轮次 / 角色步数 / 单步工具数 / 集群-A/B 策略），
+# 一行提示词都不改（提示词改动需单独批准）。
+# 语义刻意用**增量（只加不减）**：config/agent.json 已经调过基线（coordinator 14 轮、web 14 步、
+# 单步 8 工具），若用绝对值会把并行会话的调优覆盖成降级。增量保证任何档位都不会让参数变小。
+#   web  = 批处理：单步允许多个工具调用 + web 专家更多步，一次委托覆盖更多端点；
+#   ai   = 对话式：协调者轮次更多，围绕同一会话反复追问（AI 题信息分布在多轮交互里）；
+#   deep = 深单路：强制 k=1、关闭集群-A 并行，并加长重计算/逆向类角色步数——
+#         这类题需要长链推理，被切预算或分路会摊薄（cybench 口径）。
+DOMAIN_PROFILES: dict[str, dict] = {
+    "web": {"calls_per_step_add": 4, "role_steps_add": {"web": 4}},
+    "ai": {"rounds_add": 4, "role_steps_add": {"ai": 2}},
+    "deep": {
+        "role_steps_add": {"rev": 6, "crypto": 6, "pwn": 6, "misc": 6},
+        "force_k1": True,
+        "no_cluster_a": True,
+    },
+}
+# 白名单：守住「P2-2 只动编排、不动提示词/工具面」的边界（测试会断言 profile 只含这些键）
+PROFILE_KEYS = frozenset({"rounds_add", "role_steps_add", "calls_per_step_add", "force_k1", "no_cluster_a"})
+
+
+def domain_profile(cfg: dict | None, challenge, competition_id: str = "") -> dict:
+    """按题型/赛题来源选编排档位；未识别返回 {}（= 旧行为，零回归）。
+
+    判定优先级：
+      1. 显式赛题映射 cfg["domain_profile_competitions"] = {"<competition_id>": "deep|web|ai"}
+         —— 必需项：实测 CyBench 的赛题被平台统一标成 category=web（真题型在 tags 里），
+         且 competition_id 是哈希（d35cc057…），靠关键字猜不出来；
+      2. 平台赛题名/ID 含 "cybench" → deep；
+      3. category=web/web3 → web；category=ai/aisec/llm/ml → ai；
+      4. 其余（含 ctfarena 的 rev/crypto/pwn/misc）不覆盖，保持原编排。
+    cfg["domain_profiles"] = False 可整体关闭（应急开关）。
+    """
+    cfg = cfg or {}
+    if cfg.get("domain_profiles") is False:
+        return {}
+    cat = str(getattr(challenge, "category", "") or "").strip().lower()
+    comp = str(competition_id or "").lower()
+    key = ""
+    explicit = cfg.get("domain_profile_competitions") or {}
+    if isinstance(explicit, dict) and competition_id and competition_id in explicit:
+        key = str(explicit[competition_id]).strip().lower()
+    if key not in DOMAIN_PROFILES:
+        if "cybench" in comp:
+            key = "deep"
+        elif cat == "web" or cat.startswith("web"):
+            key = "web"
+        elif cat in ("ai", "aisec", "llm", "ml", "security-ai") or cat.startswith("ai"):
+            key = "ai"
+        else:
+            key = ""
+    if not key:
+        return {}
+    profile = dict(DOMAIN_PROFILES.get(key) or {})
+    # 热调参/测试覆盖：cfg["domain_profile_overrides"] = {"web": {"calls_per_step_add": 2}}
+    overrides = cfg.get("domain_profile_overrides") or {}
+    if isinstance(overrides, dict) and isinstance(overrides.get(key), dict):
+        profile.update({k: v for k, v in overrides[key].items() if k in PROFILE_KEYS})
+    return {k: v for k, v in profile.items() if k in PROFILE_KEYS}
+
+
+# 档位 → 有效参数（只加不减；测试直接单测这三个纯函数）
+def profile_rounds(profile: dict | None, default_rounds: int) -> int:
+    return max(1, int(default_rounds) + int((profile or {}).get("rounds_add") or 0))
+
+
+def profile_steps(profile: dict | None, role: str, default_steps: int) -> int:
+    add = ((profile or {}).get("role_steps_add") or {}).get(role) or 0
+    return max(1, int(default_steps) + int(add))
+
+
+def profile_calls_cap(profile: dict | None, default_cap: int) -> int:
+    return max(1, int(default_cap) + int((profile or {}).get("calls_per_step_add") or 0))
+
+
 # 默认角色。config/agent.json 的 roles 键可覆盖（会进 extra）。
 DEFAULT_ROLES: dict[str, dict] = {
     "coordinator": {"max_steps": 8, "platform": ["read", "instance", "oracle", "submit"], "local": []},
@@ -81,9 +157,12 @@ DEFAULT_ROLES: dict[str, dict] = {
     "pwn": {"max_steps": 12, "allow_shell": True,
             "platform": ["read", "instance"],
             "local": ["shell", "elfpeek", "tcp", "tcp_batch", "netcheck"]},
-    "ai": {"max_steps": 12, "allow_shell": False,
+    # [web-ai-gap 2026-10-30] ai 兜底按 agent.json 抄全（12→14 步、开 shell、
+    # local 补 shell/decode_blob），避免 config 丢失时退化成「无载荷构造」的旧面。
+    # platform 用组名：oracle 组 = verify_answer + verify_exploit，校验通道无需单列。
+    "ai": {"max_steps": 14, "allow_shell": True,
            "platform": ["read", "instance", "oracle"],
-           "local": ["http_request", "http_map", "chat"]},
+           "local": ["http_request", "http_map", "chat", "shell", "decode_blob"]},
 }
 
 # 结论交付规则：note 只落盘、不回传，report 才是唯一出口。
@@ -428,6 +507,8 @@ class Crew:
         self._question_info: dict = {}
         # 集群-B：本次尝试的决策温度（None=不改各角色自带温度，行为同旧）；由 _delegate 盖到专家上
         self._attempt_temperature: float | None = None
+        # P2-2：当前题目的按域编排档位（solve() 每轮开始时重算；{} = 旧行为）
+        self._profile: dict = {}
 
     # ---------- 工具面 ----------
 
@@ -439,12 +520,21 @@ class Crew:
             wanted |= PLATFORM_SCOPE.get(entry) or {entry}
         return wanted & set(self.platform.tool_names())
 
+    # traffic 工具默认可见面（P1-1 实测门控）：bank-500k-v1 全部 1495 次工具调用中
+    # traffic 仅 9 次、全部出自 web 角色（用流量库取缓存正文，绕账本拦截复用已抓内容）。
+    # schema ~413 tok/次却无条件随每次调用发给所有角色 = 纯线性浪费。web 默认给；
+    # 其它角色要看得在 agent.json 的 roles.<role>.local 里显式加 "traffic"。
+    TRAFFIC_DEFAULT_ROLES = frozenset({"web"})
+
     def _role_specs(self, role: str) -> list[dict]:
         specs = self.platform.openai_tools_for(self._role_platform_names(role))
         local = set((self.roles.get(role) or {}).get("local") or [])
         specs.append(NOTE_SPEC)
         _cfg = getattr(self, "config", None)
-        if _cfg is None or _cfg.extra.get("traffic_enabled", True):
+        if (
+            (_cfg is None or _cfg.extra.get("traffic_enabled", True))
+            and ("traffic" in local or role in self.TRAFFIC_DEFAULT_ROLES)
+        ):
             specs.append(TRAFFIC_SPEC)
         if "http_request" in local:
             specs.append(HTTP_SPEC)
@@ -507,7 +597,9 @@ class Crew:
             system=self._role_system(role, spec.get("system")),
             task=task,
             specs=self._role_specs(role),
-            max_steps=int(spec.get("max_steps") or 4),
+            max_steps=profile_steps(
+                self._profile, role, int(spec.get("max_steps") or 4)
+            ),
             allow_shell=bool(spec.get("allow_shell")),
             allow_chat="chat" in (spec.get("local") or []),
             platform_names=self._role_platform_names(role),
@@ -580,6 +672,11 @@ class Crew:
                         轮粒度真取消。
         """
         challenge = self.store.require(challenge_id)
+        # P2-2：按域编排档位（只动编排参数；未识别题型 → {} 即旧行为）
+        self._profile = domain_profile(
+            self.config.extra, challenge,
+            self.config.extra.get("competition_id") or self.store.meta.get("competition_id") or "",
+        )
         spending = Budget(
             max_tokens=self.config.max_tokens_per_challenge,
             max_calls=self.config.max_llm_calls,
@@ -658,7 +755,8 @@ class Crew:
 
         submitted = False
         reason = "no_more_actions"
-        rounds = max(1, int((self.roles.get("coordinator") or {}).get("max_steps") or 8))
+        _rounds_default = int((self.roles.get("coordinator") or {}).get("max_steps") or 8)
+        rounds = profile_rounds(self._profile, _rounds_default)
         reports: list[str] = []  # 已交回的专家结论，供下一轮派活做增量摘要
         ledger = Ledger.from_config(self.config)  # 跨 delegate 共享：知识不随专家上下文消失
         plan = PlanTrack()  # 协调者自己的计划状态：防「同一份侦察重写三遍」
@@ -718,6 +816,13 @@ class Crew:
                     self.store.append_transcript(
                         challenge_id, {"role": "checkpoint", "note": f"快照失败（忽略）：{exc}"}
                     )
+                # P0-2：预算阶段每轮注入协调者（实测 500k ≈ 40 次调用，agent 需要剩余量感知）
+                budget_line = BudgetPhase.line(getattr(coordinator, "budget", None))
+                if budget_line:
+                    messages.append({"role": "user", "content": budget_line})
+                    self.store.append_transcript(
+                        challenge_id, {"role": "coordinator", "step": rnd, "budget": budget_line}
+                    )
                 try:
                     messages = _compact_history(messages, self.config.max_context_tokens)
                     response = coordinator.chat(messages, tools=self._coordinator_tools())
@@ -736,8 +841,10 @@ class Crew:
 
                 calls = response.get("tool_calls") or []
                 content = response.get("content") or ""
-                if len(calls) > self.config.max_calls_per_step:
-                    calls = calls[: self.config.max_calls_per_step]
+                # P2-2：web 批处理档位放宽单步工具数（一次抓多个端点），其余沿用配置
+                _calls_cap = profile_calls_cap(self._profile, self.config.max_calls_per_step)
+                if len(calls) > _calls_cap:
+                    calls = calls[:_calls_cap]
 
                 companion = parse_companion(content)
                 record = {
@@ -1058,12 +1165,20 @@ class Crew:
         早停：解出 / 题级预算耗尽（stopped）/ 环境能力硬缺口（hopeless）都立即收手。
         """
         cfg = self.config.extra or {}
+        # P2-2：按域编排档位。deep 档（cybench 重计算题）= 深单路：关集群-A 并行、强制 k=1，
+        # 避免「同一题分 3 路各 1/3 预算」把长链推理摊薄。
+        profile = domain_profile(
+            cfg, self.store.require(challenge_id),
+            cfg.get("competition_id") or self.store.meta.get("competition_id") or "",
+        )
         # 集群-A：无状态题同题并行（与集群-B 串行互斥；A 拖广度 / B 挖深度，见 docs/plan-cluster-a.md）
         try:
             n_a = int(cfg.get("cluster_a_concurrency") or 0)
         except (TypeError, ValueError):
             n_a = 0  # 非法值兜底串行（与 resolve_k 对 clusterb_k 的宽容一致，不炸编排入口）
         n_a = min(n_a, 3)  # 平台规则 QA#26：agent 自主并发 ≤ 3（并发数只是建议，超配自动收敛）
+        if profile.get("no_cluster_a"):
+            n_a = 0
         if n_a >= 2 and self._is_stateless(challenge_id, cfg):
             return self._solve_clustera(challenge_id, n_a, cfg)
         from .retry import AttemptOutcome, Orchestrator, resolve_k  # noqa: PLC0415 - 避免顶层循环依赖
@@ -1075,6 +1190,8 @@ class Crew:
             tokens_pool=max(0, int(self.config.max_tokens_per_challenge) - int(used.get("total_tokens") or 0)),
             calls_pool=max(0, int(self.config.max_llm_calls) - int(used.get("calls") or 0)),
         )
+        if profile.get("force_k1"):
+            k = 1  # deep 档：深单路，不切片、不重跑
         if k <= 1:
             return self.solve(challenge_id)
 

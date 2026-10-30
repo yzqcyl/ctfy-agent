@@ -41,6 +41,12 @@ from smoke_brake import case_no_progress_brake  # noqa: E402
 from smoke_gate import case_done_gate, case_convergence_stalled  # noqa: E402
 from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
+from smoke_ai_infra import case_ai_infra  # noqa: E402
+from smoke_ai_mcp import case_ai_mcp  # noqa: E402
+from smoke_progress import case_progress  # noqa: E402
+from smoke_p1 import case_p1  # noqa: E402
+from smoke_p2 import case_p2  # noqa: E402
+from smoke_p21 import case_p21  # noqa: E402
 from smoke_ai_role import case_ai_contract, case_ai_wiring  # noqa: E402
 from smoke_case_misc import case_misc_ext  # noqa: E402
 from smoke_clusterb_crew import case_clusterb_crew, case_clusterb_facts_reflow  # noqa: E402
@@ -2190,7 +2196,7 @@ def case_web_playbook(tmp: Path) -> None:
 
     # 关键条款（行为依赖项，缺了就是提示词回退）
     for needle in (
-        "SPA 兜底", "不可信数据", "只有 10 步", "list_hints", "verify_answer",
+        "SPA 兜底", "不可信数据", "只有 14 步", "list_hints", "verify_answer",
         "你没有提交权", "ledger 拦截", "过滤矩阵", "回显三态", "command not found",
     ):
         assert needle in base, f"web 提示词缺关键条款: {needle}"
@@ -3999,7 +4005,8 @@ def case_ai_direction_dod(tmp: Path) -> None:
     """AI 安全方向按 extending-agent.md §9 Definition-of-Done 收口（见 docs/ai-plan.md §11）。
 
     钉四处：角色字段齐全不越权（§3）｜专属提示词不重复写 4 纪律、_role_system 自动补（§6）｜
-    _role_specs("ai") 只暴露方向工具、无 shell（§5/§9.6）｜delegate 枚举自动含 ai（§7）。
+    _role_specs("ai") 暴露方向工具（chat/shell/decode_blob）与 verify_exploit 通道（§5/§9.6，
+    M6 补齐：AI 题要构造载荷、checker 型要自校验）｜delegate 枚举自动含 ai（§7）。
     """
     from ctfy_agent.crew import Crew, DEFAULT_ROLES  # noqa: PLC0415
     from ctfy_agent.method_cards import AI_CARDS  # noqa: PLC0415
@@ -4024,8 +4031,11 @@ def case_ai_direction_dod(tmp: Path) -> None:
     assert isinstance(effective.get("max_steps"), int) and effective["max_steps"] > 0, effective
     assert effective.get("platform"), "ai 需平台只读/实例/oracle 组"
     local = list(effective.get("local") or [])
-    assert "shell" not in local, "ai 方向 local 面不允许 shell（收口）"
-    assert effective.get("allow_shell") is False, "ai 方向 allow_shell 应为 False"
+    # [web-ai-gap 2026-10-30] M6：AI 题要构造载荷/上传，shell + decode_blob 属方向工具
+    assert "shell" in local and "decode_blob" in local, local
+    assert effective.get("allow_shell") is True, "ai 方向 allow_shell 应为 True（M6）"
+    assert "verify_exploit" in local or "verify_exploit" in (effective.get("platform") or []), \
+        "checker 型 AI 题需要 verify_exploit 通道（M6）"
 
     # 2) 提示词契约（§6）：专属覆盖 + 纪律自动补、不重复写
     system = ai_cfg.get("system", "")
@@ -4046,9 +4056,11 @@ def case_ai_direction_dod(tmp: Path) -> None:
                   "ai": effective, "web": DEFAULT_ROLES["web"]}
     crew.config = _StubConfig()
     ai_names = {spec["function"]["name"] for spec in crew._role_specs("ai")}
-    for expected in ("http_request", "http_map", "chat", "report", "note"):
+    for expected in ("http_request", "http_map", "chat", "shell", "decode_blob", "report", "note"):
         assert expected in ai_names, f"ai 角色应能调 {expected}：{sorted(ai_names)}"
-    assert "shell" not in ai_names, "ai 的 _role_specs 不应暴露 shell"
+    # [web-ai-gap 2026-10-30] M6：checker 型 AI 题走 verify_exploit 自校验（平台通道，非本地工具）
+    assert "verify_exploit" in crew._role_platform_names("ai"), \
+        "ai 平台面缺 verify_exploit（M6：checker 型自校验）"
 
     delegates = [t for t in crew._coordinator_tools() if t["function"]["name"] == "delegate"]
     assert delegates, "协调者工具面缺 delegate"
@@ -4142,6 +4154,12 @@ def main() -> int:
         ("ai_contract", case_ai_contract),
         ("ai_wiring", case_ai_wiring),
         ("ai_fixtures", case_ai_fixtures),
+        ("ai_infra", case_ai_infra),
+        ("ai_mcp", case_ai_mcp),
+        ("progress", case_progress),
+        ("p1", case_p1),
+        ("p2", case_p2),
+        ("p21", case_p21),
         ("ai_agent_e2e", case_ai_agent_e2e),
         ("http_302_cookie", case_http_302_cookie),
         ("context_compress", case_context_compress),

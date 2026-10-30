@@ -25,10 +25,30 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from json import JSONDecodeError
 
 from .mcp_client import McpHttpClient, mcp_tool_to_openai, render_call_result, split_tool_name
+
+# ---------- 运行时事实修正：模型最容易在「实例/问题 id」上编参数 ----------
+# 实测 2026-10-29 SAMPLE-007：worker 已被打掉（POST /api/worker/stop -> {"worker_alive":false}），
+# 但 verify_exploit 传了 instance_id="s2mzomar64iepo3qh"（主机前缀，不是实例 UUID）、
+# question_id="deface"（幻觉；本题真实 question id 是 "outage"）→ instance_not_found，
+# 平台始终没记解。下面按 get_challenge/start_instance/get_instance 拿到的真实事实做参数修正。
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# 这些工具以 instance_id 为键（平台文档：instance UUID returned by start_instance）
+_INSTANCE_TOOLS = frozenset({
+    "verify_exploit", "verify_answer", "submit_answer", "submit_qa_answer", "submit_flag",
+    "get_instance", "get_instance_status", "get_instance_traffic",
+    "stop_instance", "renew_instance", "reset_instance",
+})
+# 这些工具带 question_id（平台默认 "flag"，但 checker 题的真实 id 可能叫 outage/…）
+_QUESTION_TOOLS = frozenset({
+    "verify_exploit", "verify_answer", "submit_answer", "submit_qa_answer", "submit_flag",
+})
 
 # ---------- 语义动作 → 线上真实工具名 ----------
 
@@ -117,6 +137,10 @@ class CtfyPlatform:
         self.tools: list[dict] = []
         self._by_name: dict[str, dict] = {}
         self._resolved: dict[str, str] = {}
+        # 本次运行的真实事实（供参数修正）：当前实例 UUID、当前题 id、题目 questions 元信息
+        self._active_instance_id: str = ""
+        self._active_challenge_id: str = ""
+        self._question_meta: dict[str, dict[str, dict]] = {}
 
     # ---------- 连接 ----------
 
@@ -251,11 +275,98 @@ class CtfyPlatform:
                     raise PlatformError(f"{name}: 参数 {field} 应为整数，收到 {value!r}")
         return cleaned
 
+    # ---------- 运行时事实修正（防模型编造 instance_id / question_id） ----------
+
+    def _remember_questions(self, challenge_id, data) -> None:
+        """从 get_challenge / start_instance / get_instance 的返回里记下题目 questions。"""
+        if not isinstance(challenge_id, str) or not challenge_id or not isinstance(data, dict):
+            return
+        questions = data.get("questions") or []
+        if not isinstance(questions, list) or not questions:
+            return
+        meta: dict[str, dict] = {}
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            qid = q.get("id") or q.get("question_id")
+            if not qid:
+                continue
+            meta[str(qid)] = {
+                "mode": str(q.get("mode") or ""),
+                "prompt": str(q.get("prompt") or "")[:160],
+            }
+        if meta:
+            self._question_meta[challenge_id] = meta
+
+    def _learn_from_result(self, name: str, arguments: dict, result) -> None:
+        """把工具返回里的事实沉淀下来；只认 dict 返回值，解析失败静默跳过。"""
+        if name not in ("start_instance", "get_instance", "get_instance_status", "get_challenge"):
+            return
+        try:
+            data = self._as_json(render_call_result(result))
+        except Exception:  # noqa: BLE001 - 事实学习失败不能影响主流程
+            return
+        if not isinstance(data, dict):
+            return
+        cid = arguments.get("challenge_id") or self._active_challenge_id
+        if isinstance(cid, str) and cid:
+            self._active_challenge_id = cid
+        iid = data.get("id") or data.get("instance_id")
+        if (name in ("start_instance", "get_instance", "get_instance_status")
+                and isinstance(iid, str) and iid):
+            self._active_instance_id = iid
+        self._remember_questions(cid, data)
+
+    def _pick_question_id(self, tool_name: str) -> str:
+        """在本题 questions 里挑最可能的目标：verify_exploit 优先唯一 checker 题，否则唯一题。"""
+        known = self._question_meta.get(self._active_challenge_id) or {}
+        if not known:
+            return ""
+        if tool_name == "verify_exploit":
+            checkers = [qid for qid, m in known.items() if (m.get("mode") or "") == "checker"]
+            if len(checkers) == 1:
+                return checkers[0]
+        if len(known) == 1:
+            return next(iter(known))
+        return ""
+
+    def _repair_runtime_args(self, name: str, arguments: dict | None) -> dict:
+        """按运行时事实修正参数；只改 schema 里真实存在的字段，绝不新增字段。"""
+        args = dict(arguments or {})
+        props = self.prop_names(name)
+        if not props:  # 假服务/无 schema：不猜，原样放行
+            return args
+        if "instance_id" in props and name in _INSTANCE_TOOLS:
+            iid = args.get("instance_id")
+            if (self._active_instance_id and isinstance(iid, str)
+                    and not _UUID_RE.match(iid.strip())):
+                args["instance_id"] = self._active_instance_id
+        if "question_id" in props and name in _QUESTION_TOOLS:
+            qid = args.get("question_id")
+            current = self._question_meta.get(self._active_challenge_id) or {}
+            if isinstance(qid, str) and qid and current and qid not in current:
+                better = self._pick_question_id(name)
+                if better:
+                    args["question_id"] = better
+        return args
+
     # ---------- 调用 ----------
 
     def call(self, name: str, arguments: dict | None = None, *, retries: int = 0):
         arguments = self._clean_args(name, arguments)
-        return self.client.call_tool(name, arguments, retries=retries)
+        arguments = self._repair_runtime_args(name, arguments)
+        result = self.client.call_tool(name, arguments, retries=retries)
+        # 兜底：参数已修正仍报 instance_not_found（例如缓存的实例已被平台回收）→ 用当前实例重试一次
+        if isinstance(result, dict) and result.get("isError") and self._active_instance_id:
+            try:
+                err_text = render_call_result(result)
+            except Exception:  # noqa: BLE001
+                err_text = ""
+            if "instance_not_found" in err_text and arguments.get("instance_id") != self._active_instance_id:
+                arguments["instance_id"] = self._active_instance_id
+                result = self.client.call_tool(name, arguments, retries=retries)
+        self._learn_from_result(name, arguments, result)
+        return result
 
     def call_raw(self, name: str, arguments: dict | None = None, *, retries: int = 0):
         """返回原始 result dict（含 isError），供提交判定精确读取。"""

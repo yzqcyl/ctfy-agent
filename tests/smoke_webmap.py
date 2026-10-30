@@ -179,12 +179,105 @@ def case_http_map_wiring(tmp: Path) -> None:
         print(f"PASS {label}")
 
 
+def case_http_map_fingerprint(tmp: Path) -> None:
+    """AI 栈组件指纹（ctf-ai-infra，MIT）：probe 按特征路径+确定性子串定型组件并给下一步打法。
+
+    三跑 0 调用的接线 bug 修掉后，下一个静默失效点是「工具在但认不出靶子是什么」——
+    本用例钉死：① 特征命中必须报组件+版本+打法；② 特征不中不能乱报；③ crawl 首页也能定型。
+    """
+    main = sys.modules.get("__main__")
+    reporter = getattr(main, "ok", None)
+
+    class _AIStackHandler(_Handler):
+        """模拟一个拼盘靶机：Ollama + ComfyUI + Open WebUI + vLLM 各暴露一个特征端点。"""
+
+        def do_GET(self):  # noqa: N802
+            if self.path == "/":
+                self._send(200, b"<html>front __COMFYUI_FRONTEND_VERSION__ = '1.2.3'</html>")
+            elif self.path == "/plain":
+                self._send(200, b"<html>just a page, no markers</html>")
+            elif self.path == "/api/version":
+                self._send(200, b'{"version":"0.1.29"}', "application/json")
+            elif self.path == "/system_stats":
+                self._send(200, b'{"comfyui_version":"0.3.27"}', "application/json")
+            elif self.path == "/api/config":
+                self._send(200, b'{"features":{"auth":true}}', "application/json")
+            elif self.path == "/v1/models":
+                self._send(200, b'{"object":"list","data":[]}', "application/json")
+            elif self.path == "/config":
+                # 同路径但正文没有 Gradio 特征：不许定型（防误报）
+                self._send(200, b"<html>settings page</html>")
+            else:
+                self._send(404, b"not found")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _AIStackHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        tools = LocalTools(_Store(), f"case-map-fp-{port}")
+        tools.allow_instance("127.0.0.1", port)
+        base = f"http://127.0.0.1:{port}"
+
+        # ---- 1) probe：四个组件按 PROBE_PATHS 顺序定型 ----
+        probe = json.loads(tools.http_map(base + "/", mode="probe"))
+        assert probe.get("components") == ["Ollama", "ComfyUI", "Open WebUI", "vLLM/LiteLLM"], probe.get("components")
+        by_path = {hit["path"]: hit for hit in probe["hits"]}
+        ollama = by_path["/api/version"]
+        assert ollama["component"] == "Ollama" and "版本 0.1.29" in ollama["why"], ollama
+        assert "CVE-2024-7773" in ollama["next"], "下一步打法应带已知洞锚点"
+        assert "customnode" in by_path["/system_stats"]["next"], by_path["/system_stats"]
+        assert "/config" in by_path and "component" not in by_path["/config"], "特征不中不许定型"
+        assert "组件定型" in probe["next"] and "服务端文件" in probe["next"], probe["next"]
+
+        # ---- 2) crawl：首页专有标记也能定型（SPA 壳探不出 API 时兜底） ----
+        crawl = json.loads(tools.http_map(base + "/"))
+        assert crawl.get("component") == "ComfyUI", crawl.get("component")
+        assert "probe" in crawl["next"], crawl["next"]
+        plain = json.loads(tools.http_map(base + "/plain"))
+        assert "component" not in plain, "无标记页面不许报组件"
+
+        # ---- 3) catch-all 兜底：身份路径全回 200 但无特征时，不许早停饿死工具面路径 ----
+        class _CatchAllHandler(_Handler):
+            def do_GET(self):  # noqa: N802
+                if self.path == "/openapi.json":
+                    self._send(200, b'{"openapi":"3.0.0"}', "application/json")
+                else:
+                    self._send(200, b"<html>frontend shell</html>")
+
+        catchall = ThreadingHTTPServer(("127.0.0.1", 0), _CatchAllHandler)
+        threading.Thread(target=catchall.serve_forever, daemon=True).start()
+        caport = catchall.server_address[1]
+        try:
+            catools = LocalTools(_Store(), f"case-map-ca-{caport}")
+            catools.allow_instance("127.0.0.1", caport)
+            caprobe = json.loads(catools.http_map(f"http://127.0.0.1:{caport}/", mode="probe"))
+            capaths = {hit["path"] for hit in caprobe["hits"]}
+            # 身份路径都 200 但定型不了组件 → 必须继续探到 openapi（位置 9+）而不是 8 条就停
+            assert "/openapi.json" in capaths, f"catch-all 早停饿死了 openapi.json：{sorted(capaths)}"
+            assert len(caprobe["hits"]) > 8, f"没定型组件时不设早停：{len(caprobe['hits'])}"
+            assert "components" not in caprobe, "无特征报文不该报组件"
+        finally:
+            catchall.shutdown()
+            catchall.server_close()
+
+        label = ("http_map 指纹：probe/crawl 组件定型（Ollama/ComfyUI/Open WebUI/vLLM）"
+                 "+ 防误报 + catch-all 不饿死工具面")
+        if callable(reporter):
+            reporter(label)
+        else:
+            print(f"PASS {label}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 if __name__ == "__main__":
     import traceback
 
     try:
         case_http_map(ROOT / "dist" / "_webmap_standalone")
         case_http_map_wiring(ROOT / "dist" / "_webmap_wiring")
+        case_http_map_fingerprint(ROOT / "dist" / "_webmap_fingerprint")
         print("OK")
     except Exception:
         traceback.print_exc()

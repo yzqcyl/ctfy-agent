@@ -38,6 +38,7 @@ from .ledger import FLAG_RE
 TOOL_TEXT_MAX = 6000
 MAX_LAYERS = 8
 UNPACK_MAX_BYTES = 64 * 1024 * 1024
+MAX_WRITE_BYTES = 512 * 1024      # write_file 单次上限：够写脚本/payload，防手滑灌满磁盘
 UNPACK_MAX_FILES = 2000
 HEXPEEK_MAX = 1024
 HEXPEEK_WIDTH = 16
@@ -469,8 +470,36 @@ def hexpeek(path: str, offset: int = 0, length: int = 256) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 对外：SPEC 与分发
+# 3.5 write_file：沙盒内原子写文本文件（跨平台可靠的「写脚本」通道）
 # ---------------------------------------------------------------------------
+# 动机（docs/audit-agent-2026-10-30.md §5 B1）：没有写文件工具时，模型只能用 shell 拼
+# `python -c "open('x.py','w').write(...)"` / heredoc 写脚本；Windows cmd 的引号与
+# `<<` 规则会把长脚本写坏，v0 批 265 次 shell 拒收多由此引发（各题平均浪费一整轮）。
+# 直接提供一个路径已经过沙盒校验的写文件工具，任何平台都只有一种写法。
+
+def write_file(path: str, content: str, append: bool = False) -> str:
+    """把 UTF-8 文本写进沙盒文件（自动建父目录），返回 JSON 摘要。"""
+    target = Path(path)
+    if target.exists() and target.is_dir():
+        _fail(f"目标已存在且是目录：{path}")
+    text = "" if content is None else str(content)
+    size = len(text.encode("utf-8"))
+    if size > MAX_WRITE_BYTES:
+        _fail(f"内容过大（{size} 字节 > 上限 {MAX_WRITE_BYTES}）。请拆分后分批写，或改用更紧凑的表示。")
+    created_dirs = not target.parent.exists()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a" if append else "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    return json.dumps(
+        {
+            "path": str(target),
+            "bytes_written": size,
+            "total_bytes": target.stat().st_size,
+            "append": bool(append),
+            "created_parent_dirs": created_dirs,
+        },
+        ensure_ascii=False,
+    )
 
 DECODE_SPEC = {
     "type": "function",
@@ -701,8 +730,30 @@ JWT_SPEC = {
 }
 
 
-MISC_EXT_SPECS = [DECODE_SPEC, UNPACK_SPEC, HEXPEEK_SPEC, JWT_SPEC]
-NAMES = {"decode_blob", "unpack_archive", "hexpeek", "jwt_forge"}
+WRITE_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": (
+            "把文本写入沙盒里的文件（自动创建父目录；默认覆盖，append=true 追加）。"
+            "写脚本/载荷/字典文件一律用它，不要用 shell 的 echo/heredoc/python -c 拼——"
+            "Windows 与 Linux 的引号规则不同，拼接长脚本极易写坏。"
+            "路径必须是相对沙盒或沙盒内的绝对路径；单次上限 512KB。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "目标文件路径（如 exp.py 或 extracted/run.sh）"},
+                "content": {"type": "string", "description": "要写入的文本内容（UTF-8）"},
+                "append": {"type": "boolean", "description": "true=追加到文件末尾；默认 false 覆盖"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
+MISC_EXT_SPECS = [DECODE_SPEC, UNPACK_SPEC, HEXPEEK_SPEC, WRITE_SPEC, JWT_SPEC]
+NAMES = {"decode_blob", "unpack_archive", "hexpeek", "write_file", "jwt_forge"}
 
 # 领域扩展（TCP 交互 / ELF 解析 / 连通性诊断）挂同一注册点：
 # crew._role_specs 已有「按角色 local 名单过滤 MISC_EXT_SPECS」的门禁循环，
@@ -719,6 +770,7 @@ _IMPL = {
     "decode_blob": decode_blob,
     "unpack_archive": unpack_archive,
     "hexpeek": hexpeek,
+    "write_file": write_file,
     "jwt_forge": jwt_forge,
 }
 

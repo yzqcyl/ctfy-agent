@@ -74,15 +74,51 @@ MAP_MAX_LINKS = 40          # 站点地图里最多列多少条链接
 MAP_MAX_FORMS = 8           # 最多展开多少张表单
 MAP_MAX_FIELDS = 12         # 单张表单最多列多少字段
 MAP_MAX_API_HINTS = 20      # JS 里挖出的接口路径上限
-MAP_PROBE_LIMIT = 14        # probe 模式最多探多少个路径（每个一次请求，总墙钟受 MAP_PROBE_BUDGET 限制）
+MAP_PROBE_LIMIT = 24        # probe 模式最多探多少个路径（每个一次请求，总墙钟受 MAP_PROBE_BUDGET 限制）
 MAP_PROBE_BUDGET = 25.0     # probe 总墙钟秒数
 MAP_PROBE_TIMEOUT = 6.0     # probe 单请求超时
 MAP_TIMEOUT = 15            # crawl 抓页面超时
-# 常见「能拿到工具面/接口清单」的路径：AI 靶场的 agent 常把能力暴露在这些地方
+# 探测路径：AI 栈身份路径在前（决定性特征，来自 ctf-ai-infra 技能卡：按特征定型，不猜端口），
+# 通用文档/工具面在后。摸到组件就该转打法，不是继续枚举端点。
 PROBE_PATHS = (
+    "/api/version", "/system_stats", "/api/tags", "/api/config", "/config",
+    "/v1/models", "/console/api/setup", "/metrics",
     "/openapi.json", "/swagger.json", "/api-docs", "/docs", "/swagger", "/redoc",
-    "/api", "/api/tools", "/api/v1/tools", "/mcp", "/sse", "/health", "/debug", "/admin",
+    "/api", "/api/tools", "/api/v1/tools",
+    "/mcp", "/sse", "/api/v1/heartbeat",
+    "/health", "/debug", "/admin",
 )
+# 组件指纹规则（来源：ctf-ai-infra 技能卡，MIT；特征为确定性子串，非启发式）：
+# (特征路径, 组件名, 正文必含子串·任一命中即定型, 下一步打法)
+_FINGERPRINT_RULES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
+    ("/api/version", "Ollama", ('"version"',),
+     "无鉴权推理 API：GET /api/tags 列模型；POST /api/generate 让本地模型读文件/执行描述的任务；"
+     "/api/pull 可拉任意 registry 的模型（CVE-2024-7773 链），配合恶意 registry 延迟触发"),
+    ("/system_stats", "ComfyUI", ("comfyui",),
+     "POST /api/customnode/install 装「自定义节点」即 RCE（payload 写最小 __init__.py，"
+     "import 期执行，别依赖 web 路由触发）；模型参数 ckpt_name/lora_name 试路径穿越"),
+    ("/config", "Gradio", ("gradio_config", "dependencies"),
+     "/upload 文件名试 ../../ 目录穿越落到可加载目录；/api/predict 或 /call/{api} 直接调后端函数；"
+     "flag 常在服务端文件里，不在页面里"),
+    ("/api/config", "Open WebUI", ('"features"',),
+     "首个注册用户即 admin：POST /api/v1/auths/signup，然后翻 /api/v1/ 管理面、"
+     "知识库文件与工作区目录"),
+    ("/console/api/setup", "Dify", ('"setup"', '"status"'),
+     "未完成 setup 时任何人都能创建管理员；工作流里找代码/表达式节点"
+     "（Jinja SSTI：{{7*7}} 探型再升级到 __class__ 链）"),
+    ("/v1/models", "vLLM/LiteLLM", ('"data"', '"object"'),
+     "OpenAI 兼容推理：POST /v1/completions 带系统提示让模型读文件；/metrics 看引擎版本；"
+     "路径含 litellm 时试其默认管理 key（sk-1234 / 配置里的 master_key）"),
+    ("/api/v1/heartbeat", "Chroma", ("heartbeat", "nanosecond"),
+     "无鉴权向量库：/api/v1/collections 列集合 → POST /api/v1/collections/{name}/get 读 points，"
+     "flag 常藏在文档 payload 里"),
+)
+# crawl 模式的页面级强特征（只在正文出现这些专有标记时才定型，避免误报）
+_PAGE_MARKERS: tuple[tuple[str, str], ...] = (
+    ("ComfyUI", "__comfyui_frontend_version__"),
+    ("Gradio", "gradio_config"),
+)
+_FINGERPRINT_VERSION_RE = re.compile(r'"version"\s*:\s*"([^"\s]{1,24})"')
 # 链接排序权重：命中这些词的端点更有可能是题目入口（工单/文档/管理/接口）
 _LINK_PRIORITY = ("ticket", "portal", "kb", "doc", "admin", "api", "user", "account",
                   "note", "order", "report", "flag", "debug", "internal")
@@ -235,7 +271,7 @@ BURST_SPEC = {
                 "body": {"type": "string", "description": "请求体；批量模式可用 {v} 占位"},
                 "headers": {"type": "object", "description": "附加请求头"},
                 "count": {"type": "integer", "description": "竞态模式并发数（2..24，默认 8）；与 values 互斥"},
-                "values": {"type": "array", "items": {"type": "string"}, "description": "批量模式的值列表（最多 24）；与 count 互斥"},
+                "values": {"type": "array", "items": {"type": "string"}, "description": "批量模式的值列表（最多 24；超出请拆成多批调用，每批换一个 nonce）；与 count 互斥"},
                 "nonce": {"type": "string", "description": "去重键：同一批想重跑就换这个值"},
             },
             "required": ["url"],
@@ -546,6 +582,12 @@ class LocalTools:
         host = self._norm_host(host)
         if not host:
             raise ToolError("host 为空")
+        # A2（实测 CTFARENA-005 有 4 次把 {v} 模板写进 host 位被拦）：模板不是主机名。
+        if "{" in host or "}" in host or "%s" in host:
+            raise ToolError(
+                f"host 里不能放模板：{host!r}。host 必须是 start_instance 返回的真实主机名；"
+                "批量枚举的 {v} 占位符只能放在 http_burst 的 url/body 里。"
+            )
         if not self.allowed_hosts and not self.allowed_endpoints:
             raise ToolError(
                 "还没有登记任何可访问实例。先用 start_instance 启动题目实例，再用它返回的 host:port。"
@@ -559,6 +601,7 @@ class LocalTools:
             f"已登记主机：{', '.join(sorted(self.allowed_hosts)) or '(无)'}；"
             f"已登记端点：{', '.join(sorted(self.allowed_endpoints)) or '(无)'}。"
             "只允许攻击平台实例，禁止访问第三方站点。"
+            "（host 必须是 start_instance 返回的主机名；批量枚举的 {v} 只能放在 url/body）"
         )
 
     # ---------- 规格 ----------
@@ -654,6 +697,10 @@ class LocalTools:
 
     def hexpeek(self, path: str, offset: int = 0, length: int = 256) -> str:
         return _call_ext("hexpeek", {"path": self._resolve_path(path), "offset": offset, "length": length})
+
+    def write_file(self, path: str, content: str, append: bool = False) -> str:
+        """B1：写文件通道（路径先做沙盒锚定，越界直接拒）。"""
+        return _call_ext("write_file", {"path": self._resolve_path(path), "content": content, "append": append})
 
     def jwt_forge(self, alg: str = "HS256", secret: str = "", token: str = "",
                   claims: dict | None = None, header: dict | None = None,
@@ -1450,8 +1497,25 @@ class LocalTools:
         path = parts.path or "/"
         return path + (f"?{parts.query}" if parts.query else "")
 
+    @staticmethod
+    def _fingerprint_component(path: str, text: str) -> tuple[str, str, str] | None:
+        """按特征路径 + 正文确定性子串定型 AI 栈组件；命中返回 (组件, 依据, 下一步)。"""
+        lowered = (text or "")[:4000].lower()
+        for rule_path, name, markers, hint in _FINGERPRINT_RULES:
+            if path != rule_path:
+                continue
+            marker = next((m for m in markers if m.lower() in lowered), None)
+            if marker is None:
+                continue
+            version = ""
+            match = _FINGERPRINT_VERSION_RE.search(text or "")
+            if match:
+                version = f"，版本 {match.group(1)}"
+            return name, f"{path} 命中特征 {marker}{version}", hint
+        return None
+
     def http_map(self, url: str, mode: str = "crawl") -> str:
-        """站点结构成图（crawl）或常见端点探测（probe）。"""
+        """站点结构成图（crawl）或常见端点探测（probe，带 AI 栈组件指纹）。"""
         self._check_target(url)
         mode = (mode or "crawl").strip().lower()
         if mode not in ("crawl", "probe"):
@@ -1461,12 +1525,15 @@ class LocalTools:
             parts = urlparse(url)
             origin = f"{parts.scheme}://{parts.netloc}"
             hits: list[dict] = []
+            components: list[str] = []
             missed = 0
             started = time.perf_counter()
             for path in PROBE_PATHS[:MAP_PROBE_LIMIT]:
                 if time.perf_counter() - started > MAP_PROBE_BUDGET:
                     break
-                if len(hits) >= 6:
+                if components and len(hits) >= 8:
+                    # 已定型组件：攒够 8 条即停。没定型（如 catch-all 兜底）不设早停，
+                    # 否则身份路径的假 200 会提前填满上限、探不到 openapi/docs/mcp 工具面。
                     break
                 try:
                     status, ctype, text = self._map_fetch(origin + path, timeout=MAP_PROBE_TIMEOUT)
@@ -1474,24 +1541,40 @@ class LocalTools:
                     continue
                 if status in (200, 201, 202, 204, 301, 302, 401, 403, 405):
                     short = ctype.split(";")[0].strip()
-                    hits.append({
+                    entry: dict = {
                         "path": path,
                         "status": status,
                         "type": short[:40],
                         "bytes": len(text),
                         "hint": ("命中，直接读" if status in (200, 201) else
                                  "存在但需鉴权/方法不对" if status in (401, 403, 405) else "跳转"),
-                    })
+                    }
+                    fp = self._fingerprint_component(path, text)
+                    if fp:
+                        entry["component"] = fp[0]
+                        entry["why"] = fp[1][:110]
+                        entry["next"] = fp[2]
+                        if fp[0] not in components:
+                            components.append(fp[0])
+                    hits.append(entry)
                 else:
                     missed += 1
-            payload = {
+            payload: dict = {
                 "mode": "probe",
                 "origin": origin,
                 "hits": hits,
                 "not_found": missed,
-                "next": ("对命中的 path 用 http_request 读原文；AI 靶子的工具面常在 openapi/docs/mcp 里。"
-                         if hits else "常见端点都不存在：回到 crawl 从页面链接/表单里找入口，别继续猜路径。"),
             }
+            if components:
+                payload["components"] = components
+                payload["next"] = (f"组件定型：{'、'.join(components)}——直接按命中 hit 里的 next 打法走"
+                                   "（框架实现漏洞：插件安装/上传穿越/URL 拉取/模板渲染）。"
+                                   "flag 通常在服务端文件里，不在模型回答里；别跑通用扫描器。")
+            elif hits:
+                payload["next"] = ("对命中的 path 用 http_request 读原文；AI 靶子的工具面常在 openapi/docs/mcp 里。"
+                                   "没定型组件时重点看 安装/上传/URL 拉取 三类入口。")
+            else:
+                payload["next"] = "常见端点都不存在：回到 crawl 从页面链接/表单里找入口，别继续猜路径。"
             return json.dumps(payload, ensure_ascii=False)
 
         status, ctype, text = self._map_fetch(url)
@@ -1538,7 +1621,7 @@ class LocalTools:
             if len(api_hints) >= MAP_MAX_API_HINTS:
                 break
 
-        payload = {
+        payload: dict = {
             "status": status,
             "mode": "crawl",
             "page": urlparse(url).path or "/",
@@ -1547,9 +1630,19 @@ class LocalTools:
             "forms": forms,
             "api_hints": api_hints,
             "counts": {"links": len(links), "forms": len(forms), "api_hints": len(api_hints)},
-            "next": ("对关键链接逐个 http_request 细读；AI 靶子优先看 kb/docs 与工单/order 详情。"
-                     if links or forms else "页面没有可解析结构（可能是纯 JS 渲染）：改用 http_map(mode='probe') 探端点。"),
         }
+        # 页面级强特征：首页专有标记 → 组件定型（与 probe 同一知识源，避免只探首页漏掉 SPA 壳）
+        lowered = text[:4000].lower()
+        for name, marker in _PAGE_MARKERS:
+            if marker in lowered:
+                payload["component"] = name
+                payload["next"] = (f"页面即 {name} 前端：转 http_map(mode='probe') 拿版本与 API 面，"
+                                   "再按该组件的结构漏洞打（插件安装/上传穿越/URL 拉取）。")
+                break
+        if "next" not in payload:
+            payload["next"] = ("对关键链接逐个 http_request 细读；AI 靶子优先看 kb/docs 与工单/order 详情。"
+                               if links or forms else
+                               "页面没有可解析结构（可能是纯 JS 渲染）：改用 http_map(mode='probe') 探端点。")
         return json.dumps(payload, ensure_ascii=False)
 
     # ---------- 对话工具（AI 安全题型：靶子是「会聊天的服务」） ----------
@@ -1772,7 +1865,9 @@ class LocalTools:
 
     @classmethod
     def _windows_shell_guard(cls, command: str) -> str | None:
-        unix_only = ("ls", "cat", "grep", "head", "tail", "pwd", "which", "wc", "cp", "mv", "sed", "awk", "xxd", "sh", "bash")
+        # 已被 _windows_rewrite 换成等价物的命令不再列入（ls/cat/pwd/which/cp/mv），
+        # 只保留「有叫法差异但无语义等价物」或「改写不安全」的命令。
+        unix_only = ("grep", "head", "tail", "wc", "sed", "awk", "xxd", "sh", "bash")
         cmds = cls._windows_command_words(command)
         notes: list[str] = []
         missing = sorted({c for c in cmds if c in unix_only})
@@ -1781,10 +1876,42 @@ class LocalTools:
         if "python3" in cmds:
             notes.append("Windows 上解释器叫 `python`（不是 python3）")
         if "<<" in command:
-            notes.append("Windows cmd 不支持 heredoc(<<)，把脚本写进文件再跑，或改 python -c")
+            notes.append("Windows cmd 不支持 heredoc(<<)，改 write_file 写脚本再跑，或 python -c")
         if "'" in command:
             notes.append("Windows cmd 不认单引号，用双引号")
         return "；".join(notes) if notes else None
+
+    # B2：Windows cmd 里「叫法不同」但不是「能力缺失」的命令 → 安全等价物。
+    # 依据 docs/audit-agent-2026-10-30.md §4：v0 批 265 次 shell 调用被守卫直接拒收，
+    # 每次拒收都逼模型再花一整轮（≈12k tok）重写命令；直接改写是零成本的。
+    _WINDOWS_ALIASES = {
+        "python3": "python", "python3.11": "python", "python3.12": "python", "python3.13": "python",
+        "ls": "dir", "cat": "type", "pwd": "cd", "which": "where",
+        "cp": "copy", "mv": "move", "rm": "del", "clear": "cls",
+    }
+
+    @classmethod
+    def _windows_rewrite(cls, command: str) -> str:
+        """把命令词位置上的别名改写成 cmd 等价物；参数/正文一律不动。"""
+        parts = re.split(r"(\|\||&&|\||;|\r|\n)", command or "")
+        changed = False
+        out: list[str] = []
+        for idx, part in enumerate(parts):
+            if idx % 2 == 1:  # 分隔符原样保留
+                out.append(part)
+                continue
+            match = re.match(r"(\s*)(\"[^\"]*\"|'[^']*'|\S+)([\s\S]*)$", part)
+            if not match:
+                out.append(part)
+                continue
+            lead, word, rest = match.group(1), match.group(2), match.group(3)
+            alias = cls._WINDOWS_ALIASES.get(word.strip("\"'").lower())
+            if alias:
+                out.append(f"{lead}{alias}{rest}")
+                changed = True
+            else:
+                out.append(part)
+        return "".join(out) if changed else command
 
     def shell(self, command: str, timeout: int = 60) -> str:
         if not self._warned_shell:
@@ -1804,6 +1931,9 @@ class LocalTools:
         # 本地 Windows 开发专用护栏：容器是 Linux（这些命令都在），只有 cmd 会踩空。
         # 与其让 cmd 吐一句没用的英文报错，不如提前把模型指回 http_request 的 grep/offset。
         if os.name == "nt":
+            rewritten = self._windows_rewrite(command)   # B2：先做安全别名改写（python3→python、ls→dir…）
+            if rewritten != command:
+                command = rewritten
             hint = self._windows_shell_guard(command)
             if hint:
                 raise ToolError(hint)

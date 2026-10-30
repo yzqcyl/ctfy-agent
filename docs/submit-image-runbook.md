@@ -24,16 +24,18 @@
 
 ### 下一步（浏览器，人工）
 
+> **逐屏操作单（含预期结果与失败排查）：[docs/platform-submit-opsheet.md](platform-submit-opsheet.md)**
+
 1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v3`
 2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
 3. 提交审核 → 通过后用「测评我的 Agent」跑一遍
 
-### ⚠️ v3 已知风险：思考模式未显式关闭
+### ℹ️ 思考模式：保持开启（2026-10-30 拍板，v4 也不做关闭机制）
 
-v3 镜像里**没有** `LLM_ENABLE_THINKING=0`（`.env` 容器读不到，平台也不注入）。本地所有实测都在 `LLM_ENABLE_THINKING=0` 下完成；v3 实跑是端点默认（百炼默认开思考），可能把 `max_tokens=8192` 烧在 `reasoning_content` 上 → `content` 空、`finish_reason=length`、白丢一步。
-- 观察点：评估结果里 `stop_reason` 是否 `max_turns`/`halted`、`tool_calls_made` 是否异常少、有没有空回答。
-- 处理：Dockerfile 加 `ENV LLM_ENABLE_THINKING=0` 重建 v4（初赛百炼 OK；11-21 正式赛换智谱后需确认该字段兼容性）。
-- 决策记录：2026-10-29 先用 v3 跑免费样例验证端到端，再决定是否重建 v4。
+决策链：10-29 先用 v3 跑免费样例 → 10-30 决定不建 v3.1 → 10-30 最终拍板**思考不关、保持端点默认**。
+依据：百炼/GLM-5.x 默认开思考，GLM-5.3 系**强制思考不可关**——「思考常开」本就是常态，关闭机制收益有限（智谱关法是 `thinking:{"type":"disabled"}`，与百炼 `enable_thinking` 不是同一字段）。
+- **观测点（出现再议，出现前不动）**：评估/实跑的 result.json 出现空回答、`halted`，且转录显示 `finish_reason=length` → 那时再议单调用 max_tokens 余量（8192→16384）。
+- 行为差异备忘：本地历史实测在思考关闭下完成；容器内是端点默认。两边数据不混着对比即可。
 
 ---
 

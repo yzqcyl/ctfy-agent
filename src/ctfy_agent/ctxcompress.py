@@ -42,10 +42,21 @@ PATH_RE = re.compile(r"/[A-Za-z0-9_\-]{2,}(?:/[A-Za-z0-9_\-.]+)+")
 HREF_RE = re.compile(r"""href=["'](/[^"']{2,80})["']""")
 FIELD_RE = re.compile(r"""name=["']([^"']{1,40})["']""")
 CRED_RE = re.compile(r"(?i)(?:authorization|set-cookie|x-api-key|bearer)\s*[:=]\s*[^\s\"'<>]{6,120}")
+# P1-2 硬值保真：ID/token/时间戳在压缩时逐字保留，只压叙述。
+# 依据 Sleeping Agent（arXiv 2608.11775）：gist 里改写/丢弃标识符是「重新获取」churn 的主因。
+# 各族限量，防止一页 hex id 吃光 12 个保留位挤掉关键行。
+JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{0,}")
+HEXID_RE = re.compile(r"\b[0-9a-f]{16,64}\b")  # sha256(64)/sha1(40)/md5(32)/会话hex id；≥16 避开普通词
+ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?")
+KV_TOKEN_RE = re.compile(
+    r"(?i)[\"']?(?:api_?key|access_?token|refresh_?token|secret|token|password)[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_\-.+/]{10,}"
+)
 TOOL_NAME_RE = re.compile(r"@@TOOL:\s*([A-Za-z_][\w]*)")
 TOOL_DEF_RE = re.compile(r"\b([a-z_]{3,32})\(([^)]{0,24})\)")
 STATUS_RE = re.compile(r'"status"\s*:\s*(\d{3})')
 TICKET_RE = re.compile(r"(?i)ticket\s*#?\s*(\d{1,3})")
+# http_map 指纹输出的 component 字段（probe 的 hits[].component / crawl 的 payload.component）
+COMPONENT_RE = re.compile(r'"component"\s*:\s*"([A-Za-z][A-Za-z0-9/ .]{1,30})"')
 
 # <meta name>/隐藏校验字段不是「要 POST 的业务字段」，别混进事实块
 META_FIELD_NAMES = {
@@ -100,6 +111,15 @@ def shrink_tool_text(text: str, limit: int = DEFAULT_TOOL_CHARS) -> str:
     # 表单字段名：模型要照着 POST，压掉了就会反复抓页面
     for match in FIELD_RE.finditer(raw):
         keep(match.group(0))
+    # P1-2 硬值：JWT / 长 hex id / ISO 时间戳 / token 键值对，逐字保留（各族限量防挤占）
+    for match in JWT_RE.findall(raw)[:2]:
+        keep(match)
+    for match in HEXID_RE.findall(raw)[:4]:
+        keep(match)
+    for match in ISO_TS_RE.findall(raw)[:2]:
+        keep(match)
+    for match in KV_TOKEN_RE.findall(raw)[:3]:
+        keep(match[:120])
 
     # ② 短行里的关键行：整行原样保留（不 strip，否则缩进行就不是原串了）
     for line in raw.splitlines():
@@ -165,11 +185,25 @@ class FactsBoard:
         lowered = scan.lower()
 
         for match in FLAG_RE.finditer(scan):
-            self._add("flag", f"候选 flag：{match.group(0)}（下一步 submit 验证）")
+            # 首个 flag 沿用固定键 "flag"；之后**不同的** flag 值各占一条（按值去重）——
+            # 多候选被 520 字符窗口挤掉会让协调者只看到第一个候选（P1-2 保真修正）
+            value = match.group(0)
+            text = f"候选 flag：{value}（下一步 submit 验证）"
+            if text not in self._facts.values():  # 同值已记（无论占的哪个键）不重复
+                has_slot = "flag" in self._facts or any(k.startswith("flag:") for k in self._facts)
+                self._add("flag" if not has_slot else f"flag:{value}", text)
             break
 
         if "set-cookie" in lowered or "session" in lowered:
             self._add("session", "会话：cookie jar 已建立，后续请求自动带（不要重新注册/登录）")
+
+        # AI 栈组件定型（http_map 指纹输出的 component 字段）：常驻事实，滑窗压缩切不掉
+        match = COMPONENT_RE.search(raw)
+        if match:
+            name = match.group(1)
+            self._add(f"component:{name}",
+                      f"靶子组件已定型：{name}（打实现漏洞：插件/上传/URL 拉取/模板渲染；"
+                      "flag 在服务端文件里，不在模型回答里）")
 
         for name in TOOL_NAME_RE.findall(scan):
             self._add(f"tool:{name}", f"AI 工具面：可调用 {name}()")
@@ -223,11 +257,29 @@ class FactsBoard:
 
     # ---------- 渲染 ----------
 
+    @staticmethod
+    def _prio(key: str) -> int:
+        """渲染优先级（P1-2）：flag/会话/组件定型先上，端点/链接这类软事实垫底。
+
+        render() 有 520 字符预算；早先按插入顺序截断，把「后发现的 flag/凭据」挤掉，
+        模型只能重新去取（reacquisition churn）。硬值事实永不因窗口被截掉。
+        """
+        stem = key.split(":")[0]
+        if stem in ("flag", "session") or key.startswith("component:") or key.startswith("ticket:"):
+            return 0
+        if stem in ("inherited",) or key.startswith("tool:") or key.startswith("form:"):
+            return 1
+        return 2  # endpoint:/href:/doc: 等软事实
+
     def render(self) -> str:
-        """渲染成提示块；无事实返回空串（调用方据此决定是否拼接）。"""
+        """渲染成提示块；无事实返回空串（调用方据此决定是否拼接）。
+
+        同优先级内保持首次出现顺序（dict 保序）；重复渲染结果稳定（可测）。
+        """
+        order = {k: i for i, k in enumerate(self._facts)}
         lines: list[str] = []
         used = 0
-        for text in self._facts.values():
+        for key, text in sorted(self._facts.items(), key=lambda kv: (self._prio(kv[0]), order[kv[0]])):
             line = "- " + " ".join(text.split())
             if used + len(line) + 1 > self.max_chars:
                 break

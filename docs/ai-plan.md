@@ -545,3 +545,63 @@ eason=step_limit，不误伤。
 
 `f4e1d3b`（候选闸门 + 假设收敛提示，作为安全网保留；arm C 验证无害但不改 attempts）。
 `462e1bf`（B1 无进展刹车 + http_map 接线 + B2 交接文档，即 M5.6）。
+
+## 10. M7 证据：AI 基础设施方向能力注入（2026-10-27）
+
+### 10.1 背景与依据
+
+用户提供技能卡 `ctf-ai-infra.md`（MIT，来源：另一仓库自建，填补 ctf-ai-ml 未覆盖的 AI 基建方向）。
+关键定位：**TPCTF 与京华杯的「AI 安全」命题 = AI 开源框架及智能体实现漏洞的挖掘与利用**——
+打的是服务实现（SSRF/路径穿越/插件 RCE/鉴权缺失/凭据泄漏），不是模型对抗，也和我们主攻的
+OWASP ASI 应用层（诱导对话）不同。此前 agent 完全没有这个方向的知识。
+
+### 10.2 改动（四层注入，同一知识源）
+
+| 层 | 文件 | 内容 |
+|---|---|---|
+| 工具 | `tools_local.py` | `PROBE_PATHS` 14→24 条（AI 栈身份路径在前）；`_FINGERPRINT_RULES` 7 组件指纹（Ollama/ComfyUI/Gradio/Open WebUI/Dify/vLLM/LiteLLM/Chroma，路径+确定性子串）；probe 命中即报 `component/why/next`（含版本提取与下一步打法，Ollama 带 CVE-2024-7773 锚点）；crawl 页面级强特征兜底（`__COMFYUI_FRONTEND_VERSION__`/`gradio_config`）；命中上限 6→8 |
+| 记忆 | `ctxcompress.py` | `COMPONENT_RE` 抽 `component` 字段 → FactsBoard 常驻事实「靶子组件已定型」（滑窗压缩切不掉） |
+| 卡片 | `method_cards.py` | `AI_CARDS` 18→20：基建定型卡 + 七类结构洞卡；`_AI_INFRA_KEYS` 14 个 tag 进 `AI_TAGS`（is_asi_tag 门控随之放行基建题） |
+| 提示词 | `roles/ai.system.txt`（已同步 config/agent.json + runs/_m5_config.json） | 靶子三类改写；新增【AI 基础设施靶子】常驻块：定型流程、七类结构洞全清单、默认凭据表、三坑（别跑通用扫描器/flag 在服务端文件/别死磕指纹）；3.2k→4.6k 字符 |
+| 路由 | `crew.py` | 协调者路由判据加 AI 框架名信号 → 派 ai 一次跑完整链，不拆「先侦察再攻击」 |
+
+### 10.3 验收
+
+- `case_http_map_fingerprint`：拼盘靶机（4 组件特征端点 + 1 个同路径无特征负例）——
+  probe 按 `PROBE_PATHS` 顺序定型 `["Ollama","ComfyUI","Open WebUI","vLLM/LiteLLM"]`，
+  Ollama 带「版本 0.1.29」与 CVE 锚点，特征不中不许定型；crawl 首页标记定型 ComfyUI，无标记页不报。
+- `case_context_compress` 扩展：`component` 字段 → 事实块出现「靶子组件已定型：Ollama」。
+- `case_ai_prompt_contract` / 卡覆盖守卫：20 卡钉子更新，`AI_TAGS` 全覆盖不变量仍成立。
+- 全套 `python tests/smoke.py` → **127 passed, 0 failed**（含并行任务同期新增用例）。
+
+### 10.4 边界（诚实清单）
+
+- 指纹规则是**确定性子串**，只认特征路径命中（`/api/version` 等 7 条），非启发式扫描；
+  组件识别覆盖 7 类，RAGFlow/n8n/Milvus/Weaviate 未入规则表（技能卡未给决定性特征）。
+- 无 CVE 离线库（技能卡的 `aisec/` 目录不在本仓库）：版本→CVE 只内嵌了 Ollama 一条锚点，
+  其余走「版本拿不到就按结构类打」的降级路径。
+- 结构洞打法全部落在提示词/卡片文案层，**无真机靶子验证过**（练习池暂无基建题）；
+  下一步可自建本地 Ollama/ComfyUI 靶机做离线验证。
+
+## 11. M7.5 证据：AI 方向按 extending-agent.md §9 DOB 完成验收（2026-10-27）
+
+依据 `docs/extending-agent.md`（a025e05）把「AI 安全方向」的完成度正式收口。核对结论：
+`ai` 角色**不是占位**——`config/agent.json` 的 `ai.system` 覆盖已生效（`_role_system` 对非空
+override 直接采纳并自动补 4 条纪律），§1 的「占位」标注是 a025e05 时点的旧观察。
+
+DOB 八项逐条：
+
+| # | DOB 项 | 结果 |
+|---|---|---|
+| 1 | 角色已注册，字段齐全 | ✅ `DEFAULT_ROLES["ai"]`(L82) + agent.json `roles.ai`（max_steps/allow_shell/platform/local/system）|
+| 2 | 专属提示词，未重复写 4 纪律 | ✅ `ai.system` 4607 字符，含 ASI 五阶段 + AI 基建打法；无 `PLAN/report/evidence` 字面量，纪律由 `_role_system` 自动补 |
+| 3 | 工具面经 `_role_specs` 收口 | ✅ local=[http_request, http_map, chat]，无 shell；平台 read/instance/oracle |
+| 4 | 新本地工具（如需） | ✅ http_map 已按 Recipe B 落地（M5.6/M7），非本轮新增 |
+| 5 | 并行白名单（如需） | ➖ ai 走串行（不进 cluster_a_categories），无状态性未声明并行，保守 |
+| 6 | 离线验收绿 + 方向用例 | ✅ 新增 `tests/smoke.py::case_ai_direction_dod`（内联于总入口） |
+| 7 | 无红线违规（§8） | ✅ 未改 web/rev/crypto 提示词、未造交付通道、未绕费用闸 |
+| 8 | 提交（代码+用例+docs 一行） | ✅ 本文件 §11 + HANDOFF |
+
+新增验收用例钉死四处（对 §3/§6/§5/§7）：角色字段齐全不越权、4 纪律自动补、`_role_specs("ai")`
+只暴露方向工具（无 shell）、delegate 枚举自动含 ai。全套 `python tests/smoke.py` → **128 passed, 0 failed**。
+

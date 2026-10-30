@@ -13,6 +13,7 @@
         "http_request",
         "http_map",
         "shell",
+        "write_file",
         "decode_blob",
         "unpack_archive",
         "hexpeek",

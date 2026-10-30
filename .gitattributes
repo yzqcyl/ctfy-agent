@@ -1,0 +1,5 @@
+# [web-ai-gap 2026-10-30] 收尾：提示词文件必须固定 LF。
+# 原因：仓库 core.autocrlf=true，若按默认策略 checkout 成 CRLF，
+# tests/smoke_ai_role.py（config roles.ai.system == roles/ai.system.txt）与
+# tests/smoke.py misc 防漂移用例（按 "\n" 逐字比对）会在 Windows 上假红。
+roles/*.system.txt text eol=lf

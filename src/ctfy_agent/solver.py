@@ -25,6 +25,7 @@ from .llm import DeepSeekLLM, LLMError
 from .mcp_client import render_call_result
 from .method_cards import is_asi_tag, method_cards
 from .platform import CtfyPlatform, PlatformError
+from .progress import BudgetPhase, EnvFailureTracker, ObservationTracker
 from .state import Store
 from .tools_local import LocalTools, ToolError, as_bool
 
@@ -125,7 +126,7 @@ def _shrink_group(group: list[dict]) -> list[dict]:
     return out
 
 
-def _compact_history(messages: list[dict], max_tokens: int) -> list[dict]:
+def _compact_history(messages: list[dict], max_tokens: int, seg_start: int | None = None) -> list[dict]:
     """上下文滑窗：保留 system + 初始 user；超阈值时先压缩旧步，再整块丢弃。
 
     每一步在 messages 里的形态是「assistant(+tool_calls) → 若干 tool 结果」，
@@ -134,6 +135,16 @@ def _compact_history(messages: list[dict], max_tokens: int) -> list[dict]:
     两级策略（M5 成本实测后加）：预算的 55% 是软阈值——超过就先压缩「除最近 3 步外」
     的旧步骤文本（结构不动，只截断），仍超才按原逻辑整块丢最旧的步。这样长跑（047 那种）
     不会等到爆窗才动手，曲线更平滑，也不会一下子把上下文清空。
+
+    P2-1 链段边界（seg_start）：链段 = 自上一次 PLAN 变更以来的连续步（模型自己声明的
+    换方向，提示词要求计划不变就原样复制）。seg_start = 当前链段首个 group 的下标：
+      - 软压缩只动下标 < seg_start 的**已闭合链段**；当前段内旧步即使越过软阈值也保持
+        原文——它们是本段推理的工作集（分页比对、多步构造这类 10+ 步链，段中截断
+        等于中途失忆，论文 2/6/9 的核心观察）；
+      - 硬窗不变：超 max_tokens 仍整块丢最旧直到塞下（API 硬约束优先）。丢的天然是
+        整段闭合链段（其结论已在 note/FactsBoard），段粒度保序；仅当单段自身超窗才会
+        段内丢弃，此时保留最新一步。
+    seg_start=None → 与旧行为完全一致（只按 KEEP_TAIL_GROUPS 保护最近 3 步）。
     """
     if len(messages) <= 2:
         return messages
@@ -142,10 +153,12 @@ def _compact_history(messages: list[dict], max_tokens: int) -> list[dict]:
     if total <= max_tokens * SOFT_COMPACT_RATIO:
         return messages
 
-    # 第一级：压缩旧步（最近 KEEP_TAIL_GROUPS 步不动）
-    if len(groups) > KEEP_TAIL_GROUPS:
-        cut = len(groups) - KEEP_TAIL_GROUPS
-        compressed = [_shrink_group(g) if i < cut else g for i, g in enumerate(groups)]
+    # 第一级：压缩旧步。保护窗 = min(最近 KEEP_TAIL_GROUPS 步, 当前链段起点)，
+    # 即当前链段与最近 3 步都不截断；seg_start=None 时退化为旧的仅保尾 3 步。
+    seg = len(groups) if seg_start is None else max(0, min(int(seg_start), len(groups)))
+    protect_from = min(len(groups) - KEEP_TAIL_GROUPS, seg)
+    if protect_from > 0:
+        compressed = [_shrink_group(g) if i < protect_from else g for i, g in enumerate(groups)]
         flattened = _flatten(head, compressed)
         if _est_tokens(flattened) <= max_tokens:
             return flattened
@@ -938,6 +951,8 @@ class Solver:
             )
         evidence_flag = ""
         tool_chars = int((self.config.extra or {}).get("tool_text_chars", DEFAULT_TOOL_TEXT_CHARS))
+        obs = ObservationTracker()  # P0-1：观测去重 + 同目标重复计数（_solve_once 路径）
+        env_fails = EnvFailureTracker()  # A1：连续环境类失败 → 提示收口（不硬拦）
 
         submitted = False
         steps_used = 0
@@ -946,13 +961,18 @@ class Solver:
         dead_ends: list[str] = []          # 集群-B：本次尝试 verify/submit 判定为假的答案（供下次避免重复）
         ledger = Ledger.from_config(self.config)
         plan = PlanTrack()
+        seg_first_step = 1  # P2-1：当前链段首步（PLAN 变更即换段，段内不软压缩）
 
         for step in range(1, budget + 1):
             steps_used = step
             challenge.steps = step
             try:
-                messages[1]["content"] = with_facts(base_head, facts.render())
-                messages = _compact_history(messages, self.config.max_context_tokens)
+                head = with_facts(base_head, facts.render())
+                budget_line = BudgetPhase.line(getattr(self.llm, "budget", None))  # P0-2：预算阶段每步可见
+                messages[1]["content"] = f"{head}\n{budget_line}" if budget_line else head
+                messages = _compact_history(
+                    messages, self.config.max_context_tokens, seg_start=seg_first_step - 1
+                )
                 response = self.llm.chat(messages, tools=specs)
             except BudgetExceeded as exc:
                 # 预算用尽：立刻停手，不发请求也就不会再产生费用
@@ -1049,14 +1069,28 @@ class Solver:
                 self.store.append_transcript(
                     challenge_id, {"step": step, "role": "tool", "name": name, "args": args, "result": text[:2000]}
                 )
+                # P0-1：观测去重——重复输出替换为省略标记；同目标第 4 次起注入换法提示。
+                display, _is_new, repeat_note = obs.observe(name, args, str(text))
                 facts.observe(name, args, text)
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.get("id") or f"call_{step}_{name}",
-                        "content": _untrusted(shrink_message_text(text, tool_chars)),
+                        "content": _untrusted(shrink_message_text(display, tool_chars)),
                     }
                 )
+                if repeat_note:
+                    messages.append({"role": "user", "content": repeat_note})
+                    self.store.append_transcript(
+                        challenge_id, {"step": step, "role": "note", "content": repeat_note}
+                    )
+                # A1：连续接入/环境类失败 → 提示收口（实测 SAMPLE-003/004 各烧 53%/54% 预算）
+                env_note = env_fails.observe(name, str(text), budget=getattr(self.llm, "budget", None))
+                if env_note:
+                    messages.append({"role": "user", "content": env_note})
+                    self.store.append_transcript(
+                        challenge_id, {"step": step, "role": "note", "content": env_note}
+                    )
                 # 证据可引用片段：工具输出里出现 flag 时给一条逐字原串，避免模型改写 evidence
                 # 导致 report 被拒 → 协调者重派 → 多烧一轮（M5 实测的 100k/轮）。
                 quotable = facts.quotable_flag()
@@ -1085,6 +1119,8 @@ class Solver:
             # A2 伴生文本：停滞判定的「推进」信号只认账本新增的、非重复的尝试，
             # 模型自述「我推进了」不算数（soliloquizing 正是要防的）。
             seen = plan.observe(content, progressed=len(ledger.order) > attempts_before)
+            if seen.get("changed"):
+                seg_first_step = step  # P2-1：模型声明换方向 → 新链段从本步起
             hint = plan.reminder() if seen["missing"] else plan.stall_hint()
             if hint:
                 messages.append({"role": "user", "content": hint})
@@ -1200,13 +1236,19 @@ class Solver:
         actions: list[str] = []  # 供步数/预算耗尽时合成一份有信息量的报告，别只交一行占位符
         last_content = ""
         plan = PlanTrack()
-        # 无进展刹车状态：seen_outputs 累积本轮见过的工具输出摘要，still_rounds 数连续无新信息的步数
-        seen_outputs: set[str] = set()
+        # 无进展刹车状态：obs 记录观测 digest（去重 + 同目标计数），still_rounds 数连续无新信息的步数
+        obs = ObservationTracker()
+        env_fails = EnvFailureTracker()  # A1：连续环境类失败 → 提示收口（不硬拦）
         still_rounds = 0
+        seg_first_step = 1  # P2-1：当前链段首步（PLAN 变更即换段，段内不软压缩）
         for step in range(1, int(max_steps) + 1):
             try:
-                messages[1]["content"] = with_facts(base_head, facts.render())
-                messages = _compact_history(messages, self.config.max_context_tokens)
+                head = with_facts(base_head, facts.render())
+                budget_line = BudgetPhase.line(getattr(llm, "budget", None))  # P0-2：预算阶段每步可见
+                messages[1]["content"] = f"{head}\n{budget_line}" if budget_line else head
+                messages = _compact_history(
+                    messages, self.config.max_context_tokens, seg_start=seg_first_step - 1
+                )
                 response = llm.chat(messages, tools=specs)
             except BudgetExceeded as exc:
                 report = f"[预算耗尽，停止] {exc}"
@@ -1309,19 +1351,32 @@ class Solver:
                 self.store.append_transcript(
                     challenge_id, {"role": role, "step": step, "tool": name, "args": args, "result": text[:2000]}
                 )
-                # 无进展信号：被账本拦下（重复调用）或输出摘要与之前完全一致 → 本步没产生新信息
-                digest = hashlib.sha1(_stable_output(str(text)).encode("utf-8", "replace")).hexdigest()[:16]
-                if not gate and digest not in seen_outputs:
-                    seen_outputs.add(digest)
+                # 无进展信号：被账本拦下（重复调用）或输出摘要与之前完全一致 → 本步没产生新信息。
+                # P0-1：digest 判定移入 ObservationTracker；重复输出替换为省略标记（省上下文，
+                # 也延缓压缩把有用证据挤出历史）；同目标第 4 次起注入换法提示（不被其它目标的新输出稀释）。
+                display, is_new, repeat_note = obs.observe(name, args, str(text))
+                if not gate and is_new:
                     step_progress = True
                 facts.observe(name, args, text)
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.get("id") or f"call_{step}_{name}",
-                        "content": _untrusted(shrink_message_text(text, tool_chars)),
+                        "content": _untrusted(shrink_message_text(display, tool_chars)),
                     }
                 )
+                if repeat_note:
+                    messages.append({"role": "user", "content": repeat_note})
+                    self.store.append_transcript(
+                        challenge_id, {"role": role, "step": step, "repeat_note": repeat_note}
+                    )
+                # A1：连续接入/环境类失败 → 提示收口（用户名角色循环同样适用）
+                env_note = env_fails.observe(name, str(text), budget=getattr(llm, "budget", None))
+                if env_note:
+                    messages.append({"role": "user", "content": env_note})
+                    self.store.append_transcript(
+                        challenge_id, {"role": role, "step": step, "env_note": env_note}
+                    )
                 # 证据可引用片段：工具输出里出现 flag 时给一条逐字原串，避免模型改写 evidence
                 # 导致 report 被拒 → 协调者重派 → 多烧一轮（M5 实测的 100k/轮）。
                 quotable = facts.quotable_flag()
@@ -1367,6 +1422,8 @@ class Solver:
             # A2 伴生文本：专家同样受「计划不变 + 无新尝试 = 停滞」约束，
             # 但提示只是注入一句，不消耗步数、不硬拦调用（与账本闸的分工一致）。
             seen = plan.observe(content, progressed=len(ledger.order) > attempts_before)
+            if seen.get("changed"):
+                seg_first_step = step  # P2-1：模型声明换方向 → 新链段从本步起
             hint = plan.reminder() if seen["missing"] else plan.stall_hint()
             if hint:
                 messages.append({"role": "user", "content": hint})

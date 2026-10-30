@@ -90,6 +90,18 @@ def case_context_compress(tmp: Path) -> None:
     assert "subject" in form_text and "body" in form_text and "priority" in form_text, form_text
     assert "csrf_token" not in form_text, "csrf 值不该进事实块（模型会照抄过期值）"
 
+    # AI 栈组件定型（ctf-ai-infra）：http_map 指纹的 component 字段要常驻事实块，
+    # 滑窗压缩切掉探测输出后模型仍知道靶子是什么、该按哪类打
+    infra_board = FactsBoard()
+    infra_board.observe("http_map", {"url": "http://h.example:11434/", "mode": "probe"},
+                        json.dumps({"mode": "probe", "components": ["Ollama"],
+                                    "hits": [{"path": "/api/version", "status": 200,
+                                              "component": "Ollama",
+                                              "next": "无鉴权推理 API：/api/tags 列模型"}]},
+                                   ensure_ascii=False))
+    assert "靶子组件已定型：Ollama" in infra_board.render(), infra_board.render()
+    assert FactsBoard().render() == ""
+
     # 关键行保留：表单结构行不能被瘦身丢掉（否则模型只能反复 grep）
     long_form = '<html>' + "x" * 3000 + '<input name="subject">' + "y" * 400 + \
                 '<textarea name="body"></textarea></html>'

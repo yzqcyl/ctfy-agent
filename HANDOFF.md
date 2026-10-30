@@ -208,3 +208,35 @@
 - 用户在意成本：实验要设预算上限，能提前停就停，报告要给"钱花在哪"的结构化拆解。
 - 验尸/统计警惕**同一事实多重计数**（拦截文本被汇报引用、echo 重复），先归类再报数。
 - 回答用中文，简洁 + 表格 + 明确口径与置信度。
+
+---
+
+## 附录 A. rev / pwn / crypto 工具箱（toolbox 会话 · 2026-10-30）
+
+> 本附录由 toolbox 会话追加；正文 §0 的镜像/基线数字以并行会话为准。详细记录见
+> `docs/rev-toolbox-plan.md`、`docs/pwn-toolbox-plan.md`、`docs/crypto-toolbox-plan.md`。
+
+| 方向 | 新增能力（全部挂既有工具注册表，零 crew 改动） | 关键点 |
+|---|---|---|
+| rev（v2） | `elfpeek` 新视图 `disasm`（capstone 可选，缺失退化字节视图）/ `bytecode`（.pyc marshal+dis+常量池；PyInstaller CArchive/PYZ 目录与提取；支持 ELF bootloader 的 PyInstaller）/ `gadgets` v2（真实指令边界枚举 + filter + /bin/sh 全偏移）/ `strings utf16` / `info` 补入口段 | 修掉"没有反汇编器"的根本短板；**capstone 用 `importlib` 动态加载**，否则 `case_stdlib_only`（src 禁第三方 import）会红 |
+| pwn（v1） | **pwngen**（op=cyclic De Bruijn 模式串 / op=build parts 拼装：hex/raw/cyclic/pad/int 小端/`path=` 落盘）、**pwnfind**（崩溃回显 3~8 字节反查偏移，文本/hex/倒序）、`elfpeek view=lookup`（符号偏移 + 相近建议 + 字符串全偏移 + libc 版本行 + ret2libc 提示） | 专为绕开 shell 引号守卫（SAMPLE-013 根因）；注册走 `DOMAIN_SPECS` 自动聚合，未碰 crew/tools_local |
+| crypto（v1） | **rsatool**（small_e / common_modulus / wiener / fermat / pollard_pm1 / pollard_rho / hastad / crt / factor）、**aesblock**（纯 stdlib AES-128/192/256：ecb/cbc/ctr、xor、CBC bitflip、pkcs7）、**prng**（MT19937 标准实现 + 624 输出状态恢复预测、LCG 参数恢复） | **零镜像依赖**（不增体积）；RSA 攻击与 AES 原语从"每题手写脚本"变为一次工具调用 |
+
+**配置变更**（config/agent.json，JSON 无注释故记录于此）：rev / pwn / crypto 三个角色均 `max_steps 12→14`、`platform` 加 `oracle`（verify_answer）、`local` 加 `hexpeek`（及 pwn 的 pwngen/pwnfind、crypto 的 rsatool/aesblock/prng）、提示词接入新工具用法并删除"没有反汇编器/手动核对"类旧指引。
+
+**测试**：`python tests/smoke.py` → **144 passed / 0 failed**；`tests/smoke_rev.py` → 15/15（capstone 有/无两条路径）；`tests/smoke_pwn.py` → 24/24；`tests/smoke_crypto.py` → 27/27（FIPS-197 全密钥长度 + NIST SP800-38A + MT19937 标准向量）。
+**代码审计**（2026-10-30 第二轮）：发现 10 处问题（1 高：cyclic 缓存键漏字母表会串号；6 中：多处参数垃圾值/多字节字符裸崩、prng 大输出绕过 6000 字符契约；3 低），**全部已修**（`[toolbox-fix 2026-10-30]` 标识）；pwngen 落盘沙盒锚定、ELF32 lookup、dynsym 覆盖均实测确认。详见 `docs/toolbox-audit-2026-10-30.md`。
+**待办**：capstone==5.0.3 进 v4 镜像（约 +4–6MB，随 v4 重建，需批准；crypto 侧零新增依赖）→ v4 仍未建（等并行会话收工）；真机复跑 stalled 题验收需模型预算单独申请。
+
+---
+
+## 附录 B. web / AI 安全「剩余短板」补齐（M6 补丁 · toolbox 会话 · 2026-10-30）
+
+> 依据用户提供的两张「剩余短板」截图；详细记录见 `docs/web-ai-gap-plan.md`。
+
+**AI 安全（4 项）**：① `platform` += `verify_exploit`——checker 型 AI 题自校验（`instance_id=UUID / question_id=questions[].id`），不再绕协调者；② `allow_shell false→true`，`local` += `shell`/`decode_blob`——载荷构造（base64/URL/JSON 转义、multipart 用 `python3 -c`/`curl -F`）；③ `max_steps 12→14`（与 r/p/c 对齐，提示词同步「上限 14 步」）；④ 提示词新增【工具面】两行。`config/agent.json` 与 `roles/ai.json`+`roles/ai.system.txt` 同步改（零漂移契约，`tests/smoke_ai_role.py` 硬断言）。
+**Web（3 项）**：① 提示词加「侦察预算」——http_map ≤2 次/轮、URL 不重复抓、侦察 ≤1/3 步数（治 185k vs 801k 的 4 倍波动）；② evidence 条款细化——同一份输出原样复制 20–200 字符连续正文、不拼接/不省略（治 report_rejected 13 次）；③ `method_cards.py` 新增 2 张专项卡（SQLi 靶场序列 / 文件上传靶场）+ 提示词「上传点」指路 `curl -F`（http_request 不支持 multipart）。**web 工具白名单未动**（仍 10 个）。
+**本地无法修复（登记）**：003/004/012 平台占位/VPN-only（需 VPN/平台侧修）；011 与 M6/v4 镜像重建（本机无 Docker，需有 Docker 的机器，届时 v4 一并带 capstone）。
+**测试**：`tests/smoke.py` **144/0**；`tests/smoke_ai_role.py`、`smoke_ai_chat/agent/mcp/infra`、`smoke_webmap` 全 OK；新增 `tests/smoke_webai_gap.py` **12/12**（含兜底同步用例）；pwn/crypto/rev 维持 24/27/15。
+**代码审计**（2026-10-30 第二轮，九项独立核查）：功能接线（shell/decode_blob/门禁）、真实题库匹配（67+23 靶场题全命中、最大 5 卡无截断）、注入面/禁字面量、multipart 说法、verify_exploit 修复层**全部通过**；schema 增量实测 +267 tok/步（≈4%/题预算，可接受）。**2 项 LOW 已修（并行会话同意）**：① web 提示词「只有 10 步」→「只有 14 步：2 指纹/4 枚举/5 验证/1 收口/2 缓冲」（misc 核查 10==10 一致未动，smoke needle 同步）；② crew.py `DEFAULT_ROLES.ai` 兜底抄全（14/True/local+shell+decode_blob；platform 组名 oracle 本就含 verify_exploit），新增 `case_default_ai_fallback_sync` 防再漂移。**提示词黑话清除**：「（M6 补齐）」等内部里程碑字样已从生产提示词移除（两处同步、零漂移复验通过）。另钉 `.gitattributes`（`roles/*.system.txt text eol=lf`）——仓库 autocrlf=true，防止提示词被 checkout 成 CRLF 后零漂移契约假红。详见 `docs/web-ai-gap-plan.md` §5。
+**风险**：W1/W2 与 A1–A3 均为提示词/工具面修补，真机效果（降载、降 rejected、038+ 提分）待跑批验证，需模型预算授权。

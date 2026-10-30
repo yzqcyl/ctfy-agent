@@ -1,8 +1,8 @@
 {
   "ai": {
     "model": "DeepSeek-V4.1-Flash-1017",
-    "max_steps": 12,
-    "allow_shell": false,
+    "max_steps": 14,
+    "allow_shell": true,
     "max_tokens": 4096,
     "platform": [
       "get_challenge",
@@ -13,12 +13,16 @@
       "start_instance",
       "list_instance_attachments",
       "download_instance_attachment",
-      "verify_answer"
+      "verify_answer",
+      "verify_exploit"
     ],
     "local": [
       "http_request",
       "http_map",
-      "chat"
+      "chat",
+      "shell",
+      "write_file",
+      "decode_blob"
     ]
   }
 }
