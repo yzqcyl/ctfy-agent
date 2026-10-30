@@ -1,6 +1,11 @@
 # O2/O3 实现规格（收窄版）：burst 分组归一化 + 静态资源短路
 
-> 状态：**待实现（门 A 后）**；触碰 `src/ctfy_agent/tools_local.py`（与 O1 同一提交，约 +25 行）。
+> 状态：**O2' 已实现（2026-10-31，门 A 后）**；O3 关闭（不写代码）。
+> 实现落点：`src/ctfy_agent/tools_local.py`（`_BURST_VOLATILE` + `_burst_group_key` + 分组循环）、
+> `tests/smoke_burst_group.py`（12 条离线断言，全过）。
+> **实现细节/偏离**：① 状态码进分组键（同正文但 200/403 不是同一种结果，规格第 4 条要求）；
+> ② 汇总增 `raw_distinct_bodies`（归一化确实合掉碎片时才出现），组对象增 `raw_count`；
+> ③ race 模式完全走旧路径，输出结构逐字段不变（有回归断言）。
 > 依据：`docs/audit-behavior-2026-10-30.md` 实测 + 本文件第 1 节的代码事实核对。
 
 ## 1. 现状核对（避免重复造轮子）

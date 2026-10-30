@@ -295,6 +295,31 @@ BURST_READ_BYTES = 2048
 BURST_STORE_BYTES = 64 * 1024    # 流量库落盘用：比分组指纹（2048）读得更全，仍远小于 2MB 上限
 MAX_BURST_GROUPS = 12             # 分组详情最多展开这么多组，其余折叠（防 JSON 被 solver 截半）
 
+# O2'：burst 分组前对正文做归一化，消掉「响应回显 payload」造成的分组碎片化。
+# 只影响分组键，输出里的 head 仍是该组首个样本的原始正文。
+_BURST_VOLATILE = (
+    re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),  # ISO 时间
+    re.compile(r"\b\d{13}\b"),                                     # epoch 毫秒
+    re.compile(r"\b\d{10}\b"),                                     # epoch 秒
+    re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),  # UUID
+    re.compile(r"\b[0-9a-fA-F]{16,}\b"),                           # ≥16 位 hex（hash/token）
+    re.compile(r"\b\d{6,}\b"),                                     # 长数字（自增 ID/随机种子）
+)
+
+
+def _burst_group_key(body: str, vals: list[str]) -> str:
+    """O2'：把正文里的 payload 回显换成 <V>、时变片段换成 <N>，得到分组键。
+
+    实测（audit-behavior §2）：13 组碎成 4 组的主因是错误页把 payload 原样回显，
+    每个值一个组，模型得自己从 13 个垃圾组里找规律。归一化后同一「结果类型」才合组。
+    """
+    text = body[:BURST_READ_BYTES]
+    for v in sorted((v for v in vals if v), key=len, reverse=True):  # 长的先替换，防子串吞掉长值
+        text = text.replace(v, "<V>")
+    for pattern in _BURST_VOLATILE:
+        text = pattern.sub("<N>", text)
+    return text
+
 BURST_SPEC = {
     "type": "function",
     "function": {
@@ -1514,10 +1539,13 @@ class LocalTools:
                 )
 
         # 按响应正文分组（正文即指纹：错误提示 vs 成功页的分界通常在前几行）
+        # O2'：batch 模式先归一化（payload 回显 → <V>，时变片段 → <N>）再分组，
+        # 避免「同一结果类型被 payload 回显拆成十几组」；race 模式无 values，走原路径。
         ok = failed = 0
         status_counter: dict[int, int] = {}
         times: list[float] = []
-        groups: dict[str, dict] = {}
+        groups: dict[object, dict] = {}
+        raw_bodies: set[str] = set()
         for r in results:
             r = r or {}
             if "error" in r:
@@ -1526,9 +1554,25 @@ class LocalTools:
             ok += 1
             status_counter[r["status"]] = status_counter.get(r["status"], 0) + 1
             times.append(r["ms"])
-            g = groups.setdefault(r["body"][:BURST_READ_BYTES], {"count": 0, "i": [], "status": r["status"], "head": r["body"][:120]})
+            raw_key = r["body"][:BURST_READ_BYTES]
+            raw_bodies.add(raw_key)
+            if mode == "batch":
+                # 状态码进键：同正文不同状态（如 200 空页 vs 403 空页）不是同一种结果
+                key = (r["status"], _burst_group_key(r["body"], vals))
+                g = groups.setdefault(
+                    key,
+                    {"count": 0, "i": [], "status": r["status"], "head": r["body"][:120], "_raw": set()},
+                )
+                g["_raw"].add(raw_key)
+            else:
+                g = groups.setdefault(raw_key, {"count": 0, "i": [], "status": r["status"], "head": r["body"][:120]})
             g["count"] += 1
             g["i"].append(r["i"])
+        for g in groups.values():
+            raw = g.pop("_raw", None)
+            if raw is not None:
+                # 合并前该组由几个原始正文组成；>1 说明归一化确实合掉了碎片
+                g["raw_count"] = len(raw)
 
         groups_sorted = sorted(groups.values(), key=lambda g: -g["count"])
         shown = groups_sorted[:MAX_BURST_GROUPS]
@@ -1556,6 +1600,9 @@ class LocalTools:
             "distinct_bodies": len(groups),
             "groups": shown,
         }
+        if mode == "batch" and len(raw_bodies) != len(groups):
+            # 归一化合掉了碎片时给出原始正文组数，让模型知道「多少个 payload 只产生几种结果」
+            summary["raw_distinct_bodies"] = len(raw_bodies)
         if times:
             summary["ms"] = {"min": min(times), "max": max(times), "spread": round(max(times) - min(times), 1)}
         if mode == "batch":

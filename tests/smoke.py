@@ -3320,12 +3320,15 @@ def case_http_burst(tmp: Path) -> None:
         assert "ms" in out and out["ms"]["max"] >= out["ms"]["min"] >= 0, out
 
         out = json.loads(local.http_burst(url=base + "/enum/{v}", method="GET", values=["alice", "bob", "carol"]))
-        assert out["mode"] == "batch" and out["distinct_bodies"] == 3, out
-        assert sorted(g["v"][0] for g in out["groups"]) == ["alice", "bob", "carol"], out
+        # O2'：响应回显 payload 会被归一化 → 3 个不同值合成 1 组；原始组数单独报告、成员 v 全保留
+        assert out["mode"] == "batch" and out["distinct_bodies"] == 1, out
+        assert out["raw_distinct_bodies"] == 3 and out["groups"][0]["raw_count"] == 3, out
+        assert sorted(out["groups"][0]["v"]) == ["alice", "bob", "carol"], out
 
         out = json.loads(local.http_burst(url=base + "/submit", method="POST", body='{"id":"{v}"}', values=["1", "2"]))
-        bodies = sorted(g["head"] for g in out["groups"])
-        assert bodies == ['echo={"id":"1"}', 'echo={"id":"2"}'], bodies
+        assert out["distinct_bodies"] == 1, out
+        assert out["groups"][0]["head"] == 'echo={"id":"1"}', out   # head 仍是该组首个原始正文
+        assert sorted(out["groups"][0]["v"]) == ["1", "2"], out
 
         out = json.loads(local.http_burst(url=base + "/race", method="GET", count=99))
         assert out["requested"] == 24, out
