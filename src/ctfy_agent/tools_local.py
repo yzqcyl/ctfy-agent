@@ -54,9 +54,32 @@ HTTP_WINDOW = 5000
 MAX_GREP_BYTES = 2 * 1024 * 1024  # 本地读取上限：小响应读到 EOF 即止；大响应保留中/尾可切片
 MAX_GREP_MATCHES = 30             # 30×~175 字符 ≈ 5.2KB，整张匹配表能塞进 6000 的可见上限
 MAX_GREP_PATTERN_LEN = 256        # 正则长度上限（stdlib re 无超时，尽力缓解灾难性回溯）
+MAX_GREP_PATTERNS = 6             # O1a：一次调用最多同时搜 6 个正则（多搜 = 少抓一轮）
+MAX_GREP_PER_PATTERN = 8          # O1a：多 pattern 模式下每个 pattern 命中上限
 SHELL_TIMEOUT_MAX = 120
 CACHE_MAX_ENTRIES = 16            # body 缓存条数上限（FIFO）
 CACHE_MAX_BYTES = 8 * 1024 * 1024  # body 缓存字节上限
+CACHE_MAX_ERROR_ENTRIES = 64      # O1b：403/404 保留上限（总容量 16 时由「优先逐非 200」生效，见 _cache_put）
+CACHE_ERROR_MAX_BODY = 64 * 1024  # O1b：只缓存小体积的非 200 响应（错误页通常很小）
+
+
+def _normalize_grep(grep) -> tuple[list[str], int]:
+    """O1a：把 grep 参数规范成 pattern 列表。
+
+    - `str` 原样单元素（旧行为完全不变）；`list/tuple` 保序去重；
+    - 丢空串与重复项，截断到 MAX_GREP_PATTERNS，返回被丢弃的个数（输出里提示模型）。
+    """
+    if grep is None or grep == "":
+        return [], 0
+    items = [grep] if isinstance(grep, str) else list(grep)
+    out: list[str] = []
+    for item in items:
+        text = str(item or "")
+        if not text or text in out:
+            continue
+        out.append(text)
+    dropped = max(0, len(out) - MAX_GREP_PATTERNS)
+    return out[:MAX_GREP_PATTERNS], dropped
 DIFF_MAX_CHARS = 4000             # diff 文本上限（solver 还会把工具结果截到 MAX_TOOL_TEXT=6000）
 DIFF_CONTEXT_LINES = 1            # 差异上下文行数：IDOR 枚举只要「哪个字段变了」，别把整段再塞回上下文
 CHAT_MAX_REPLY = 2500             # chat 单次回复上限：一句回复 + 元数据要塞进 6000 可见窗口
@@ -212,13 +235,33 @@ HTTP_SPEC = {
                         "可选正则。提供时先读完整响应（上限 2MB）再只返回每个匹配附近 ±80 字符的片段"
                         "（带字符偏移），最多 30 条。用于在大 JS/HTML 里搜 flag/凭据/接口/路径，"
                         "例如 \"flag\\\\{[^}]+\\\\}\" 或 \"(admin|token|secret|api)\"。"
+                        "要一次搜多个关键词用 greps（数组），别对同一 URL 反复抓。"
+                    ),
+                },
+                "greps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "可选：正则数组（最多 6 个，与 grep 二选一或并用）。任一命中即返回，"
+                        "输出按偏移升序合并、并用 grep_matched 标注每个正则命中数——"
+                        "一次调用同时搜 flag/凭据/接口/路径。"
+                        "例：[\"flag\\\\{\", \"(admin|token|secret|api)\", \"set-cookie\"]。"
+                        "多 pattern 时每个正则最多 8 条、全局最多 30 条。"
                     ),
                 },
                 "offset": {
                     "type": "integer",
                     "description": (
                         "从正文第 offset 个字符开始返回一个窗口（配合返回的 next_offset 翻页）。"
-                        "用于分段读大文件的中段/尾段；与 grep 互斥（给 grep 时忽略 offset）。"
+                        "用于分段读大文件的中段/尾段；与 grep 组合时先切出该窗口，再在窗口内搜索"
+                        "（偏移仍报全文绝对位置）。"
+                    ),
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": (
+                        "true 时跳过缓存读、强制重新请求（默认 false）。登录/写操作后发现之前的"
+                        "403/404 或旧页面可能过期时用；缓存桩里带的 body 是上次那份。"
                     ),
                 },
                 "diff": {
@@ -742,7 +785,11 @@ class LocalTools:
         self.cache.pop(key, None)  # 同 key 重抓：先删再插，刷新 FIFO 位置（否则最新反而最先被逐，审计 A2）
         self.cache[key] = entry
         while len(self.cache) > CACHE_MAX_ENTRIES:
-            self.cache.popitem(last=False)  # FIFO
+            # O1b：超容时优先逐非 200 条目——403/404 探测刷屏不能把 200 的真实攻击面挤出去；
+            # 只剩 200 时才按插入序逐最旧的（FIFO）。
+            oldest_error = next((k for k, e in self.cache.items() if (e.get("status") or 200) != 200), None)
+            victim = oldest_error if oldest_error is not None else next(iter(self.cache))
+            del self.cache[victim]
         total = sum(len(e.get("payload") or "") for e in self.cache.values())
         while total > CACHE_MAX_BYTES and self.cache:
             k = next(iter(self.cache))
@@ -753,17 +800,26 @@ class LocalTools:
     def _render_cache_stub(entry: dict) -> str:
         payload = entry.get("payload") or ""
         raw_total = entry.get("content_length")
+        status = entry.get("status")
         if raw_total is None:
             total = f">={MAX_GREP_BYTES}" if entry.get("capped") else len(payload)
         else:
             total = int(raw_total)
+        if status in (403, 404):
+            note = (
+                f"该 URL 本轮已读过并返回 {status}（缓存命中，未重复请求）。"
+                "若刚登录或刚做过写操作，这个结果可能已过期——加 fresh=1 强制重取；"
+                "要看片段请带 offset 或 grep。"
+            )
+        else:
+            note = "该 URL 本轮已读过（缓存命中，未重复返回全文）。要看任意片段请带 offset 或 grep。"
         return json.dumps(
             {
-                "status": entry.get("status"),
+                "status": status,
                 "cached": True,
                 "total_bytes": total,
                 "body": payload[:500],
-                "note": "该 URL 本轮已读过（缓存命中，未重复返回全文）。要看任意片段请带 offset 或 grep。",
+                "note": note,
             },
             ensure_ascii=False,
         )
@@ -822,12 +878,24 @@ class LocalTools:
         jar = self._jar.get(netloc)
         return "; ".join(f"{k}={v}" for k, v in jar.items()) if jar else None
 
-    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False, follow_redirect: bool = True, body_b64: str = "") -> str:
+    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False, follow_redirect: bool = True, body_b64: str = "", fresh: bool = False, greps: list[str] | None = None) -> str:
         self._check_target(url)
         netloc = urlparse(url).netloc
         method = (method or "GET").upper()
         diff = as_bool(diff)
         follow = as_bool(follow_redirect)
+        fresh = as_bool(fresh)
+        # O1a：grep（字符串）与 greps（数组）合并成一个列表交给渲染层；
+        # 只有单个 pattern 时渲染层走旧路径，输出形状与旧版逐字节一致。
+        grep_arg: list[str] = []
+        if grep:
+            grep_arg.extend([grep] if isinstance(grep, str) else list(grep))
+        if greps:
+            grep_arg.extend([greps] if isinstance(greps, str) else list(greps))
+        if len(grep_arg) == 1:
+            grep_render: str | list[str] = grep_arg[0]
+        else:
+            grep_render = grep_arg
         if body and body_b64:
             raise ToolError("body 与 body_b64 互斥，只填一个")
         if body_b64:
@@ -883,7 +951,8 @@ class LocalTools:
             hit = self.cache.get(cache_key)
             # diff 要「这次真实响应」当右侧：跳过缓存读（cache_key 仍留着事后落盘）。
             # follow_redirect=false 同理：要看到原始 3xx+Location，不能拿缓存的落地页顶替。
-            if hit is not None and not diff and follow:
+            # fresh=true（O1b）：登录/写操作后强制重取，跳过缓存读。
+            if hit is not None and not diff and follow and not fresh:
                 _hit_hdrs = hit.get("headers") or {}
                 self._traffic_record(
                     source="http_request", method=method, url=url, status=hit.get("status"),
@@ -893,7 +962,7 @@ class LocalTools:
                     truncated=(1 if len(hit.get("payload") or "") >= MAX_GREP_BYTES else 0),
                     cache_hit=1,
                 )
-                if not grep and not offset:
+                if not grep_render and not offset:
                     # 完全重复读：返回桩而不是再次塞全文进上下文（省 token 的真正来源）
                     return self._render_cache_stub(hit)
                 # 带 offset/grep：直接从缓存切片/筛，省掉一次网络往返
@@ -901,7 +970,7 @@ class LocalTools:
                     hit.get("status") or 200,
                     hit.get("headers") or {},
                     hit.get("payload") or "",
-                    grep,
+                    grep_render,
                     offset,
                     hit.get("content_length"),
                     limit,
@@ -971,6 +1040,17 @@ class LocalTools:
         baseline = self._diff_baseline(netloc, urlparse(url).path) if diff else None
 
         if method == "GET" and status == 200:
+            cache_entry = {
+                "status": status,
+                "headers": interesting,
+                "payload": payload,
+                "content_length": content_length,
+                "capped": len(payload) >= MAX_GREP_BYTES,
+            }
+            self._cache_put(cache_key, cache_entry)
+        elif method == "GET" and status in (403, 404) and len(payload) <= CACHE_ERROR_MAX_BODY:
+            # O1b：403/404 也缓存——重复探测不存在路径/被拒端点时直接命中桩，不再耗网络。
+            # 体积限 64KB 且单列条数上限（见 _cache_put），防刷接口把 200 条目挤出去。
             self._cache_put(
                 cache_key,
                 {
@@ -978,12 +1058,12 @@ class LocalTools:
                     "headers": interesting,
                     "payload": payload,
                     "content_length": content_length,
-                    "capped": len(payload) >= MAX_GREP_BYTES,
+                    "capped": False,
                 },
             )
         if diff:
-            return self._render_diff(status, interesting, payload, baseline, grep, offset, content_length, limit, elapsed_ms)
-        return self._render_http(status, interesting, payload, grep, offset, content_length, limit, elapsed_ms)
+            return self._render_diff(status, interesting, payload, baseline, grep_render, offset, content_length, limit, elapsed_ms)
+        return self._render_http(status, interesting, payload, grep_render, offset, content_length, limit, elapsed_ms)
 
     def _diff_baseline(self, netloc: str, path: str) -> str | None:
         """diff 的基线：缓存里同 host + 同 path（忽略 query）的**最近一条**响应的正文。
@@ -996,7 +1076,12 @@ class LocalTools:
                 continue
             if str(key[1]).split("?", 1)[0] != path:
                 continue
-            payload = (self.cache.get(key) or {}).get("payload")
+            entry = self.cache.get(key) or {}
+            # O1b：403/404 也进缓存了，但 diff 的基线只认 200 的真实页面，
+            # 否则「404 变 403」这类差异会被当成页面内容变化刷满差异行。
+            if (entry.get("status") or 200) != 200:
+                continue
+            payload = entry.get("payload")
             if isinstance(payload, str):
                 return payload
         return None
@@ -1062,7 +1147,7 @@ class LocalTools:
         return json.dumps(out, ensure_ascii=False)
 
     @staticmethod
-    def _render_http(status: int, headers: dict, payload: str, grep: str, offset: int = 0, content_length: str | None = None, limit: int = 0, elapsed_ms: float | None = None) -> str:
+    def _render_http(status: int, headers: dict, payload: str, grep: str | list[str], offset: int = 0, content_length: str | None = None, limit: int = 0, elapsed_ms: float | None = None) -> str:
         offset = max(0, int(offset or 0))
         wsize = HTTP_WINDOW
         if limit:
@@ -1071,30 +1156,100 @@ class LocalTools:
         total = len(payload)
         capped = total >= MAX_GREP_BYTES  # 读到本地 2MB 上限（未必是文件末尾）
 
-        if grep:
-            if len(grep) > MAX_GREP_PATTERN_LEN:
-                raise ToolError(f"grep 正则过长（{len(grep)}>{MAX_GREP_PATTERN_LEN} 字符），请精简")
-            try:
-                pattern = re.compile(grep)
-            except re.error as exc:
-                raise ToolError(f"grep 正则无效: {exc}") from None
+        patterns, dropped = _normalize_grep(grep)
+        if patterns:
             # 按「匹配片段 ±80 字符」抽取，而非按行——压缩过的 JS 常是单行，按行会把整包返回。
             # 边扫边截到 MAX_GREP_MATCHES：绝不全量物化（宽正则打 2MB 会 OOM，审计 B11）。
-            shown: list[str] = []
+            # O1a：offset 与 grep 组合 = 先切窗口再搜，报的仍是全文绝对偏移。
+            window = payload[offset : offset + wsize] if offset > 0 else payload
+            base = offset if offset > 0 else 0
+            if len(patterns) == 1:
+                # 单 pattern 走旧路径：输出形状逐字节保持不变（快照兼容）
+                single = patterns[0]
+                if len(single) > MAX_GREP_PATTERN_LEN:
+                    raise ToolError(f"grep 正则过长（{len(single)}>{MAX_GREP_PATTERN_LEN} 字符），请精简")
+                try:
+                    pattern = re.compile(single)
+                except re.error as exc:
+                    raise ToolError(f"grep 正则无效: {exc}") from None
+                shown: list[str] = []
+                truncated = False
+                for m in pattern.finditer(window):
+                    if len(shown) >= MAX_GREP_MATCHES:
+                        truncated = True
+                        break
+                    start, end = base + m.start(), base + m.end()
+                    shown.append(f"[{start}] {payload[max(0, start - 80): end + 80]}")
+                out = {
+                    "status": status,
+                    "headers": headers,
+                    "grep": single,
+                    "matched": len(shown),
+                    "truncated": truncated,
+                    "body": "\n".join(shown),
+                }
+                if elapsed_ms is not None:
+                    out["elapsed_ms"] = elapsed_ms
+                if content_length is not None:
+                    out["total_bytes"] = int(content_length)
+                elif capped:
+                    out["total_bytes"] = f">={MAX_GREP_BYTES}"
+                return json.dumps(out, ensure_ascii=False)
+
+            # 多 pattern（O1a）：逐正则搜、按偏移升序合并、同偏移保留先出现者；
+            # 每 pattern ≤MAX_GREP_PER_PATTERN、全局 ≤MAX_GREP_MATCHES，超限报告被截断的正则。
+            errors: list[dict] = []
+            compiled: list[tuple[str, re.Pattern]] = []
+            for pat in patterns:
+                if len(pat) > MAX_GREP_PATTERN_LEN:
+                    errors.append({"pattern": pat, "error": f"正则过长（>{MAX_GREP_PATTERN_LEN} 字符）"})
+                    continue
+                try:
+                    compiled.append((pat, re.compile(pat)))
+                except re.error as exc:
+                    errors.append({"pattern": pat, "error": f"bad regex: {exc}"})
+            hits: list[tuple[int, int, str]] = []
+            per_count: dict[str, int] = {}
+            per_trunc: dict[str, int] = {}
+            seen_start: set[int] = set()
+            for pat, regex in compiled:
+                kept = 0
+                found = 0
+                for m in regex.finditer(window):
+                    found += 1
+                    if kept >= MAX_GREP_PER_PATTERN:
+                        per_trunc[pat] = found
+                        break
+                    start, end = base + m.start(), base + m.end()
+                    if start in seen_start:  # 同偏移重叠：首个 pattern 保留，其余不重复计
+                        continue
+                    seen_start.add(start)
+                    hits.append((start, end, pat))
+                    kept += 1
+                per_count[pat] = kept
+            hits.sort(key=lambda item: item[0])
+            shown = []
             truncated = False
-            for m in pattern.finditer(payload):
+            for start, end, _pat in hits:
                 if len(shown) >= MAX_GREP_MATCHES:
                     truncated = True
                     break
-                shown.append(f"[{m.start()}] {payload[max(0, m.start() - 80): m.end() + 80]}")
+                shown.append(f"[{start}] {payload[max(0, start - 80): end + 80]}")
             out = {
                 "status": status,
                 "headers": headers,
-                "grep": grep,
+                "grep": patterns,
                 "matched": len(shown),
-                "truncated": truncated,
+                "truncated": truncated or bool(per_trunc),
+                "grep_matched": [{"pattern": pat, "count": per_count.get(pat, 0)} for pat, _ in compiled],
                 "body": "\n".join(shown),
             }
+            if dropped:
+                out["grep_dropped"] = dropped  # 超过 6 个被丢弃的个数
+            if per_trunc:
+                out["grep_truncated"] = per_trunc  # 每个被截断正则的至少命中数
+            if errors:
+                out["grep_errors"] = errors  # 非法/过长正则只影响自身
             if elapsed_ms is not None:
                 out["elapsed_ms"] = elapsed_ms
             if content_length is not None:

@@ -1,8 +1,16 @@
 # O1 实现规格：多 pattern grep + 非 200 响应缓存
 
-> 状态：**待实现（门 A 后）**。依据：`docs/audit-behavior-2026-10-30.md`（实测）。
-> 触碰文件：`src/ctfy_agent/tools_local.py`（+~50 行）、`tests/smoke_http_cache.py`（新增）。
-> **前置约束：`tools_local.py` 在并行会话活动锁内，实现必须等门 A。**
+> 状态：**已实现（2026-10-31，门 A 后）**。依据：`docs/audit-behavior-2026-10-30.md`（实测）。
+> 实现落点：`src/ctfy_agent/tools_local.py`（渲染/缓存/schema）、`src/ctfy_agent/ledger.py`（去重键）、
+> `tests/smoke_http_cache.py`（24 条离线断言，全过）。
+> **实现偏离（相对本规格原稿，均记录理由）**：
+> 1. schema 不用 `"type": ["string","array"]`（全仓库无 union 类型先例，provider 严格校验会连累
+>    核心工具）；改为 `grep` 保持 string 不变 + 新增 `greps` 字符串数组参数，运行时合并。
+> 2. 403/404 不是「单列 64 条」，而是**超容时优先逐非 200 条目**（总容量仍 16）；理由：总容量
+>    16 < 64 时单列上限无意义，真正要保的是 200 的真实攻击面。
+> 3. `grep + offset`：offset>0 时先切窗口再搜（报绝对偏移）；offset=0 仍搜全文（旧输出逐字节兼容）。
+> 4. 顺带修掉一个潜伏 bug：`_cache_put` 的 FIFO 用了 `dict.popitem(last=False)`（OrderedDict API），
+>    缓存超过 16 条必崩；此前因 200-only 缓存很少超 16 而没暴露，O1 让 403/404 进缓存后会更早触发。
 
 ## 1. 现状（先别重复造轮子）
 
@@ -28,16 +36,18 @@ HTTP 响应缓存**已存在**（并行会话 v3 改动），已具备：
 
 ## 3. O1a：`grep` 支持多 pattern（主收益）
 
-### 3.1 Schema（`tools_local.py:209` 附近）
+### 3.1 Schema（`tools_local.py` HTTP_SPEC）
 
 ```python
-"grep": {
-    "type": ["string", "array"],          # 向后兼容：单字符串行为完全不变
-    "items": {"type": "string"},
-    "description": ("可选正则或正则数组（最多 6 个）。数组时任一命中即返回，输出按 pattern 分段"
-                    "标注命中数；用于一次调用同时搜 flag/凭据/接口/路径，避免同一文件多次抓取。"),
-}
+"grep": {"type": "string", ...},                     # 旧参数，语义不变
+"greps": {                                            # O1a 新增（数组先例：http_burst.values）
+    "type": "array", "items": {"type": "string"},
+    "description": "正则数组（最多 6 个，与 grep 并用）；任一命中即返回，输出按偏移升序 + grep_matched 计数",
+},
+"fresh": {"type": "boolean", ...},                    # O1b：跳过缓存读
 ```
+
+> 运行时把 `grep` 与 `greps` 合并成列表；**只有一个 pattern 时走旧渲染路径，输出逐字节不变**。
 
 ### 3.2 语义
 
@@ -66,6 +76,8 @@ HTTP 响应缓存**已存在**（并行会话 v3 改动），已具备：
 
 ## 5. 验收（`tests/smoke_http_cache.py`，无网络，用 `_render_http`/`_cache_put` 单测 + 假 opener）
 
+原 12 条全部覆盖，另加 2 条账本交互（13/14），共 **24 条断言，全过**：
+
 1. 多 pattern OR 命中、偏移升序、去重、每 pattern ≤8 条；
 2. 全局 30 条上限 + `grep_truncated` 报告正确；
 3. 非法正则只影响自身；
@@ -73,11 +85,13 @@ HTTP 响应缓存**已存在**（并行会话 v3 改动），已具备：
 5. 7 个 pattern 被截断到 6 并在输出提示；
 6. GET 404 二次请求走缓存桩（opener 计数=1）；
 7. `fresh=1` 强制重取（opener 计数=2）；
-8. POST 不缓存（opener 计数=2）；
-9. 403/404 条目不挤占 200 条目（容量断言）；
-10. `solver._solve_once` 开头清空缓存后不命中（跨题隔离回归）；
-11. 多角色共享缓存（同题两个 LocalTools 实例 → opener 计数=1）；
-12. `grep + offset` 组合语义。
+8. POST 不缓存（两次 POST 都发网络）；
+9. 403/404 刷屏不挤占 200 条目（超容优先逐非 200）；
+10. `solver._solve_once` 开头 `_http_cache.clear()`（跨题隔离回归）；
+11. 多角色共享缓存（同题两个 LocalTools 实例 → 计数=1）；
+12. `grep + offset` 组合语义（窗口内命中报绝对偏移；窗口外不返回）；
+13. `greps` 数组进账本去重键、同参撞键；
+14. `fresh=1` 与普通 GET 键不同（账本不会误拦 O1b 逃生口）。
 
 ## 6. 预期收益（基于审计实测，给出区间不吹）
 

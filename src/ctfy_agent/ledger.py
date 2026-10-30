@@ -178,9 +178,19 @@ def normalize_args(tool: str, args: dict | None) -> dict:
         hdr = _header_fingerprint(args.get("headers"))
         if hdr:
             out["headers"] = hdr
-        for key in ("grep", "offset", "limit"):
-            if args.get(key) not in (None, ""):
-                out[key] = _norm_scalar(args.get(key))
+        for key in ("grep", "greps", "offset", "limit"):
+            value = args.get(key)
+            if value in (None, "") or value == []:
+                continue
+            if key in ("grep", "greps") and isinstance(value, (list, tuple)):
+                # O1a：多 pattern 保序拼接进键（同一组正则重复调用必须撞键，仍由账本拦截）。
+                out[key] = "\x00".join(_norm_scalar(item) for item in value)
+            else:
+                out[key] = _norm_scalar(value)
+        # O1b：fresh=true 改变行为（跳过缓存、必然重新发网络），必须与普通 GET 区分，
+        # 否则「缓存桩 → fresh 重取」这一步会被账本当成重复调用拦掉，逃生口形同虚设。
+        if args.get("fresh") in (True, "true", "1", "yes", "on"):
+            out["fresh"] = True
         # diff 改变「输出内容」（差异 vs 全窗），必须进键：否则 diff 调用与普通同参 GET 撞键，
         # 落账后反手把后续普通读也误拦（审计 B2）。
         if args.get("diff") in (True, "true", "1", "yes", "on"):
