@@ -114,13 +114,15 @@ def _run(tmp: pathlib.Path, port: int) -> int:
     resp = _body(local.http_request(
         f"{base}/upload", method="POST",
         form={"csrf": "tok123", "action": "upload"},
-        files=[{"field": "f", "filename": "shell.php", "content": "<?php echo 1; ?>"}],
+        # 注意：不要在这里落 .php/webshell 样本——本机杀软（火绒）会把测试产物当木马删掉，
+        # 导致「工具坏了吗」的假故障。本用例只验证 multipart 传输，载荷内容与语言无关。
+        files=[{"field": "f", "filename": "probe.bin", "content": "multipart-payload-0123456789"}],
     ))
     parts = {p["name"]: p for p in resp["parts"]}
     check("multipart 字段名齐全", {"csrf", "action", "f"} <= set(parts), str(list(parts)))
     check("form 文本字段值正确", base64.b64decode(parts["csrf"]["content_b64"]) == b"tok123")
-    check("文件名保留", parts["f"]["filename"] == "shell.php", str(parts["f"]["filename"]))
-    check("文件内容正确", base64.b64decode(parts["f"]["content_b64"]) == b"<?php echo 1; ?>")
+    check("文件名保留", parts["f"]["filename"] == "probe.bin", str(parts["f"]["filename"]))
+    check("文件内容正确", base64.b64decode(parts["f"]["content_b64"]) == b"multipart-payload-0123456789")
     check("Content-Type 带 boundary", "multipart/form-data" in resp["content_type"] and "boundary=" in resp["content_type"])
 
     # ---- 2) content_b64 二进制原样 ----
@@ -132,15 +134,15 @@ def _run(tmp: pathlib.Path, port: int) -> int:
     got = base64.b64decode(resp2["parts"][0]["content_b64"])
     check("二进制内容字节级一致", got == blob, f"{got[:8]!r} vs {blob[:8]!r}")
 
-    # ---- 3) path 来源读沙箱文件 ----
+    # ---- 3) path 来源读沙箱文件（同样用无害样本，避免杀软拦截）----
     sandbox = local._sandbox_dir()
     sandbox.mkdir(parents=True, exist_ok=True)
-    (sandbox / "shell.php").write_text("<?php system($_GET[1]); ?>", encoding="utf-8")
+    (sandbox / "probe.bin").write_bytes(b"path-source-payload")
     resp3 = _body(local.http_request(
         f"{base}/upload", method="POST",
-        files=[{"field": "f", "filename": "shell.php", "path": "shell.php"}],
+        files=[{"field": "f", "filename": "probe.bin", "path": "probe.bin"}],
     ))
-    check("path 来源读到沙箱文件", b"system($_GET[1])" in base64.b64decode(resp3["parts"][0]["content_b64"]))
+    check("path 来源读到沙箱文件", base64.b64decode(resp3["parts"][0]["content_b64"]) == b"path-source-payload")
 
     # ---- 4) files 与 body 互斥 ----
     try:
