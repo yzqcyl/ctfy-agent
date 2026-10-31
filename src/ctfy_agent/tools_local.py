@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -228,6 +229,20 @@ HTTP_SPEC = {
                 "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], "default": "GET"},
                 "body": {"type": "string", "description": "请求体（表单或 JSON 字符串）"},
                 "body_b64": {"type": "string", "description": "base64 编码的二进制请求体（反序列化/上传等；与 body 互斥）"},
+                "files": {
+                    "type": "array",
+                    "description": (
+                        "可选：multipart/form-data 文件数组（上传点首选，自动拼 boundary 与 Content-Type，"
+                        "不必再 write_file + curl -F 两段式）。每项 {field: 字段名, filename: 文件名, "
+                        "content_b64: base64 内容} 或 {content: 文本} 或 {path: 沙箱内相对路径}，"
+                        "可选 content_type（默认 application/octet-stream）。与 body/body_b64 互斥。"
+                    ),
+                    "items": {"type": "object"},
+                },
+                "form": {
+                    "type": "object",
+                    "description": "可选：multipart 里的普通文本字段（与 files 同用，例如 csrf token、action 名）。",
+                },
                 "headers": {"type": "object", "description": "附加请求头，例如 {\"Content-Type\": \"application/json\"}"},
                 "grep": {
                     "type": "string",
@@ -934,7 +949,7 @@ class LocalTools:
         jar = self._jar.get(netloc)
         return "; ".join(f"{k}={v}" for k, v in jar.items()) if jar else None
 
-    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False, follow_redirect: bool = True, body_b64: str = "", fresh: bool = False, greps: list[str] | None = None) -> str:
+    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False, follow_redirect: bool = True, body_b64: str = "", fresh: bool = False, greps: list[str] | None = None, files: list | None = None, form: dict | None = None) -> str:
         self._check_target(url)
         netloc = urlparse(url).netloc
         method = (method or "GET").upper()
@@ -954,13 +969,20 @@ class LocalTools:
             grep_render = grep_arg
         if body and body_b64:
             raise ToolError("body 与 body_b64 互斥，只填一个")
-        if body_b64:
-            try:
-                data = base64.b64decode(body_b64, validate=True)
-            except Exception as exc:
-                raise ToolError(f"body_b64 不是合法 base64：{exc}") from None
+        if files or form:
+            # O-F：multipart 上传（与 body/body_b64 互斥，Content-Type 由本方法生成）
+            if body or body_b64:
+                raise ToolError("files/form 与 body/body_b64 互斥，只填一组")
+            data, _multipart_ctype = self._build_multipart(files or [], form)
         else:
-            data = body.encode("utf-8") if body else None
+            _multipart_ctype = ""
+            if body_b64:
+                try:
+                    data = base64.b64decode(body_b64, validate=True)
+                except Exception as exc:
+                    raise ToolError(f"body_b64 不是合法 base64：{exc}") from None
+            else:
+                data = body.encode("utf-8") if body else None
 
         # 拦截模型常写的 Range 头：不转发给服务器（越界会 416、且分片再被截断就成盲区），
         # 本地解析成 offset。这样服务器永远回 200，416 从根上消失。
@@ -973,6 +995,9 @@ class LocalTools:
         # 显式要 identity，防服务器回 gzip 乱码（urllib 不自动解压）
         if not any(str(k).lower() == "accept-encoding" for k in forwarded):
             forwarded["Accept-Encoding"] = "identity"
+        # O-F：multipart 自动带 Content-Type（模型显式传了就不覆盖）
+        if _multipart_ctype and not any(str(k).lower() == "content-type" for k in forwarded):
+            forwarded["Content-Type"] = _multipart_ctype
         # 会话续期：jar 里有该 host 的 cookie 且模型没显式传 Cookie 时，自动带上
         if not any(str(k).lower() == "cookie" for k in forwarded):
             cookie = self._cookie_header(netloc)
@@ -1376,6 +1401,49 @@ class LocalTools:
     # ---------- 目录/参数发现（ffuf 封装） ----------
     # 实现在 tools_webscan.py（纯 stdlib、可注入假 ffuf 单测）；这里只做契约适配：
     # 注入目标白名单校验与流量落库回调，命令行开关一律由模块内部硬编码。
+
+    def _build_multipart(self, files: list, form: dict | None) -> tuple[bytes, str]:
+        """O-F：拼 multipart/form-data 请求体，返回 (bytes, Content-Type)。
+
+        files 每项支持三种内容来源：content_b64 / content（文本）/ path（沙箱内相对路径）。
+        path 会做越界校验——上传物必须已经在沙箱里，不允许读沙箱外文件。
+        """
+        boundary = "----ctfyagent" + uuid.uuid4().hex
+        parts: list[bytes] = []
+        for key, value in (form or {}).items():
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode("utf-8")
+            )
+        base = self._sandbox_dir().resolve()
+        for i, spec in enumerate(files or []):
+            if not isinstance(spec, dict):
+                raise ToolError(f"files[{i}] 必须是对象：{{field, filename, content_b64|content|path}}")
+            field = str(spec.get("field") or "file")
+            filename = str(spec.get("filename") or f"upload{i}.bin")
+            if spec.get("content_b64"):
+                try:
+                    content = base64.b64decode(str(spec["content_b64"]), validate=True)
+                except Exception as exc:
+                    raise ToolError(f"files[{i}].content_b64 不是合法 base64：{exc}") from None
+            elif spec.get("path"):
+                p = (base / str(spec["path"])).resolve()
+                if base not in p.parents and p != base:
+                    raise ToolError(f"files[{i}].path 越界（只允许沙箱内文件）：{spec['path']}")
+                if not p.is_file():
+                    raise ToolError(f"files[{i}].path 不是文件：{spec['path']}")
+                content = p.read_bytes()
+            elif spec.get("content") is not None:
+                content = str(spec["content"]).encode("utf-8")
+            else:
+                raise ToolError(f"files[{i}] 需要 content_b64 / content / path 之一")
+            ctype = str(spec.get("content_type") or "application/octet-stream")
+            head = (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"'
+                f"\r\nContent-Type: {ctype}\r\n\r\n"
+            )
+            parts.append(head.encode("utf-8") + content + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
     def _fuzz_record(self, url: str, status) -> None:
         """命中落流量库（source=fuzz）；失败不影响扫描结果。"""

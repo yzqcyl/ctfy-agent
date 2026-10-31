@@ -34,6 +34,9 @@
 | src/ctfy_agent/{solver,tools_webscan,tools_domain_ext,tools_misc_ext,tools_websql,tools_websec}.py | X（agent 优化线） | 10-31 17:50–18:00 | 工具输出硬上限改为 env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 不变，O-C A/B 用） |
 | runs/_oc_patch.py, runs/_oc_ab.py, runs/_oc_report.py | X（agent 优化线） | 10-31 17:50–18:50 | O-C 参数化脚本 + A/B 驱动 + 报告生成 |
 | runs/_retry_round.py | X（agent 优化线） | 10-31 18:00–18:10 | 重试轮机制（未解未撞预算题同预算再跑 + 并集统计） |
+| src/ctfy_agent/tools_local.py | X（agent 优化线） | 10-31 19:00–19:20 | O-F：http_request 新增 multipart files/form + _build_multipart（含沙箱越界校验） |
+| config/agent.json | X（agent 优化线） | 10-31 19:20–19:25 | web 提示词：上传点优先用 files，curl -F 降为兜底（JSON 无法加 WIP 标识） |
+| tests/smoke_http_multipart.py | X（agent 优化线） | 10-31 19:20–19:35 | 新增 O-F 冒烟 10 条断言（全量 29/29 通过） |
 | tests/smoke_burst_group.py | X（agent 优化线） | 10-31 16:00–16:15 | 新增 /authwall 路由 + 2 条 advice 断言（28/28 通过） |
 | src/ctfy_agent/ledger.py + tests/smoke_evidence.py | Y（镜像/验证线） | 10-30 22:40–23:10 | **agent 打磨**：M4 证据归一修复（嵌套 JSON 内层证据被误杀 → 真实回放 10/14 转接受；smoke.py 144 通过）；**未提交**，门 A 统一提交 |
 | config/agent.json + roles/{ai,misc}.json + roles/{ai,misc}.system.txt | Y（镜像/验证线） | 10-31 03:30–03:50 | **提示词补丁**：web/ai 引导 greps 多搜与 fresh 重取；misc/rev/crypto/pwn/web 引导 write_file 落盘脚本；三源零漂移自检通过、全量 28/28（已提交 504b2e1） |
