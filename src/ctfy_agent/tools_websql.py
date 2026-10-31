@@ -21,7 +21,8 @@ import sys
 import time
 from pathlib import Path
 
-TOOL_TEXT_MAX = 6000
+TOOL_TEXT_MAX = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
+# O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
 SQLI_TEXT_SLACK = 40
 SQLI_TIMEOUT_DEFAULT = 60
 SQLI_TIMEOUT_MAX = 120

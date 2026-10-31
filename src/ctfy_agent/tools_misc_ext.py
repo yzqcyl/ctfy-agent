@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import os
+
 import base64
 import binascii
 import bz2
@@ -35,7 +37,8 @@ from urllib.parse import unquote
 
 from .ledger import FLAG_RE
 
-TOOL_TEXT_MAX = 6000
+TOOL_TEXT_MAX = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
+# O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
 MAX_LAYERS = 8
 UNPACK_MAX_BYTES = 64 * 1024 * 1024
 MAX_WRITE_BYTES = 512 * 1024      # write_file 单次上限：够写脚本/payload，防手滑灌满磁盘

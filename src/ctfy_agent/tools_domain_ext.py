@@ -17,6 +17,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import marshal  # [rev-toolbox] bytecode 视图：.pyc / PyInstaller 的 marshal 载荷
 import math  # [crypto-toolbox] isqrt/gcd（纯 stdlib 大数算法）
 import socket
@@ -26,7 +28,8 @@ import types  # [rev-toolbox] bytecode 视图：CodeType 判定
 import zlib  # [rev-toolbox] bytecode 视图：PyInstaller/PYZ 的 zlib 载荷
 from pathlib import Path
 
-TOOL_TEXT_MAX = 6000
+TOOL_TEXT_MAX = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
+# O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
 MAX_READ = 65536
 
 

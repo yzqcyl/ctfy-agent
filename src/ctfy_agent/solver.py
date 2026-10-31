@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import os
+
 import hashlib
 import json
 import time
@@ -29,7 +31,8 @@ from .progress import BudgetPhase, EnvFailureTracker, ObservationTracker
 from .state import Store
 from .tools_local import LocalTools, ToolError, as_bool
 
-MAX_TOOL_TEXT = 6000
+MAX_TOOL_TEXT = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
+# O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
 # 进上下文的工具结果目标长度（字符）：完整原文仍在转录里，模型可 grep/offset 再取。
 # 默认 1600 ≈ M5 实测「够看状态+关键行」的长度；可用 config.extra["tool_text_chars"] 覆盖。
 DEFAULT_TOOL_TEXT_CHARS = 1600

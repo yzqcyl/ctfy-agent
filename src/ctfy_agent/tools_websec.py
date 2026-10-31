@@ -17,13 +17,16 @@
 
 from __future__ import annotations
 
+import os
+
 import hashlib
 import json
 import re
 import time
 from urllib.parse import urljoin, urlparse
 
-TOOL_TEXT_MAX = 6000
+TOOL_TEXT_MAX = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
+# O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
 WEB_SEC_ADDED_LEN = 40
 
 # ---------- authdiff ----------

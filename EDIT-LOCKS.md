@@ -31,6 +31,9 @@
 | src/ctfy_agent/crew.py | X（agent 优化线） | 10-31 15:10–15:40 | O-E：COORDINATOR_PROMPT 增加「先提交再补链路」+ 错误值防重复提交 |
 | src/ctfy_agent/tools_local.py | X（agent 优化线） | 10-31 15:30–15:40 | 修 http_burst 归一化漏「浮点 epoch」（smoke_burst_group 既有 flaky，10 连跑 0 失败） |
 | src/ctfy_agent/tools_webscan.py | X（agent 优化线） | 10-31 16:00–16:15 | fuzz 命中全 401/403 时给认证层 note（与 burst advice 对齐） |
+| src/ctfy_agent/{solver,tools_webscan,tools_domain_ext,tools_misc_ext,tools_websql,tools_websec}.py | X（agent 优化线） | 10-31 17:50–18:00 | 工具输出硬上限改为 env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 不变，O-C A/B 用） |
+| runs/_oc_patch.py, runs/_oc_ab.py, runs/_oc_report.py | X（agent 优化线） | 10-31 17:50–18:50 | O-C 参数化脚本 + A/B 驱动 + 报告生成 |
+| runs/_retry_round.py | X（agent 优化线） | 10-31 18:00–18:10 | 重试轮机制（未解未撞预算题同预算再跑 + 并集统计） |
 | tests/smoke_burst_group.py | X（agent 优化线） | 10-31 16:00–16:15 | 新增 /authwall 路由 + 2 条 advice 断言（28/28 通过） |
 | src/ctfy_agent/ledger.py + tests/smoke_evidence.py | Y（镜像/验证线） | 10-30 22:40–23:10 | **agent 打磨**：M4 证据归一修复（嵌套 JSON 内层证据被误杀 → 真实回放 10/14 转接受；smoke.py 144 通过）；**未提交**，门 A 统一提交 |
 | config/agent.json + roles/{ai,misc}.json + roles/{ai,misc}.system.txt | Y（镜像/验证线） | 10-31 03:30–03:50 | **提示词补丁**：web/ai 引导 greps 多搜与 fresh 重取；misc/rev/crypto/pwn/web 引导 write_file 落盘脚本；三源零漂移自检通过、全量 28/28（已提交 504b2e1） |

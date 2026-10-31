@@ -30,7 +30,8 @@ import tempfile
 import time
 from pathlib import Path
 
-TOOL_TEXT_MAX = 6000
+TOOL_TEXT_MAX = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
+# O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
 FUZZ_MAX_WORDS = 200          # 自定义 words 上限（超了让模型自己收窄，别塞整本字典）
 FUZZ_MAX_RESULTS = 100        # max_results 硬上限
 FUZZ_TIMEOUT_DEFAULT = 45     # 默认单次预算（秒）：10 步题里一步占 45 秒是可接受的
