@@ -12,6 +12,7 @@
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
 | docs/plan-p2v-validation-and-alignment.md | Y（镜像/验证线） | 10-30 19:00 | 方案已批；按门推进时更新，门 C 后释放 |
+| docs/audit-budget-exhausted-2026-10-31.md | X（agent 优化线） | 10-31 15:00 | 回填 O-A 实验结果行 + 改建议顺序；写毕即释放 |
 
 ## 已释放
 
