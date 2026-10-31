@@ -310,6 +310,34 @@ _BURST_VOLATILE = (
 )
 
 
+def _wall_advice(status_counter: dict, total: int) -> str:
+    """撞墙判据（确定性版）：整批响应几乎全 401/403 或全 404 时，直接给出换法提示。
+
+    依据 docs/audit-budget-exhausted-2026-10-31.md 的 M1/M2：历史失败题里出现过
+    单端点 94 次 401（其中一次 70×POST /api/auth/otp，76 秒内盲猜 OTP）与 162 次连续 404。
+    提示词约束不了「一次 burst 打 24 个值」这种形态，所以在工具输出里直接下判据。
+    """
+    if not total:
+        return ""
+    auth = int(status_counter.get(401, 0)) + int(status_counter.get(403, 0))
+    if auth >= max(3, int(total * 0.8)):
+        return (
+            f"【撞墙判据·认证层】本批 {auth}/{total} 个响应是 401/403：墙在认证/授权层，"
+            "换 value、加字典、换参数一律无效。下一步只做这四类之一：换凭据类型"
+            "（cookie / JWT / Basic / API-Key / 表单会话）、换身份（注册新号 / 提权 / 换角色字段）、"
+            "换端点族（/api/v1 → /api/internal → /admin）、换传参位置（header / cookie / query / body）。"
+            "不要再用 burst 猜值。"
+        )
+    n404 = int(status_counter.get(404, 0))
+    if n404 >= max(3, int(total * 0.9)):
+        return (
+            f"【撞墙判据·发现手段空手】本批 {n404}/{total} 个响应是 404：再换 value 也是空手。"
+            "下一步换发现手段：fuzz 换档（common→small→加 ext=bak,zip）→ 拉 JS bundle 用 greps 抽 API 面 "
+            "→ robots.txt / sitemap / 列表页 href / 源码注释 / 备份文件。"
+        )
+    return ""
+
+
 def _burst_group_key(body: str, vals: list[str]) -> str:
     """O2'：把正文里的 payload 回显换成 <V>、时变片段换成 <N>，得到分组键。
 
@@ -1606,6 +1634,10 @@ class LocalTools:
         if mode == "batch" and len(raw_bodies) != len(groups):
             # 归一化合掉了碎片时给出原始正文组数，让模型知道「多少个 payload 只产生几种结果」
             summary["raw_distinct_bodies"] = len(raw_bodies)
+        # 撞墙判据：整批几乎全 401/403 或全 404 时直接给换法（提示词管不住「一次打 24 个值」）
+        advice = _wall_advice(status_counter, ok)
+        if advice:
+            summary["advice"] = advice
         if times:
             summary["ms"] = {"min": min(times), "max": max(times), "spread": round(max(times) - min(times), 1)}
         if mode == "batch":

@@ -37,6 +37,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         v = self.path.rstrip("/").split("/")[-1]
+        if self.path.startswith("/authwall"):
+            # 认证层的墙：任何值都 401（验 _wall_advice 的「认证层」判据）
+            self._send(401, "unauthorized")
+            return
         if self.path.startswith("/samebody"):
             # 同一正文，但状态码按值区分（验「状态码不同必须分组」）
             status = 403 if v == "b" else 200
@@ -104,6 +108,13 @@ def _run(tmp: pathlib.Path, port: int) -> int:
     # ---- 4) 归一化不误合：状态码不同仍分开 ----
     status_burst = json.loads(local.http_burst(f"{base}/samebody/{{v}}", method="GET", values=["a", "b"]))
     check("同正文不同状态码仍分两组", status_burst["distinct_bodies"] == 2, str(status_burst["distinct_bodies"]))
+
+    # ---- 4b) 撞墙判据：整批全 401 → 输出带 advice（认证层换法），不再只是原始分组 ----
+    wall = json.loads(local.http_burst(f"{base}/authwall/{{v}}", method="GET",
+                                       values=[f"{i:06d}" for i in range(6)]))
+    advice = wall.get("advice") or ""
+    check("全 401 批次给出认证层 advice", "认证层" in advice, advice[:80])
+    check("advice 指明换凭据/身份/端点族", "换凭据类型" in advice and "换端点族" in advice, advice[:80])
 
     # ---- 5) 输出仍是合法 JSON 且可解析（结构完整）----
     check("输出为合法 JSON 且结构完整", isinstance(burst.get("groups"), list) and "status" in burst and "ok" in burst, str(burst.keys()))

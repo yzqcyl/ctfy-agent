@@ -397,6 +397,14 @@ def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str 
             notes.append("字典内没有差异命中（已开自动软 404 校准）。"
                          "可换 wordlist=small、加 ext=\"bak,zip,php\"，"
                          "或确认目标不是 SPA 兜底（所有路径同长度）。")
+    else:
+        # 撞墙判据（与 http_burst 的 _wall_advice 对齐）：命中全是 401/403 = 认证层的墙，
+        # 换字典/换参数无效，只能换凭据/身份/端点族/传参位置。
+        statuses = {int(h.get("status") or 0) for h in hits if isinstance(h, dict)}
+        if statuses and statuses <= {401, 403}:
+            notes.append("命中全是 401/403：墙在认证/授权层，别再换字典或参数——"
+                         "换凭据类型（cookie/JWT/Basic/API-Key）、换身份（注册/提权）、"
+                         "换端点族（/api/v1→/api/internal→/admin）或换传参位置。")
     if notes:
         out["note"] = "；".join(notes)
     return _clip(json.dumps(out, ensure_ascii=False))
