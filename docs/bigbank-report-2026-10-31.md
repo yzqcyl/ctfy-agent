@@ -2,12 +2,20 @@
 
 > 数据：平台实跑（CTFARENA / CYBENCH / SAMPLE / UPLOADLABS / 小库），模型 `deepseek-v4.1-flash-1017`（DashScope 兼容接口），**thinking 开启**，单题预算 500k tokens。生成时间 2026-10-31 06:14。
 
+> **勘误（2026-10-31 复盘后补，见 `docs/audit-budget-exhausted-2026-10-31.md`）**
+> 1. 本地沙箱（Windows，无平台 VPN 隧道）**连不上 `.internal` 的 VPN 题**：共 12 题（SAMPLE-003/004/012、
+>    CYBENCH-001/002/010/011/025/026/036/038/040）全程未打通业务流量，属评测口径缺陷、非能力结论。
+>    剔除后可达集 **77/120 = 64.2%**（分库：CTFARENA 60.0%、CYBENCH 45.2%、SAMPLE **100%**、UPLOADLABS 90.5%）。
+> 2. 本文早期版本曾写「VPN 实例能正常创建并交互」——**结论作废**：能创建的是实例，连不通的是隧道。
+> 3. 500k 是本轮为对齐历史基线人为设的预算；`config/agent.json` 生产默认是 `1200000`，按实测单次调用
+>    ~16k token，500k ≈ 32 次调用、1.2M ≈ 75–80 次。失败题平均 33.1 次调用即撞墙，故 58.3% 是「500k 切片」。
+
 ## 总览
 
 | 指标 | 数值 |
 |---|---|
-| 题目数 | 132 |
-| 解出 | 77（58.3%） |
+| 题目数 | 132（可达 120） |
+| 解出 | 77（58.3%；**可达集 64.2%**） |
 | 总 token | 46.6M（均 353k/题） |
 | 总时长 | 7.6 小时（均 206s/题） |
 | 与基线对比 | bank-500k-v1 = 10/35 = 28.6%（thinking 关、无本轮打磨） |
@@ -200,7 +208,7 @@
 - **实例泄漏是最大运营坑**：`stop_instance` 回 success 后实例仍以 `ready` 残留在配额里，占满 3 个槽后所有 start 都被报成「rate limited」。修法：开跑前全局清空 + 每链开题前按题库前缀清残留 + 每库跑完再清一次（已写进 `runs/_paced_batch.py`）。
 - 有 1 题（SAMPLE-015）平台侧报 `tcp_public_port_unavailable`，重试两次仍拿不到实例，记无效并从分母剔除；其余缺结果的题都在补跑轮清掉。
 - 失败口径：`budget_exhausted` = 烧满 500k 预算仍未解出（真实能力/策略问题，不是环境不通）；`coordinator_done` = 协调者主动收口放弃；`no_more_actions`/`no_candidate` = 模型自认无路可走。
-- VPN 型题（实例 `access=vpn`、host 以 `.internal` 结尾，如 SAMPLE-003/004、CYBENCH-011/036）：本轮实例能正常创建并进入实际交互，失败原因是利用链没打通（`coordinator_done`/`budget_exhausted`），**不是隧道不通**——此前把这类题归为「环境不可达」的结论需要修正。
+- VPN 型题（实例 `access=vpn`、host 以 `.internal` 结尾，如 SAMPLE-003/004、CYBENCH-011/036）：**本地沙箱连不通**（无平台 VPN 隧道，DNS 解析 `.internal` 直接失败，agent 反复找 tailscale/试 10.90.x 节点），12 题全灭属评测口径缺陷，见勘误与复盘文档。
 
 ## 复现方式
 
