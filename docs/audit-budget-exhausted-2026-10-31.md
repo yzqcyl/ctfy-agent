@@ -128,7 +128,7 @@ multipart 上传原语 → 退化成 `write_file` 写 python 生成载荷 + `she
 | ✅ **O-E 已实现（10-31）** | 协调者：疑似成功值 → 下一动作必须 submit；错值记 note 防重复提交 | 把「差一点」变成得分 | 纯提示词（`crew.py` COORDINATOR_PROMPT） | 待下一轮实战验证转化率 |
 | ✅ **O-F 已实现（10-31）** | `http_request` 原生 multipart：`files=[{field,filename,content_b64|content|path}]` + 可选 `form={...}`，自动 boundary/Content-Type，含沙箱越界校验 | 上传/表单类题省掉 write_file+curl 两段式（每题 5–10 次调用） | 冒烟 `tests/smoke_http_multipart.py` 10 条断言；全量 29/29 | 待 UPLOADLABS 实战对比调用数 |
 | ✅ **O-H 已实现（10-31）** | 重试轮机制 `runs/_retry_round.py`：未解且 reason ∈ {coordinator_done, no_more_actions, no_candidate} 的题**同预算再跑一轮**，结果取并集 | O-A 数据显示 18 题属此类；同预算重试 ≈5.5M/解 < 翻倍预算 7.4M/解 | 无 agent 改动，纯调度脚本 | 18 题实战验证（进行中），看新增解出数与每解 token |
-| **O-G**
+| **O-G** | VPN 整题不可达时快速判环境失败（≤6 次调用就收口，别烧 30+） | 省时间/token，归因更干净（不直接加分） | 提示词+进度守卫微调 | 12 个 VPN 题重跑看调用数 |
 
 **建议顺序（10-31 晚更新）**：O-A 证伪「预算为主因」；O-D/O-E 已落地并验证（提示词无效、工具级判据把撞墙请求砍 8 成）；O-C 已证伪（两个旋钮对均 prompt 无效）；O-F 已落地（原生 multipart，29/29 冒烟）。下一步：**O-H 重试轮**实战验证 → O-C 变体（`tool_text_chars` 1600→900 单臂 5 题）→ O-G 环境失败快速收口。预算口径维持 500k–1M，正式赛上「未解题同预算重试一遍」比「翻倍预算」更划算。
 
