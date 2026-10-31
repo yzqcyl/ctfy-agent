@@ -1,4 +1,4 @@
-# EDIT-LOCKS —— 跨会话文件编辑锁（防两个对话同时改一个文件）
+﻿# EDIT-LOCKS —— 跨会话文件编辑锁（防两个对话同时改一个文件）
 
 > **约定（2026-10-30 起生效，两个会话都遵守）：**
 > 1. **改任何「非本轮新建」的文件之前**，先在下表登记一行；**会跨轮继续改的文件必须登记**。
@@ -12,7 +12,6 @@
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
 | docs/plan-p2v-validation-and-alignment.md | Y（镜像/验证线） | 10-30 19:00 | 方案已批；按门推进时更新，门 C 后释放 |
-| docs/audit-budget-exhausted-2026-10-31.md | X（agent 优化线） | 10-31 15:00 | 回填 O-A 实验结果行 + 改建议顺序；写毕即释放 |
 
 ## 已释放
 
@@ -27,6 +26,7 @@
 | docs/platform-submit-opsheet.md | Y（镜像/验证线） | 10-30 21:40–21:50 | 平台提交逐屏操作单（第 1 项交付） |
 | docs/spec-o2-o3-tools.md | Y（镜像/验证线） | 10-30 21:50–22:00 | O2 收窄规格 + O3 关闭记录（第 2 项交付） |
 | docs/note-zhipu-model-choice.md | Y（镜像/验证线） | 10-30 22:00–22:10 | 正式赛模型选型备忘（第 3 项交付） |
+| docs/audit-budget-exhausted-2026-10-31.md | X（agent 优化线） | 10-31 15:00–15:05 | 回填 O-A 实验结果（4/33 转化，预算非主因）+ 改建议顺序（已提交 82d5938） |
 | src/ctfy_agent/ledger.py + tests/smoke_evidence.py | Y（镜像/验证线） | 10-30 22:40–23:10 | **agent 打磨**：M4 证据归一修复（嵌套 JSON 内层证据被误杀 → 真实回放 10/14 转接受；smoke.py 144 通过）；**未提交**，门 A 统一提交 |
 | config/agent.json + roles/{ai,misc}.json + roles/{ai,misc}.system.txt | Y（镜像/验证线） | 10-31 03:30–03:50 | **提示词补丁**：web/ai 引导 greps 多搜与 fresh 重取；misc/rev/crypto/pwn/web 引导 write_file 落盘脚本；三源零漂移自检通过、全量 28/28（已提交 504b2e1） |
 | docs/bigbank-report-2026-10-31.md + docs/bigbank-results-2026-10-31.csv | Y（镜像/验证线） | 10-31 06:00–06:30 | **大规模综合测试报告**：132 题实跑，77 解出（58.3%）；重叠 35 题 28.6%→48.6%；含环境限制与复现命令 |
