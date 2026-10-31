@@ -298,6 +298,9 @@ MAX_BURST_GROUPS = 12             # 分组详情最多展开这么多组，其�
 # O2'：burst 分组前对正文做归一化，消掉「响应回显 payload」造成的分组碎片化。
 # 只影响分组键，输出里的 head 仍是该组首个样本的原始正文。
 _BURST_VOLATILE = (
+    # 浮点 epoch 秒（如 ts=1759123456.123456）：必须先整段吞掉，否则小数位不足 6 位时
+    # 会残留 ".5"/".25" 之类的尾巴，让同一类结果被拆成多组（smoke_burst_group 偶发失败即此因）。
+    re.compile(r"\b\d{9,}\.\d+\b"),
     re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),  # ISO 时间
     re.compile(r"\b\d{13}\b"),                                     # epoch 毫秒
     re.compile(r"\b\d{10}\b"),                                     # epoch 秒
