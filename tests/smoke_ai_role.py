@@ -179,8 +179,8 @@ def case_ai_contract(tmp: Path) -> None:
         covered = set().union(*(set(keys) for keys, _ in AI_CARDS))
         missing = AI_TAGS - covered - {"agentic_ai"}
         assert not missing, f"这些 AI tag 没有卡片覆盖（新增陷阱时必须补卡）：{sorted(missing)}"
-        assert len(AI_CARDS) == 20, (f"AI 卡应为 10 张 ASI + 1 张载荷清单 + 7 张防御族 "
-                                     f"+ 2 张 AI 基建（指纹定型 + 七类结构洞），实有 {len(AI_CARDS)}")
+        assert len(AI_CARDS) == 21, (f"AI 卡应为 10 张 ASI + 1 张标识符 oracle + 1 张载荷清单 "
+                                     f"+ 7 张防御族 + 2 张 AI 基建（指纹定型 + 七类结构洞），实有 {len(AI_CARDS)}")
 
         all_keys = covered | set().union(*(set(keys) for keys, _ in CARDS)) | set(IGNORED_TAGS)
         exempt = {"agentic_ai"}  # 族标签：全族共有的粗粒度标签，无专属打法
@@ -228,7 +228,7 @@ def case_ai_contract(tmp: Path) -> None:
         plain_ai = Solver._method_hint(Challenge(id="y", category="ai", tags=["some_unknown_tag"]))
         assert plain_ai == "", plain_ai
 
-        _ok("AI/M2 契约：ai 零漂移接入（10 工具白名单含 verify_exploit / 无提交权 / chat+shell+decode_blob / 三规则 / 路由判据 / 20 卡覆盖 + 三池对账）")
+        _ok("AI/M2 契约：ai 零漂移接入（10 工具白名单含 verify_exploit / 无提交权 / chat+shell+decode_blob / 三规则 / 路由判据 / 21 卡覆盖 + 三池对账）")
     finally:
         server.shutdown()
         server.server_close()

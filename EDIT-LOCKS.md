@@ -54,3 +54,10 @@
 | config/agent.json | Y → 已释放（O-G 提示词） | 11-01 15:00–15:20 | web system 加「内网不可达判据」 |
 | tests/smoke_vpn_advice.py | 新建后已释放 | 11-01 15:05–15:20 | O-G 冒烟 5 条 |
 | docs/p0-calibration-2026-11-01.md | 新建后已释放 | 11-01 15:40–16:00 | P0 校准结果 |
+| src/ctfy_agent/method_cards.py | X → 已释放（AI 方向） | 11-01 16:10–16:40 | 新增 ASI01-标识符 oracle 卡（20→21 张） |
+| src/ctfy_agent/tools_local.py | X → 已释放（AI 方向） | 11-01 16:20–17:20 | chat 解析 tool_calls（JSON/OpenAI/SSE）+ 新增 extra 参数 |
+| config/agent.json + roles/ai.system.txt | X → 已释放（AI 方向） | 11-01 17:20–17:35 | AI 提示词加「注入面不只在 message」（零漂移已校验） |
+| tests/smoke_ai_oracle.py | 新建后已释放 | 11-01 16:30–17:40 | AI 方向冒烟 14 条 |
+| tests/smoke.py + tests/smoke_ai_role.py | X → 已释放（AI 方向） | 11-01 17:30–17:40 | AI 卡张数断言 20→21 |
+| docs/ai-oracle-2026-11-01.md | 新建后已释放 | 11-01 17:40–18:00 | AI 方向补齐记录 |
+| src/ctfy_agent/crew.py + src/ctfy_agent/solver.py + tests/smoke_ctxopt.py | **并行对话（非本线）** | 11-01 起 | S1b 轮间会话重置等；本线未触碰、不提交 |

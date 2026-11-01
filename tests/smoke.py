@@ -4071,7 +4071,7 @@ def case_ai_direction_dod(tmp: Path) -> None:
     assert "ai" in enum, f"delegate 枚举应自动含 ai：{enum}"
 
     # 4) 方法卡（M7）
-    assert len(AI_CARDS) == 20, f"AI 卡应 20 张（含基建 2 张），实有 {len(AI_CARDS)}"
+    assert len(AI_CARDS) == 21, f"AI 卡应 21 张（含基建 2 张 + 标识符 oracle 1 张），实有 {len(AI_CARDS)}"
 
     ok("AI 安全方向 §9 DOB：角色契约 + 提示词纪律自动补 + 工具面收口 + delegate 枚举 + 方法卡")
 
