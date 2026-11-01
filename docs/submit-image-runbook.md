@@ -1,6 +1,31 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
-## ✅ v3 已构建、匿名可拉取（2026-10-29）——**提交用这个**
+## ✅ v4 已构建、匿名可拉取（2026-11-01）——**提交用这个**
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v4` |
+| digest | `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef` |
+| 构建 | GitHub Actions run `41304971894`（branch `v3`、sha `ccc6213`）→ 全绿 |
+| 代码基线 | commit `ccc6213`：v3 之后 38 个提交（工具链扩展：domain_ext +1562 行 / local +772 行、方法卡、progress、提示词与附件落盘、上下文优化 ctxopt）|
+| 思考模式 | ✅ `LLM_ENABLE_THINKING=0` 已写入镜像 `Env`（与本地实测同口径，防 reasoning 烧穿 max_tokens）|
+| 非 root | ✅ `User="app"`（uid 10001、`HOME=/home/app`、`PYTHONPATH=/ctfy/src`）|
+| 入口 | `Entrypoint=["python","-m","ctfy_agent","agent"]`、`WorkingDir=/ctfy`、`Cmd=None` |
+| 体积 | 16 层，匿名传输 59.2 MB（解压 ~150 MB，平台上限 400 MB）|
+| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v4`）|
+| 单测基线 | `tests/smoke.py` **152 passed / 0 failed**（含 ctxopt 8 条）|
+
+### 下一步（浏览器，人工）
+
+> **逐屏操作单（含预期结果与失败排查）：[docs/platform-submit-opsheet.md](platform-submit-opsheet.md)**
+
+1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v4`
+2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
+3. 提交审核 → 通过后用「测评我的 Agent」跑一遍
+
+---
+
+## 历史：`v3` 已构建、匿名可拉取（2026-10-29）——已被 v4 取代
 
 | 项 | 值 |
 |---|---|
@@ -14,7 +39,7 @@
 | 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v3`） |
 | CI 契约 | ✅ 五条路径全 `exit 0`（dry_run / no_task / bad_run_mode / no_creds / no_mcp） |
 | 构建内自检 | ✅ ffuf（`ffuf selftest ok`）、sqlmap（产出 injectable 判定）、302 跳转探针（`decoy_hits=0`） |
-| `latest` | 已随本次构建指向 v3（`ctfy-agent:latest` / `ctfy-agent-pub:latest`）——提交仍请**显式填 `:v3`** |
+| `latest` | 历史值；现 `latest` 已随 v4 构建指向 v4 —— 提交请**显式填 `:v4`** |
 
 ### 与 v2.1 的差异（净改进，无行为回归）
 
@@ -22,20 +47,17 @@
 - 新增 LLM 读超时兜底：单次模型挂起不再让整题报废（`llm.py` 把裸 `TimeoutError` 归一为可重试 `LLMError` + 1 次重试；容器默认读超时 120→240s）。
 - 新增 web 工具链：ffuf 2.1.0 + SecLists 三张表 + sqlmap 1.10.10（版本/字节数/sha256 全钉死，构建期实测跑通）。
 
-### 下一步（浏览器，人工）
+### 历史：v3 当时的下一步（已被 v4 取代）
 
-> **逐屏操作单（含预期结果与失败排查）：[docs/platform-submit-opsheet.md](platform-submit-opsheet.md)**
+### ℹ️ 思考模式：v4 起内置关闭（2026-11-01 拍板，覆盖 10-30 的「不关」决策）
 
-1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v3`
-2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
-3. 提交审核 → 通过后用「测评我的 Agent」跑一遍
+**现行决策（2026-11-01）**：v4 镜像 `ENV LLM_ENABLE_THINKING=0`，与本地全部实测同口径。
+- 直接效果：请求带 `enable_thinking: false`，避免 reasoning 把 `max_tokens=8192` 烧穿 → `content` 空 / `finish_reason=length`。
+- 适用：11-15 初赛（自备百炼 key，OpenAI 兼容端点认这个字段）。
+- **回滚方式**：11-21 正式赛若换官方智谱且该字段被拒（智谱关思考是 `thinking:{"type":"disabled"}`，与百炼字段不同），删掉 Dockerfile 里那行 `ENV LLM_ENABLE_THINKING=0` 重建即可，代码无需改。
+- 历史决策（2026-10-30，已被覆盖）：曾拍板「思考不关、保持端点默认，v4 也不做关闭机制」，依据是 GLM-5.3 系强制思考、关闭收益有限。现按 11-01 用户拍板改为关闭，先保证与实测数据可比。
 
-### ℹ️ 思考模式：保持开启（2026-10-30 拍板，v4 也不做关闭机制）
-
-决策链：10-29 先用 v3 跑免费样例 → 10-30 决定不建 v3.1 → 10-30 最终拍板**思考不关、保持端点默认**。
-依据：百炼/GLM-5.x 默认开思考，GLM-5.3 系**强制思考不可关**——「思考常开」本就是常态，关闭机制收益有限（智谱关法是 `thinking:{"type":"disabled"}`，与百炼 `enable_thinking` 不是同一字段）。
-- **观测点（出现再议，出现前不动）**：评估/实跑的 result.json 出现空回答、`halted`，且转录显示 `finish_reason=length` → 那时再议单调用 max_tokens 余量（8192→16384）。
-- 行为差异备忘：本地历史实测在思考关闭下完成；容器内是端点默认。两边数据不混着对比即可。
+**观测点（出现再议）**：评估/实跑 `result.json` 出现空回答、`halted`，且转录显示 `finish_reason=length` → 再议单调用 `max_tokens` 余量（8192→16384）。
 
 ---
 

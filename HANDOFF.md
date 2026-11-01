@@ -10,7 +10,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **交付物（容器镜像）** | ✅ **v3 已完成并推送**：`ghcr.io/yzqcyl/ctfy-agent-pub:v3`，digest `sha256:e658b9f6a466209813d1278bfa379b38e0275cf5fe0f0d8f41459f423bbf8a56`（Actions run `40837543846`、sha `5a7f8c5`、匿名校验 + 五条契约 + 构建内自检全绿）。历史：v2.1 `sha256:6406286f…`、v2 `sha256:73b39430…`、v1 `sha256:a68ebe6e…` 仅留档。**`:latest` 已指向 v3，提交时务必显式填 `:v3`。** |
+| **交付物（容器镜像）** | ✅ **v4 已完成并推送**：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef`（Actions run `41304971894`、sha `ccc6213`、匿名校验 + 五条契约全绿；`LLM_ENABLE_THINKING=0` 已进镜像 `Env`）。历史：v3 `sha256:e658b9f6…`、v2.1 `sha256:6406286f…`、v2 `sha256:73b39430…`、v1 `sha256:a68ebe6e…` 仅留档。**`:latest` 已指向 v4，提交时务必显式填 `:v4`。** |
 | **平台审核 / 提交** | ⬜ **未开始**。只能由用户走浏览器 4 步，步骤见 `docs/submit-image-runbook.md`。这是当前唯一卡在"人"身上的事。 |
 | **大规模基准测试** | ✅ 完成。报告：**`runs/bench-web-report.md`**（16 道归档 + 3 道中断 + A/B 对照 + 并行求解器评估，含勘误记录）。 |
 | **模型 A/B 对照** | ✅ 结论：**换更强模型不涨分**（同题 Pro 0/3 vs K2.7 0/3，速度 2.27×，覆盖面反而更窄）。 |
@@ -20,12 +20,12 @@
 | **集群-B（同题多策略多尝试）** | ✅ **批次2+A+完整度补强 已落地、机理真机验证**：k 次串行尝试 + 策略/温度差异化（0.2/0.5/0.8）+ 黑板三段继承（结论事实 + 判错死路 + 待验候选值，800/400/300 限额）+ step_limit 归因 + `k` 支持动态（`"auto"` 按剩余 calls 池算）。**默认关闭**（config 不加 `clusterb_k` → k=1 = 旧版行为等价、零回归）；激活=config 加 `"clusterb_k": 3`（或 `"auto"`）。详见 `docs/plan-concurrency.md` §16。 |
 | **step_limit 修复** | ✅ 既有 bug：`_solve_once` 步数用满时 reason 误记 `budget_exhausted`（`step_limit→max_turns` 在 `agent_main._STOP_MAP` 本有映射却从没触发）。已在 `be5d035` 修。 |
 | **A/B 实测** | ✅ SAMPLE-001 k=1 等价回归解出（88.9k token）；SAMPLE-008 k=3 三次尝试（~186k/次）机制正确但未解出。**10-29 归因实验已给出结论：k=3 有害**——SAMPLE-007 上 k=3@511k 花 493,615 tok 未解出，k=1@511k 用 313,076 tok 达成（worker 下线），根因是切片切断累积上下文；v3 因此保持 k=1（见 `docs/clusterb-p1-result.md`）。 |
-| **代码版本** | HEAD `14e5172`（含集群-B 补强 `e55560b`/`ebb6ba0` + 超时修复 + Dockerfile 三修）；v3 镜像同源 `5a7f8c5`（与 HEAD 的 `src/` 无差异）。 |
+| **代码版本** | HEAD `ccc6213`（v3 分支；含 v3 之后 38 个提交：工具链扩展 / 方法卡 / progress / 上下文优化 ctxopt）；v4 镜像同源 `ccc6213`。 |
 | **遗留未提交** | 无（`llm.py` 已随 `a245b81` 提交；`agent-artifacts-m55-m56.zip` untracked，别动）。 |
 | **实例** | 0 个（已清空）。 |
-| **单测基线** | `tests/smoke.py` **126 passed / 0 failed**（含 `tests/smoke_clustera.py` 15 条集群-A 断言）；retry 自检 + 集群-B 离线 6 脚本全绿；`runs/_verify_clustera_step1.py` 全绿。 |
+| **单测基线** | `tests/smoke.py` **152 passed / 0 failed**（含集群-A 15 条、集群-B 8 条、ctxopt 8 条、LLM 超时重试 4 条）；retry 自检 + 集群-B 离线 6 脚本全绿。 |
 
-**一句话**：**v3 镜像已推送并匿名校验通过，只等用户在浏览器提交审核**；集群-B 已完成归因实测（k=3@511k 花 493,615 tok 未解出 vs k=1@511k 用 313,076 tok 达成 → 切分有害，v3 保持 k=1 默认关闭）；顺带修掉「LLM 读超时整题报废」缺陷并把 web 工具链（ffuf/SecLists/sqlmap）烤进镜像。失败根因仍是 flag 发现（access-control 面）。
+**一句话**：**v4 镜像已推送并匿名校验通过，只等用户在浏览器提交审核**；本轮把 v3 之后 38 个提交（工具链扩展、方法卡、progress、上下文优化 ctxopt、提示词/附件落盘）+ `LLM_ENABLE_THINKING=0` 烤进镜像；集群-B 仍默认关闭（10-29 归因实测 k=3 有害）；失败根因仍是 flag 发现（access-control 面）。
 
 ---
 
@@ -164,8 +164,8 @@
 
 ## 6. 待办与阻塞
 
-1. **等平台审核 + 提交 v3**（用户）：`docs/submit-image-runbook.md`；提交时显式 `:v3`，别用 `latest`。
-2. ~~v3 镜像重建/push~~ ✅ 已完成（run `40837543846`）：`ghcr.io/yzqcyl/ctfy-agent-pub:v3`，digest `sha256:e658b9f6a466209813d1278bfa379b38e0275cf5fe0f0d8f41459f423bbf8a56`，需重新构建时走 `python tools/publish_image.py --tag <新tag>`（需 GH_TOKEN，见 runbook）。
+1. **等平台审核 + 提交 v4**（用户）：`docs/submit-image-runbook.md`；提交时显式 `:v4`，别用 `latest`。
+2. ~~镜像重建/push~~ ✅ 最新 v4（run `41304971894`）：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef`；重建走 `python tools/publish_image.py --tag <新tag>`（需 GH_TOKEN；本轮用的是 Windows 凭据管理器里的 `gho_` token，见 `runs/_do_publish.py`）。
 3. **CTFARENA 50 道 web 需换时间窗重测**（上游限流是暂时的，不是我们代码问题）。
 4. **GitHub PAT 吊销**（此前暴露过，仍未处理）。
 5. 失败根因=flag 发现（access-control 面），非编排/预算/模型可调。若要提分，方向是**补 web 安全领域知识**（Werkzeug debug 模式 / 访问控制绕过 playbook），不是加并行路数或调参。
