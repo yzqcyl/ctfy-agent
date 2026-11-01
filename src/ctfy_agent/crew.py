@@ -147,8 +147,8 @@ def profile_calls_cap(profile: dict | None, default_cap: int) -> int:
 # 默认角色。config/agent.json 的 roles 键可覆盖（会进 extra）。
 DEFAULT_ROLES: dict[str, dict] = {
     "coordinator": {"max_steps": 8, "platform": ["read", "instance", "oracle", "submit"], "local": []},
-    "web": {"max_steps": 10, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request"]},
-    "rev": {"max_steps": 12, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell"]},
+    "web": {"max_steps": 10, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request"], "keep_tail": 5, "facts_max": 12, "facts_chars": 780},
+    "rev": {"max_steps": 12, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell"], "keep_tail": 4},
     "crypto": {"max_steps": 10, "allow_shell": True, "platform": ["read", "instance", "oracle"], "local": ["shell"]},
     "misc": {"max_steps": 8, "allow_shell": False, "platform": ["read", "instance"], "local": ["http_request"]},
     # pwn/ai 与 config/agent.json 的 roles 键对齐：DEFAULT_ROLES 是「角色丢失时的兜底」，
@@ -611,6 +611,10 @@ class Crew:
             allow_chat="chat" in (spec.get("local") or []),
             platform_names=self._role_platform_names(role),
             ledger=ledger,
+            # S2 上下文结构按角色调参：尾部保真组数与事实板尺寸（web 的 SPA 链更长、面更大）
+            keep_tail=spec.get("keep_tail"),
+            facts_max=spec.get("facts_max"),
+            facts_chars=spec.get("facts_chars"),
         )
         self.on_event("report", {"role": role, "report": result["report"]})
         if facts_sink is not None:
@@ -691,6 +695,7 @@ class Crew:
             price_input=self.config.price_input_per_mtok,
             price_output=self.config.price_output_per_mtok,
             label=challenge_id,
+            cache_discount=bool(self.config.extra.get("budget_cache_discount")),
         ).load(challenge.tokens)
         if attempt_caps:
             # 集群-B：本次尝试切片（空/None = 不切片，行为同旧）。必须在首个 spending.check() 之前设。
@@ -816,6 +821,26 @@ class Crew:
                         challenge_id, {"role": "coordinator", "step": rnd, "note": "已取消（他路解出）"}
                     )
                     break
+                # S1b 轮间会话重置：协调者每轮只带 [system, 任务头, 摘要卡] 开新会话，不携带
+                # 全量跨轮历史。跨轮信息由持久结构承载（reports/ledger/plan/facts_sink）：
+                # 账本摘要 + 最近 3 份专家结论进摘要卡（_prior_digest，与派活摘要同源），
+                # 完整原文在转录与 store 笔记里。依据：跨轮重建是实测最大开销（8 轮×~95k）；
+                # HMA 会话交替以 1/4 时间预算超基线 8 分。开关 extra.fresh_sessions=false 回旧行为。
+                if rnd > start_rnd and self.config.extra.get("fresh_sessions", True):
+                    digest = _prior_digest(reports, ledger=ledger)
+                    if digest:
+                        messages = [
+                            messages[0],
+                            messages[1],
+                            {"role": "user", "content":
+                                "[轮间摘要卡] 跨轮只保留这份摘要与账本（完整历史在转录里）；"
+                                "基于它继续派活或提交，不要重复已完成方向。" + digest},
+                        ]
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "coordinator", "step": rnd,
+                             "note": f"轮间会话重置：携带 {min(len(reports), 3)} 份结论摘要 + 账本摘要"},
+                        )
                 try:
                     _ckpt_save(ckpt_path, challenge_id=challenge_id, next_round=rnd,
                                messages=messages, reports=reports, ledger=ledger, plan=plan)

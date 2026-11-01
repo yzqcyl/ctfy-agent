@@ -41,6 +41,7 @@ class Budget:
         label: str = "",
         attempt_tokens: int = 0,
         attempt_calls: int = 0,
+        cache_discount: bool = False,
     ):
         self.max_tokens = max(0, int(max_tokens or 0))       # 0 = 不限
         self.max_calls = max(0, int(max_calls or 0))         # 0 = 不限
@@ -51,6 +52,11 @@ class Budget:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.calls = 0
+        # S-A3 缓存折价：端点命中前缀缓存的部分计费 ~1/10（DeepSeek 文档）。
+        # 默认 False=按全量 prompt 计（旧口径）。cached/raw 两个计数器始终记录，供审计。
+        self.cache_discount = bool(cache_discount)
+        self.cached_tokens = 0
+        self.raw_prompt_tokens = 0
         # 集群-B：尝试级切片（0=不限）。_attempt_used_* 是本次尝试已用，reset_attempt 时清零。
         self.attempt_tokens = max(0, int(attempt_tokens or 0))
         self.attempt_calls = max(0, int(attempt_calls or 0))
@@ -85,6 +91,8 @@ class Budget:
         self.prompt_tokens = max(self.prompt_tokens, int(snapshot.get("prompt_tokens") or 0))
         self.completion_tokens = max(self.completion_tokens, int(snapshot.get("completion_tokens") or 0))
         self.calls = max(self.calls, int(snapshot.get("calls") or 0))
+        self.cached_tokens = max(self.cached_tokens, int(snapshot.get("cached_tokens") or 0))
+        self.raw_prompt_tokens = max(self.raw_prompt_tokens, int(snapshot.get("raw_prompt_tokens") or 0))
         return self
 
     def snapshot(self) -> dict:
@@ -101,6 +109,8 @@ class Budget:
             "attempt_calls": self.attempt_calls,
             "attempt_used_tokens": self._attempt_used_tokens,
             "attempt_used_calls": self._attempt_used_calls,
+            "cached_tokens": self.cached_tokens,
+            "raw_prompt_tokens": self.raw_prompt_tokens,
         }
 
     # ---------- 集群-B：尝试级切片 ----------
@@ -164,6 +174,15 @@ class Budget:
         usage = usage or {}
         pt = int(usage.get("prompt_tokens") or 0)
         ct = int(usage.get("completion_tokens") or 0)
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        if cached > pt:
+            cached = pt  # 防御：脏 usage 不允许 cached > prompt
+        self.raw_prompt_tokens += pt
+        self.cached_tokens += cached
+        # 折价口径：命中部分按 1/10 计（(pt-cached) 全价 + cached*0.1，向上取整）
+        if self.cache_discount and cached:
+            pt = (pt - cached) + (cached + 9) // 10
         self.prompt_tokens += pt
         self.completion_tokens += ct
         self.calls += 1

@@ -52,6 +52,7 @@ from smoke_case_misc import case_misc_ext  # noqa: E402
 from smoke_clusterb_crew import case_clusterb_crew, case_clusterb_facts_reflow  # noqa: E402
 from smoke_clustera import case_cluster_a  # noqa: E402
 from smoke_llm_retry import case_llm_timeout_retry  # noqa: E402
+from smoke_ctxopt import case_ctxopt  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -4178,6 +4179,7 @@ def main() -> int:
         ("clusterb_facts_reflow", case_clusterb_facts_reflow),
         ("cluster_a_crew", case_cluster_a),
         ("llm_timeout_retry", case_llm_timeout_retry),
+        ("ctxopt", case_ctxopt),
     ]
     for name, case in cases:
         try:

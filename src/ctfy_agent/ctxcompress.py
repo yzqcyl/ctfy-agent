@@ -160,11 +160,36 @@ class FactsBoard:
 
     # ---------- 抽取 ----------
 
+    # S2b 逐族上限：软族（端点/链接/表单等）滑窗——同族超上限丢最旧；硬值族满员拒收新条目。
+    FAMILY_CAPS = {"endpoint": 6, "href": 2, "doc": 4, "flag": 4, "tool": 8,
+                   "form": 2, "ticket": 3, "component": 2}
+    # 永不驱逐族：flag/会话/组件定型/工单线索是决策关键（P1-2：丢了会 reacquisition churn），
+    # 总量满员时只驱逐软事实，硬值全在也拒收新条目，绝不挤掉已记录的硬值。
+    NEVER_EVICT = ("flag", "session", "component", "ticket")
+
     def _add(self, key: str, text: str) -> None:
         if key in self._facts:
             return
-        if len(self._facts) >= self.max_facts and key.startswith("endpoint:"):
-            return  # 端点满了就不再塞新的，给 flag/会话等更高价值事实留位
+        stem = key.split(":")[0]
+        cap = self.FAMILY_CAPS.get(stem)
+        if cap is not None:
+            same = [k for k in self._facts if k.split(":")[0] == stem]
+            if len(same) >= cap:
+                if stem in self.NEVER_EVICT:
+                    return  # 硬值族满员：拒收（候选 flag 超过 4 个时保留最先出现的）
+                del self._facts[same[0]]  # 软族滑窗：丢最旧的同族条目
+        if len(self._facts) >= self.max_facts:
+            if self._prio(key) >= 2:
+                return  # 软事实不挤人（旧 endpoint 拒收语义的推广）
+            # 给高价值新事实腾位：驱逐「优先级最低、最旧」的非硬值条目
+            order = {k: i for i, k in enumerate(self._facts)}
+            victims = sorted(
+                (k for k in self._facts if k.split(":")[0] not in self.NEVER_EVICT),
+                key=lambda k: (-self._prio(k), order[k]),
+            )
+            if not victims:
+                return  # 板上全是硬值：宁可不收新条目
+            del self._facts[victims[0]]
         self._facts[key] = text
 
     def observe(self, tool: str, args: dict | None, text: str) -> None:

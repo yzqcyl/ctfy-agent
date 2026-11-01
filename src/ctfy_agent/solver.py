@@ -129,7 +129,8 @@ def _shrink_group(group: list[dict]) -> list[dict]:
     return out
 
 
-def _compact_history(messages: list[dict], max_tokens: int, seg_start: int | None = None) -> list[dict]:
+def _compact_history(messages: list[dict], max_tokens: int, seg_start: int | None = None,
+                     keep_tail: int | None = None, soft_mode: str = "truncate") -> list[dict]:
     """上下文滑窗：保留 system + 初始 user；超阈值时先压缩旧步，再整块丢弃。
 
     每一步在 messages 里的形态是「assistant(+tool_calls) → 若干 tool 结果」，
@@ -158,10 +159,21 @@ def _compact_history(messages: list[dict], max_tokens: int, seg_start: int | Non
 
     # 第一级：压缩旧步。保护窗 = min(最近 KEEP_TAIL_GROUPS 步, 当前链段起点)，
     # 即当前链段与最近 3 步都不截断；seg_start=None 时退化为旧的仅保尾 3 步。
+    # S2a：keep_tail 可按角色放大（web=5/rev=4）——SPA 翻 JS、反汇编长链的工作集更深，
+    # 尾部 3 组不够时模型被迫重抓已看过的高成本响应（m5j 实测连抓 6 次 ≈48k token）。
+    _kt = KEEP_TAIL_GROUPS if keep_tail is None else max(1, int(keep_tail))
     seg = len(groups) if seg_start is None else max(0, min(int(seg_start), len(groups)))
-    protect_from = min(len(groups) - KEEP_TAIL_GROUPS, seg)
+    protect_from = min(len(groups) - _kt, seg)
     if protect_from > 0:
-        compressed = [_shrink_group(g) if i < protect_from else g for i, g in enumerate(groups)]
+        # S-A2 软压模式：truncate=截断保骨架（默认，与历史行为逐字节一致）；
+        # elide=整组丢弃（Harness 实证研究 2609.20804：规则式 elision 是最强效率档，
+        # 前提是结论已沉淀进事实板/账本——闭合链段的原文价值已被吸收）。
+        # 组 = assistant + 它的 tool 结果，整组丢不拆 tool_call 配对。
+        if soft_mode == "elide":
+            compressed = [g if i >= protect_from else [] for i, g in enumerate(groups)]
+        else:
+            compressed = [_shrink_group(g) if i < protect_from else g for i, g in enumerate(groups)]
+        compressed = [g for g in compressed if g]
         flattened = _flatten(head, compressed)
         if _est_tokens(flattened) <= max_tokens:
             return flattened
@@ -867,6 +879,7 @@ class Solver:
             price_input=self.config.price_input_per_mtok,
             price_output=self.config.price_output_per_mtok,
             label=challenge_id,
+            cache_discount=bool(self.config.extra.get("budget_cache_discount")),
         ).load(challenge.tokens)
         if hasattr(self.llm, "budget"):
             self.llm.budget = spending
@@ -965,18 +978,25 @@ class Solver:
         ledger = Ledger.from_config(self.config)
         plan = PlanTrack()
         seg_first_step = 1  # P2-1：当前链段首步（PLAN 变更即换段，段内不软压缩）
+        burns = 0  # S1c：连续「补全打满且无输出」计数（思考烧穿护栏）
 
         for step in range(1, budget + 1):
             steps_used = step
             challenge.steps = step
             try:
-                head = with_facts(base_head, facts.render())
-                budget_line = BudgetPhase.line(getattr(self.llm, "budget", None))  # P0-2：预算阶段每步可见
-                messages[1]["content"] = f"{head}\n{budget_line}" if budget_line else head
+                # S1a 稳定前缀：任务头（含首步事实板）只在首步定稿，之后不改写 messages[1]——
+                # 每步改写位置 1 会让后缀全部重填、前缀缓存全毁（阶段0探针：共享前缀
+                # cached_tokens 2560/2643 命中 96.9%，改写即归零）。
+                # 事实板与预算行改为「尾部时变消息」：每步重建、不入历史，历史字节稳定。
+                if step == 1:
+                    messages[1]["content"] = with_facts(base_head, facts.render())
                 messages = _compact_history(
-                    messages, self.config.max_context_tokens, seg_start=seg_first_step - 1
+                    messages, self.config.max_context_tokens, seg_start=seg_first_step - 1,
+                    soft_mode=self.config.extra.get("history_soft_mode", "truncate"),
                 )
-                response = self.llm.chat(messages, tools=specs)
+                tail_bits = [x for x in (facts.render(), BudgetPhase.line(getattr(self.llm, "budget", None))) if x]
+                out_messages = messages + [{"role": "user", "content": "\n".join(tail_bits)}] if tail_bits else messages
+                response = self.llm.chat(out_messages, tools=specs)
             except BudgetExceeded as exc:
                 # 预算用尽：立刻停手，不发请求也就不会再产生费用
                 self.store.append_transcript(
@@ -994,7 +1014,21 @@ class Solver:
             calls = response.get("tool_calls") or []
             content = response.get("content") or ""
 
-            # 审计 M2：单步工具调用数设上限，防止模型一步刷出大量写操作
+            # S1c 思考护栏：补全打满且无可见输出 = 思考块烧穿（端点不认 enable_thinking 时发生，
+            # 实测 reasoning_tokens 与 finish=length 空 content 并存）。空 assistant 消息不回喂历史
+            # （回喂会让后续调用在烂尾上继续打转），计一次烧穿并重试；连续 2 次才终止。
+            if not calls and not content.strip() and response.get("finish_reason") == "length":
+                burns += 1
+                self.store.append_transcript(
+                    challenge_id,
+                    {"step": step, "role": "note",
+                     "content": f"[思考烧穿] 补全打满且无输出，第 {burns} 次，空消息不回喂历史"},
+                )
+                if burns >= 2:
+                    reason = "completion_burned"
+                    break
+                continue
+            burns = 0
             if len(calls) > self.config.max_calls_per_step:
                 dropped = calls[self.config.max_calls_per_step :]
                 calls = calls[: self.config.max_calls_per_step]
@@ -1193,6 +1227,9 @@ class Solver:
         allow_chat: bool = False,
         platform_names: set[str] | None = None,
         ledger: Ledger | None = None,
+        keep_tail: int | None = None,
+        facts_max: int | None = None,
+        facts_chars: int | None = None,
     ) -> dict:
         """给专家角色跑一个有界对话：只执行工具、不提交；调用 report 或停手即结束。
 
@@ -1228,7 +1265,11 @@ class Solver:
 
         # 与 solve() 同一套成本机制：事实块常驻头部 user 消息 + 工具结果瘦身
         base_head = task
-        facts = FactsBoard()
+        # S2b 按角色调板面尺寸：web 的工具面/端点族更大（facts_max/facts_chars 来自角色 spec）
+        facts = FactsBoard(
+            max_facts=int(facts_max) if facts_max else 8,
+            max_chars=int(facts_chars) if facts_chars else 520,
+        )
         evidence_flag = ""
         tool_chars = int((self.config.extra or {}).get("tool_text_chars", DEFAULT_TOOL_TEXT_CHARS))
 
@@ -1244,15 +1285,20 @@ class Solver:
         env_fails = EnvFailureTracker()  # A1：连续环境类失败 → 提示收口（不硬拦）
         still_rounds = 0
         seg_first_step = 1  # P2-1：当前链段首步（PLAN 变更即换段，段内不软压缩）
+        burns = 0  # S1c：连续「补全打满且无输出」计数（思考烧穿护栏）
         for step in range(1, int(max_steps) + 1):
             try:
-                head = with_facts(base_head, facts.render())
-                budget_line = BudgetPhase.line(getattr(llm, "budget", None))  # P0-2：预算阶段每步可见
-                messages[1]["content"] = f"{head}\n{budget_line}" if budget_line else head
+                # S1a 稳定前缀（run_role 同款）：任务头首步定稿，事实板/预算行走尾部时变消息。
+                if step == 1:
+                    messages[1]["content"] = with_facts(base_head, facts.render())
                 messages = _compact_history(
-                    messages, self.config.max_context_tokens, seg_start=seg_first_step - 1
+                    messages, self.config.max_context_tokens, seg_start=seg_first_step - 1,
+                    keep_tail=keep_tail,
+                    soft_mode=self.config.extra.get("history_soft_mode", "truncate"),
                 )
-                response = llm.chat(messages, tools=specs)
+                tail_bits = [x for x in (facts.render(), BudgetPhase.line(getattr(llm, "budget", None))) if x]
+                out_messages = messages + [{"role": "user", "content": "\n".join(tail_bits)}] if tail_bits else messages
+                response = llm.chat(out_messages, tools=specs)
             except BudgetExceeded as exc:
                 report = f"[预算耗尽，停止] {exc}"
                 reason = "budget_exhausted"
@@ -1266,6 +1312,21 @@ class Solver:
             content = response.get("content") or ""
             if content.strip():
                 last_content = content.strip()
+
+            # S1c 思考护栏（run_role 同款）：烧穿步不回喂空 assistant 消息；连续 2 次终止。
+            if not calls and not content.strip() and response.get("finish_reason") == "length":
+                burns += 1
+                self.store.append_transcript(
+                    challenge_id,
+                    {"step": step, "role": role,
+                     "content": f"[思考烧穿] 补全打满且无输出，第 {burns} 次，空消息不回喂历史"},
+                )
+                if burns >= 2:
+                    report = f"[思考烧穿终止] 连续 {burns} 次补全打满且无输出（reasoning 占满 max_tokens）"
+                    reason = "completion_burned"
+                    break
+                continue
+            burns = 0
             if len(calls) > self.config.max_calls_per_step:
                 calls = calls[: self.config.max_calls_per_step]
 
