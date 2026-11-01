@@ -64,6 +64,26 @@ def main() -> int:
     check("坏输入不炸", domain_cards(None) == [] and domain_cards([]) == [] and domain_cards(["nope"]) == [])
     check("不影响 web 卡路径", "打法提示" not in "".join(method_cards(["sqli"])))
 
+    # ---- 门控（solver._method_hint）：非 web 题真的会被注入 ----
+    from ctfy_agent.solver import Solver  # noqa: PLC0415
+    from ctfy_agent.state import Challenge  # noqa: PLC0415
+
+    def hint(cat: str, tags: list[str]) -> str:
+        return Solver._method_hint(Challenge(id="T-1", name="t", category=cat, tags=tags))
+
+    for cat, tags, prefix in (
+        ("rev", ["python", "xor", "per-team-artifact"], "REV"),
+        ("pwn", ["elf", "stack", "bof", "tcp"], "PWN"),
+        ("crypto", ["aes", "ecb", "oracle", "tcp"], "CRYPTO"),
+        ("misc", ["udp", "connectivity"], "MISC"),
+    ):
+        out = hint(cat, tags)
+        check(f"门控：{cat} 题注入方向卡", out.startswith("打法提示") and prefix in out, out[:60])
+
+    check("门控：非 web 未命中 tag 不注入", hint("rev", ["nope"]) == "")
+    check("门控：web 题仍走 web/AI 卡", hint("web", ["sqli"]).startswith("打法提示"))
+    check("门控：AI tag 仍走 ASI 卡", "ASI01" in hint("web", ["owasp_2026_asi01"]))
+
     print()
     if FAILS:
         print(f"失败 {len(FAILS)} 项: {FAILS}")

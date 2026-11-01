@@ -25,7 +25,7 @@ from .ctxcompress import FactsBoard, shrink_message_text, with_facts
 from .ledger import NO_DEDUPE, Ledger, claims_discovery
 from .llm import DeepSeekLLM, LLMError
 from .mcp_client import render_call_result
-from .method_cards import is_asi_tag, method_cards
+from .method_cards import domain_cards, is_asi_tag, method_cards
 from .platform import CtfyPlatform, PlatformError
 from .progress import BudgetPhase, EnvFailureTracker, ObservationTracker
 from .state import Store
@@ -1508,8 +1508,13 @@ class Solver:
         category = (getattr(challenge, "category", "") or "").strip().lower()
         tags = list(getattr(challenge, "tags", None) or [])
         if category != "web" and not any(is_asi_tag(str(tag)) for tag in tags):
-            return ""
-        cards = method_cards(tags)
+            # 非 web 方向（rev/pwn/crypto/misc）：走方向卡表，命中才注入（此前直接 return，
+            # 导致这 4 个方向 0 张卡、模型只能盲打；卡键取自平台真实 tag 词表）。
+            cards = domain_cards(tags)
+            if not cards:
+                return ""
+        else:
+            cards = method_cards(tags)
         if not cards:
             return ""
         return "打法提示（按平台题型 tag 生成，仅供参考）：\n" + "\n".join(f"- {c}" for c in cards)
