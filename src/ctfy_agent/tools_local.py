@@ -561,6 +561,27 @@ REPORT_SPEC = {
 }
 
 
+def _dns_unreachable_advice(url: str, err: str) -> str:
+    """DNS 解析失败 = 本机没有平台内网隧道（VPN 题）。给模型的确定性结论，别换工具反复重试。
+
+    实测教训（P0 校准 2026-11-01）：XBOW-001 是 *.internal 内网实例，agent 依次试了
+    http_request → http_map → curl → python socket，烧掉 0.44M token / 296s 才确认 DNS 不可达。
+    这里直接把结论写进错误文本，等价于 O-D 的「撞墙判据」——工具层判据比提示词可靠。
+    """
+    low = (err or "").lower()
+    dns_fail = any(k in low for k in (
+        "getaddrinfo failed", "name or service not known", "temporary failure in name resolution",
+        "nodename nor servname", "errno 11001", "no address associated with hostname",
+    ))
+    if not dns_fail:
+        return ""
+    host = urlparse(url).hostname or ""
+    hint = "，域名形如 *.internal（平台内网实例）" if host.endswith(".internal") else ""
+    return ("\n（诊断）DNS 解析失败 = 本机没有平台内网隧道" + hint +
+            "。这类实例用 http_request / http_map / fuzz / curl 都会同样失败——换工具重试没有意义："
+            "直接 report 交付「VPN/内网不可达」卡点，把预算留给其他题。 别用 shell 的 getent/nslookup/curl/ipconfig/wg 去复核——shell 里没有 netcheck 命令，这些在本机同样无效；要判定就调 netcheck 工具一次，然后收口。")
+
+
 class LocalTools:
     def __init__(self, store, challenge_id: str, *, allow_shell: bool = False, verbose: bool = False, cache: dict | None = None, jar: dict | None = None, chats: dict | None = None, allow_chat: bool = True, traffic_enabled: bool = True):
         self.store = store
@@ -1096,7 +1117,7 @@ class LocalTools:
                 source="http_request", method=method, url=url, req_headers=forwarded,
                 req_body=body, error=f"{type(exc).__name__}: {exc.reason}",
             )
-            raise ToolError(f"请求失败 {url}: {exc.reason}") from None
+            raise ToolError(f"请求失败 {url}: {exc.reason}{_dns_unreachable_advice(url, str(exc.reason))}") from None
         except OSError as exc:
             # 连接被重置/中断/读超时等（http.client 会直接抛 ConnectionAbortedError 之类，
             # 不走 URLError），统一转成 ToolError 回给模型，别让整轮崩掉。
@@ -1104,7 +1125,7 @@ class LocalTools:
                 source="http_request", method=method, url=url, req_headers=forwarded,
                 req_body=body, error=f"{type(exc).__name__}: {exc}",
             )
-            raise ToolError(f"请求失败 {url}: {exc}") from None
+            raise ToolError(f"请求失败 {url}: {exc}{_dns_unreachable_advice(url, str(exc))}") from None
         # ToolError 从 GuardedRedirect 的 _check_target 抛出来，原样上抛
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
@@ -1776,11 +1797,11 @@ class LocalTools:
         except urllib.error.URLError as exc:
             self._traffic_record(source=source, method=method, url=url, req_headers=headers,
                                  error=f"{type(exc).__name__}: {exc.reason}")
-            raise ToolError(f"请求失败 {url}: {exc.reason}") from None
+            raise ToolError(f"请求失败 {url}: {exc.reason}{_dns_unreachable_advice(url, str(exc.reason))}") from None
         except OSError as exc:
             self._traffic_record(source=source, method=method, url=url, req_headers=headers,
                                  error=f"{type(exc).__name__}: {exc}")
-            raise ToolError(f"请求失败 {url}: {exc}") from None
+            raise ToolError(f"请求失败 {url}: {exc}{_dns_unreachable_advice(url, str(exc))}") from None
 
     def _sec_fetch(self, url: str, *, method: str = "GET", body: str = "",
                    extra_headers: dict | None = None, use_jar: bool = True,

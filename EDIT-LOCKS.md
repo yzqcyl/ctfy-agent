@@ -49,3 +49,8 @@
 | src/ctfy_agent/tools_local.py + src/ctfy_agent/ledger.py + tests/smoke_http_cache.py | Y（镜像/验证线，门 A 已过） | 10-31 01:30–02:40 | **O1 多 pattern grep（`greps` 数组）+ 非 200 响应缓存 + `fresh=1`**；顺带修 `_cache_put` 的 `dict.popitem(last=False)` 潜伏崩溃、账本键补 greps/fresh。验收 `tests/smoke_http_cache.py` 24 条全过 + 全量 27/27 smoke 回归绿；规格 `docs/spec-o1-http-cache.md` 已标注实现偏离（已提交 73b4a6a） |
 | src/ctfy_agent/tools_local.py + tests/smoke.py + tests/smoke_burst_group.py | Y（镜像/验证线，门 A 已过） | 10-31 02:50–03:20 | **O2' burst 分组归一化**：`_burst_group_key`（payload 回显→`<V>`，时间/epoch/UUID/hex/长数字→`<N>`）+ 状态码进分组键；组增 `raw_count`、汇总增 `raw_distinct_bodies`；race 模式输出不变。验收 `tests/smoke_burst_group.py` 12 条全过 + `smoke.py` 既有 burst 断言按新语义更新后 144/0；规格 `docs/spec-o2-o3-tools.md`，O3 关闭 |
 | docs/capability-gap-2026-10-31.md | X（agent 优化线） | 10-31 20:10–20:45 | 新增：各方向能力盘点（新建文件，无需互斥） |
+| src/ctfy_agent/tools_local.py | Y → 已释放（O-G 判据） | 11-01 14:30–15:10 | 新增 _dns_unreachable_advice + 4 处请求错误路径接入 |
+| src/ctfy_agent/crew.py | Y → 已释放（O-G 协调者规则） | 11-01 15:10–15:25 | COORDINATOR_PROMPT 加「接入层不可达→本轮只发 done」 |
+| config/agent.json | Y → 已释放（O-G 提示词） | 11-01 15:00–15:20 | web system 加「内网不可达判据」 |
+| tests/smoke_vpn_advice.py | 新建后已释放 | 11-01 15:05–15:20 | O-G 冒烟 5 条 |
+| docs/p0-calibration-2026-11-01.md | 新建后已释放 | 11-01 15:40–16:00 | P0 校准结果 |
