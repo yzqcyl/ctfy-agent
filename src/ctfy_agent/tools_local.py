@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import difflib
 import inspect
+import hashlib
 import json
 import http.client
 from html.parser import HTMLParser
@@ -270,6 +271,14 @@ HTTP_SPEC = {
                         "从正文第 offset 个字符开始返回一个窗口（配合返回的 next_offset 翻页）。"
                         "用于分段读大文件的中段/尾段；与 grep 组合时先切出该窗口，再在窗口内搜索"
                         "（偏移仍报全文绝对位置）。"
+                    ),
+                },
+                "save": {
+                    "type": "string",
+                    "description": (
+                        "把响应**原始字节**存到这个沙盒路径（自动建父目录）。二进制题（ELF/pcap/zip/图片）"
+                        "必须用它：正文走 utf-8 解码会把二进制弄坏。返回 saved/size/sha256/magic/head_hex，"
+                        "之后用 hexpeek / elfpeek / unpack_archive 分析该文件。与 grep/offset/diff 互斥（save 优先）。"
                     ),
                 },
                 "fresh": {
@@ -981,7 +990,7 @@ class LocalTools:
         jar = self._jar.get(netloc)
         return "; ".join(f"{k}={v}" for k, v in jar.items()) if jar else None
 
-    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False, follow_redirect: bool = True, body_b64: str = "", fresh: bool = False, greps: list[str] | None = None, files: list | None = None, form: dict | None = None) -> str:
+    def http_request(self, url: str, method: str = "GET", body: str = "", headers: dict | None = None, grep: str = "", offset: int = 0, limit: int = 0, diff: bool = False, follow_redirect: bool = True, body_b64: str = "", fresh: bool = False, greps: list[str] | None = None, files: list | None = None, form: dict | None = None, save: str = "") -> str:
         self._check_target(url)
         netloc = urlparse(url).netloc
         method = (method or "GET").upper()
@@ -1065,7 +1074,8 @@ class LocalTools:
             # diff 要「这次真实响应」当右侧：跳过缓存读（cache_key 仍留着事后落盘）。
             # follow_redirect=false 同理：要看到原始 3xx+Location，不能拿缓存的落地页顶替。
             # fresh=true（O1b）：登录/写操作后强制重取，跳过缓存读。
-            if hit is not None and not diff and follow and not fresh:
+            # save：要原始字节落盘，缓存桩只有 utf-8 正文（二进制已损坏），必须回源。
+            if hit is not None and not diff and follow and not fresh and not save:
                 _hit_hdrs = hit.get("headers") or {}
                 self._traffic_record(
                     source="http_request", method=method, url=url, status=hit.get("status"),
@@ -1099,10 +1109,12 @@ class LocalTools:
         interesting: dict = {}
         content_length = None
         payload = ""
+        raw = b""  # save 参数要原始字节：二进制经 utf-8 replace 就废了
         t0 = time.perf_counter()
         try:
             with opener.open(request, timeout=20) as response:
-                payload = read_limited(response, MAX_GREP_BYTES).decode("utf-8", "replace")
+                raw = read_limited(response, MAX_GREP_BYTES)
+                payload = raw.decode("utf-8", "replace")
                 status = response.status
                 interesting = {
                     key: value for key, value in response.headers.items()
@@ -1113,7 +1125,8 @@ class LocalTools:
         except urllib.error.HTTPError as exc:
             status = exc.code
             try:
-                payload = read_limited(exc, MAX_GREP_BYTES).decode("utf-8", "replace")
+                raw = read_limited(exc, MAX_GREP_BYTES)
+                payload = raw.decode("utf-8", "replace")
             except Exception:
                 payload = ""
             if exc.headers:
@@ -1174,9 +1187,76 @@ class LocalTools:
                     "capped": False,
                 },
             )
+        if save:
+            return self._save_body(status, interesting, raw, save, content_length, elapsed_ms)
         if diff:
             return self._render_diff(status, interesting, payload, baseline, grep_render, offset, content_length, limit, elapsed_ms)
         return self._render_http(status, interesting, payload, grep_render, offset, content_length, limit, elapsed_ms)
+
+    # 常见二进制魔数：落盘后直接告诉模型「这文件是什么」，省一轮 hexpeek
+    MAGIC_TABLE: tuple[tuple[bytes, str], ...] = (
+        (b"\x7fELF", "ELF 可执行"),
+        (b"MZ", "PE 可执行"),
+        (b"PK\x03\x04", "ZIP/JAR/DOCX"),
+        (b"\x1f\x8b", "gzip"),
+        (b"BZh", "bzip2"),
+        (b"\xfd7zXZ", "xz"),
+        (b"\x89PNG", "PNG 图片"),
+        (b"\xff\xd8\xff", "JPEG 图片"),
+        (b"GIF8", "GIF 图片"),
+        (b"%PDF", "PDF"),
+        (b"\xd4\xc3\xb2\xa1", "PCAP（小端）"),
+        (b"\xa1\xb2\xc3\xd4", "PCAP（大端）"),
+        (b"\x0a\x0d\x0d\x0a", "PCAPNG"),
+        (b"SQLite format 3", "SQLite"),
+        (b"\x28\xb5\x2f\xfd", "zstd"),
+        (b"\x37\x7a\xbc\xaf", "7z"),
+        (b"Rar!", "RAR"),
+    )
+
+    @classmethod
+    def _magic_kind(cls, data: bytes) -> str:
+        """按魔数猜类型：猜不出给空串（不瞎猜）。"""
+        for magic, label in cls.MAGIC_TABLE:
+            if data.startswith(magic):
+                return label
+        head = data[:512]
+        try:
+            text = head.decode("utf-8")
+        except UnicodeDecodeError:
+            return "未知二进制"
+        if text and all(ch in "\t\n\r" or ord(ch) >= 32 for ch in text):
+            return "文本"
+        return "未知二进制"
+
+    def _save_body(self, status: int, headers: dict, raw: bytes, save: str,
+                   content_length: str | None, elapsed_ms: float | None = None) -> str:
+        """把响应原始字节写进沙盒文件，只回摘要（不在上下文里塞二进制）。"""
+        target = Path(save)
+        if target.exists() and target.is_dir():
+            raise ToolError(f"save 目标已存在且是目录：{save}")
+        if len(raw) > MAX_GREP_BYTES:
+            raw = raw[:MAX_GREP_BYTES]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        out = {
+            "status": status,
+            "headers": headers,
+            "saved": str(target),
+            "total_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "magic": self._magic_kind(raw),
+            "head_hex": raw[:48].hex(),
+            "note": (
+                "已按原始字节落盘（不经 utf-8 解码，二进制安全）。下一步用 hexpeek/elfpeek/unpack_archive "
+                "读这个文件，不要把二进制塞回上下文；文本型附件也可以直接用 shell 的 python 分析。"
+            ),
+        }
+        if content_length is not None:
+            out["declared_bytes"] = int(content_length)
+        if elapsed_ms is not None:
+            out["elapsed_ms"] = elapsed_ms
+        return json.dumps(out, ensure_ascii=False)
 
     def _diff_baseline(self, netloc: str, path: str) -> str | None:
         """diff 的基线：缓存里同 host + 同 path（忽略 query）的**最近一条**响应的正文。
