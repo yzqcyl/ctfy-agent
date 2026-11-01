@@ -251,6 +251,57 @@ AI_CARDS: list[tuple[tuple[str, ...], str]] = [
 ]
 
 
+# 方向方法卡（rev/pwn/crypto/misc）：与 web 卡分表，避免泛键（python/tcp）污染 web 打法块。
+# 键取自平台真实 tag 词表（`runs/_nonweb_inventory.py`）；卡面只讲「用现有工具怎么走」，
+# 不写镜像里没有的东西（无 gdb/objdump/ROPgadget/pycryptodome，disasm 依赖 v4 capstone）。
+DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
+    (("reverse", "stripped", "per_team_artifact", "per-team-artifact"),
+     "REV 定型四步：hexpeek 看魔数判型（ELF/PE/pyc/脚本）→ elfpeek view=info（架构/PIE/入口）→ "
+     "view=symbols 找校验函数（被 strip 就靠 view=strings 的提示串与常量推理）→ view=disasm 只反汇编"
+     "可疑函数那一段。.pyc/PyInstaller 用 view=bytecode 先列目录再 extract（PYZ 用 pyz:模块名）。"
+     "别整段反汇编，步数会烧光。"),
+    (("xor", "rc4", "rc4_xor", "bytecode"),
+     "REV 算法复现：先用已知输入（全 0、全 1、题面样例）在本地把加密函数跑出来，再对密文求逆；"
+     "XOR/查表/位运算优先写 python 复现并对拍。爆破空间 <1e6 直接穷举；更大就找前缀匹配、CRC、"
+     "长度、字符集约束收窄，不要盲爆。"),
+    (("bof", "stack", "elf"),
+     "PWN 栈溢出四步：elfpeek info 看 PIE/NX/canary → symbols/strings 找 gets/read/system/win → "
+     "pwngen op=cyclic 生成模式串、tcp 发超长触发崩溃 → pwnfind 反查精确偏移。"
+     "有附件 libc 就 elfpeek view=lookup 拿 system、/bin/sh 偏移走 ret2libc；"
+     "payload 一律 pwngen op=build 组装后 tcp(hex_mode=true) 发，别手搓转义串。"),
+    (("format_string", "heap", "rop", "seccomp"),
+     "PWN 进阶：格式化串先 %p 泄栈找自己输入的位置（tcp_batch 批量试 %1$p..%20$p 一次收敛）；"
+     "没有 win 函数走 ROP，elfpeek view=gadgets filter=rdi|rsi|rdx|syscall；堆题先看 malloc/free 顺序"
+     "与 tcache 是否 double-free，别急着一次打通；远程先泄漏 libc 基址再算偏移。"),
+    (("rsa", "small_e", "wiener", "common_modulus"),
+     "CRYPTO RSA 先自动试：rsatool op=small_e（c 开 e 次根）/ wiener（d 小）/ common_modulus（同 n 两组）/ "
+     "fermat（p、q 相邻）。都不中就找 n 的分解线索（题面给的 factor 提示、共享因子、p=q 情形），"
+     "拿到 d 后用 hexpeek 拼明文再 decode_blob。"),
+    (("aes", "ecb", "oracle", "cbc"),
+     "CRYPTO 分组密码：先判模式——16 字节对齐后出现相同块 = ECB；ECB 打块剪切/字节翻转移位取目标块；"
+     "CBC 打 IV 与前一密文块的位翻转；padding oracle 用 tcp_batch 一次批量试末字节（≤200/轮）。"
+     "密钥已知就用 aesblock 本地算（ecb/cbc/ctr 都有），别手搓分组填充。"),
+    (("zip", "archive", "forensics"),
+     "MISC 归档/取证：unpack_archive 按魔数解包（zip 加密先判 ZipCrypto 还是 AES，别硬跑）；"
+     "zip 常见套路是伪加密（改通用标志位）、注释/文件名/额外字段藏值、CRC 与明文碰撞；"
+     "取证先 hexpeek 看头与尾部附加数据，再 decode_blob 剥编码链，不要整文件打印。"),
+    (("udp", "connectivity", "pcap", "stego", "image_encoding"),
+     "MISC 通道/隐写：先 netcheck 判 DNS 与端口可达（不可达=环境问题，立刻卡点收口）；"
+     "UDP 服务没有专用工具——用 write_file 落一个 python socket 脚本再 shell 跑（镜像 stdlib 可用）；"
+     "隐写/图片先 hexpeek 看尾部与 ZIP/PNG 文本块，再 decode_blob 逐层剥。"),
+]
+
+
+def domain_cards(tags, limit: int = MAX_CARDS) -> list[str]:
+    """非 web 方向（rev/pwn/crypto/misc）的打法卡：只由方向表命中，与 web/AI 表互不干扰。"""
+    wanted = set(tags or [])
+    out: list[str] = []
+    for keys, card in DOMAIN_CARDS:
+        if wanted.intersection(keys) and card not in out:
+            out.append(card)
+    return out[:limit]
+
+
 def method_cards(tags, limit: int = MAX_CARDS) -> list[str]:
     """tags → 打法卡列表。AI 卡在前、web 卡补充；表序输出、按条目去重、截断到 limit。"""
     wanted = set(tags or [])
