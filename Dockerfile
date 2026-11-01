@@ -161,6 +161,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/ctfy/src
 
+# 关思考模式：百炼（DashScope 兼容端点）默认开启思考，重推理步骤会把 max_tokens 烧在
+# reasoning_content 上 → content 空 / finish_reason=length，白丢一步（实测坑）。
+# 本地所有实测都在 LLM_ENABLE_THINKING=0 下完成，镜像必须同口径。
+# 注意：11-21 正式赛换官方智谱后若该字段不被接受，重建时去掉这行即可。
+ENV LLM_ENABLE_THINKING=0
+
 # 瘦身（主办方：镜像太大传不上去）。运行时只用 stdlib，下列都是死重量（约 20MB）：
 #   pip/setuptools/wheel/ensurepip（不安装依赖）、test 模块、idlelib/lib2to3/pydoc_data/turtledemo。
 # 另：.dockerignore 已排除 tests/docs/runs/__pycache__，ENV 里禁了运行时写 .pyc。
