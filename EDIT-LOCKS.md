@@ -1,4 +1,4 @@
-﻿# EDIT-LOCKS —— 跨会话文件编辑锁（防两个对话同时改一个文件）
+# EDIT-LOCKS —— 跨会话文件编辑锁（防两个对话同时改一个文件）
 
 > **约定（2026-10-30 起生效，两个会话都遵守）：**
 > 1. **改任何「非本轮新建」的文件之前**，先在下表登记一行；**会跨轮继续改的文件必须登记**。
@@ -61,3 +61,4 @@
 | tests/smoke.py + tests/smoke_ai_role.py | X → 已释放（AI 方向） | 11-01 17:30–17:40 | AI 卡张数断言 20→21 |
 | docs/ai-oracle-2026-11-01.md | 新建后已释放 | 11-01 17:40–18:00 | AI 方向补齐记录 |
 | src/ctfy_agent/crew.py + src/ctfy_agent/solver.py + tests/smoke_ctxopt.py | **并行对话（非本线）** | 11-01 起 | S1b 轮间会话重置等；本线未触碰、不提交 |
+| HANDOFF.md + docs/OPENING.txt | Z（交接线） | 11-03 21:00–21:30 | 对外交接版重写（A–H+附录结构；关键数字全部标注实测口径；新增缺口 #11：总入口依赖未入库的 runs/bench_stats.py，干净 clone 151/1；B.4 列全未提交 WIP 处置清单）；OPENING.txt 同步浓缩；随本轮提交 |

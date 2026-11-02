@@ -1,242 +1,342 @@
-# 交接文档 — TPCTF 2026 智能体赛道
+# 交接文档 — ctfy-agent（TPCTF 2026 智能体团队赛道）· 对外交接版
 
-> 给新对话的 agent：先读完 **§0** 再动手。§0 是当前真实状态，其余章节是仍然有效的背景与禁忌。
-> 所有结论都有实测依据；**不要重新推导已验证过的东西**（会浪费 token 和实例配额）。
-> 只想粘一段话开新对话 → 用 `docs/OPENING.txt`（本文件的自包含浓缩版）。
+> **读者**：接手整个项目的外部团队/个人。本文件自包含，按 A→G 顺序读即可上手；
+> §H 与附录是项目积累的经验教训，一并移交，避免重蹈覆辙。
+> 只想粘一段话开新对话 → 用 `docs/OPENING.txt`（本文件浓缩版）。
+> **口径规则**：每个关键数字后标注来源（【实测 N】=当天实跑；【审计 N】=当日审计文档；
+> 【本地-only】=证据文件在 gitignored 目录，需另行转移才能看到）。
 
 ---
 
-## 0. 当前状态（2026-11）
+## A. 项目是什么 · 现状一句话
+
+### A.1 定位
+
+- **目标**：TPCTF 2026 **智能体团队赛道**，提交物 = **一个容器镜像**（不是本地 CLI）。
+- 镜像里是纯 stdlib Python 的多智能体 CTF 解题框架：1 个协调者 + 6 个方向专家
+  （web / pwn / rev / crypto / misc / ai），通过平台 MCP 工具解题并当场提交。
+- 入口：`python -m ctfy_agent agent`；读 `/ctfy/work/task.json` → 写 `/ctfy/work/result.json` → `exit 0`；
+  **stdout 不被平台读**，日志全走 stderr。
+- 仓库：`E:\ctfy_project` → GitHub `https://github.com/yzqcyl/ctfy-agent.git`（branch `v3` 为当前线，`master` 为旧线）。
+
+### A.2 现状速览（2026-11-03）
 
 | 项 | 状态 |
 |---|---|
-| **交付物（容器镜像）** | ✅ **v4 已完成并推送**：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef`（Actions run `41304971894`、sha `ccc6213`、匿名校验 + 五条契约全绿；`LLM_ENABLE_THINKING=0` 已进镜像 `Env`）。历史：v3 `sha256:e658b9f6…`、v2.1 `sha256:6406286f…`、v2 `sha256:73b39430…`、v1 `sha256:a68ebe6e…` 仅留档。**`:latest` 已指向 v4，提交时务必显式填 `:v4`。** |
-| **平台审核 / 提交** | ⬜ **未开始**。只能由用户走浏览器 4 步，步骤见 `docs/submit-image-runbook.md`。这是当前唯一卡在"人"身上的事。 |
-| **大规模基准测试** | ✅ 完成。报告：**`runs/bench-web-report.md`**（16 道归档 + 3 道中断 + A/B 对照 + 并行求解器评估，含勘误记录）。 |
-| **模型 A/B 对照** | ✅ 结论：**换更强模型不涨分**（同题 Pro 0/3 vs K2.7 0/3，速度 2.27×，覆盖面反而更窄）。 |
-| **并行求解器可行性** | ✅ 已评估（报告 §12）：**模型路线已被证伪**。多策略并行未测 → 2026-11 已落地为**集群-A**（见下一行），真机 A/B 留正式赛。 |
-| **集群-A（无状态题同题 N 路并行）** | ✅ **已实施 + 两轮审查修正（默认关闭，实验开关）**：`crew._solve_clustera` 对无状态题（category∈crypto/rev 白名单）同题 N∈[2,3] 路并行独立尝试，每路独立 Crew/Store 视图 + 预分配预算切片（`cluster_a_multiplier` 默认 1.0=总预算不增只换墙钟）+ 温度差异化 + 先到先赢(file lock)+黑板合并。**默认关闭**（config 不加 `cluster_a_concurrency`=走原串行、零回归）；激活=config.extra 加 `cluster_a_concurrency: 2~3`。已修（plan-cluster-a.md §9/§10）：提交状态从 lane 终态快照回传主 store（answers 不丢）、用量合并记账（usage 净增量口径，续跑不低计）、solve_attempts 归因、预检短路、并发钳制≤3（QA#26）、非法配置兜底、**轮粒度真取消**（`solve(cancel_event=…)`）、transcript 加跨实例锁。真机 A/B 留正式赛。 |
-| **800k 复测（arm C）** | ✅ SAMPLE-009 @800k 三臂（干净 Crew / solo / B1+闸门+收敛）全部 **0 候选 0 提交 budget_exhausted** → 编排/模型/调参均非瓶颈；**瓶颈=flag 发现（access-control 面）**。 |
-| **集群-B（同题多策略多尝试）** | ✅ **批次2+A+完整度补强 已落地、机理真机验证**：k 次串行尝试 + 策略/温度差异化（0.2/0.5/0.8）+ 黑板三段继承（结论事实 + 判错死路 + 待验候选值，800/400/300 限额）+ step_limit 归因 + `k` 支持动态（`"auto"` 按剩余 calls 池算）。**默认关闭**（config 不加 `clusterb_k` → k=1 = 旧版行为等价、零回归）；激活=config 加 `"clusterb_k": 3`（或 `"auto"`）。详见 `docs/plan-concurrency.md` §16。 |
-| **step_limit 修复** | ✅ 既有 bug：`_solve_once` 步数用满时 reason 误记 `budget_exhausted`（`step_limit→max_turns` 在 `agent_main._STOP_MAP` 本有映射却从没触发）。已在 `be5d035` 修。 |
-| **A/B 实测** | ✅ SAMPLE-001 k=1 等价回归解出（88.9k token）；SAMPLE-008 k=3 三次尝试（~186k/次）机制正确但未解出。**10-29 归因实验已给出结论：k=3 有害**——SAMPLE-007 上 k=3@511k 花 493,615 tok 未解出，k=1@511k 用 313,076 tok 达成（worker 下线），根因是切片切断累积上下文；v3 因此保持 k=1（见 `docs/clusterb-p1-result.md`）。 |
-| **代码版本** | HEAD `ccc6213`（v3 分支；含 v3 之后 38 个提交：工具链扩展 / 方法卡 / progress / 上下文优化 ctxopt）；v4 镜像同源 `ccc6213`。 |
-| **遗留未提交** | 无（`llm.py` 已随 `a245b81` 提交；`agent-artifacts-m55-m56.zip` untracked，别动）。 |
-| **实例** | 0 个（已清空）。 |
-| **单测基线** | `tests/smoke.py` **152 passed / 0 failed**（含集群-A 15 条、集群-B 8 条、ctxopt 8 条、LLM 超时重试 4 条）；retry 自检 + 集群-B 离线 6 脚本全绿。 |
+| **git 基线** | HEAD `89739a5`（v3 线），树 ≈3.2 MB；src 29 模块 ≈16.2k 行；docs 78 篇；测试 34 个文件 |
+| **交付镜像** | ✅ v4 已构建推送：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb…`（详见 §D.1/附录 D）|
+| **平台审核/提交** | ⬜ **未开始**，只能人工走浏览器（`docs/submit-image-runbook.md` + `platform-submit-opsheet.md`）——交接后第一优先级之一 |
+| **总入口单测（干净 clone）** | ⚠️ **151 passed / 1 failed**【实测 11-03】：`case_bench_stats` import 未入库的 `runs/bench_stats.py`（见缺口 #11）|
+| **总入口单测（原工作区）** | 154/0【审计 11-02/11-03】，含 3 个缺陷修复的回归用例——**这批修复尚未提交**（§B.4）|
+| **最新实测能力** | 六题型 52 题：解出 **51.9%**，剔环境阻塞 **65.9%**，能力口径 **75.6%**；qa 12/12、web 7/11、misc 4/6、crypto 2/8、rev 2/3、pwn 0/1（样本无效）【实测 11-03】|
+| **CI** | HEAD 的 workflow **不跑任何单测**；补测试步的修改在工作树未提交（§B.4）|
 
-**一句话**：**v4 镜像已推送并匿名校验通过，只等用户在浏览器提交审核**；本轮把 v3 之后 38 个提交（工具链扩展、方法卡、progress、上下文优化 ctxopt、提示词/附件落盘）+ `LLM_ENABLE_THINKING=0` 烤进镜像；集群-B 仍默认关闭（10-29 归因实测 k=3 有害）；失败根因仍是 flag 发现（access-control 面）。
+### A.3 五个必须先知道的事实
 
----
-
-## 1. 任务与契约要点
-
-- 目标：TPCTF 2026 **智能体团队赛道**的提交物 = **一个容器镜像**（不是本地 CLI）。纯 stdlib Python，模型走 DeepSeek/Paratera 的 OpenAI 兼容接口。
-- 入口：`python -m ctfy_agent agent`；读 `/ctfy/work/task.json`（CTFY-0001 schema v2）→ 写 `/ctfy/work/result.json` → `exit 0`。
-- **stdout 对用户镜像不读**（平台自有镜像才有 legacy 兜底）→ 日志一律 stderr。
-- 解题在**运行期**通过 MCP `submit_answer` 完成，不是赛后判分。
-- 合规赛道：**Web / Pwn / AI 安全**；当前全部实测都在 Web。
-- 工作目录：`E:\ctfy_project`。
+1. **单模型契约**：一次运行只允许一个 provider 的一个模型，所有槽位同值。代码已双保险
+   （`agent_main._build_config` pop 掉角色级 `model` + `llm_factory` 忽略入参 + 非 openai flavor 直接 refused），
+   `LLM_API_KEY` 为空必须大声失败、绝不回退自有 key。
+2. **平台实例配额**：每队**并发 1 个实例**（第 2 个 0.5s 被拒）；**每题 `start_instance` 硬上限 5 次**
+   （用尽当天该题作废，11-03 批次 21% 的题因此未测到）。多题并行在平台侧被堵死。
+3. **最新 3 个修复 + CI 测试步还在未提交的工作树里**（多问题提交题号、部分解口径、QA 提交通道），
+   丢了它们等于丢了 11-03 的成绩来源（§B.4 有文件级清单）。
+4. **README.md 有 6 处失真**（自称 18 项自测/12 步/30 万 token/方向未做等，全过时），
+   一切数字以本文件与 docs/ 实测报告为准。
+5. **交接前必须处理安全项**：吊销此前暴露过的 GitHub PAT；轮换 `CTFY_TOKEN` 与模型 Key（§F.2）。
 
 ---
 
-## 2. 仓库地图（关键锚点）
+## B. 你拿到什么（四层清单）
 
-| 文件 | 作用 | 关键位置 |
-|---|---|---|
-| `src/ctfy_agent/agent_main.py` | **B1 适配层**（镜像入口） | 读 task.json → env 组 Config → dry_run 分支 → 非 instance 拒跑 → Crew（**关 stop_instance**）→ 原子写 rollup；启动即写 provisional result.json |
-| `src/ctfy_agent/crew.py` | 多智能体：协调者 + web/rev/crypto/misc/ai 专家 | `_brief`、`_prior_digest`、`_delegate_task`、`COORDINATOR_PROMPT`/`_TOOLS`、`_delegate`、`_role_system`、`solve` |
-| `src/ctfy_agent/solver.py` | 专家主循环、工具分派、上下文滑窗；**集群-B 编排** | `_ledger_gate`/`_ledger_after`（去重闸）、`_check_report`（证据契约）、`_execute`、`solve`（k>1 走 `_solve_clusterb`）、`_solve_once`、`run_role`（专家侧注入）、`_role_context`、**无进展刹车（`_NO_PROGRESS_*`）** |
-| `src/ctfy_agent/retry.py` | **集群-B 编排器（零耦合库，0 LLM/0 平台/0 写盘）** | `Orchestrator`（caps_fn/precheck_fn 注入）、`Blackboard`（facts/dead_ends/candidates 三段注入）、`classify_failure`（solved/stopped/hopeless/near_miss/retryable）、`STRATEGY_SPECS`（temp 0.2/0.5/0.8）、`decide_k` |
-| `src/ctfy_agent/budget.py` | 题级+尝试级两级记账 | `Budget.compute_attempt_caps`/`set_attempt_caps`/`attempt_exceeded`、`BudgetExceeded.attempt` 区分切片 vs 题级 |
-| `src/ctfy_agent/state.py` | 状态持久化 | `Challenge.solve_attempts`（集群-B 每次尝试的 index/strategy/reason/tokens 归因落盘） |
-| `src/ctfy_agent/ledger.py` | 确定性账本 + 证据校验 | `normalize_args`、`attempt_key`、`looks_failed`、`claims_discovery`、`Ledger`、`verify_evidence`、`digest` |
-| `src/ctfy_agent/companion.py` | PLAN/REFLECTION 有状态伴生文本 | `parse_companion`、`PlanTrack`（推进信号只认账本新增尝试） |
-| `src/ctfy_agent/ctxcompress.py` | 工具结果瘦身 + 关键事实常驻 + 两级滑窗 | v2 新增 |
-| `src/ctfy_agent/tools_local.py` | 本地工具 http_request/shell/note/report + `jwt_forge`/`http_burst`/`http_map` | `http_map` = crawl 站点成图（链接/表单/字段/接口线索）+ probe 常见端点 + **AI 栈组件指纹**（M7：Ollama/ComfyUI/Gradio/Open WebUI/Dify/vLLM/Chroma 命中即报 component+版本+打法；来源 ctf-ai-infra 技能卡，MIT） |
-| `src/ctfy_agent/tools_misc_ext.py` | misc 外包：decode_blob / unpack_archive / hexpeek | 纯 stdlib |
-| `src/ctfy_agent/platform.py` | MCP 客户端 | 97 个工具暴露；`MODEL_TOOLS` = 单 agent 真白名单 |
-| `src/ctfy_agent/llm.py` | OpenAI 兼容客户端（urllib，非流式） | 只有 `/chat/completions`，**不认 anthropic flavor** |
-| `config/agent.json` | 角色/模型/预算 | coordinator+web=Kimi-K2.7、rev=Kimi-K3、ai=Kimi-K3、crypto=DeepSeek-V4-Pro-0813、misc=GLM-Z1-AirX；`max_tokens_per_challenge=800000`、`max_llm_calls=80`。**容器里角色 model 会被 `agent_main._build_config` 覆盖为 `LLM_MODEL`** |
-| `tests/smoke.py` | 离线回归（总入口，跑完打印 `N passed, N failed`） | **v2 提交版 83/83**；当前工作区 **128/128**（并行任务同期也在加用例，以实跑为准）。改动后必须保持全绿。内联 `case_ai_direction_dod`（AI 方向 §9 DOB 验收） |
-| `tests/smoke_context.py` | 上下文压缩/事实/滑窗/证据逐字性 12 组断言 | 并行会话有改动 |
-| `tests/smoke_http_session.py` | 302 上 Set-Cookie 入 jar 回归 | — |
-| `tests/smoke_webmap.py` | `http_map` 站点成图/probe/白名单 + 角色挂载接线 | 专抓「工具存在但没下发给模型」这类漏接线；`case_http_map_fingerprint` 钉组件定型与防误报 |
-| `tests/smoke_brake.py` | 无进展刹车：输出重复 3 步提示、5 步止损；内容有变化不误伤 | 039/043 退化循环的回归 |
-| `src/ctfy_agent/method_cards.py` | 题型方法卡 | web 50 题词表 + AI 20 张（含 M7 基建定型卡 + 七类结构洞卡）+ AI tag 词表（M7 新增 14 个 AI 基建 tag） |
-| `roles/` + `tests/fixtures/` | 角色提示词与离线夹具 | `roles/misc.json` **不会被框架读**，必须并入 config |
-| `docs/submit-image-runbook.md` | **提交镜像的操作手册**（digest、4 步、快照命令） | 提交前必读 |
-| `docs/b1-adapter-plan.md` | B1 方案 + 平台源码硬事实 + 容器内 G1–G8 | — |
-| `docs/report-ctfy-rules.md` | 官网规则调研；标准全文在 `runs/site/standards/` | — |
-| `.tools/ctfy-src/` | **平台源码**（契约真源，别去网上找文档） | 见 §5 |
-| `PROGRESS.md` | 耐久 checkpoint（历史细节都在这里） | §§3.1–3.13 |
-| `runs/bench-web-report.md` | **本轮大规模实测报告（最新事实）** | 见 §4 |
+### B.1 git 基线（HEAD `89739a5`，branch `v3`）
 
----
-
-## 3. 已完成的能力线（浓缩，细节见 PROGRESS）
-
-- **框架**：MCP 握手、多智能体、预算三层刹车、实例生命周期、转录、单测。
-- **A0 题型信息送达**：`tags/difficulty/solves_count` 入库并送达三处提示；`list_hints/view_hint` 放行。M1 真机验证。
-- **A1 确定性 Ledger**：归一化 args 去重，**crew 跨 delegate 共享**；真实转录回放拦 18 次重复（≈15.5 万 prompt token）。
-- **A2 输出契约 + 逐字证据**：`report` 必填 `evidence`（工具输出逐字子串）；`PLAN:`/`REFLECTION:` 由 `PlanTrack` 有状态消费；`delegate` 改 `role+objective+done_when`。
-- **全量代码审计**：5 个缺陷已修（详见 `docs/audit-2026-10-25.md`）。
-- **misc 外包全流程**：3 个工具 + 提示词 + 夹具，离线验收（`docs/review-misc-module.md`）。
-- **B1 适配层 + v2 镜像**：见 §0 / §5。
-- **v2 新增工具**：`jwt_forge`（none/HS256-512/RS256，secret 只进账本指纹）、`http_burst`、`http_request` P0 修复、`ctxcompress`。
-
----
-
-## 4. 实测基准（2026-10-26 晚，**本轮核心，勿重推**）
-
-完整报告：`runs/bench-web-report.md`；原始数据：`runs/bench-*/`、`runs/ab-pro-*/`。
-
-### 4.1 口径（先看这个，否则数字会误读）
-
-- 单题预算 **150,000 token**（环境变量 `AGENT_MAX_TOKENS_PER_CHALLENGE=150000`），**生产默认是 800,000**——这是理解全部结果的前提。
-- 模型 = `config/agent.json` 的角色模型（Kimi-K2.7 / K3 / Pro-0813），全部 `category=web`。
-- 代码 = 提交 `1aeee61`（v2 同源），**不含**并行会话的未提交改动。
-
-### 4.2 总体
-
-| 指标 | 数值 |
+| 内容 | 说明 |
 |---|---|
-| 归档 | **16 道**（另 3 道中断） |
-| 解出 | **5（31.2%）**；easy 5/9=56%、medium 0/4、hard 0/3 |
-| 平均耗时 / 消耗 | **290.4 s** / **99,313 token** 每题 |
-| 吞吐 | **12.4 题/小时**（串行，含实例启停） |
-| token 合计 | K2.7 臂 **2,130,710** + Pro 臂 **437,299** = **2,568,009** |
-| **失败题 attempts** | **全部为 0**——没有一道是"提交了但 flag 错"，失败都在"没产出候选 flag" |
+| `src/ctfy_agent/` 29 模块 | 框架本体（§D.1 模块地图）；纯 stdlib（`case_stdlib_only` 强制）|
+| `tests/` 34 文件 | 总入口 `smoke.py` + 33 个独立套件（25 个免凭据 / 8 个要真实 `.env`）|
+| `config/agent.json` | 7 角色、预算、工具面（§D.2 当前真值）|
+| `roles/` 4 文件 | ai/misc 的外包交付格式角色卡（json + system.txt，与 config 零漂移由 smoke 硬断言）|
+| `docs/` 72 篇（跟踪）| 方案/审计/实测报告/操作单（附录 C 索引）；另有 6 篇最新报告**未入库**（§B.4）|
+| `Dockerfile` + `.github/workflows/build-agent-image.yml` | 镜像构建（§C.3）；构建期含 ffuf/sqlmap 自检 |
+| `tools/` 6 脚本 | container_check / publish_image / verify_image / make_misc_kit / bench_misc_bank / misc_contract_selftest |
+| `run.cmd` / `.env.example` / `EDIT-LOCKS.md` / `PROGRESS.md` | 本地入口 / 凭据模板 / 跨会话文件锁协议 / 历史进度存档 |
 
-### 4.3 卡点（这是报告最值钱的部分）
+### B.2 容器镜像（可直接提交的交付物）
 
-| 卡点 | 次数 | 说明 |
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v4`（**提交显式填 `:v4`，别用 `:latest`**）|
+| digest | `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef` |
+| 构建 | Actions run `41304971894` @ `ccc6213` 全绿；匿名拉取三层 200（`tools/verify_image.py`）|
+| 形态 | 59.2 MB 压缩（上限 400）；uid 10001 非 root；`ENTRYPOINT ["python","-m","ctfy_agent","agent"]`；`ENV LLM_ENABLE_THINKING=0` |
+| 内置工具链 | ffuf 2.1.0（Apache-2.0）、SecLists 三表 @758fecf（MIT）、sqlmap 1.10.10（GPLv2+），版本/字节数/sha256 三钉死 + 构建期实跑自检；**capstone 不在镜像**（`elfpeek disasm` 自动退化字节视图）|
+
+### B.3 本地数据（.gitignore 忽略，**不随 git 走，需另行打包转移**）
+
+| 路径 | 内容 | 价值 |
 |---|---|---|
-| **预算耗尽** | 6 | medium/hard 平均 159k，正好撞 150k 上限 |
-| **协调者空转** | 2 | 只写 PLAN 不发工具调用 → 被判完成，1 步归零（非截断） |
-| **实例起不来** | 2 | 上游 `Rate limited by upstream API`，且**失败后不硬停**，空转烧完整轮 |
-| 协调者自认完成但未提交 | 1 | — |
+| `runs/` | 全部实验工件：`bench-web-report.md`（10-26 基准）【本地-only】、`clusterb-exp-summary.md`、中英 handbook、数百个 `_*.py` 驱动/验尸脚本、全部题目的 transcripts/`*.jsonl`、**`bench_stats.py`（总入口单测依赖它！6 KB）** | 复现一切历史数字 |
+| `misc-bank/` | 真实 misc 题库 33 文件 18.1 MB（task/expected/files 附件）| misc 方向回归素材 |
+| `inbox/misc-module/` | misc 方向外包交付原件（install.py + patches + 任务书）| 外包流程参考 |
+| `.tools/ctfy-src/` | **平台源码**（契约真源，别去网上找文档）| 契约争议仲裁 |
+| `dist/` | 两份现成交付包：`all-directions-pack-20261101.zip/.tar.gz`（7 角色卡+工具源码+125 附件，184 文件）、`directions-pack-20261030.zip` | 可直接发给接手人 |
+| `.ref/` `.workbuddy/` `_extbank/` `x/` `work/` `js/` 等 | 参考库/会话记忆/实验残留（§F.3 污染表）| 大多可清理 |
 
-工具层摩擦：`shell` 报错 **67%**（Windows 不认 POSIX 写法）、`start_instance` **61%**、`http_burst` **25%**、`report` 被拒 **13 次**（证据必须逐字子串）、账本拦截 **23 次**（K2.7 19 + Pro 4）。
+### B.4 未提交的工作树改动（**交接时必须处置，别丢**）
 
-**环境级阻塞**：**CTFARENA 全库 50 道 web 全部起不来**（同一个上游限流），整库缺席；SAMPLE/CYBENCH/AGENTBENCH/AGENT-DEFENSE 正常。
+**修改（6+1 文件，内容 = 11-02/11-03 实测发现并修复的缺陷）**：
 
-**无效样本**：SAMPLE-006 复用了已死实例（23 次 404、0 次 2xx，156k token 纯浪费）。剔除后 **5/15 = 33.3%**。
+| 文件 | 内容 |
+|---|---|
+| `.github/workflows/build-agent-image.yml` | **CI 加两步**：总入口单测 + 25 个免凭据套件（修复「CI 不跑测试」缺口）|
+| `src/ctfy_agent/platform.py` `solver.py` | 缺陷 A：多问题题提交缺题号回落 `flag` → 422 丢分；修为 verify 记住题号 + `preferred_question_id()`（A/B：CTFARENA-048 未解→correct）|
+| `src/ctfy_agent/crew.py` `state.py` | 缺陷 B：部分解被 `get_my_solves` 兜底翻成整题解出；兜底排除 `partial_solve`/`superseded` |
+| `src/ctfy_agent/cli.py` `solver.py` `state.py` | 缺陷 C：QA 题提交通道整条不通（`is_qa_only` 映射 + `submit_qa_answer` + `competition_id`）；修后 MCQ 12/12、SECQA-0001 从 57s/33k 变 8.9s/2.1k |
+| `tests/smoke.py`（+107 行，纯新增）| 上述修复的回归用例（`case_submit_question_id` / `case_qa_submit` 等）|
 
-### 4.4 模型 A/B（回答"是不是 K2.7 能力不足"）
+**未跟踪的 6 份关键报告**（结论被反复引用，建议连同 WIP 一起入库）：
+`docs/bench-1102-report.md`、`docs/bench-1103-report.md`、`docs/project-completeness-2026-11-02.md`、
+`docs/gate2-context-ab-2026-11-01.md`、`docs/p0-calibration-2026-10-31.md`、`docs/eval-mix-live-2026-10-30.md`。
 
-同代码、同配置、同预算，只把 6 个角色换成 `DeepSeek-V4-Pro-0813`，跑同 3 道 K2.7 失败题：
+> 处置建议：由原会话（或交接人逐文件 review 后）**尽早提交**；提交前跑一遍总入口单测（151+新增全绿口径，见 §C.2 的 bench_stats 坑）。
 
-| 题 | K2.7 | Pro | 速度比 |
+---
+
+## C. 十分钟上手
+
+### C.1 本地 CLI
+
+```powershell
+# 任何 Python 3.12 皆可（stdlib-only）；本机沿用过 DSH 运行时也可
+Copy-Item .env.example .env   # 填 CTFY_TOKEN（平台→设置→API 令牌）与模型 Key
+.\run.cmd doctor              # MCP 握手 + 工具清单 + 配置自检（平台实测 3.4.6 / 96 工具）
+.\run.cmd challenges          # 题单（练习库 id 见 §D.4）
+.\run.cmd crew  CTFARENA-001  # 协调者 + 专家跑一题（生产路径）
+.\run.cmd demo                # 无令牌无 Key 也能看全链路（假 MCP + 脚本化 LLM）
+```
+
+Windows 坑：先 `$env:PYTHONIOENCODING="utf-8"`；**本机有代理时必须 `$env:NO_PROXY="127.0.0.1,localhost"`**
+（否则 127.0.0.1 的测试请求被代理变 502，制造假 FAIL【审计 11-02】）。
+
+### C.2 测试
+
+```powershell
+python tests/smoke.py          # 总入口（免凭据）
+```
+
+- **干净 clone 期望 151 passed / 1 failed**：`case_bench_stats` import 的 `runs/bench_stats.py` 不在 git 里
+  （缺口 #11）。先从 `runs/` 拷入该文件（或按 F.1 建议挪进 `tools/`）即可全绿；原工作区口径 154/0。
+- 33 个独立套件：25 个免凭据（`smoke_rev 15` / `smoke_pwn 24` / `smoke_crypto 27` / `smoke_webai_gap 12` /
+  `smoke_ctxopt` / `smoke_http_*` / `smoke_ai_*` …），8 个要真实 `.env`
+  （`smoke_ai_role / brake / clustera / clusterb_crew / ctxopt / p1 / p2 / p21`）——CI 里显式 SKIP。
+- 改动后必须保持全绿再提交。
+
+### C.3 容器：契约检查 / 构建 / 发布
+
+```powershell
+python tools/container_check.py --local      # 五条契约路径全 exit 0（dry_run/no_task/bad_run_mode/no_creds/no_mcp）
+python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v4   # 匿名拉取校验（不启 docker）
+python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下）
+```
+
+- 构建走 **GitHub Actions 手动 dispatch**（`build-agent-image.yml`）：平台审核按 **digest** 钉死，
+  **不要覆盖已提交的 tag**，发新版本用新号（v5、v6…）。
+- 镜像瘦身与烤入工具链的细节都在 `Dockerfile` 注释里（含「为什么 sqlmap 要归档+raw 双下载」这类实测坑）。
+
+### C.4 环境变量总表
+
+| 组 | 变量 | 说明 |
+|---|---|---|
+| 平台注入（容器）| `CTFY_PLATFORM_URL` `CTFY_TOKEN` `CTFY_WORK_DIR` `CTFY_EVAL_CHALLENGE_ID` `CTFY_EVAL_COMPETITION_ID` `CTFY_EVAL_MAX_TURNS`（缺失=无预算）`CTFY_EVAL_DRY_RUN` | MCP 地址从 `$CTFY_WORK_DIR/mcp.json` 或 `PLATFORM_URL + /api/v1/mcp/` 拼；**`CTFY_MCP_URL`/`CTFY_TARGET_URL` 在用户镜像里不存在** |
+| LLM 网关（容器）| `LLM_FLAVOR`(只认 openai) `LLM_API_KEY` `LLM_BASE_URL` `LLM_MODEL` | **空 key = 没人出资 = 必须 refused，禁止回退自有 key**；角色级 `model` 会被剥掉（单模型契约）|
+| 本地（.env）| `DEEPSEEK_API_KEY` `DEEPSEEK_BASE_URL` `DEEPSEEK_MODEL` + 可选 `AGENT_*`（步数/预算/单价…）| 见 `.env.example`；`AGENT_MAX_TOKENS_PER_CHALLENGE` 等全部可覆盖 |
+
+---
+
+## D. 架构与配置真值
+
+### D.1 模块地图（src/ctfy_agent，29 模块 ≈16.2k 行）
+
+| 层 | 模块（行数）| 职责锚点 |
+|---|---|---|
+| 入口/编排 | `agent_main`(562) `crew`(1599) `solver`(1647) `retry`(432) `auto`(98) `cli`(708) | B1 适配层（task.json→result.json）；协调者+专家；专家主循环+集群-B 编排；集群-B 零耦合编排器（Orchestrator/Blackboard/classify_failure）|
+| 平台/传输 | `platform`(524) `mcp_client`(351) `httputil`(104) `llm`(177) | MCP 封装 + `MODEL_TOOLS` 白名单 + 运行期参数修复；JSON/SSE 双兼容；重定向护栏；OpenAI 兼容客户端（超时归一可重试）|
+| 状态/预算 | `state`(406) `budget`(203) `ledger`(706) `checkpoint`(160) `progress`(265) `companion`(161) `ctxcompress`(373) `traffic`(484) `artifacts`(164) | 状态机+原子落盘+transcript 锁；token/调用/金额三层刹车+尝试切片；确定性账本（同参数拦截+逐字证据校验）；断点续跑；环境失败断路器；PLAN/REFLECTION 消费；上下文压缩/事实板/滑窗 |
+| 工具 | `tools_local`(2481) `tools_domain_ext`(2118) `tools_misc_ext`(796) `tools_webscan`(411) `tools_websec`(426) `tools_websql`(250) | 共 **25 个本地工具**（见 D.2）；全部沙盒锚定、输出 ≤6000 字符（`AGENT_TOOL_TEXT_MAX` 可调）|
+| 知识 | `method_cards`(313) | 25 张题型方法卡（AI 21 + 领域 8，含交叉），按 tags 命中注入 |
+
+### D.2 角色与工具面（HEAD 真值；本地工具合计 25 个）
+
+| 角色 | 步数 | shell | 平台工具 | 本地工具 |
+|---|---|---|---|---|
+| coordinator | 14 | — | read/instance/oracle/**submit** | —（delegate/note/done 内置；提示词 = `crew.COORDINATOR_PROMPT`）|
+| web | 14 | ✅ | 10 个直接工具名（题面/附件/提示/start_instance/verify_*）| http_request, http_map, http_burst, fuzz, authdiff, jsrecon, sqli, jwt_forge, shell, write_file, decode_blob（11）|
+| ai | 14 | ✅ | 同 web | http_request, http_map, chat, shell, write_file, decode_blob（6）|
+| pwn | 14 | ✅ | read/instance/oracle | shell, write_file, elfpeek, hexpeek, pwngen, pwnfind, tcp, tcp_batch, netcheck（9）|
+| rev | 14 | ✅ | read/instance/oracle | shell, write_file, elfpeek, hexpeek, tcp, tcp_batch, netcheck（7）|
+| crypto | 14 | ✅ | read/instance/oracle | shell, write_file, hexpeek, rsatool, aesblock, prng, tcp, tcp_batch, netcheck（9）|
+| misc | 10 | ✅ | read/instance | http_request, http_map, shell, write_file, decode_blob, unpack_archive, hexpeek, tcp, tcp_batch, netcheck（10）|
+
+- 模型：7 角色全部 `DeepSeek-V4.1-Flash-1017`（单模型契约，入口会 pop）；温度 0.2；单轮 4096；
+  题预算 1,200,000 token / 100 次调用；上下文 32k；`submit_limit` 3；并发钳制 ≤3（QA#26）。
+- 双层门禁：`crew._role_specs`（模型看不看得到）+ `solver._execute`（能不能真执行）；只登记在 `local` 不算数。
+- 4 条纪律由 `crew._role_system` 自动追加（PLAN/REFLECTION、逐字 evidence、report 唯一交付、不可达纪律），
+  **写提示词时别重复**。
+
+### D.3 编排与实验开关（全部默认关 = 生产是单路串行）
+
+- **集群-B**（`clusterb_k`）：同题 k 次串行 + 温度/策略差异化 + 黑板继承。**10-29 实测定论 k=3 有害**
+  （493,615 tok 未解 vs k=1 313,076 tok 解出；切片切断累积上下文），保持默认 k=1【实测 10-29】。
+- **集群-A**（`cluster_a_concurrency`）：无状态题 N 路并行。默认关；真机 A/B 留正式赛。
+- 其他：缓存折价 `budget_cache_discount`（11-01 A/B：输入成本 −44%）、工具输出上限参数化等，`config.extra` 里都不存在 = 冷代码。
+
+### D.4 平台契约要点（`.tools/ctfy-src` 逐字读出 + 实测）
+
+- `result.json` 核心 = `answers`（按 question id，平台代交）；写完 `exit 0`；`solved` 平台自算。
+- `task.json`（schema v2）：`run_mode` ∈ instance/qa/defence/engagement/awd。**当前只支持 instance**
+  （非 instance 写空 result + exit 0 = 静默 0 分）；QA 路径已在本地 CLI 修复但未提交（§B.4）。
+- 硬约束：`internet_policy=deny`、`tcp_access=tls_sni`、单模型、实例并发 1 / 每题 start 5 次、
+  同分先解出者靠前、3 段 session（11/15、11/21、11/22 各 10:00–20:00 CST）、agent 自主并发 ≤3。
+- 竞赛 id：TPCTF=`c0d8b4e3dd3b42c095d63d7dfa66431f`；练习库 CTFARENA=`4394a10aa5d24f97a1ec3301ca718a45`、
+  CYBENCH=`d35cc057773c44f79eec192b54551327`、AGENTBENCH=`9f613f261b68469b9c4da805197983b2`、
+  AGENT-DEFENSE=`d4917609895644e1bcf92b3c9b3bc70f`、SAMPLE=`e4e78ff318dc4844beac13f9ea7409aa`。
+- 网关两个实测事实【实测 11-02】：① `enable_thinking:false` **被网关忽略**（reasoning 照常返回计费，
+  镜像里那条 ENV 在此网关无效果）；② 缓存真实生效（单题命中 88.8–90.6%，`budget.py` 解析嵌套字段口径正确）。
+
+---
+
+## E. 实测能力（历轮基准，**勿重推**；先看口径再引用数字）
+
+### E.1 时间线
+
+| 轮 | 样本/口径 | 结果 | 报告 |
 |---|---|---|---|
-| SAMPLE-007 | ✗ 335 s | ✗ 849 s | 2.53× |
-| SAMPLE-009 | ✗ 464 s | ✗ 1,196 s | 2.58× |
-| AGENTBENCH-002 | ✗ 352 s | ✗ 597 s（LLM 504） | 1.70× |
+| 10-26 | 16 道 web @**150k** token（口径偏悲观）、Kimi-K2.7 | 解出 5/16=31.2%（easy 5/9）；A/B 换 Pro 模型 0/3 vs 0/3、慢 2.27×、覆盖更窄 → **换模型无效** | `runs/bench-web-report.md`【本地-only】|
+| 10-31 | 132 题综合（bigbank）| **77 解出 58.3%**；重叠 35 题复测 28.6%→48.6% | `docs/bigbank-report-2026-10-31.md`（已入库）|
+| 11-02 | 未解池随机 12 题 @400k | 平台确认 5/11=45%；剔环境阻塞 5/8=63%；能力口径 6/8=75%；均 396s/308k tok；缓存 90.6%；≈¥0.15–0.22/题 | `docs/bench-1102-report.md`【未入库】|
+| **11-03** | **六题型 52 题 @默认预算** | **51.9% / 剔阻塞 65.9% / 能力 75.6%**；qa 12/12（均 12s、2.8k tok）；web 7/11=64%；misc 4/6=67%；crypto 2/8=25%（3 题最后一步被预算截断）；rev 2/3；pwn 0/1（池中 3/4 需 VPN，样本无效）；easy 92% / medium 61% / hard 33%；均 277s/276k tok | `docs/bench-1103-report.md`【未入库】|
 
-**结论：0/3 vs 0/3，慢 2.27×，覆盖面更窄**（SAMPLE-007：K2.7 探 38 条路径，Pro 仅 10 条，其中 8 条被 K2.7 包含，Pro 独有 2 条）。→ **瓶颈在预算与机制，不在模型 IQ。换模型不解决问题。**
+### E.2 已证伪路线（别再花预算）
 
-### 4.5 并行求解器（多 LLM 同题并行）评估结论
+1. **换更强模型**：10-26 A/B（0/3 vs 0/3、更慢更窄）。
+2. **集群-B k=3**：10-29 归因实验（有害，见 D.3）。
+3. **重试轮当默认策略**：18 题 1 解 / 9.05M token 每解（`docs/retry-round-2026-10-31.md`）。
+4. **提示词级劝导**（O-D）：无效；**工具级 advice**（O-E 把撞墙请求砍 8 成）与缓存折价才有效。
 
-- **"多 LLM（换模型）"已被 A/B 证伪**；
-- **"多策略并行"没有被直接测量过**，唯一硬支撑是"失败主要是策略塌缩"（同一 POST 原样重发 5 次全被账本拦、反复换措辞重派同一思路）；
-- 两个硬前提：①预算必须 **×N**（否则等于拆预算，必亏）；②环境失败（实例限流、旧实例、504）对 N 路**同时生效**，只是把浪费乘以 N；
-- 实现上**不是改配置能解决的**：`Crew` 是单线程顺序编排，需要改编排层 + 预算/账本并发安全；建议先做 **2 路 × 4–6 道 medium** 的小实验；
-- 并行会话正在加的**串行换路线干预**（`STRATEGY_SIMILARITY_LIMIT`）能以 1× 成本吃到大部分多样性收益，**它上线后并行的边际收益更小**。
+### E.3 失败主因（10-26 验尸口径，仍适用）
 
-### 4.6 数据可信度（坑）
-
-- 150k 口径使 medium/hard 偏悲观；CTFARENA 缺席；A/B 样本仅 3 道。
-- **统计时警惕重复计数**：拦截标记串会被账本重渲染与结论回显重复计入（"35 次账本拦截"就是这么来的，精确值是 23）。验尸一律按"结果行"计数，不按文本出现次数。
-- 本次审核已修正 3 处初版数字（报告 §11 有记录）：账本拦截 35→23、"Pro 找到 K2.7 漏掉的端点"→ 不成立、"{v} 落 host 段两人都撞过"→ 仅 Pro。
+失败题 attempts 全为 0——不是「交错了」而是「没产出候选 flag」：预算耗尽 / 协调者空转 / 实例起不来（上游限流）。
+提分方向 = **补方向领域知识与方法卡**（如 web 访问控制绕过 playbook），不是加并行或调参。
 
 ---
 
-## 5. 平台契约（从 `.tools/ctfy-src` 逐字读出，硬点）
+## F. 已知缺口与风险（交接必读）
 
-- **result.json**：写 `$CTFY_WORK_DIR/result.json` 后 `exit 0`（非 0 一律失败）。核心字段 `answers`（按 question id，平台代交）；`solved` 由平台按提交记录重算，写它不加分；其余 `turns/tool_calls_made/input_tokens/output_tokens/stop_reason/writeup` 可选。dry run 写 `{"schema_version":2,"solved":[],"fully_solved":false,"stop_reason":"dry_run"}`。
-- **task.json**（schema_version=2）：`run_mode` ∈ instance|qa|defence|engagement|awd；含 `challenge/competition_id/questions/gated_questions/scope/rules_of_engagement/deliverable/platform_url/max_turns/result{path,stdout_fallback}/target_instance`。
-- **环境变量**：`CTFY_PLATFORM_URL`、`CTFY_TOKEN`、`CTFY_EVAL_CHALLENGE_ID`、`CTFY_EVAL_COMPETITION_ID`、`CTFY_EVAL_MAX_TURNS`（缺失=无预算）、`CTFY_WORK_DIR`、`CTFY_EVAL_DRY_RUN`。**`CTFY_MCP_URL`/`CTFY_TARGET_URL` 在用户镜像里不存在**——MCP 地址从 `$CTFY_WORK_DIR/mcp.json` 或 `CTFY_PLATFORM_URL + /api/v1/mcp/` 拼。
-- **LLM 网关**：`LLM_FLAVOR`(openai|anthropic) + `LLM_API_KEY/LLM_BASE_URL/LLM_MODEL`。**`LLM_API_KEY` 为空必须大声失败，禁止回退自有 key**。
-- **赛事硬约束**（实测）：`internet_policy=deny`（容器无外网）、**单模型**（一次运行只允许一个 provider 的一个模型，所有槽位同值；角色级 `model` 被入口剥掉，禁止 tier 解析绕行）、`max_instances_per_team_effective=1`、3 段 session（11/15、11/21、11/22 各 10:00–20:00 CST）、同分先解出者靠前。
-- 竞赛 id：`TPCTF`=`c0d8b4e3dd3b42c095d63d7dfa66431f`；练习库：CTFARENA=`4394a10aa5d24f97a1ec3301ca718a45`、CYBENCH=`d35cc057773c44f79eec192b54551327`、AGENTBENCH=`9f613f261b68469b9c4da805197983b2`、AGENT-DEFENSE=`d4917609895644e1bcf92b3c9b3bc70f`、SAMPLE=`e4e78ff318dc4844beac13f9ea7409aa`。
+### F.1 缺口清单（11-02 审计 10 条 + 本次新增，按风险排序）
 
----
-
-## 6. 待办与阻塞
-
-1. **等平台审核 + 提交 v4**（用户）：`docs/submit-image-runbook.md`；提交时显式 `:v4`，别用 `latest`。
-2. ~~镜像重建/push~~ ✅ 最新 v4（run `41304971894`）：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef`；重建走 `python tools/publish_image.py --tag <新tag>`（需 GH_TOKEN；本轮用的是 Windows 凭据管理器里的 `gho_` token，见 `runs/_do_publish.py`）。
-3. **CTFARENA 50 道 web 需换时间窗重测**（上游限流是暂时的，不是我们代码问题）。
-4. **GitHub PAT 吊销**（此前暴露过，仍未处理）。
-5. 失败根因=flag 发现（access-control 面），非编排/预算/模型可调。若要提分，方向是**补 web 安全领域知识**（Werkzeug debug 模式 / 访问控制绕过 playbook），不是加并行路数或调参。
-
----
-
-## 7. 本地环境与操作要点（踩过坑）
-
-- Python：`$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
-- 先 `$env:PYTHONIOENCODING="utf-8"`；跑批量再设 `$env:PYTHONUNBUFFERED="1"`（否则后台 job 看不到进度）。
-- 跑题：后台 job 跑 `cmd /c run.cmd crew <ID>`；**先确认转录文件出现**再判定跑过。
-- 单测：`python tests/smoke.py`，v2 基线 **83 passed**，当前工作区 **88 passed / 0 failed**（含 B1 刹车 / http_map / smoke_gate 新增用例）；改动后必须全绿。
-- 无 Docker / 无 WSL / 非管理员（镜像构建走 GitHub Actions）。
-- `web_search` 不可用；`raw.githubusercontent.com` 被 DNS 拦；`git clone --filter=blob:none` + `git show HEAD:path` 取单文件可用。
-- 凭据在 `.env`（`CTFY_TOKEN`、`DEEPSEEK_API_KEY`），**引用时打码**；临时目录里复制 `.env` 后**用完必须删**。
-- **实例**：配额 1，串行；`runs/_instances.py`（`--stop` 清实例）；`start_instance` 必须带 `competition_id`；失败常见 "Rate limited by upstream API"；**跑前务必确认 0 实例**（旧实例会污染：SAMPLE-006 复用死实例白烧 156k）。
-- **基准/分析脚本**（全在 `runs/`，只读）：`_bench_web.py`（批量驱动）、`_bench_report.py`（分类统计）、`_final_stats.py`、`_consolidate.py`（两臂汇总）、`_cluster_eval.py`（并行求解器评估）、`_tools_stats.py`、`_start_probe.py`（零 LLM 探实例）、`_model_probe.py`（探模型可用性）、`_audit_*.py`（数字审核）。
-- 转录 `runs/<run>/transcripts/<ID>.jsonl`：**一行一个工具调用+结果**（`role`=专家名、`tool`、`args`、`result`、`usage`、`step`）；统计一律按行，不按文本出现次数。
-
----
-
-## 8. 禁忌（别重做）
-
-1. 不要重新推导 A/B 结论、基准数字、卡点分类——都在 `runs/bench-web-report.md`，直接引用。
-2. 不要用 150k 预算再跑一遍就去解释"模型不行"——那是预算掐断，不是能力结论。
-3. 不要在大规模测试里复用已存在的实例（先 `_instances.py --stop`）。
-4. 不要提交 `:v1` 或 `:latest`；不要移动 v1 的 digest。
-5. 不要统计时按文本出现次数数拦截/报错（会翻倍）。
-6. 不要擅自 commit / revert 并行会话的未提交改动。
-7. 不要重复穷举 CTFARENA-035 的凭据（~1202 次全 401 已试；但**不要断言凭据路是死路**——tags 指明方向对，是候选覆盖不足）。
-8. 未经用户单独批准，不要改提示词内容。
-
----
-
-## 9. 与用户的协作偏好
-
-- **只认实验数据**；写数字前用脚本/行号核实，不凭印象。
-- 方案先批准再实施；**提示词改动单独批准**。
-- 密钥打码。
-- 用户在意成本：实验要设预算上限，能提前停就停，报告要给"钱花在哪"的结构化拆解。
-- 验尸/统计警惕**同一事实多重计数**（拦截文本被汇报引用、echo 重复），先归类再报数。
-- 回答用中文，简洁 + 表格 + 明确口径与置信度。
-
----
-
-## 附录 A. rev / pwn / crypto 工具箱（toolbox 会话 · 2026-10-30）
-
-> 本附录由 toolbox 会话追加；正文 §0 的镜像/基线数字以并行会话为准。详细记录见
-> `docs/rev-toolbox-plan.md`、`docs/pwn-toolbox-plan.md`、`docs/crypto-toolbox-plan.md`。
-
-| 方向 | 新增能力（全部挂既有工具注册表，零 crew 改动） | 关键点 |
+| # | 缺口 | 状态（11-03）|
 |---|---|---|
-| rev（v2） | `elfpeek` 新视图 `disasm`（capstone 可选，缺失退化字节视图）/ `bytecode`（.pyc marshal+dis+常量池；PyInstaller CArchive/PYZ 目录与提取；支持 ELF bootloader 的 PyInstaller）/ `gadgets` v2（真实指令边界枚举 + filter + /bin/sh 全偏移）/ `strings utf16` / `info` 补入口段 | 修掉"没有反汇编器"的根本短板；**capstone 用 `importlib` 动态加载**，否则 `case_stdlib_only`（src 禁第三方 import）会红 |
-| pwn（v1） | **pwngen**（op=cyclic De Bruijn 模式串 / op=build parts 拼装：hex/raw/cyclic/pad/int 小端/`path=` 落盘）、**pwnfind**（崩溃回显 3~8 字节反查偏移，文本/hex/倒序）、`elfpeek view=lookup`（符号偏移 + 相近建议 + 字符串全偏移 + libc 版本行 + ret2libc 提示） | 专为绕开 shell 引号守卫（SAMPLE-013 根因）；注册走 `DOMAIN_SPECS` 自动聚合，未碰 crew/tools_local |
-| crypto（v1） | **rsatool**（small_e / common_modulus / wiener / fermat / pollard_pm1 / pollard_rho / hastad / crt / factor）、**aesblock**（纯 stdlib AES-128/192/256：ecb/cbc/ctr、xor、CBC bitflip、pkcs7）、**prng**（MT19937 标准实现 + 624 输出状态恢复预测、LCG 参数恢复） | **零镜像依赖**（不增体积）；RSA 攻击与 AES 原语从"每题手写脚本"变为一次工具调用 |
+| 1 | 只支持 `run_mode=instance`；qa/defence/engagement/awd 会静默 0 分 | 部分：QA 已修（**未提交**，§B.4）；defence/engagement/awd 未动 |
+| 2 | CI 不跑任何单测（HEAD）| **修在工作树未提交**（workflow +两步）|
+| 3 | 33 个测试套件不在总入口 | 部分：25 个免凭据套件接进 CI（同上未提交）|
+| 4 | README 6 处失真（自称 18 项/12 步/30 万 token/方向未做…）| 未修；**以本文件为准** |
+| 5 | 本地跑题污染仓库根（`js/`、`work/capture.pcap`、`x/`、`%TEMP%/`）| 未修；本地跑题请显式锚定 run 目录/沙箱 |
+| 6 | XBOW 50 题 + 部分 CYBENCH 实例 `*.internal` 需 VPN，本机不可达 | 环境限制；这些库的 0% 不是能力结论 |
+| 7 | 网关忽略 `enable_thinking:false`（思考 token 照计费）| 网关侧，代码不可修；预算按含思考估算 |
+| 8 | 多问题题提交回落 `flag` → 422 丢分 | **已修未提交**（A/B 验证 CTFARENA-048 转 correct）|
+| 9 | 部分解被兜底翻成整题解出（完成度虚高）| **已修未提交** |
+| 10 | QA 提交通道不通 | **已修未提交**（MCQ 12/12）|
+| **11** | **总入口 `case_bench_stats` 依赖未入库的 `runs/bench_stats.py` → 干净 clone 必红 1 条**【实测 11-03，本次交接新发现】| 未修；修法：把 `runs/bench_stats.py`（6 KB）挪进 `tools/` 并改 import，或在用例里 try/except ImportError 跳过并标注 |
+| 12 | capstone 未进镜像（`elfpeek disasm` 退化字节视图）| 待批：随 v5 重建加 `-u pip install capstone==5.0.3`（约 +4–6 MB，需 `importlib` 动态加载，`case_stdlib_only` 才不红）|
 
-**配置变更**（config/agent.json，JSON 无注释故记录于此）：rev / pwn / crypto 三个角色均 `max_steps 12→14`、`platform` 加 `oracle`（verify_answer）、`local` 加 `hexpeek`（及 pwn 的 pwngen/pwnfind、crypto 的 rsatool/aesblock/prng）、提示词接入新工具用法并删除"没有反汇编器/手动核对"类旧指引。
+### F.2 安全与合规（交接前逐项打勾）
 
-**测试**：`python tests/smoke.py` → **144 passed / 0 failed**；`tests/smoke_rev.py` → 15/15（capstone 有/无两条路径）；`tests/smoke_pwn.py` → 24/24；`tests/smoke_crypto.py` → 27/27（FIPS-197 全密钥长度 + NIST SP800-38A + MT19937 标准向量）。
-**代码审计**（2026-10-30 第二轮）：发现 10 处问题（1 高：cyclic 缓存键漏字母表会串号；6 中：多处参数垃圾值/多字节字符裸崩、prng 大输出绕过 6000 字符契约；3 低），**全部已修**（`[toolbox-fix 2026-10-30]` 标识）；pwngen 落盘沙盒锚定、ELF32 lookup、dynsym 覆盖均实测确认。详见 `docs/toolbox-audit-2026-10-30.md`。
-**待办**：capstone==5.0.3 进 v4 镜像（约 +4–6MB，随 v4 重建，需批准；crypto 侧零新增依赖）→ v4 仍未建（等并行会话收工）；真机复跑 stalled 题验收需模型预算单独申请。
+1. **吊销此前暴露过的 GitHub PAT**（遗留未处理）。
+2. **轮换凭据**：`CTFY_TOKEN`（平台令牌 30 天有效可吊销）与模型 Key；`.env` 不进 git 但在本地——**打包转移时剔除**。
+3. 密钥扫描：HEAD 全树无 `sk-/ghp_/gho_/AKIA/xoxb-` 命中【实测 11-03】；`.env.example` 全占位符。
+4. **无 LICENSE 文件**：接手方需自定代码许可；镜像分发的第三方义务——ffuf Apache-2.0 / SecLists MIT / sqlmap **GPLv2+**（GPL 传播需提供对应源码，上游 pin 见 Dockerfile）；`tools_local.http_map` 的 AI 组件指纹来源为 MIT 技能卡（ctfy-ai-infra）。
+5. GHCR 包随仓库转移时注意：镜像在 `ghcr.io/yzqcyl/` 名下，换主需重推并重过平台审核（digest 会变）。
+
+### F.3 仓库卫生（可清理清单）
+
+根目录未跟踪杂物（**多为本地跑题泄漏，见缺口 #5**）：`js/`、`bundle.js`、`assets_index.js`、`idx.js`、`home.html`、
+`work/capture.pcap`、`x/`、`%TEMP%/`、`crush`、`message.txt.cz`、`recruitment.eml`、`agent-artifacts-m55-m56.zip`（853 KB 构建产物）、
+`新建文件夹 (2)/`（他人 6.8 MB tarball）。→ 建议交接打包前整批删除（先扫一眼无独有数据）。
 
 ---
 
-## 附录 B. web / AI 安全「剩余短板」补齐（M6 补丁 · toolbox 会话 · 2026-10-30）
+## G. 交接操作清单（按序执行）
 
-> 依据用户提供的两张「剩余短板」截图；详细记录见 `docs/web-ai-gap-plan.md`。
+1. ☐ 转移 git 仓库访问权（v3 为当前线）；`git clone` 后核对 HEAD `89739a5`。
+2. ☐ **处置未提交 WIP**（§B.4）：review 后提交（或请原会话提交）——这是 11-03 成绩的代码来源。
+3. ☐ 把 `runs/bench_stats.py` 挪进 `tools/` 修掉缺口 #11，总入口单测恢复全绿（干净 clone 口径）。
+4. ☐ 本地起环境：`.env` 填新令牌 → `run.cmd doctor` → `python tests/smoke.py`（记得 NO_PROXY）。
+5. ☐ **吊销旧 GitHub PAT、轮换 CTFY_TOKEN/模型 Key**（§F.2）。
+6. ☐ 拿走本地数据：`runs/`（transcripts+报告+脚本）、`misc-bank/`、`inbox/`、`.tools/ctfy-src/`、`dist/` 两个交付包。
+7. ☐ 决定 LICENSE 与第三方合规口径（§F.2.4）。
+8. ☐ （可选）清理根目录杂物（§F.3），重写 README（缺口 #4）。
+9. ☐ 平台提交镜像：按 `docs/submit-image-runbook.md` 走浏览器 4 步（显式 `:v4`）；或先重建 v5
+   （带上 WIP 修复 + capstone，走手动 dispatch workflow），再提交 v5。
+10. ☐ 通读 §H 禁忌与附录 A/B（工具箱与补短板记录），再动提示词——**改提示词要单独走审批**（原团队规矩）。
 
-**AI 安全（4 项）**：① `platform` += `verify_exploit`——checker 型 AI 题自校验（`instance_id=UUID / question_id=questions[].id`），不再绕协调者；② `allow_shell false→true`，`local` += `shell`/`decode_blob`——载荷构造（base64/URL/JSON 转义、multipart 用 `python3 -c`/`curl -F`）；③ `max_steps 12→14`（与 r/p/c 对齐，提示词同步「上限 14 步」）；④ 提示词新增【工具面】两行。`config/agent.json` 与 `roles/ai.json`+`roles/ai.system.txt` 同步改（零漂移契约，`tests/smoke_ai_role.py` 硬断言）。
-**Web（3 项）**：① 提示词加「侦察预算」——http_map ≤2 次/轮、URL 不重复抓、侦察 ≤1/3 步数（治 185k vs 801k 的 4 倍波动）；② evidence 条款细化——同一份输出原样复制 20–200 字符连续正文、不拼接/不省略（治 report_rejected 13 次）；③ `method_cards.py` 新增 2 张专项卡（SQLi 靶场序列 / 文件上传靶场）+ 提示词「上传点」指路 `curl -F`（http_request 不支持 multipart）。**web 工具白名单未动**（仍 10 个）。
-**本地无法修复（登记）**：003/004/012 平台占位/VPN-only（需 VPN/平台侧修）；011 与 M6/v4 镜像重建（本机无 Docker，需有 Docker 的机器，届时 v4 一并带 capstone）。
-**测试**：`tests/smoke.py` **144/0**；`tests/smoke_ai_role.py`、`smoke_ai_chat/agent/mcp/infra`、`smoke_webmap` 全 OK；新增 `tests/smoke_webai_gap.py` **12/12**（含兜底同步用例）；pwn/crypto/rev 维持 24/27/15。
-**代码审计**（2026-10-30 第二轮，九项独立核查）：功能接线（shell/decode_blob/门禁）、真实题库匹配（67+23 靶场题全命中、最大 5 卡无截断）、注入面/禁字面量、multipart 说法、verify_exploit 修复层**全部通过**；schema 增量实测 +267 tok/步（≈4%/题预算，可接受）。**2 项 LOW 已修（并行会话同意）**：① web 提示词「只有 10 步」→「只有 14 步：2 指纹/4 枚举/5 验证/1 收口/2 缓冲」（misc 核查 10==10 一致未动，smoke needle 同步）；② crew.py `DEFAULT_ROLES.ai` 兜底抄全（14/True/local+shell+decode_blob；platform 组名 oracle 本就含 verify_exploit），新增 `case_default_ai_fallback_sync` 防再漂移。**提示词黑话清除**：「（M6 补齐）」等内部里程碑字样已从生产提示词移除（两处同步、零漂移复验通过）。另钉 `.gitattributes`（`roles/*.system.txt text eol=lf`）——仓库 autocrlf=true，防止提示词被 checkout 成 CRLF 后零漂移契约假红。详见 `docs/web-ai-gap-plan.md` §5。
-**风险**：W1/W2 与 A1–A3 均为提示词/工具面修补，真机效果（降载、降 rejected、038+ 提分）待跑批验证，需模型预算授权。
+---
+
+## H. 经验与禁忌（别重做 / 别踩）
+
+1. 不要重新推导 §E 的基准数字与 A/B 结论——直接引用，报告里有勘误记录。
+2. 不要用偏离默认的预算口径跑批再下「模型不行」结论（150k 那轮就是这么偏的）。
+3. 大规模跑题**先确认 0 实例**再开跑（复用死实例 = 白烧 token；10-26 有 156k 的教训）；
+   也别为探配额反复启停（每题 5 次上限，触上限当天该题作废）。
+4. 统计一律按**结果行**（transcripts jsonl 每行一事件），不按文本出现次数（拦截文案被回显会翻倍，10-26 实测 35→23）。
+5. 不要提交 `:latest` / 覆盖已审核 tag；平台按 digest 钉死。
+6. **不要擅自 commit / revert 他人未提交改动**（WIP 处置走 §G.2）；改共享文件前查 `EDIT-LOCKS.md` 登记锁。
+7. 不要断言 CTFARENA-035 的凭据路线是死路（~1202 次全 401 只是候选覆盖不足，tags 指明方向对）。
+8. 未经批准不要改角色提示词内容（web/crypto/rev 的调教是资产）；改 config 的 roles 必须同步 `roles/*.json`
+   （零漂移契约有 smoke 硬断言）。
+9. 干净 clone 上跑总入口会红 1 条（缺口 #11），先修再判回归。
+10. 本地跑题务必锚定沙箱/run 目录，防根目录污染与多题串数据（§F.3 就是这么来的）。
+
+**与原作者协作偏好**（继续有效）：只认实验数据，写数字先核实；方案先批准再实施，提示词改动单独批准；
+密钥打码；在意成本——实验设预算上限、报告给「钱花在哪」的结构化拆解；回答中文、表格化、标口径与置信度。
+
+---
+
+## 附录 A. rev / pwn / crypto 工具箱（2026-10-30，已提交）
+
+| 方向 | 新增能力（全部挂既有注册表，零 crew 改动）|
+|---|---|
+| rev | `elfpeek` 新视图：disasm（capstone 可选，缺失退化字节视图）/ bytecode（.pyc marshal+dis+常量池、PyInstaller CArchive/PYZ 提取）/ gadgets v2 / strings utf16 / info 补入口段 |
+| pwn | `pwngen`（cyclic De Bruijn / build 拼装 hex·raw·pad·int 小端·落盘）、`pwnfind`（回显 3~8 字节反查偏移、倒序、hex/文本）、`elfpeek view=lookup`（符号偏移+相近建议+ret2libc 提示）|
+| crypto | `rsatool`（small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor）、`aesblock`（纯 stdlib AES-128/192/256 ecb/cbc/ctr/xor/bitflip/pkcs7，FIPS-197+NIST 向量过）、`prng`（MT19937 状态恢复预测、LCG 参数恢复）|
+
+第二轮审计修 10 处（`[toolbox-fix 2026-10-30]` 标识）；专项套件 `smoke_rev 15 / smoke_pwn 24 / smoke_crypto 27`。
+
+## 附录 B. web / AI 补短板（M6，2026-10-30，已提交）
+
+AI：`verify_exploit` 自校验、`allow_shell=true`+shell/decode_blob、步数 12→14、提示词补【工具面】。
+Web：侦察预算（http_map ≤2 次/轮、侦察 ≤1/3 步数）、evidence 条款细化（20–200 字符连续原文）、
+SQLi/上传靶场方法卡、multipart 原生支持（O-F，`files/form` 参数）。
+本地无法修复（登记）：003/004/012 平台占位或 VPN-only；capstone 随 v5（缺口 #12）。
+
+## 附录 C. docs/ 索引（分类；★=未入库需转移）
+
+- **契约/规则**：`report-ctfy-rules.md`（平台规则调研）、`b1-adapter-plan.md`（容器适配+平台源码硬事实）、`submit-image-runbook.md` + `platform-submit-opsheet.md`（提交操作单）、`OPENING.txt`
+- **方案**：`plan-v1`（总纲）、`plan-concurrency`（集群 A/B）、`plan-cluster-a`、`plan-misc`、`extending-agent.md`（**新方向接入规范**）、`authoring-*`/`why-authoring`（出题线）
+- **审计**：`security-audit/fixes`、`audit-2026-10-25`、`audit-agent-2026-10-30`、`toolbox-audit-2026-10-30`、`audit-budget-exhausted-2026-10-31`、★`project-completeness-2026-11-02`（**全项目实跑审计，接手先读**）
+- **实测报告**：`bigbank-report-2026-10-31`（+CSV）、`cybench-retest-2026-11-01`、`clusterb-p1-result`、★`bench-1102-report`、★`bench-1103-report`、★`eval-mix-live-2026-10-30`、★`gate2-context-ab-2026-11-01`、★`p0-calibration-2026-10-31`
+- **工具/提示词**：`domain-tools.md`、`misc-handover.md`、`misc-module-brief.md`、`web-playbook-v3.md`、`web-ai-gap-plan.md`、`ai-plan.md`、`note-zhipu-model-choice.md`
+- 另有 `runs/bench-web-report.md`、`runs/handbook-{zh-CN,en}.md`【本地-only】
+
+## 附录 D. 镜像版本史（digest 钉死，勿覆盖）
+
+| tag | digest（前 12 位）| 基线 | 状态 |
+|---|---|---|---|
+| v4 | `sha256:4e153aeb41fb` | `ccc6213`（run 41304971894）| **当前提交目标**；+ctxopt/方法卡/工具链/`LLM_ENABLE_THINKING=0` |
+| v3 | `sha256:e658b9f6a466` | `5a7f8c5`（run 40837543846）| 历史；集群-B 接线 + web 工具链 |
+| v2.1 | `sha256:6406286f857c` | `429d280` | 历史；非 root 修复 |
+| v2 | `sha256:73b39430873a` | `21488518` | 历史；**曾被协议检查拒（root）**，教训保留 |
+| v1 | `sha256:a68ebe6e…` | — | 最早留档 |
+
+---
+
+*本版由交接线重写（2026-11-03），替代旧「给新对话 agent」内部版；旧版的有效内容（契约、基准、禁忌、附录）已全部并入或更新。数字若有出入，以本文件标注的【实测/审计】口径为准。*
