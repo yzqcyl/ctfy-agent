@@ -23,7 +23,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **git 基线** | HEAD `89739a5`（v3 线），树 ≈3.2 MB；src 29 模块 ≈16.2k 行；docs 78 篇；测试 34 个文件 |
+| **git 基线** | HEAD `773892d`（v3 线，2026-11-02 三连提交：`fc7dc42` 许可 → `291e1d0` 报告 → `773892d` WIP+融合）；树 ≈3.2 MB；`ctfy_agent` 包 31 模块；docs 74 篇；smoke 套件 34 个文件 |
 | **交付镜像** | ✅ v4 已构建推送：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb…`（详见 §D.1/附录 D）|
 | **平台审核/提交** | ⬜ **未开始**，只能人工走浏览器（`docs/submit-image-runbook.md` + `platform-submit-opsheet.md`）——交接后第一优先级之一 |
 | **总入口单测（干净 clone）** | ⚠️ **151 passed / 1 failed**【实测 11-03】：`case_bench_stats` import 未入库的 `runs/bench_stats.py`（见缺口 #11）|
@@ -38,8 +38,8 @@
    `LLM_API_KEY` 为空必须大声失败、绝不回退自有 key。
 2. **平台实例配额**：每队**并发 1 个实例**（第 2 个 0.5s 被拒）；**每题 `start_instance` 硬上限 5 次**
    （用尽当天该题作废，11-03 批次 21% 的题因此未测到）。多题并行在平台侧被堵死。
-3. **最新 3 个修复 + CI 测试步还在未提交的工作树里**（多问题提交题号、部分解口径、QA 提交通道），
-   丢了它们等于丢了 11-03 的成绩来源（§B.4 有文件级清单）。
+3. **最新 3 个修复 + CI 测试步已于 2026-11-02 提交**（多问题提交题号、部分解口径、QA 提交通道；`773892d`），
+   它们就是 11-03 成绩的代码来源（§B.4 有文件级清单）。
 4. **README.md 有 6 处失真**（自称 18 项自测/12 步/30 万 token/方向未做等，全过时），
    一切数字以本文件与 docs/ 实测报告为准。
 5. **交接前必须处理安全项**：吊销此前暴露过的 GitHub PAT；轮换 `CTFY_TOKEN` 与模型 Key（§F.2）。
@@ -56,7 +56,7 @@
 | `tests/` 34 文件 | 总入口 `smoke.py` + 33 个独立套件（25 个免凭据 / 8 个要真实 `.env`）|
 | `config/agent.json` | 7 角色、预算、工具面（§D.2 当前真值）|
 | `roles/` 4 文件 | ai/misc 的外包交付格式角色卡（json + system.txt，与 config 零漂移由 smoke 硬断言）|
-| `docs/` 72 篇（跟踪）| 方案/审计/实测报告/操作单（附录 C 索引）；另有 6 篇最新报告**未入库**（§B.4）|
+| `docs/` 74 篇（全部跟踪）| 方案/审计/实测报告/操作单（附录 C 索引）；11-02 补入 6 篇最新报告（§B.4）|
 | `Dockerfile` + `.github/workflows/build-agent-image.yml` | 镜像构建（§C.3）；构建期含 ffuf/sqlmap 自检 |
 | `tools/` 6 脚本 | container_check / publish_image / verify_image / make_misc_kit / bench_misc_bank / misc_contract_selftest |
 | `run.cmd` / `.env.example` / `EDIT-LOCKS.md` / `PROGRESS.md` | 本地入口 / 凭据模板 / 跨会话文件锁协议 / 历史进度存档 |
@@ -241,7 +241,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 
 - `result.json` 核心 = `answers`（按 question id，平台代交）；写完 `exit 0`；`solved` 平台自算。
 - `task.json`（schema v2）：`run_mode` ∈ instance/qa/defence/engagement/awd。**当前只支持 instance**
-  （非 instance 写空 result + exit 0 = 静默 0 分）；QA 路径已在本地 CLI 修复但未提交（§B.4）。
+  （非 instance 写空 result + exit 0 = 静默 0 分）；QA 路径已修复并提交（§B.4）。
 - 硬约束：`internet_policy=deny`、`tcp_access=tls_sni`、单模型、实例并发 1 / 每题 start 5 次、
   同分先解出者靠前、3 段 session（11/15、11/21、11/22 各 10:00–20:00 CST）、agent 自主并发 ≤3。
 - 竞赛 id：TPCTF=`c0d8b4e3dd3b42c095d63d7dfa66431f`；练习库 CTFARENA=`4394a10aa5d24f97a1ec3301ca718a45`、
@@ -283,16 +283,16 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 
 | # | 缺口 | 状态（11-03）|
 |---|---|---|
-| 1 | 只支持 `run_mode=instance`；qa/defence/engagement/awd 会静默 0 分 | 部分：QA 已修（**未提交**，§B.4）；defence/engagement/awd 未动 |
-| 2 | CI 不跑任何单测（HEAD）| **修在工作树未提交**（workflow +两步）|
-| 3 | 33 个测试套件不在总入口 | 部分：25 个免凭据套件接进 CI（同上未提交）|
+| 1 | 只支持 `run_mode=instance`；qa/defence/engagement/awd 会静默 0 分 | 部分：QA 已修并提交（§B.4）；defence/engagement/awd 未动 |
+| 2 | CI 不跑任何单测 | **已修并提交**：workflow 加 总入口单测 / 25 个免凭据套件 / 密钥扫描 / 镜像姿态探针 |
+| 3 | 33 个测试套件不在总入口 | 部分：25 个免凭据套件接进 CI（同上，已提交）|
 | 4 | README 6 处失真（自称 18 项/12 步/30 万 token/方向未做…）| 未修；**以本文件为准** |
 | 5 | 本地跑题污染仓库根（`js/`、`work/capture.pcap`、`x/`、`%TEMP%/`）| 未修；本地跑题请显式锚定 run 目录/沙箱 |
 | 6 | XBOW 50 题 + 部分 CYBENCH 实例 `*.internal` 需 VPN，本机不可达 | 环境限制；这些库的 0% 不是能力结论 |
 | 7 | 网关忽略 `enable_thinking:false`（思考 token 照计费）| 网关侧，代码不可修；预算按含思考估算 |
-| 8 | 多问题题提交回落 `flag` → 422 丢分 | **已修未提交**（A/B 验证 CTFARENA-048 转 correct）|
-| 9 | 部分解被兜底翻成整题解出（完成度虚高）| **已修未提交** |
-| 10 | QA 提交通道不通 | **已修未提交**（MCQ 12/12）|
+| 8 | 多问题题提交回落 `flag` → 422 丢分 | **已修并提交**（A/B 验证 CTFARENA-048 转 correct）|
+| 9 | 部分解被兜底翻成整题解出（完成度虚高）| **已修并提交** |
+| 10 | QA 提交通道不通 | **已修并提交**（MCQ 12/12）|
 | **11** | **总入口 `case_bench_stats` 依赖未入库的 `runs/bench_stats.py` → 干净 clone 必红 1 条**【实测 11-03，本次交接新发现】| 未修；修法：把 `runs/bench_stats.py`（6 KB）挪进 `tools/` 并改 import，或在用例里 try/except ImportError 跳过并标注 |
 | 12 | capstone 未进镜像（`elfpeek disasm` 退化字节视图）| 待批：随 v5 重建加 `-u pip install capstone==5.0.3`（约 +4–6 MB，需 `importlib` 动态加载，`case_stdlib_only` 才不红）|
 
@@ -314,8 +314,8 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 
 ## G. 交接操作清单（按序执行）
 
-1. ☐ 转移 git 仓库访问权（v3 为当前线）；`git clone` 后核对 HEAD `89739a5`。
-2. ☐ **处置未提交 WIP**（§B.4）：review 后提交（或请原会话提交）——这是 11-03 成绩的代码来源。
+1. ☐ 转移 git 仓库访问权（v3 为当前线）；`git clone` 后核对 HEAD `773892d`。
+2. ☑ **处置未提交 WIP**（§B.4）：2026-11-02 已 review 并提交（`773892d`；160/0 与密钥扫描均通过）。
 3. ☐ 把 `runs/bench_stats.py` 挪进 `tools/` 修掉缺口 #11，总入口单测恢复全绿（干净 clone 口径）。
 4. ☐ 本地起环境：`.env` 填新令牌 → `run.cmd doctor` → `python tests/smoke.py`（记得 NO_PROXY）。
 5. ☐ **吊销旧 GitHub PAT、轮换 CTFY_TOKEN/模型 Key**（§F.2）。
@@ -336,7 +336,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
    也别为探配额反复启停（每题 5 次上限，触上限当天该题作废）。
 4. 统计一律按**结果行**（transcripts jsonl 每行一事件），不按文本出现次数（拦截文案被回显会翻倍，10-26 实测 35→23）。
 5. 不要提交 `:latest` / 覆盖已审核 tag；平台按 digest 钉死。
-6. **不要擅自 commit / revert 他人未提交改动**（WIP 处置走 §G.2）；改共享文件前查 `EDIT-LOCKS.md` 登记锁。
+6. **不要擅自 commit / revert 他人未提交改动**（B.4 的 WIP 已于 2026-11-02 提交，此后新增改动仍按此条）；改共享文件前查 `EDIT-LOCKS.md` 登记锁。
 7. 不要断言 CTFARENA-035 的凭据路线是死路（~1202 次全 401 只是候选覆盖不足，tags 指明方向对）。
 8. 未经批准不要改角色提示词内容（web/crypto/rev 的调教是资产）；改 config 的 roles 必须同步 `roles/*.json`
    （零漂移契约有 smoke 硬断言）。
@@ -365,7 +365,7 @@ Web：侦察预算（http_map ≤2 次/轮、侦察 ≤1/3 步数）、evidence 
 SQLi/上传靶场方法卡、multipart 原生支持（O-F，`files/form` 参数）。
 本地无法修复（登记）：003/004/012 平台占位或 VPN-only；capstone 随 v5（缺口 #12）。
 
-## 附录 C. docs/ 索引（分类；★=未入库需转移）
+## 附录 C. docs/ 索引（分类；★=接手先读的高价值篇目，均已入库）
 
 - **契约/规则**：`report-ctfy-rules.md`（平台规则调研）、`b1-adapter-plan.md`（容器适配+平台源码硬事实）、`submit-image-runbook.md` + `platform-submit-opsheet.md`（提交操作单）、`OPENING.txt`
 - **方案**：`plan-v1`（总纲）、`plan-concurrency`（集群 A/B）、`plan-cluster-a`、`plan-misc`、`extending-agent.md`（**新方向接入规范**）、`authoring-*`/`why-authoring`（出题线）
