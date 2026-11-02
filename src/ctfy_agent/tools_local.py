@@ -59,6 +59,8 @@ MAX_GREP_PATTERN_LEN = 256        # 正则长度上限（stdlib re 无超时，�
 MAX_GREP_PATTERNS = 6             # O1a：一次调用最多同时搜 6 个正则（多搜 = 少抓一轮）
 MAX_GREP_PER_PATTERN = 8          # O1a：多 pattern 模式下每个 pattern 命中上限
 SHELL_TIMEOUT_MAX = 120
+SHELL_HEAD_BYTES = 3000           # 子进程输出保留的头部字节（报错/用法提示通常在最前）
+SHELL_TAIL_BYTES = 9000           # 保留的尾部字节（模型看的是末尾，MAX_BODY=8000 从这里取）
 CACHE_MAX_ENTRIES = 16            # body 缓存条数上限（FIFO）
 CACHE_MAX_BYTES = 8 * 1024 * 1024  # body 缓存字节上限
 CACHE_MAX_ERROR_ENTRIES = 64      # O1b：403/404 保留上限（总容量 16 时由「优先逐非 200」生效，见 _cache_put）
@@ -90,6 +92,145 @@ CHAT_MAX_TURNS = 40               # 单个会话最多保留的消息条数（�
 CHAT_TIMEOUT = 20                 # 与 http_request 同量级；流式接口必须限时，否则挂死整步
 # 值得回给模型的响应头白名单（成功与 3xx/4xx/5xx 两条路径共用；401 的 WWW-Authenticate、302 的 Location 都要见得到）
 _INTERESTING_HEADERS = ("content-type", "location", "set-cookie", "server", "www-authenticate")
+
+
+# ---------- 子进程有界收割（P0-2） ----------
+
+class _BoundedSink:
+    """只保留「头 N 字节 + 尾 M 字节」的输出缓冲，内存占用与输出总量无关。"""
+
+    __slots__ = ("head", "tail", "total", "_head_bytes", "_tail_bytes")
+
+    def __init__(self, head_bytes: int, tail_bytes: int):
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+        self._head_bytes = max(0, head_bytes)
+        self._tail_bytes = max(0, tail_bytes)
+
+    def feed(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        room = self._head_bytes - len(self.head)
+        if room > 0:
+            self.head.extend(chunk[:room])
+            chunk = chunk[room:]
+        if chunk:
+            self.tail.extend(chunk)
+            overflow = len(self.tail) - self._tail_bytes
+            if overflow > 0:
+                del self.tail[:overflow]
+
+    def text(self) -> str:
+        head = self.head.decode("utf-8", errors="replace")
+        tail = self.tail.decode("utf-8", errors="replace")
+        omitted = self.total - len(self.head) - len(self.tail)
+        if omitted > 0:
+            return f"{head}\n…[中间省略 {omitted} 字节，可用重定向/offset 取回]…\n{tail}"
+        return head + tail
+
+
+def _kill_tree(process: subprocess.Popen) -> None:
+    """杀掉整棵进程树。
+
+    `shell=True` 时进程是 shell，真正干活的是它的子进程；只杀 shell 会留下孙进程继续占 pid
+    （平台 limits.pids=32，几次就爆）。POSIX 用独立进程组 killpg，Windows 用 taskkill /T。
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True, timeout=10,
+            )
+            if process.poll() is None:
+                process.kill()
+        else:
+            import signal  # noqa: PLC0415 - 仅 POSIX 需要
+
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                process.kill()
+    except Exception:  # noqa: BLE001 - 清理失败也要继续，不能反过来把工具调用搞崩
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def run_bounded(command: str, *, cwd: str, env: dict, timeout: float,
+                head_bytes: int = SHELL_HEAD_BYTES,
+                tail_bytes: int = SHELL_TAIL_BYTES) -> dict:
+    """流式执行 shell 命令并**有界**收割输出；超时杀整棵进程树。
+
+    为什么不用 `subprocess.run(capture_output=True, timeout=…)`：那是先把**全量输出灌进内存**
+    再切片，一条 `yes`/`dd`/超大日志就能把容器内存打满（平台 limits.memory=8g）；
+    而 timeout 只杀直接子进程，`sh -c "long & wait"` 这类孙进程会留下来继续占 pid。
+    这里改为：双线程边读边丢、只留头尾，内存恒为 head_bytes+tail_bytes。
+    """
+    kwargs: dict = {
+        "shell": True,
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        # 独立会话 = 独立进程组，超时时可以整组杀掉（含 shell 派生的所有后代）
+        kwargs["start_new_session"] = True
+
+    started = time.monotonic()
+    process = subprocess.Popen(command, **kwargs)  # noqa: S602 - 故意用 shell：模型要走管道/重定向
+    sinks = [_BoundedSink(head_bytes, tail_bytes), _BoundedSink(head_bytes, tail_bytes)]
+
+    def drain(stream, sink: _BoundedSink) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                sink.feed(chunk)
+        except Exception:  # noqa: BLE001 - 进程被杀时读端会抛，正常路径
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    readers = [
+        threading.Thread(target=drain, args=(stream, sinks[i]), daemon=True)
+        for i, stream in enumerate((process.stdout, process.stderr))
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(process)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass  # 杀不动也要往下走，至少把已收到的输出还回去
+    for reader in readers:
+        reader.join(timeout=3)
+
+    return {
+        "exit_code": -1 if timed_out else process.returncode,
+        "stdout": sinks[0].text(),
+        "stderr": sinks[1].text(),
+        "status": "TIMEOUT" if timed_out else "COMPLETED",
+        "bytes_total": sinks[0].total + sinks[1].total,
+        "duration": round(time.monotonic() - started, 3),
+    }
+
 
 # ---------- http_map：爬取 / 端点探测 ----------
 # 灵感来自 AIxCC 决赛队伍 Theori 的经验：「窄工具 > 通用 bash，精修工具集是最耗时的部分」，
@@ -2460,22 +2601,21 @@ class LocalTools:
         env.setdefault("PYTHONUTF8", "1")
 
         try:
-            completed = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                timeout=limit,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=str(cwd),
-                env=env,
+            # P0-2：有界收割 + 超时杀整棵进程树（旧写法是 capture_output 全量进内存后切片）
+            result = run_bounded(command, cwd=str(cwd), env=env, timeout=limit)
+        except OSError as exc:
+            raise ToolError(f"命令无法启动（{type(exc).__name__}: {exc}）: {command}") from None
+        if result["status"] == "TIMEOUT":
+            tail = (result["stdout"] or result["stderr"] or "")[-1500:]
+            raise ToolError(
+                f"命令超时（{limit}s，已杀掉整棵进程树）: {command}"
+                + (f"\n[超时前最后的输出]\n{tail}" if tail else "")
             )
-        except subprocess.TimeoutExpired:
-            raise ToolError(f"命令超时（{limit}s）: {command}") from None
         output = {
-            "exit_code": completed.returncode,
-            "stdout": (completed.stdout or "")[-MAX_BODY:],
-            "stderr": (completed.stderr or "")[-2000:],
+            "exit_code": result["exit_code"],
+            "stdout": (result["stdout"] or "")[-MAX_BODY:],
+            "stderr": (result["stderr"] or "")[-2000:],
         }
+        if result.get("bytes_total", 0) > MAX_BODY + 2000:
+            output["note"] = f"输出共 {result['bytes_total']} 字节，这里只保留首尾；需要全量请重定向到文件再分段读。"
         return json.dumps(output, ensure_ascii=False)

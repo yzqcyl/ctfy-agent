@@ -214,6 +214,20 @@ def run_case(tag: str, name: str, task: dict | None, env_extra: dict, expect_rea
     shutil.rmtree(host_dir, ignore_errors=True)
 
 
+def posture(tag: str) -> None:
+    """第 6 项（可选，--posture 开启）：平台姿态自检。
+
+    用「非 root / 只读根 / 断网 / 只有 /ctfy/work 可写」这套约束把镜像再跑一遍，
+    确认 dry_run 仍 exit 0 并写出 result.json。历史教训：v2 曾因 root 被协议检查直接拒收。
+    刻意做成 opt-in：本机不一定有可用引擎，默认不引入新的失败面。
+    """
+    script = ROOT / "tools" / "isolation_probe.py"
+    proc = sh([sys.executable, str(script), "--image", tag], timeout=600)
+    print((proc.stdout or "").strip())
+    if proc.returncode != 0:
+        raise Fail(f"平台姿态自检未通过（--posture）：\n{(proc.stderr or proc.stdout or '')[-1500:]}")
+
+
 def contract_cases(tag: str, local: bool = False) -> None:
     inst = {"schema_version": 2, "run_mode": "instance", "challenge": {"id": "ctf-smoke"}}
     # 4.1 dry run：最便宜的注册门
@@ -240,6 +254,8 @@ def main(argv=None) -> int:
     parser.add_argument("--local", action="store_true",
                         help="不碰 Docker：直接在本机跑那五条契约路径（验证脚本预期与适配层行为一致）")
     parser.add_argument("--max-mb", type=float, default=400.0, help="镜像体积上限 MB（默认 400）")
+    parser.add_argument("--posture", action="store_true",
+                        help="额外跑平台姿态自检（非 root/只读根/断网 下 dry_run 仍 exit 0）")
     args = parser.parse_args(argv)
 
     try:
@@ -265,6 +281,8 @@ def main(argv=None) -> int:
         check_nonroot(args.image)
         check_cwd_independent(args.image)
         contract_cases(args.image)
+        if args.posture:
+            posture(args.image)
 
         print("\n全部通过 ✓ 镜像可以直接上传。")
         return 0

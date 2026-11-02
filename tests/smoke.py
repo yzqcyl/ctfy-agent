@@ -1239,6 +1239,335 @@ def case_ensure_instance(tmp: Path) -> None:
         server.server_close()
 
 
+def case_instance_guard(tmp: Path) -> None:
+    """P0-1：实例守卫——清扫残留、宽限期/未知年龄保护、配额见底不投机重试。
+
+    背景（实测）：配额只有 1，进程被 kill 时 finally 不跑 → 残留实例占位 → start 报限流 →
+    原地重试 → 每题 5 次上限烧光（11-03 有 21% 的题这样作废）。
+    """
+    from ctfy_agent.instance_guard import (
+        instance_challenge_id, reap, start_remaining, summarize,
+    )
+
+    class ReapPlatform:
+        def __init__(self, items):
+            self.items = list(items)
+            self.stopped: list[str] = []
+
+        def try_resolve(self, kind):
+            return "list_instances" if kind == "list_instances" else None
+
+        def list_instances(self):
+            return self.items
+
+        def stop_instance(self, instance_id):
+            self.stopped.append(instance_id)
+            return {"ok": True}
+
+    items = [
+        {"id": "i-orphan-old", "challenge_id": "other-01", "created_at": 1.0},       # 老：该清
+        {"id": "i-orphan-iso", "challenge": {"id": "other-02"},
+         "created_at": "2026-01-01T00:00:00+00:00"},                                  # ISO 时间：该清
+        {"id": "i-keeping", "challenge_id": "web-01", "created_at": 1.0},             # 本题：留
+        {"id": "i-protected", "challenge_id": "sibling-01", "created_at": 1.0},       # 保护名单：留
+        {"id": "i-no-age", "challenge_id": "other-03"},                               # 无时间戳：不动
+    ]
+    pa = ReapPlatform(items)
+    guard = reap(pa, keep="web-01", protect=("sibling-01",), grace_seconds=120)
+    assert instance_challenge_id(items[1]) == "other-02", "challenge 为 dict 时要能取出 id"
+    assert sorted(pa.stopped) == ["i-orphan-iso", "i-orphan-old"], pa.stopped
+    assert {x["id"] for x in guard["kept"]} == {"i-keeping", "i-protected"}, guard["kept"]
+    assert [x["id"] for x in guard["skipped_unknown_age"]] == ["i-no-age"], guard["skipped_unknown_age"]
+
+    # 读取列表失败时不得抛异常（清扫是尽力而为）
+    class BrokenPlatform(ReapPlatform):
+        def list_instances(self):
+            raise RuntimeError("network down")
+
+    broken = reap(BrokenPlatform([]), keep="web-01")
+    assert broken["ok"] is False and "network down" in broken["error"], broken
+    assert summarize(broken).startswith("[实例守卫]"), summarize(broken)
+
+    # --- 配额读数 ---
+    store = Store(tmp / "ig_quota").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    assert start_remaining(store, "web-01", 5) == 5
+    for _ in range(4):
+        store.record_call("web-01", "start_instance", 5)
+    assert start_remaining(store, "web-01", 5) == 1
+
+    # --- 自愈路径：start 失败 → 清扫残留 → 重试一次 ---
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp)
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store2 = Store(tmp / "ig_recover").load()
+        store2.challenges.clear()
+        seed_challenge(store2)
+        live = [{"id": "i-orphan", "challenge_id": "other-01", "created_at": 1.0}]
+        stopped: list[str] = []
+        platform.try_resolve = lambda kind: {
+            "start_instance": "start_instance",
+            "list_instances": "list_instances",
+            "stop_instance": "stop_instance",
+        }.get(kind)
+        platform.call_text = lambda name, args=None, **kw: (
+            json.dumps(live) if name == "list_instances" else "{}"
+        )
+        platform.list_instances = lambda: live
+        platform.stop_instance = lambda iid: stopped.append(iid) or {"ok": True}
+
+        solver = Solver(config, platform, fake_llm.ScriptedLLM([]), store2)
+        attempts: list[str] = []
+
+        def flaky_backoff(cid):
+            attempts.append(cid)
+            return None if len(attempts) == 1 else {"id": "i-new", "challenge_id": "web-01"}
+
+        solver._start_with_backoff = flaky_backoff
+        info = solver._ensure_instance("web-01")
+        assert info and info.get("id") == "i-new", info
+        assert stopped == ["i-orphan"], f"应先清残留再重试，实际停掉：{stopped}"
+        assert len(attempts) == 2, attempts
+        assert store2.require("web-01").instance_id == "i-new"
+
+        # --- 配额见底：不再投机重试，也不乱扫 ---
+        store3 = Store(tmp / "ig_lastchance").load()
+        store3.challenges.clear()
+        seed_challenge(store3)
+        for _ in range(4):
+            store3.record_call("web-01", "start_instance", 5)
+        stopped3: list[str] = []
+        platform.stop_instance = lambda iid: stopped3.append(iid) or {"ok": True}
+        solver3 = Solver(config, platform, fake_llm.ScriptedLLM([]), store3)
+        tries3: list[str] = []
+
+        def always_none(cid):
+            tries3.append(cid)
+            return None
+
+        solver3._start_with_backoff = always_none
+        assert solver3._ensure_instance("web-01") is None
+        assert len(tries3) == 1, f"配额只剩 1 次时不应重试，实际 {len(tries3)} 次"
+        assert stopped3 == [], f"不应在配额见底时清扫（可能误伤别人）：{stopped3}"
+        ok("实例守卫：清扫残留 + 宽限/未知年龄保护 + 自愈重试 + 配额见底不投机")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def case_bounded_run(tmp: Path) -> None:
+    """P0-2：子进程有界收割——大输出不驻留内存；超时杀整棵进程树（孙进程不许留）。"""
+    from ctfy_agent.tools_local import _BoundedSink, run_bounded
+
+    # --- 1) 缓冲语义：头尾各留、中间标注省略 ---
+    sink = _BoundedSink(1000, 2000)
+    sink.feed(b"A" * 5000)
+    sink.feed(b"B" * 5000)
+    assert sink.total == 10000, sink.total
+    assert len(sink.head) == 1000 and len(sink.tail) == 2000, (len(sink.head), len(sink.tail))
+    text = sink.text()
+    assert text.startswith("A") and text.endswith("B") and "中间省略 7000 字节" in text, text[:200]
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
+    # --- 2) 20MB 输出：返回体有界，且字节数被如实记账 ---
+    big = run_bounded(
+        f'"{sys.executable}" -c "import sys;sys.stdout.write(chr(120)*20000000)"',
+        cwd=str(tmp), env=env, timeout=120,
+    )
+    assert big["exit_code"] == 0 and big["status"] == "COMPLETED", big["status"]
+    assert big["bytes_total"] >= 19_000_000, big["bytes_total"]
+    assert len(big["stdout"]) <= 13000, f"输出没被截住：{len(big['stdout'])} 字符"
+
+    # --- 3) 超时：杀掉的是整棵树，孙进程不能在超时后继续写盘 ---
+    marker = tmp / "leaked_by_orphan.txt"
+    if os.name == "nt":
+        command = f'ping -n 4 127.0.0.1 >nul && echo late>{marker}'
+    else:
+        command = f"sleep 3 && echo late > {marker}"
+    started = __import__("time").monotonic()
+    killed = run_bounded(command, cwd=str(tmp), env=env, timeout=1)
+    assert killed["status"] == "TIMEOUT" and killed["exit_code"] == -1, killed
+    assert __import__("time").monotonic() - started < 12, "超时没有及时返回"
+    __import__("time").sleep(3.5)
+    assert not marker.exists(), "孙进程还在跑：进程树没有被杀干净"
+    ok("子进程有界收割：大输出不驻留、超时杀整棵进程树")
+
+
+def case_wall_clock(tmp: Path) -> None:
+    """P0-3：墙钟刹车——到点即收口、reason=wall_clock、且一次模型请求都不发。
+
+    背景：token/调用数都拦不住「慢慢磨到 session 结束」。比赛每段 10:00–20:00，到点没交就是白跑。
+    """
+    import time as _time
+
+    from ctfy_agent.budget import Budget, BudgetExceeded, apply_deadline, stop_reason_of
+    from ctfy_agent.progress import BudgetPhase
+
+    # --- 1) 闸门与分类：token 还有 100 万也要按时间停 ---
+    gate = Budget(max_tokens=1_000_000, max_calls=999)
+    gate.set_deadline(at=_time.time() - 1)
+    try:
+        gate.check()
+        raise AssertionError("到期却没拦住")
+    except BudgetExceeded as exc:
+        assert exc.kind == "wall_clock", exc.kind
+        assert stop_reason_of(exc) == "wall_clock", stop_reason_of(exc)
+    assert gate.total_tokens == 0, "闸门不该有任何 token 消耗"
+
+    # --- 2) 配置解析：三种写法可用，写错格式绝不把题卡死 ---
+    assert apply_deadline(Budget(), {"deadline_minutes": 30}).seconds_left > 1700
+    assert apply_deadline(Budget(), {"deadline_at": "2026-11-21T20:00:00+08:00"}).deadline_clock == "20:00"
+    assert apply_deadline(Budget(), {"deadline_at": "not-a-date"}).deadline_at is None
+    assert apply_deadline(Budget(), {}).deadline_at is None, "默认必须不限（旧行为逐字不变）"
+
+    # --- 3) 提示行：只设墙钟（无 token 上限）也要让模型看见剩余时间 ---
+    line = BudgetPhase.line(apply_deadline(Budget(), {"deadline_minutes": 12}))
+    assert line and "剩余 12 分钟" in line, line
+
+    # --- 4) 专家路径：到期后第一步就停，零模型请求，报告写明"时间到" ---
+    store = Store(tmp / "wallclock").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    config = make_config("http://127.0.0.1:1/", tmp)
+    llm = fake_llm.ScriptedLLM([{"content": "不该被调用"}])
+    llm.budget = Budget(max_tokens=1_000_000).set_deadline(at=_time.time() - 1)
+    solver = Solver(config, CtfyPlatform(config.mcp_url, config.token), llm, store)
+    result = solver.run_role(
+        "web-01", role="web", llm=llm, system="sys", task="task", specs=[], max_steps=3,
+    )
+    assert result["reason"] == "wall_clock", result
+    assert "时间到" in result["report"], result["report"]
+    assert llm.calls == 0, f"到期后不该再发模型请求，实际发了 {llm.calls} 次"
+    ok("墙钟刹车：到期即收口、reason=wall_clock、零请求")
+
+
+def case_input_fingerprint(tmp: Path) -> None:
+    """P1-1：题面指纹——题面被改过就丢掉 checkpoint，不拿失效前提续跑。"""
+    from ctfy_agent import checkpoint
+
+    store = Store(tmp / "fp").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    challenge = store.require("web-01")
+    fp_before = challenge.fingerprint()
+    assert len(fp_before) == 32 and fp_before == challenge.fingerprint(), "指纹必须稳定"
+
+    path = tmp / "fp" / "ckpt.json"
+    from ctfy_agent.companion import PlanTrack
+    from ctfy_agent.ledger import Ledger
+
+    checkpoint.save(path, challenge_id="web-01", next_round=2, messages=[{"role": "user", "content": "x"}],
+                    reports=["r"], ledger=Ledger(), plan=PlanTrack(), fingerprint=fp_before)
+    # 同指纹 → 可续跑；不同指纹 → 丢弃
+    assert checkpoint.load(path, challenge_id="web-01", fingerprint=fp_before) is not None
+    challenged = store.require("web-01")
+    challenged.description = challenged.description + "（平台补充：注意 X-Forwarded-Host）"
+    store.save()
+    fp_after = store.require("web-01").fingerprint()
+    assert fp_after != fp_before, "题面改了指纹却没变"
+    assert checkpoint.load(path, challenge_id="web-01", fingerprint=fp_after) is None, \
+        "题面变了还允许续跑 = 拿失效前提往下推"
+
+    # 升级前的旧 checkpoint（没有 fingerprint 字段）→ 放行，避免升级后一律重跑
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    legacy.pop("fingerprint", None)
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    assert checkpoint.load(path, challenge_id="web-01", fingerprint=fp_after) is not None
+    # 不给指纹（调用方没传）→ 旧行为：只校验题号
+    assert checkpoint.load(path, challenge_id="web-01") is not None
+    ok("题面指纹：题面变更即丢弃 checkpoint，旧格式向后兼容")
+
+
+def case_auto_order(tmp: Path) -> None:
+    """P2-1：批次选题按「已解队伍数」降序——免费且最准的难度指标，比按题号或分值都划算。"""
+    from ctfy_agent.auto import run_auto
+
+    store = Store(tmp / "autoorder").load()
+    store.challenges.clear()
+    rows = [
+        ("A", 0, "hard", 500),      # 0 队解出的高分题：最后才碰
+        ("B", 200, "easy", 100),    # 200 队解出：先打
+        ("C", 50, "medium", 300),
+        ("D", None, "easy", 150),   # 平台没给 solve 数：按中等处理，排在已知的后面
+    ]
+    for cid, solves, difficulty, points in rows:
+        store.upsert({"id": cid, "name": cid, "category": "web", "description": "x"})
+        item = store.require(cid)
+        item.solves_count = solves
+        item.difficulty = difficulty
+        item.points = points
+    store.save()
+
+    seen: list[str] = []
+
+    def solve(cid: str) -> dict:
+        seen.append(cid)
+        return {"submitted": False, "reason": "step_limit", "tokens_spent": 1}
+
+    run_auto(store=store, solve=solve, statuses=("new",), order="score")
+    assert seen == ["B", "C", "D", "A"], f"solve 数降序没生效：{seen}"
+
+    seen.clear()
+    run_auto(store=store, solve=solve, statuses=("new",), order="id")
+    assert seen == ["A", "B", "C", "D"], f"order=id 应退回按题号：{seen}"
+    ok("批次选题：solve 数降序（score）/ 按题号（id）")
+
+
+def case_handoff_and_rejected(tmp: Path) -> None:
+    """P2-2 交接卡五要素 + P2-4 已判错答案回显。"""
+    from ctfy_agent import handoff
+
+    store = Store(tmp / "p2fusion").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    challenge = store.require("web-01")
+    summary = {
+        "challenge_id": "web-01",
+        "submitted": False,
+        "reason": "budget_exhausted",
+        "facts": ["/api/team 返回 3 个用户名", "/api/company 325B"],
+        "dead_ends": ["POST /api/login 18 个候选全 401"],
+        "candidates": ["FLAG{candidate_only}"],
+        "tail_action": "http_request",
+        "budget": {"total_tokens": 12345, "calls": 40},
+        "transcript": str(tmp / "run" / "transcripts" / "web-01.jsonl"),
+        "plan": {"changes": 2},
+    }
+    text = handoff.render(challenge, summary)
+    for section in ("## 1. 已确证事实", "## 2. 已否证路径（别重复）",
+                    "## 3. 精确卡点", "## 4. 下一步建议", "## 5. 产物路径"):
+        assert section in text, f"缺段落：{section}\n{text[:400]}"
+    assert "18 个候选全 401" in text and "FLAG{candidate_only}" in text, text[:600]
+    assert "已解" not in text.split("\n")[0], "已解出的题不该再要求接续"
+
+    path = handoff.write(tmp / "run", challenge, summary)
+    assert path and path.is_file() and path.parent.name == "handoff", path
+    assert "budget_exhausted" in path.read_text(encoding="utf-8")
+
+    # 已判错值：去重保序 + 回显
+    store.note_rejected("web-01", "FLAG{a}")
+    store.note_rejected("web-01", "FLAG{b}")
+    store.note_rejected("web-01", "FLAG{a}")
+    assert store.require("web-01").rejected_answers == ["FLAG{b}", "FLAG{a}"], \
+        store.require("web-01").rejected_answers
+    for i in range(12):  # 上限 8 条，只留最近
+        store.note_rejected("web-01", f"FLAG{{n{i}}}")
+    assert len(store.require("web-01").rejected_answers) == 8, store.require("web-01").rejected_answers
+
+    config = make_config("http://127.0.0.1:1/", tmp)
+    solver = Solver(config, CtfyPlatform(config.mcp_url, config.token), fake_llm.ScriptedLLM([]), store)
+    hint = solver._rejected_hint("web-01")
+    assert "已判错" in hint and "FLAG{n11}" in hint, hint
+    assert solver._rejected_hint("不存在的题") == "", "读不到题时不该抛，也不该编提示"
+    ok("交接卡五要素落盘 + 已判错答案（去重/封顶/回显）")
+
+
 def case_windows_shell_guard(tmp: Path) -> None:
     """Fix 4b：Windows 上 Unix-only 内建命令/heredoc/单引号被明确拦截并指回正路。"""
     if os.name != "nt":
@@ -1351,6 +1680,111 @@ def case_multi_question(tmp: Path) -> None:
 
     assert Crew._question_ids({"flag_solves": {"a": 1, "b": 2}}) == ["a", "b"]
     ok("多问题题：brief 列出全部题号并提示逐题提交；单问题不加噪音；取题失败静默退化")
+
+
+def case_submit_question_id(tmp: Path) -> None:
+    """多问题题：submit 省略 question_id 时不能落到平台默认 "flag"（实测 CTFARENA-048 丢分）。
+
+    真实故障链：agent 用 verify_answer(question_id=user) 判过 true，随后 submit(answer=...)
+    不带题号 → 平台按默认 "flag" 提交 → 422 unknown_question_id（本题真实题号只有
+    user/admin/techniques）→ 正确答案被丢弃，bench 记成未解。
+    """
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        platform = CtfyPlatform(url, "pf_test_token_123456")
+        platform.connect()
+        # 假服务没有这两个工具，注入带 question_id 的 schema 以贴近真实平台
+        qid_schema = {
+            "type": "object",
+            "properties": {"instance_id": {}, "answer": {}, "question_id": {}},
+        }
+        platform._by_name["verify_answer"] = {"name": "verify_answer", "inputSchema": qid_schema}
+        platform._by_name["submit_answer"] = {"name": "submit_answer", "inputSchema": qid_schema}
+        platform._active_challenge_id = "CTFARENA-048"
+        platform._question_meta["CTFARENA-048"] = {
+            "user": {"mode": "flag", "prompt": "root welcome"},
+            "admin": {"mode": "flag", "prompt": "admin console"},
+            "techniques": {"mode": "flag", "prompt": "n techniques"},
+        }
+
+        # 多问题且没验过：不猜，保持不带题号（避免把答案错投到别的题上）
+        assert platform.preferred_question_id() == ""
+        assert "question_id" not in platform._repair_runtime_args("submit_answer", {"answer": "x"})
+
+        # verify_answer 判 true 之后，那个题号成为默认提交目标
+        platform._learn_from_result(
+            "verify_answer",
+            {"instance_id": "i", "answer": "x", "question_id": "user"},
+            {"content": [{"type": "text", "text": "true"}]},
+        )
+        assert platform.preferred_question_id() == "user"
+        repaired = platform._repair_runtime_args("submit_answer", {"answer": "x"})
+        assert repaired.get("question_id") == "user", repaired
+
+        # 判 false 不能污染默认题号
+        platform._learn_from_result(
+            "verify_answer",
+            {"instance_id": "i", "answer": "bad", "question_id": "admin"},
+            {"content": [{"type": "text", "text": "false"}]},
+        )
+        assert platform.preferred_question_id() == "user"
+
+        # 单问题题：即使没验过也直接用它，别退回 "flag"
+        platform._active_challenge_id = "UPLOADLABS-021"
+        platform._question_meta["UPLOADLABS-021"] = {"outage": {"mode": "flag"}}
+        assert platform.preferred_question_id() == "outage"
+        assert platform._repair_runtime_args("submit_answer", {})["question_id"] == "outage"
+        ok("多问题题默认题号：verify 通过后沿用该题号，单问题题不回落到 flag")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def case_qa_submit(tmp: Path) -> None:
+    """知识问答题（MCQ）：提交走 submit_qa_answer(challenge_id, competition_id)，不碰实例。
+
+    真实故障链（实测 SECQA-0001，模型答对 D 却 0 分）：qa 题的 category 不是 web，
+    is_qa_only 从来没入库 → submit 走 submit_answer 的 instance 分支 → 被
+    「本题还没有实例」挡死；补上 is_qa_only 后又漏了 competition_id → 400。
+    """
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp)
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        platform._by_name["submit_qa_answer"] = {
+            "name": "submit_qa_answer",
+            "inputSchema": {"type": "object", "properties": {
+                "competition_id": {}, "challenge_id": {}, "answer": {}, "question_id": {}}},
+        }
+        store = Store(tmp / "qa").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        challenge = store.require("web-01")
+        challenge.is_qa_only = True
+        store.meta["competition_id"] = "COMP-1"
+        store.save()
+
+        solver = Solver(config, platform, fake_llm.ScriptedLLM([]), store)
+        calls: list[tuple[str, dict]] = []
+
+        def fake_call(name, arguments=None, **kwargs):
+            calls.append((name, dict(arguments or {})))
+            return {"content": [{"type": "text", "text": '{"correct": true}'}]}
+
+        platform.call_raw = fake_call
+        text, accepted = solver._submit({"answer": "D"}, "web-01")
+
+        assert accepted is True, text
+        assert calls and calls[0][0] == "submit_qa_answer", calls
+        payload = calls[0][1]
+        assert payload.get("competition_id") == "COMP-1", payload
+        assert payload.get("challenge_id") == "web-01", payload
+        assert "instance_id" not in payload, payload
+        ok("QA 题提交：走 submit_qa_answer 且带 competition_id，不需要实例")
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def case_stdlib_only(tmp: Path) -> None:  # noqa: ARG001 - 签名与其它用例统一
@@ -4108,12 +4542,20 @@ def main() -> int:
         ("run_role_synthesis", case_run_role_synthesis),
         ("rescue_report", case_rescue_report),
         ("ensure_instance", case_ensure_instance),
+        ("instance_guard", case_instance_guard),
+        ("bounded_run", case_bounded_run),
+        ("wall_clock", case_wall_clock),
+        ("input_fingerprint", case_input_fingerprint),
+        ("auto_order", case_auto_order),
+        ("handoff_and_rejected", case_handoff_and_rejected),
         ("windows_shell_guard", case_windows_shell_guard),
         ("prompt_hints", case_prompt_hints),
         ("limit_and_kwargs", case_limit_and_kwargs),
         ("prior_digest", case_prior_digest),
         ("challenge_meta", case_challenge_meta),
         ("multi_question", case_multi_question),
+        ("submit_question_id", case_submit_question_id),
+        ("qa_submit", case_qa_submit),
         ("stdlib_only", case_stdlib_only),
         ("hint_scope", case_hint_scope),
         ("ledger", case_ledger),

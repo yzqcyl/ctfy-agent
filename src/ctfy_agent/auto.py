@@ -18,11 +18,34 @@ from typing import Callable, Iterable
 
 DEFAULT_STATUSES = ("new", "parsed", "instance_up", "stalled")
 
+# 难度兜底：平台没给 difficulty 时按这个排（越小越先打）
+_DIFFICULTY_RANK = {"easy": 0, "1": 0, "medium": 1, "2": 1, "hard": 2, "3": 2}
 
-def _select(store, statuses: Iterable[str], limit: int) -> list:
+
+def _score(challenge) -> tuple:
+    """选题优先级（越小越先打）。依据：实战里「已解队伍数」是免费且最准的难度指标。
+
+    排序口径（P2-1）：
+      1. **solve 数降序** —— 200 队解出的题远比 3 队解出的题更可能在预算内拿下；
+      2. 分值降序 —— 动态计分赛事里高分题越早交越值钱；
+      3. 难度升序 —— 平台标了 easy 的先打；
+      4. 题号升序 —— 兜底确定性（同分同难度时不要每跑一次换一个顺序）。
+    缺 solve 数（None）按"中等"处理，不给它编排上的特权也不歧视。
+    """
+    solves = getattr(challenge, "solves_count", None)
+    solves_key = -1 if solves is None else -int(solves)   # 有 solve 数的排前面，且多的更前
+    points = int(getattr(challenge, "points", 0) or 0)
+    rank = _DIFFICULTY_RANK.get(str(getattr(challenge, "difficulty", "") or "").lower(), 1)
+    return (solves_key, -points, rank, str(getattr(challenge, "id", "")))
+
+
+def _select(store, statuses: Iterable[str], limit: int, order: str = "score") -> list:
     wanted = set(statuses)
     rows = [c for c in store.challenges.values() if getattr(c, "status", None) in wanted]
-    rows.sort(key=lambda c: getattr(c, "id", ""))
+    if order == "id":
+        rows.sort(key=lambda c: getattr(c, "id", ""))
+    else:
+        rows.sort(key=_score)
     if limit and limit > 0:
         return rows[:limit]
     return rows
@@ -36,11 +59,12 @@ def run_auto(
     limit: int = 0,
     max_total_tokens: int = 0,
     max_failures: int = 3,
+    order: str = "score",
     on_event: Callable[[str, dict], None] | None = None,
 ) -> dict:
     """依次解题。solve(challenge_id) 返回带 budget/usage 的摘要。"""
     emit = on_event or (lambda kind, payload=None: None)
-    rows = _select(store, statuses, limit)
+    rows = _select(store, statuses, limit, order)
     emit("plan", {"candidates": [getattr(c, "id", "") for c in rows]})
 
     results: list[dict] = []

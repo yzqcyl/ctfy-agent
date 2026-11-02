@@ -149,6 +149,7 @@ class Challenge:
     tags: list[str] = field(default_factory=list)   # 如 weak_password / osint / authentication_failures
     difficulty: str = ""                            # easy / medium / hard，也可能是数字
     solves_count: int | None = None                 # 已解队伍数（难度与方向的客观参照）
+    is_qa_only: bool = False                        # 纯知识问答/MCQ：提交走 submit_qa_answer，不需要实例
     status: str = "new"
     attempts: int = 0
     solve_attempts: list = field(default_factory=list)  # 集群-B 解题尝试记录（跨进程持久化，每项一次尝试的摘要）
@@ -158,6 +159,9 @@ class Challenge:
     oracle_calls: int = 0         # verify_answer 探针次数（不记账的免费试答案）
     tokens: dict = field(default_factory=dict)  # 累计用量（跨进程继承，费用刹车用）
     flags_tried: list[str] = field(default_factory=list)  # flag 的 sha256 前缀
+    # P2-4：平台判定为错的**明文**答案（只留最近几条，用于回显「别再交这些」）。
+    # 与 flags_tried 的分工：那个是幂等去重（哈希、永久），这个是给模型的负样本提示。
+    rejected_answers: list[str] = field(default_factory=list)
     flag_value: str = ""          # 只在校验通过后记录
     next_question_id: str = ""    # 多问题题：下一道待提交的 question_id（per-challenge 隔离，不写 config.extra）
     notes: list[str] = field(default_factory=list)
@@ -184,6 +188,20 @@ class Challenge:
         item.difficulty = normalize_difficulty(item.difficulty)
         item.solves_count = normalize_solves(item.solves_count)
         return item
+
+    def fingerprint(self) -> str:
+        """题目输入的指纹（P1-1）：题号 + 描述的 sha256。
+
+        用途：断点续跑前比对。附件/题面被平台改过（换包、补说明、复用了同名题号）时，
+        旧上下文里的结论已经不可信，继续续跑等于拿错前提往下推——宁可重跑。
+
+        刻意**不含**实例附件：每题实例都是新生成的（slug/flag 随实例变），
+        把它算进去会让每次续跑都判不一致，指纹就失去意义了。
+        """
+        import hashlib  # noqa: PLC0415 - 只在这一处用
+
+        material = f"{self.id}\n{self.description or ''}".encode("utf-8")
+        return hashlib.sha256(material).hexdigest()[:32]
 
     def facets(self) -> str:
         """题型线索单行文本：`难度 easy | 已解 10 队 | tags: weak_password, osint`。
@@ -355,6 +373,23 @@ class Store:
 
     def can_submit(self, challenge_id: str, limit: int) -> bool:
         return self.require(challenge_id).attempts < limit
+
+    def note_rejected(self, challenge_id: str, answer: str, cap: int = 8) -> None:
+        """记下平台判错的答案（P2-4）。只保留最近 cap 条，去重保序。
+
+        提交次数只有 3 次，一次错交就是 1/3 的预算。把"已经交过的错答案"回显给模型，
+        比事后在报告里解释便宜得多——它至少不会把同一个猜测再包装一遍交上来。
+        """
+        text = str(answer or "").strip()
+        if not text:
+            return
+        with _lock_exclusive(self._lock_path()):
+            item = self.require(challenge_id)
+            rows = [x for x in item.rejected_answers if x != text]
+            rows.append(text)
+            item.rejected_answers = rows[-max(1, int(cap)):]
+            item.touch()
+            self.save()
 
     # ---------- 写操作频控 ----------
 

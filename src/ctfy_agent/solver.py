@@ -18,7 +18,7 @@ import time
 from json import JSONDecodeError
 
 from .artifacts import DOWNLOAD_TOOLS, persist_download
-from .budget import Budget, BudgetExceeded
+from .budget import Budget, BudgetExceeded, apply_deadline, stop_reason_of
 from .companion import PlanTrack, parse_companion
 from .config import Config
 from .ctxcompress import FactsBoard, shrink_message_text, with_facts
@@ -539,6 +539,36 @@ class Solver:
         self.on_event("instance_started", {"challenge_id": challenge_id, "instance": info})
         return info
 
+    def _recover_instance_slot(self, challenge_id: str, start_name: str) -> dict | None:
+        """start 失败后的自愈：先清掉「不属于本题」的残留实例，再重试一次。
+
+        为什么不是原地重试：11-03 的失败链是「上一次进程被 kill → 残留实例占住唯一槽位 →
+        start 报 upstream 限流 → 原地重试 → 每题 5 次硬上限烧光，当天该题作废」。
+        清扫是这条链上唯一有效的动作，原地重试只会加速烧额度。
+        只在**剩余配额 ≥2** 时执行（留一次给正常流程），且不设保护名单之外的例外。
+        """
+        from .instance_guard import reap, start_remaining, summarize  # noqa: PLC0415 - 只在失败路径需要
+
+        remaining = start_remaining(self.store, challenge_id, self.config.instance_ops_limit)
+        if remaining < 2:
+            self.on_event(
+                "instance_guard",
+                {"note": f"start 配额仅剩 {remaining} 次，放弃清扫重试（避免当天作废）"},
+            )
+            return None
+        guard = reap(
+            self.platform,
+            keep=challenge_id,
+            protect=tuple(self.config.extra.get("instance_reap_protect") or ()),
+            grace_seconds=float(self.config.extra.get("instance_recovery_grace_seconds", 60) or 60),
+        )
+        self.on_event("instance_guard", {"note": summarize(guard), "detail": guard})
+        if not guard.get("stopped"):
+            return None  # 槽位不是被残留实例占着，重试没有意义
+        if not self.store.record_call(challenge_id, start_name, self.config.instance_ops_limit):
+            return None
+        return self._start_with_backoff(challenge_id)
+
     def _ensure_instance(self, challenge_id: str) -> dict | None:
         """幂等地确保本题有一个运行中实例：已有复用；没有先查平台再 start（带退避）。
 
@@ -556,6 +586,8 @@ class Solver:
             if not self.store.record_call(challenge_id, start_name, self.config.instance_ops_limit):
                 return None
             info = self._start_with_backoff(challenge_id)
+            if not info:
+                info = self._recover_instance_slot(challenge_id, start_name)
         if not info:
             return None
         return self._register_instance(challenge_id, info)
@@ -672,15 +704,35 @@ class Solver:
         if not answer:
             return "[提交失败] 缺少 answer/flag 参数", False
 
-        submit_name = self.platform.resolve("submit_flag")
+        challenge = self.store.require(challenge_id)
+        # 知识问答/MCQ 题没有实例，提交必须走 submit_qa_answer(challenge_id, …)。
+        # 否则会落进 instance 分支，被「本题还没有实例」拦死（实测 SECQA-0001 答对 D 却提交不了）。
+        qa_only = bool(getattr(challenge, "is_qa_only", False)) or any(
+            str(t).lower() in ("qa", "mcq", "single_select") for t in (challenge.tags or [])
+        )
+        submit_name = (self.platform.try_resolve("submit_qa") if qa_only else None) \
+            or self.platform.resolve("submit_flag")
         props = self.platform.prop_names(submit_name)
-        instance_mode = "instance_id" in props
-        question_id = str(args.get("question_id") or self.store.require(challenge_id).next_question_id or "flag")
+        instance_mode = "instance_id" in props and not qa_only
+        question_id = str(
+            args.get("question_id")
+            or challenge.next_question_id
+            or self.platform.preferred_question_id("submit_answer")
+            or "flag"
+        )
+
+        if qa_only and question_id == "flag":
+            question_id = ""  # QA 题的题号不是 flag，交给平台默认，别硬塞瞎猜的值
 
         payload = dict(args)
         payload["answer" if "answer" in props else "flag"] = answer
-        if "question_id" in props:
+        if "question_id" in props and question_id:
             payload["question_id"] = question_id
+        if "competition_id" in props:
+            # submit_qa_answer 等 QA 工具按 (competition_id, challenge_id) 定位，缺一个就 400
+            comp = str((getattr(self.store, "meta", {}) or {}).get("competition_id") or "")
+            if comp:
+                payload["competition_id"] = comp
         if instance_mode:
             instance_id = self.store.require(challenge_id).instance_id
             if not instance_id:
@@ -742,7 +794,23 @@ class Solver:
             self.on_event("flag_accepted", {"challenge_id": challenge_id})
             return f"{text}\n\n[判定] 平台确认该答案通过。", True
         verdict_text = "判定为未通过" if accepted is False else "无法判定是否通过"
-        return f"{text}\n\n[判定] {verdict_text}，继续换思路。", False
+        if accepted is False:
+            # P2-4：记下这次错交，并回显全部已判错值——提交次数只有 3 次，错交一次就少 1/3
+            self.store.note_rejected(challenge_id, answer)
+        return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
+
+    def _rejected_hint(self, challenge_id: str) -> str:
+        """回显「平台已判错的答案」（P2-4）。读不到就什么都不加，绝不因此中断提交。"""
+        try:
+            tried = list(self.store.require(challenge_id).rejected_answers or [])
+        except Exception:  # noqa: BLE001
+            return ""
+        if not tried:
+            return ""
+        return (
+            f"\n\n[已判错] 以下 {len(tried)} 个答案平台已判定为错，不要再交、也不要只改一两个字符："
+            + " / ".join(tried[-8:])
+        )
 
     # ---------- 主循环 ----------
 
@@ -881,6 +949,8 @@ class Solver:
             label=challenge_id,
             cache_discount=bool(self.config.extra.get("budget_cache_discount")),
         ).load(challenge.tokens)
+        # P0-3 墙钟刹车（未配置 = 不限，逐字等价旧行为）
+        apply_deadline(spending, self.config.extra)
         if hasattr(self.llm, "budget"):
             self.llm.budget = spending
         start_usage = spending.snapshot()
@@ -996,6 +1066,9 @@ class Solver:
                 )
                 tail_bits = [x for x in (facts.render(), BudgetPhase.line(getattr(self.llm, "budget", None))) if x]
                 out_messages = messages + [{"role": "user", "content": "\n".join(tail_bits)}] if tail_bits else messages
+                # P0-3 兜底闸门：与 llm.chat 内部同源，但不依赖客户端实现（墙钟必须在每步前生效）
+                if getattr(self.llm, "budget", None) is not None:
+                    self.llm.budget.check()
                 response = self.llm.chat(out_messages, tools=specs)
             except BudgetExceeded as exc:
                 # 预算用尽：立刻停手，不发请求也就不会再产生费用
@@ -1004,7 +1077,7 @@ class Solver:
                 )
                 self.on_event("budget_exhausted", exc.snapshot)
                 steps_used = step - 1
-                reason = "attempt_cap" if exc.attempt else "budget_exhausted"
+                reason = stop_reason_of(exc)
                 break
             finally:
                 # 每步都把用量写盘，进程被强杀也不会丢账
@@ -1298,10 +1371,15 @@ class Solver:
                 )
                 tail_bits = [x for x in (facts.render(), BudgetPhase.line(getattr(llm, "budget", None))) if x]
                 out_messages = messages + [{"role": "user", "content": "\n".join(tail_bits)}] if tail_bits else messages
+                # P0-3 兜底闸门：专家路径不能只靠 llm.chat 内部的检查（墙钟必须每步前生效）
+                if getattr(llm, "budget", None) is not None:
+                    llm.budget.check()
                 response = llm.chat(out_messages, tools=specs)
             except BudgetExceeded as exc:
-                report = f"[预算耗尽，停止] {exc}"
-                reason = "budget_exhausted"
+                # P0-3：墙钟到期与预算耗尽对模型是两回事（一个没钱，一个没时间收口）
+                wall = getattr(exc, "kind", "") == "wall_clock"
+                report = f"[{'时间到，收口' if wall else '预算耗尽'}，停止] {exc}"
+                reason = stop_reason_of(exc)
                 break
             finally:
                 if getattr(llm, "budget", None) is not None:

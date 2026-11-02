@@ -107,10 +107,13 @@ def plan_from_dict(data: dict | None) -> PlanTrack | None:
 # ---------- checkpoint 读写 ----------
 
 def save(path: Path, *, challenge_id: str, next_round: int, messages: list, reports: list,
-         ledger: Ledger, plan: PlanTrack) -> None:
+         ledger: Ledger, plan: PlanTrack, fingerprint: str = "") -> None:
     payload = {
         "version": VERSION,
         "challenge_id": challenge_id,
+        # P1-1：把「题目输入指纹」一起落盘。题面被改过就说明存下来的上下文前提已失效，
+        # 续跑会拿着旧结论往下推——load() 里比对不上会直接丢弃这份 checkpoint。
+        "fingerprint": fingerprint or "",
         "next_round": int(next_round),
         "messages": messages,
         "reports": reports,
@@ -123,11 +126,14 @@ def save(path: Path, *, challenge_id: str, next_round: int, messages: list, repo
     os.replace(tmp, path)
 
 
-def load(path: Path, *, challenge_id: str) -> dict | None:
+def load(path: Path, *, challenge_id: str, fingerprint: str | None = None) -> dict | None:
     """读回 checkpoint。缺文件 / 损坏 / 题号不符 / 版本不符 / 字段类型不对 → None。
 
     不校验就 return 会把坏数据一路带进 crew.solve 的恢复块（int("abc") 之类直接崩掉整道题），
     所以这里把关：坏 checkpoint 一律当不存在，绝不抛、绝不让坏字段流出。
+
+    P1-1 输入指纹：给了 `fingerprint` 且与存档里的不一致 → 丢弃（题面变了，旧上下文不可信）。
+    存档里没有该字段（升级前的旧 runtime 写的）→ 放行，避免升级后一律重跑。
     """
     try:
         if not path.is_file():
@@ -140,6 +146,9 @@ def load(path: Path, *, challenge_id: str) -> dict | None:
     if data.get("version") != VERSION:
         return None
     if data.get("challenge_id") != challenge_id:
+        return None
+    stored_fp = data.get("fingerprint")
+    if fingerprint is not None and isinstance(stored_fp, str) and stored_fp and stored_fp != fingerprint:
         return None
     # 恢复块会直接 int(next_round) / list(messages) / list(reports)：先验类型，挡住 ValueError 与垃圾数据
     if not isinstance(data.get("next_round"), int):

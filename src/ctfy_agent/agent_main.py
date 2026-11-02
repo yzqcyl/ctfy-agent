@@ -126,6 +126,7 @@ _STOP_MAP = {
     "no_more_actions": "done",
     "step_limit": "max_turns",
     "budget_exhausted": "cut_off",
+    "wall_clock": "cut_off",   # P0-3：时间到与预算耗尽对平台是同一类（都是"没做完"）
     "llm_error": "halted",
 }
 

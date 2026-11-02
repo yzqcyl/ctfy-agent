@@ -37,6 +37,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: 单测：总入口（tests/smoke.py，回归网基线）
+        run: |
+          export PYTHONPATH=src
+          export NO_PROXY="127.0.0.1,localhost"
+          python3 tests/smoke.py
+
+      - name: 密钥扫描（只审计将要提交的内容，不靠 .gitignore 兜底）
+        # P1-2：`.gitignore` 只管"什么不进仓库"，管不了"进了仓库的东西里有没有密钥"。
+        # 默认排除 tests/（夹具天然含假凭据），src/config/docs/tools 全扫。
+        run: python3 tools/secret_scan.py --all
+
+      - name: 单测：独立套件（smoke_*.py，总入口不引用的那批）
+        # 这些模块曾经只躺在仓库里没人跑，逻辑回归一路绿灯进镜像。逐个跑，任一失败即红。
+        # 依赖真实 .env 的 8 个（ai_role/brake/clustera/clusterb_crew/ctxopt/p1/p2/p21）跳过：
+        # CI 没有凭据，跑起来只会因为环境缺失而红，噪声比覆盖更贵。
+        run: |
+          export PYTHONPATH=src
+          export NO_PROXY="127.0.0.1,localhost"
+          fail=0
+          for f in tests/smoke_*.py; do
+            [ "$f" = "tests/smoke.py" ] && continue
+            if grep -q "Config.load()\|from ctfy_agent.config import load" "$f"; then
+              echo "SKIP (needs .env): $f"; continue
+            fi
+            echo "=== $f"
+            python3 "$f" || { echo "FAILED: $f"; fail=1; }
+          done
+          exit $fail
+
       - name: Build image（普通 docker build，让镜像落在本地 daemon，供校验/导出用）
         run: |
           docker build \
@@ -48,6 +77,11 @@ jobs:
 
       - name: 校验：B1 契约（体积 / 目录洁净度 / cwd 无关 / 五条路径全部 exit 0）
         run: python3 tools/container_check.py --no-build --image "$IMAGE:$TAG"
+
+      - name: 校验：平台姿态（非 root / 只读根 / 断网 下 dry_run 仍 exit 0）
+        # P1-3：平台按「只读根 + 断网 + 非 root」跑我们，历史上 v2 就因 root 被协议检查直接拒收。
+        # 这一步把同一套约束搬进 CI，避免到提交时才发现镜像在这种姿态下写不出 result.json。
+        run: python3 tools/isolation_probe.py --image "$IMAGE:$TAG"
 
       - name: 导出 tar 制品
         run: docker save "$IMAGE:$TAG" | gzip > ctfy-agent.tar.gz

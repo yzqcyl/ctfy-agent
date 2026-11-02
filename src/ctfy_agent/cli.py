@@ -83,6 +83,9 @@ def normalize_challenge(item: dict) -> dict:
         "tags": normalize_tags(pick("tags", "tag", "labels", "topics")),
         "difficulty": pick("difficulty", "level", "difficulty_level"),
         "solves_count": pick("solves_count", "solve_count", "solves", "solved", "solved_by"),
+        # 知识问答题（MCQ/QA）：提交走 submit_qa_answer，且不需要实例。
+        # 曾因不认这个字段，QA 题在提交时被「本题还没有实例」挡住，正确答案直接丢（实测 SECQA-0001）。
+        "is_qa_only": bool(pick("is_qa_only")),
     }
 
 
@@ -421,6 +424,45 @@ def cmd_solve(args) -> int:
 # ---------- crew（多智能体协作） ----------
 
 
+def instance_preflight(platform, challenge_id: str, config, *, enabled: bool) -> None:
+    """开跑前的实例体检（P0-1）。绝不抛异常——清扫只是多一层保险，不能反过来毁掉 run。
+
+    enabled=False 时只读不杀，仅提示可能占用唯一位子的残留实例。
+    """
+    from .instance_guard import (  # noqa: PLC0415 - 只有 crew/auto 需要
+        instance_challenge_id, instance_id, list_all, reap, summarize,
+    )
+
+    protect = tuple((config.extra or {}).get("instance_reap_protect") or ())
+    grace = float((config.extra or {}).get("instance_reap_grace_seconds", 120) or 120)
+    if enabled:
+        guard = reap(platform, keep=challenge_id, protect=protect, grace_seconds=grace)
+        print(summarize(guard))
+        for item in guard.get("stopped") or []:
+            print(f"           [清扫] 停掉 {item.get('id', '')[:12]}（属于 {item.get('challenge_id') or '未知题'}）")
+        for item in guard.get("skipped_unknown_age") or []:
+            print(
+                f"           [跳过] {str(item.get('id', ''))[:12]}（属于 {item.get('challenge_id') or '未知题'}，"
+                f"存活不足 {grace:.0f}s 或无时间戳；确认无人使用后可 --reap + instance_reap_grace_seconds=0）"
+            )
+        return
+    items = list_all(platform)
+    if items is None:
+        return
+    strangers = [x for x in items if instance_challenge_id(x) not in {challenge_id, *protect}]
+    if strangers:
+        print(
+            f"[实例守卫] 平台上有 {len(strangers)} 个不属于本题的实例；配额只有 1，"
+            "它们可能正是「start_instance 被限流」的原因。加 --reap 可先清扫。",
+            file=sys.stderr,
+        )
+        for item in strangers:
+            print(
+                f"           - {instance_id(item)[:12] or '(无 id)'}  challenge={instance_challenge_id(item) or '未知'}",
+                file=sys.stderr,
+            )
+
+
 def cmd_crew(args) -> int:
     from .crew import Crew  # noqa: PLC0415 - 只有 crew 命令需要
 
@@ -453,6 +495,12 @@ def cmd_crew(args) -> int:
             print(f"           [实例] {json.dumps(payload['instance'], ensure_ascii=False)[:160]}")
         elif kind == "instance_start_failed":
             print(f"           [实例] 自动启动失败，交给协调者处理：{payload['error'][:160]}")
+        elif kind == "instance_guard":
+            print(f"           {payload.get('note', '')[:200]}")
+
+    # P0-1：开跑前体检。--reap 显式清扫；配置 instance_reap=true 时每轮也会自动扫。
+    if not getattr(args, "no_reap", False):
+        instance_preflight(platform, args.challenge_id, config, enabled=bool(getattr(args, "reap", False)))
 
     crew = Crew(config, platform, store, lambda model=None: make_llm(config, model=model), on_event=on_event)
     try:
@@ -514,6 +562,11 @@ def cmd_auto(args) -> int:
             remaining = total_cap - spent["tokens"]
             if remaining > 0:
                 config.max_tokens_per_challenge = min(per_challenge, remaining)
+        # P0-1：批量串行跑，每题开跑前清掉上一题残留的实例（默认开，--no-reap 关）。
+        # 串行是这批脚本的既定形态；若要并发跑多道实例题，先关掉它并把兄弟题写进
+        # instance_reap_protect —— 配额只有 1，并发本来就抢不到第二个位子。
+        if not getattr(args, "no_reap", False):
+            instance_preflight(platform, challenge_id, config, enabled=True)
         # 集群-B：k<=1 时与 crew.solve 等价；batch 场景默认不启用（config 不写 clusterb_k）
         return crew.solve_clusterb(challenge_id)
 
@@ -533,6 +586,7 @@ def cmd_auto(args) -> int:
         limit=args.limit,
         max_total_tokens=total_cap,
         max_failures=args.max_failures,
+        order=getattr(args, "order", "score"),
         on_event=on_event,
     )
 
@@ -661,13 +715,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_crew = sub.add_parser("crew", help="多智能体协作解题（协调者 + web/rev/crypto/misc 专家）")
     p_crew.add_argument("challenge_id")
     p_crew.add_argument("--max-steps", type=int, help="覆盖协调者回合数")
+    p_crew.add_argument("--reap", action="store_true",
+                        help="开跑前清掉不属于本题的残留实例（配额只有 1，泄漏会堵死后续题）")
+    p_crew.add_argument("--no-reap", action="store_true", help="即使配置里开了也跳过清扫")
 
     p_auto = sub.add_parser("auto", help="无人值守批量解本地题单（单题失败不中断）")
+    p_auto.add_argument("--no-reap", action="store_true",
+                        help="关掉每题开跑前的实例清扫（默认开：批量串行跑，残留实例会吃掉唯一位子）")
     p_auto.add_argument("--status", nargs="*", default=["new", "parsed", "instance_up", "stalled"],
                         help="只跑这些状态的题")
     p_auto.add_argument("--limit", type=int, default=0, help="最多跑几道（0=不限）")
     p_auto.add_argument("--max-total-tokens", type=int, default=0, help="整批 token 上限（0=不限）")
     p_auto.add_argument("--max-failures", type=int, default=3, help="连续失败几次就停")
+    p_auto.add_argument("--order", choices=["score", "id"], default="score",
+                        help="选题顺序：score=已解队伍数降序（默认，经验上最划算）/ id=按题号")
 
     p_demo = sub.add_parser("demo", help="离线演练（假 MCP + 脚本化 LLM）")
     p_demo.add_argument("--mode", choices=["json", "sse"], default="json")

@@ -141,6 +141,8 @@ class CtfyPlatform:
         self._active_instance_id: str = ""
         self._active_challenge_id: str = ""
         self._question_meta: dict[str, dict[str, dict]] = {}
+        # 最近一次 verify_* 判过 true 的 question_id；多问题题提交时优先用它当默认题号
+        self._verified_qid: str = ""
 
     # ---------- 连接 ----------
 
@@ -300,11 +302,22 @@ class CtfyPlatform:
 
     def _learn_from_result(self, name: str, arguments: dict, result) -> None:
         """把工具返回里的事实沉淀下来；只认 dict 返回值，解析失败静默跳过。"""
-        if name not in ("start_instance", "get_instance", "get_instance_status", "get_challenge"):
+        if name not in ("start_instance", "get_instance", "get_instance_status", "get_challenge",
+                        "verify_answer", "verify_exploit"):
             return
         try:
             data = self._as_json(render_call_result(result))
         except Exception:  # noqa: BLE001 - 事实学习失败不能影响主流程
+            return
+        # verify_* 返回 true/{"result": true}：记住这个题号，后续 submit 默认打向它。
+        # 否则平台会按默认 "flag" 提交，而多问题题（user/admin/techniques）根本没有这个题号，
+        # 会以 422 unknown_question_id 失败——正确答案就此被丢掉（实测 CTFARENA-048 踩到）。
+        if name in ("verify_answer", "verify_exploit"):
+            verdict = data.get("result") if isinstance(data, dict) else data
+            if verdict is True or str(verdict).strip().lower() == "true":
+                qid = arguments.get("question_id")
+                if isinstance(qid, str) and qid:
+                    self._verified_qid = qid
             return
         if not isinstance(data, dict):
             return
@@ -322,6 +335,9 @@ class CtfyPlatform:
         known = self._question_meta.get(self._active_challenge_id) or {}
         if not known:
             return ""
+        # 已用 verify_* 判过 true 的题号最可信（多问题题里这是唯一确定「答案对得上」的那个）
+        if self._verified_qid and self._verified_qid in known:
+            return self._verified_qid
         if tool_name == "verify_exploit":
             checkers = [qid for qid, m in known.items() if (m.get("mode") or "") == "checker"]
             if len(checkers) == 1:
@@ -329,6 +345,10 @@ class CtfyPlatform:
         if len(known) == 1:
             return next(iter(known))
         return ""
+
+    def preferred_question_id(self, tool_name: str = "submit_answer") -> str:
+        """供调用方（solver/crew）决定默认题号的公开入口；拿不到就返回空串。"""
+        return self._pick_question_id(tool_name)
 
     def _repair_runtime_args(self, name: str, arguments: dict | None) -> dict:
         """按运行时事实修正参数；只改 schema 里真实存在的字段，绝不新增字段。"""
@@ -345,6 +365,11 @@ class CtfyPlatform:
             qid = args.get("question_id")
             current = self._question_meta.get(self._active_challenge_id) or {}
             if isinstance(qid, str) and qid and current and qid not in current:
+                better = self._pick_question_id(name)
+                if better:
+                    args["question_id"] = better
+            elif not qid and current:
+                # 没给题号时别让平台落到默认 "flag"：本题真实题号可能是 user/outage/…
                 better = self._pick_question_id(name)
                 if better:
                     args["question_id"] = better

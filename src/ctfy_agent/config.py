@@ -203,6 +203,16 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
         if env_key in os.environ and os.environ[env_key].strip():
             raw[field_name] = _coerce(os.environ[env_key], DEFAULTS[field_name])
 
+    # P0-3 墙钟配置允许用环境变量注入：容器里没有命令行，平台只给 task.json + env，
+    # 所以 deadline 必须能走 AGENT_* 说明。解析在 budget.apply_deadline（写错格式当没设）。
+    for env_key, extra_key in (
+        ("AGENT_DEADLINE_AT", "deadline_at"),
+        ("AGENT_DEADLINE_MINUTES", "deadline_minutes"),
+    ):
+        value = os.environ.get(env_key, "").strip()
+        if value:
+            extra[extra_key] = value
+
     return Config(
         mcp_url=raw["mcp_url"],
         timeout=float(raw["timeout"]),

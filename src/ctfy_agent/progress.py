@@ -242,24 +242,31 @@ class BudgetPhase:
 
     @staticmethod
     def line(budget) -> str | None:
-        """无预算上限（max_tokens=0）或无 budget 对象时返回 None。"""
+        """无预算上限且无墙钟时返回 None（默认配置下行为与旧版逐字一致）。"""
         if budget is None:
             return None
         cap = int(getattr(budget, "max_tokens", 0) or 0)
-        if cap <= 0:
+        left_seconds = getattr(budget, "seconds_left", None)
+        if cap <= 0 and left_seconds is None:
             return None
-        used = int(budget.total_tokens or 0)
-        calls = int(budget.calls or 0)
-        ratio = used / cap
-        left_calls = ""
-        if calls > 0:
-            avg = used / calls
-            if avg > 0:
-                left_calls = f"，按当前消耗约剩 {max(0, int((cap - used) / avg))} 次模型调用"
-        if ratio < BudgetPhase.CONVERGE_AT:
-            phase = "探索期：可开辟新攻击面"
-        elif ratio < BudgetPhase.CLOSE_AT:
-            phase = "收敛期：优先把已有证据整理成候选并验证，少开新面"
-        else:
-            phase = "收口期：只验证/提交已有候选，禁止开辟新攻击面"
-        return f"[预算] 已用 {used:,}/{cap:,} tok（{ratio:.0%}{left_calls}）— {phase}"
+        bits: list[str] = []
+        if left_seconds is not None:
+            # 墙钟是独立一层：token 还剩很多也可能已经没有时间了，必须让模型看得见
+            bits.append(f"剩余 {left_seconds / 60:.0f} 分钟（截止 {budget.deadline_clock}）")
+        if cap > 0:
+            used = int(budget.total_tokens or 0)
+            calls = int(budget.calls or 0)
+            ratio = used / cap
+            left_calls = ""
+            if calls > 0:
+                avg = used / calls
+                if avg > 0:
+                    left_calls = f"，按当前消耗约剩 {max(0, int((cap - used) / avg))} 次模型调用"
+            if ratio < BudgetPhase.CONVERGE_AT:
+                phase = "探索期：可开辟新攻击面"
+            elif ratio < BudgetPhase.CLOSE_AT:
+                phase = "收敛期：优先把已有证据整理成候选并验证，少开新面"
+            else:
+                phase = "收口期：只验证/提交已有候选，禁止开辟新攻击面"
+            bits.append(f"已用 {used:,}/{cap:,} tok（{ratio:.0%}{left_calls}）— {phase}")
+        return "[预算] " + "；".join(bits)

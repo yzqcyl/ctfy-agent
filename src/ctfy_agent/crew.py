@@ -20,7 +20,7 @@ import json
 import re
 from json import JSONDecodeError
 
-from .budget import Budget, BudgetExceeded
+from .budget import Budget, BudgetExceeded, apply_deadline, stop_reason_of
 from .progress import BudgetPhase
 from .checkpoint import (
     discard as _ckpt_discard,
@@ -30,6 +30,7 @@ from .checkpoint import (
     plan_from_dict,
 )
 from .companion import PlanTrack, parse_companion
+from .handoff import write as write_handoff
 from .config import Config
 from .ledger import FLAG_RE, Ledger
 from .llm import LLMError
@@ -580,6 +581,26 @@ class Crew:
 
     # ---------- 专家 ----------
 
+    def _instance_sweep(self, challenge_id: str, rnd: int) -> dict:
+        """停掉不属于本题的残留实例（P0-1）。尽力而为：任何失败只留痕，不影响 run。"""
+        from .instance_guard import reap, summarize  # noqa: PLC0415 - 开关关闭时不导入
+
+        try:
+            guard = reap(
+                self.platform,
+                keep=challenge_id,
+                protect=tuple(self.config.extra.get("instance_reap_protect") or ()),
+                grace_seconds=float(self.config.extra.get("instance_reap_grace_seconds", 120) or 120),
+            )
+        except Exception as exc:  # noqa: BLE001
+            guard = {"ok": False, "error": f"清扫异常：{exc}"}
+        note = summarize(guard) if isinstance(guard, dict) else str(guard)
+        self.on_event("instance_guard", {"note": f"第 {rnd} 轮 {note}", "detail": guard})
+        self.store.append_transcript(
+            challenge_id, {"role": "instance", "step": rnd, "note": note}
+        )
+        return guard
+
     def _delegate(self, challenge_id: str, role: str, task: str, solver: Solver, prior: list[str] | None = None,
                   ledger: Ledger | None = None, facts_sink: list[str] | None = None) -> str:
         spec = self.roles.get(role)
@@ -697,6 +718,9 @@ class Crew:
             label=challenge_id,
             cache_discount=bool(self.config.extra.get("budget_cache_discount")),
         ).load(challenge.tokens)
+        # P0-3 墙钟刹车：token/调用数拦不住「磨到 session 结束」，时间必须是独立一层。
+        # 未配置 deadline_at/deadline_minutes 时逐字等价旧行为（deadline_at=None）。
+        apply_deadline(spending, self.config.extra)
         if attempt_caps:
             # 集群-B：本次尝试切片（空/None = 不切片，行为同旧）。必须在首个 spending.check() 之前设。
             spending.set_attempt_caps(attempt_caps)
@@ -726,8 +750,8 @@ class Crew:
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "tokens_spent": 0,
                 "transcript": str(self.store.transcript_path(challenge_id)),
-                # 集群-B：切片用尽 ≠ 题级预算耗尽；后者才该让编排器停手
-                "reason": "attempt_cap" if getattr(exc, "attempt", False) else "budget_exhausted",
+                # 集群-B：切片用尽 ≠ 题级预算耗尽；wall_clock = 时间到（与钱无关，优先）
+                "reason": stop_reason_of(exc),
                 "facts": [], "dead_ends": [], "tail_action": "",
             }
             self.on_event("done", summary)
@@ -785,13 +809,16 @@ class Crew:
         # 每轮开跑前把 messages/reports/ledger/plan 快照到 run_dir/checkpoints/；正常收尾删除，
         # 进程被 kill 则残留 → 下次跑题时续跑。extra.resume 设为 false/off/no/0 可强制从零重跑。
         ckpt_path = self.store.run_dir / "checkpoints" / (self.store.transcript_path(challenge_id).stem + ".json")
+        # P1-1：题面指纹。题面被改过（换包/补说明）时，旧上下文的结论前提已失效，
+        # 宁可重跑也不续跑——比对在 checkpoint.load 里做，不符即丢弃。
+        _fingerprint = challenge.fingerprint()
         start_rnd = 1
         _RESUMABLE = {"new", "parsed", "instance_up", "probing", "candidate_flag"}
         _resume = self.config.extra.get("resume")
         _resume_off = _resume is False or str(_resume).strip().lower() in ("false", "off", "no", "0")
         if not _resume_off and challenge.status in _RESUMABLE:
             try:
-                ckpt = _ckpt_load(ckpt_path, challenge_id=challenge_id)
+                ckpt = _ckpt_load(ckpt_path, challenge_id=challenge_id, fingerprint=_fingerprint)
                 if ckpt is not None:
                     messages = list(ckpt.get("messages") or messages)
                     reports = list(ckpt.get("reports") or [])
@@ -842,12 +869,19 @@ class Crew:
                              "note": f"轮间会话重置：携带 {min(len(reports), 3)} 份结论摘要 + 账本摘要"},
                         )
                 try:
-                    _ckpt_save(ckpt_path, challenge_id=challenge_id, next_round=rnd,
+                    _ckpt_save(ckpt_path, challenge_id=challenge_id, fingerprint=_fingerprint, next_round=rnd,
                                messages=messages, reports=reports, ledger=ledger, plan=plan)
                 except Exception as exc:  # 快照是尽力而为，落盘失败绝不毁掉 run
                     self.store.append_transcript(
                         challenge_id, {"role": "checkpoint", "note": f"快照失败（忽略）：{exc}"}
                     )
+                # P0-1 实例守卫（默认关，extra.instance_reap=true 才启用）：配额只有 1，
+                # 长跑里一条残留实例会把后续所有题一起拖死（11-03 实测 21% 的题因此作废）。
+                # 生产容器里平台自己回收实例（keep_instance_on_*=True），只有本地批量才需要。
+                if self.config.extra.get("instance_reap") and rnd > 1:
+                    _every = max(1, int(self.config.extra.get("instance_reap_every") or 3))
+                    if rnd % _every == 0:
+                        self._instance_sweep(challenge_id, rnd)
                 # P0-2：预算阶段每轮注入协调者（实测 500k ≈ 40 次调用，agent 需要剩余量感知）
                 budget_line = BudgetPhase.line(getattr(coordinator, "budget", None))
                 if budget_line:
@@ -860,7 +894,8 @@ class Crew:
                     response = coordinator.chat(messages, tools=self._coordinator_tools())
                 except BudgetExceeded as exc:
                     # 集群-B：attempt_cap（切片用尽、题级还有配额）≠ budget_exhausted（题级真耗尽）
-                    reason = "attempt_cap" if getattr(exc, "attempt", False) else "budget_exhausted"
+                    # P0-3：wall_clock（时间到）单独成一类，便于赛后区分「没钱」与「没时间」
+                    reason = stop_reason_of(exc)
                     self.store.append_transcript(challenge_id, {"role": "coordinator", "step": rnd, "note": f"预算耗尽：{exc}"})
                     break
                 except LLMError as exc:
@@ -1148,7 +1183,9 @@ class Crew:
         )
         # proof-of-exploitation 兜底：专家调 verify_exploit 通过后平台已记 solve，但那条回执不经过
         # 协调者的 submit 分支（没有 flag 可交）。收尾前用 get_my_solves 对一次事实，避免统计漏记。
-        if not submitted and reason != "superseded":
+        # 但 partial_solve 不能翻案：多问题题里「平台记了 solve」只代表某一题号过了，
+        # 翻成 exploit_verified 会把 1/3 的完成度报成整题解出（实测 CTFARENA-048 复测踩到）。
+        if not submitted and reason not in ("superseded", "partial_solve"):
             try:
                 if challenge_id in self.platform.my_solved_ids():
                     submitted = True
@@ -1178,6 +1215,11 @@ class Crew:
             "candidates": _ledger_candidates(ledger),
             "tail_action": (ledger.order[-1].tool if ledger.order else ""),
         }
+        # P2-2 交接卡：数据都已在 summary 里，只差渲染成人能照做的五要素。
+        # 写盘失败只少一个产物，绝不改摘要、绝不拖累 run。
+        _card = write_handoff(self.store.run_dir, challenge, summary)
+        if _card is not None:
+            summary["handoff"] = str(_card)
         self.on_event("done", summary)
         return summary
 

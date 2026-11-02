@@ -18,15 +18,20 @@
 
 from __future__ import annotations
 
+import time
+
 
 class BudgetExceeded(RuntimeError):
     """预算耗尽。带上一份快照，方便落盘和汇报。"""
 
-    def __init__(self, reason: str, snapshot: dict, *, attempt: bool = False):
+    def __init__(self, reason: str, snapshot: dict, *, attempt: bool = False, kind: str = ""):
         super().__init__(reason)
         self.reason = reason
         self.snapshot = snapshot
         self.attempt = attempt  # True=本次尝试切片超限（题内可再试）；False=题级硬闸门
+        # kind：把"为什么停"机器可读化（wall_clock / tokens / calls / cost / attempt）。
+        # 报告与统计要按这个字段分类，而不是去正则匹配中文文案。
+        self.kind = kind
 
 
 class Budget:
@@ -42,10 +47,14 @@ class Budget:
         attempt_tokens: int = 0,
         attempt_calls: int = 0,
         cache_discount: bool = False,
+        deadline_at: float | None = None,
     ):
         self.max_tokens = max(0, int(max_tokens or 0))       # 0 = 不限
         self.max_calls = max(0, int(max_calls or 0))         # 0 = 不限
         self.max_cost = max(0.0, float(max_cost or 0.0))     # 0 = 不限
+        # 墙钟截止（epoch 秒）。None = 不限。token/调用数都拦不住「慢慢磨到 session 结束」：
+        # 比赛每段只有 10:00–20:00，到点没交就等于白跑，所以时间必须是独立的一层刹车。
+        self.deadline_at = float(deadline_at) if deadline_at else None
         self.price_input = max(0.0, float(price_input or 0.0))    # 每百万 token 单价
         self.price_output = max(0.0, float(price_output or 0.0))
         self.label = label
@@ -84,6 +93,31 @@ class Budget:
     def cost_left(self) -> float | None:
         return None if self.max_cost <= 0 else max(0.0, self.max_cost - self.cost)
 
+    # ---------- 墙钟 ----------
+
+    @property
+    def seconds_left(self) -> float | None:
+        """离截止还有多少秒（None = 没设墙钟）。"""
+        if self.deadline_at is None:
+            return None
+        return max(0.0, self.deadline_at - time.time())
+
+    @property
+    def deadline_clock(self) -> str:
+        if self.deadline_at is None:
+            return ""
+        return time.strftime("%H:%M", time.localtime(self.deadline_at))
+
+    def set_deadline(self, seconds_from_now: float | None = None, *, at: float | None = None) -> "Budget":
+        """挂一个墙钟截止：给相对秒数或绝对 epoch。传 None 表示解除。"""
+        if at is not None:
+            self.deadline_at = float(at) if at else None
+        elif seconds_from_now is not None and float(seconds_from_now) > 0:
+            self.deadline_at = time.time() + float(seconds_from_now)
+        else:
+            self.deadline_at = None
+        return self
+
     # ---------- 续算（跨进程继承历史用量） ----------
 
     def load(self, snapshot: dict | None) -> "Budget":
@@ -111,6 +145,8 @@ class Budget:
             "attempt_used_calls": self._attempt_used_calls,
             "cached_tokens": self.cached_tokens,
             "raw_prompt_tokens": self.raw_prompt_tokens,
+            "deadline_at": self.deadline_at,
+            "seconds_left": None if self.seconds_left is None else round(self.seconds_left, 1),
         }
 
     # ---------- 集群-B：尝试级切片 ----------
@@ -151,24 +187,39 @@ class Budget:
 
     # ---------- 闸门 ----------
 
+    def _exceeded(self) -> tuple[str, str] | None:
+        """题级超限（kind, 文案）；未超返回 None。kind 供报告分类，别拿中文文案做判断。"""
+        # 墙钟排在最前：到点了就该收口，即使 token 还有余量（比赛到点即结束，余量作废）
+        if self.deadline_at is not None and time.time() >= self.deadline_at:
+            return "wall_clock", f"墙钟预算到期（截止 {self.deadline_clock}）"
+        if self.max_calls and self.calls >= self.max_calls:
+            return "calls", f"模型调用次数已达上限 {self.max_calls} 次"
+        if self.max_tokens and self.total_tokens >= self.max_tokens:
+            return "tokens", f"token 用量已达上限 {self.max_tokens}（当前 {self.total_tokens}）"
+        if self.max_cost > 0 and self.cost >= self.max_cost:
+            return "cost", f"费用已达上限 {self.max_cost:.4f}（当前 {self.cost:.4f}）"
+        return None
+
     def exceeded(self) -> str | None:
         """题级超限原因；未超返回 None。"""
-        if self.max_calls and self.calls >= self.max_calls:
-            return f"模型调用次数已达上限 {self.max_calls} 次"
-        if self.max_tokens and self.total_tokens >= self.max_tokens:
-            return f"token 用量已达上限 {self.max_tokens}（当前 {self.total_tokens}）"
-        if self.max_cost > 0 and self.cost >= self.max_cost:
-            return f"费用已达上限 {self.max_cost:.4f}（当前 {self.cost:.4f}）"
-        return None
+        hit = self._exceeded()
+        return hit[1] if hit else None
+
+    def exceeded_kind(self) -> str:
+        """题级超限的机器可读分类（wall_clock/calls/tokens/cost）；未超返回空串。"""
+        hit = self._exceeded()
+        return hit[0] if hit else ""
 
     def check(self) -> None:
         # 尝试级切片优先：命中表示「本次尝试该停了」，但题还有后续尝试机会
         a = self.attempt_exceeded()
         if a:
-            raise BudgetExceeded(f"{self.label + '：' if self.label else ''}{a}", self.snapshot(), attempt=True)
-        reason = self.exceeded()
-        if reason:
-            raise BudgetExceeded(f"{self.label + '：' if self.label else ''}{reason}", self.snapshot())
+            raise BudgetExceeded(f"{self.label + '：' if self.label else ''}{a}", self.snapshot(),
+                                 attempt=True, kind="attempt")
+        hit = self._exceeded()
+        if hit:
+            raise BudgetExceeded(f"{self.label + '：' if self.label else ''}{hit[1]}", self.snapshot(),
+                                 kind=hit[0])
 
     def record(self, usage: dict | None) -> None:
         usage = usage or {}
@@ -196,8 +247,56 @@ class Budget:
             return f"{limit}{unit}" if limit else "不限"
 
         money = f"{self.cost:.4f} / {cap(self.max_cost)}" if (self.max_cost or self.price_input or self.price_output) else "未计价"
+        clock = ""
+        left = self.seconds_left
+        if left is not None:
+            clock = f"  剩余 {left / 60:.0f} 分钟（截止 {self.deadline_clock}）"
         return (
             f"token {self.total_tokens} / {cap(self.max_tokens)}  "
             f"调用 {self.calls} / {cap(self.max_calls)}  "
-            f"费用 {money}"
+            f"费用 {money}{clock}"
         )
+
+
+def stop_reason_of(exc: "BudgetExceeded") -> str:
+    """把 BudgetExceeded 翻成可落盘的 reason 串（报告/统计按此分类，不靠中文文案）。
+
+    wall_clock 必须优先：它说明"这次是时间到，不是钱花完"，下一轮调度据此决定要不要重跑。
+    """
+    if getattr(exc, "kind", "") == "wall_clock":
+        return "wall_clock"
+    return "attempt_cap" if getattr(exc, "attempt", False) else "budget_exhausted"
+
+
+def apply_deadline(budget: Budget, extra: dict | None) -> Budget:
+    """按 config.extra 给 budget 挂墙钟（P0-3）。两个键二选一，都不写=不限（旧行为逐字不变）：
+
+      - `deadline_at`      ：ISO 时间（`2026-11-21T20:00:00+08:00`）或 epoch 秒；
+      - `deadline_minutes` ：从现在起算的分钟数（实验/批量用，最省事）。
+
+    为什么放在 config.extra 而不是命令行参数：容器里没有命令行，平台只给 task.json；
+    而 extra 在本地 config 与容器适配层都能读到（agent_main 也会合并 env）。
+    """
+    extra = extra or {}
+    raw = extra.get("deadline_at")
+    minutes = extra.get("deadline_minutes")
+    if raw not in (None, ""):
+        text = str(raw).strip()
+        try:
+            budget.set_deadline(at=float(text))
+            return budget
+        except (TypeError, ValueError):
+            pass
+        try:
+            from datetime import datetime  # noqa: PLC0415 - 只在真给了 ISO 时才导入
+
+            budget.set_deadline(at=datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+            return budget
+        except ValueError:
+            pass  # 写错格式就当没设，绝不因为配置笔误把题卡死
+    if minutes not in (None, "", 0, "0"):
+        try:
+            budget.set_deadline(seconds_from_now=float(minutes) * 60)
+        except (TypeError, ValueError):
+            pass
+    return budget

@@ -27,9 +27,9 @@
 | **交付镜像** | ✅ v4 已构建推送：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb…`（详见 §D.1/附录 D）|
 | **平台审核/提交** | ⬜ **未开始**，只能人工走浏览器（`docs/submit-image-runbook.md` + `platform-submit-opsheet.md`）——交接后第一优先级之一 |
 | **总入口单测（干净 clone）** | ⚠️ **151 passed / 1 failed**【实测 11-03】：`case_bench_stats` import 未入库的 `runs/bench_stats.py`（见缺口 #11）|
-| **总入口单测（原工作区）** | 154/0【审计 11-02/11-03】，含 3 个缺陷修复的回归用例——**这批修复尚未提交**（§B.4）|
+| **总入口单测（原工作区）** | **160 passed / 0 failed**【实测 11-02】：154 基线 + 本批新增 6 条（`instance_guard` / `bounded_run` / `wall_clock` / `input_fingerprint` / `auto_order` / `handoff_and_rejected`）；含 3 个缺陷修复的回归用例——**已全部提交**（§B.4 / §B.5）|
 | **最新实测能力** | 六题型 52 题：解出 **51.9%**，剔环境阻塞 **65.9%**，能力口径 **75.6%**；qa 12/12、web 7/11、misc 4/6、crypto 2/8、rev 2/3、pwn 0/1（样本无效）【实测 11-03】|
-| **CI** | HEAD 的 workflow **不跑任何单测**；补测试步的修改在工作树未提交（§B.4）|
+| **CI** | workflow **已跑单元测试**：总入口单测 + 25 个免凭据套件 + 密钥扫描 + 镜像姿态探针（§B.4 / §B.5，已提交）|
 
 ### A.3 五个必须先知道的事实
 
@@ -82,7 +82,7 @@
 | `dist/` | 两份现成交付包：`all-directions-pack-20261101.zip/.tar.gz`（7 角色卡+工具源码+125 附件，184 文件）、`directions-pack-20261030.zip` | 可直接发给接手人 |
 | `.ref/` `.workbuddy/` `_extbank/` `x/` `work/` `js/` 等 | 参考库/会话记忆/实验残留（§F.3 污染表）| 大多可清理 |
 
-### B.4 未提交的工作树改动（**交接时必须处置，别丢**）
+### B.4 工作树改动（**2026-11-02 已全部提交**，此处保留内容索引）
 
 **修改（6+1 文件，内容 = 11-02/11-03 实测发现并修复的缺陷）**：
 
@@ -94,11 +94,58 @@
 | `src/ctfy_agent/cli.py` `solver.py` `state.py` | 缺陷 C：QA 题提交通道整条不通（`is_qa_only` 映射 + `submit_qa_answer` + `competition_id`）；修后 MCQ 12/12、SECQA-0001 从 57s/33k 变 8.9s/2.1k |
 | `tests/smoke.py`（+107 行，纯新增）| 上述修复的回归用例（`case_submit_question_id` / `case_qa_submit` 等）|
 
-**未跟踪的 6 份关键报告**（结论被反复引用，建议连同 WIP 一起入库）：
+**6 份关键报告**（结论被反复引用，**2026-11-02 已入库**）：
 `docs/bench-1102-report.md`、`docs/bench-1103-report.md`、`docs/project-completeness-2026-11-02.md`、
 `docs/gate2-context-ab-2026-11-01.md`、`docs/p0-calibration-2026-10-31.md`、`docs/eval-mix-live-2026-10-30.md`。
 
-> 处置建议：由原会话（或交接人逐文件 review 后）**尽早提交**；提交前跑一遍总入口单测（151+新增全绿口径，见 §C.2 的 bench_stats 坑）。
+> 处置状态：**已提交**（提交前跑过总入口单测 160/0 与密钥扫描，均通过）。
+> 剩余未跟踪项只有调试残留（详见 §B.6），不属于项目源码，未入库是刻意的。
+
+### B.5 本批增补（2026-11-02，P0+P1+P2：跨项目机制融合，**已提交**）
+
+来源：对 `ctf-forge`（另一套 CTF 解题工作台，HI Cyber Con 2026 42/68 题）的机制对标，
+评估报告 `docs/merge-ctf-forge-2026-11-02.md`（含互补矩阵、不采纳清单、AGPL 边界）。
+**只借鉴机制自行实现，未复制任何源码**（ctf-forge 是 AGPL-3.0）。
+
+| 项 | 内容 | 关掉了什么风险 |
+|---|---|---|
+| P0-1 实例守卫 | 新 `instance_guard.py` + `solver._recover_instance_slot` + `crew._instance_sweep` + `cli.instance_preflight` + 新 `tools/instance_reap.py` | start 失败时先清残留再重试、**配额剩 1 次绝不重试**；对应 11-03 「21% 的题因 start 5 次上限作废」 |
+| P0-2 有界收割 | `tools_local.run_bounded` + `_BoundedSink` + `_kill_tree` | 子进程输出不再全量驻留内存；超时杀**整棵进程树**（旧写法只杀 shell，孙进程继续占 pid） |
+| P0-3 墙钟刹车 | `budget.apply_deadline` + `Budget.deadline_at` + `stop_reason_of` + 每步前置 `budget.check()` | 只有 token/calls 拦不住「磨到 session 结束」；现在 `reason=wall_clock` 可单独统计 |
+| P1-1 题面指纹 | `Challenge.fingerprint()` + checkpoint 比对 | 题面被改过就丢弃 checkpoint，不拿失效前提续跑 |
+| P1-2 合规三件套 | `LICENSE`(MIT) + `THIRD_PARTY_NOTICES.md` + `tools/secret_scan.py` + CI 一步 | 补上 F.2.4 的 LICENSE 缺口与 GPL 分发义务；密钥扫描从"一次性人工"变"每次都跑" |
+| P1-3 姿态自检 | `tools/isolation_probe.py` + `container_check --posture` + CI 一步 | 非 root/只读根/断网 下 dry_run 仍 exit 0（v2 曾因 root 被拒收） |
+
+**新增配置键全部默认关**：`deadline_at` / `deadline_minutes`（或 `AGENT_DEADLINE_*`）、
+`instance_reap`(false) / `instance_reap_every`(3) / `instance_reap_protect`([]) /
+`instance_reap_grace_seconds`(120) / `instance_recovery_grace_seconds`(60)。不配 = 旧行为逐字不变。
+
+**复验**（免令牌免 Docker）：`python tests/smoke.py` → **160/0**；`python tools/secret_scan.py --all` → 干净；
+`python tools/isolation_probe.py` → SKIP（无引擎时）；`python tools/container_check.py --local` → 5/5。
+
+| P2 项 | 内容 | 说明 |
+|---|---|---|
+| P2-1 选题顺序 | `auto._score` + `cli --order {score,id}` | 按 solve 数降序（免费且最准的难度指标）→ 分值 → 难度 → 题号；`--order id` 退回旧行为 |
+| P2-2 交接卡 | **新** `src/ctfy_agent/handoff.py` + `crew.solve` 收尾 | 把 summary 里已有的 facts/dead_ends/candidates/tail_action 渲染成五要素 md，写 `<run>/handoff/<cid>.md` |
+| P2-4 已判错回显 | `state.note_rejected` + `solver._rejected_hint` | 平台判错时记明文答案（去重、留最近 8 条），下次提交失败回显"这些别再交"（提交预算只有 3 次）|
+| P2-3 停机原因枚举化 | **刻意未做** | 现有 reason 串已被 `retry.py::STOP_REASONS`、`agent_main::_STOP_MAP` 与全部历史统计脚本消费，强行收敛会改统计口径，收益只是"好看" |
+
+**P2 效果不理想时怎么退**：`E:\ctfy_backups\20261102-stage1-p0p1\worktree-src.tar.gz` 覆盖回 P0+P1 阶段
+（`tar xzf … -C E:/ctfy_project`）；要退到融合之前用 `20261102-pre-merge\`（git bundle + WIP patch + tar）。
+
+### B.6 仓库根目录的调试残留（**刻意未入库**，别误当源码）
+
+11-02 16:00 前后排查具体题目时落在仓库根的一次性产物，与 agent 源码无关：
+
+| 路径 | 是什么 | 为什么留在这 |
+|---|---|---|
+| `crush`(ELF)、`bundle.js`、`idx.js`、`assets_index.js`、`js/`、`home.html` | 某 web 题的静态资源 | 下载工具以仓库根为 cwd 落下 |
+| `message.txt.cz`、`recruitment.eml` | 某 misc 题的题面附件（邮件头含 `X-Pm-Content-Encryption`）| 同上 |
+| `agent-artifacts-m55-m56.zip`、`_extbank/` | 历史题包与外部 bank 缓存 | 同上 |
+| `%TEMP%/`、`work/`、`x/`、`新建文件夹 (2)/` | 字面量目录名（`%TEMP%` 在 bash 下没被展开）| 测试/手工调试的副作用 |
+
+处置：想清理直接删（都在 `.gitignore` 之外但非源码）；**不要** `git add -A`，会把它们一起提交。
+后续若要彻底免疫，把它们加进 `.gitignore`（本轮未改 `.gitignore`，避免影响其他分支）。
 
 ---
 
@@ -213,8 +260,8 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 |---|---|---|---|
 | 10-26 | 16 道 web @**150k** token（口径偏悲观）、Kimi-K2.7 | 解出 5/16=31.2%（easy 5/9）；A/B 换 Pro 模型 0/3 vs 0/3、慢 2.27×、覆盖更窄 → **换模型无效** | `runs/bench-web-report.md`【本地-only】|
 | 10-31 | 132 题综合（bigbank）| **77 解出 58.3%**；重叠 35 题复测 28.6%→48.6% | `docs/bigbank-report-2026-10-31.md`（已入库）|
-| 11-02 | 未解池随机 12 题 @400k | 平台确认 5/11=45%；剔环境阻塞 5/8=63%；能力口径 6/8=75%；均 396s/308k tok；缓存 90.6%；≈¥0.15–0.22/题 | `docs/bench-1102-report.md`【未入库】|
-| **11-03** | **六题型 52 题 @默认预算** | **51.9% / 剔阻塞 65.9% / 能力 75.6%**；qa 12/12（均 12s、2.8k tok）；web 7/11=64%；misc 4/6=67%；crypto 2/8=25%（3 题最后一步被预算截断）；rev 2/3；pwn 0/1（池中 3/4 需 VPN，样本无效）；easy 92% / medium 61% / hard 33%；均 277s/276k tok | `docs/bench-1103-report.md`【未入库】|
+| 11-02 | 未解池随机 12 题 @400k | 平台确认 5/11=45%；剔环境阻塞 5/8=63%；能力口径 6/8=75%；均 396s/308k tok；缓存 90.6%；≈¥0.15–0.22/题 | `docs/bench-1102-report.md`（已入库）|
+| **11-03** | **六题型 52 题 @默认预算** | **51.9% / 剔阻塞 65.9% / 能力 75.6%**；qa 12/12（均 12s、2.8k tok）；web 7/11=64%；misc 4/6=67%；crypto 2/8=25%（3 题最后一步被预算截断）；rev 2/3；pwn 0/1（池中 3/4 需 VPN，样本无效）；easy 92% / medium 61% / hard 33%；均 277s/276k tok | `docs/bench-1103-report.md`（已入库）|
 
 ### E.2 已证伪路线（别再花预算）
 
