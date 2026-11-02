@@ -71,6 +71,82 @@ def build_elf64(seg_off: int = 0) -> Path:
     return p
 
 
+def build_elf64_dyn() -> Path:
+    """带节头的 ELF64：.dynstr / .dynsym / .rela.plt / .rela.dyn / .dynamic / .text / .shstrtab。
+
+    用于 relocs / dynamic 两个新视图（这两视图只读节头 + 符号表，所以不需要 PT_LOAD）。
+    .rela.plt 里 printf/system 的顺序刻意与符号表下标一致，用来验证「节内顺序 = PLT stub 顺序」。
+    """
+    def add_str(blob: bytearray, text: str) -> int:
+        off = len(blob)
+        blob += text.encode() + b"\0"
+        return off
+
+    dynstr = bytearray(b"\0")
+    s_libc = add_str(dynstr, "libc.so.6")
+    s_printf = add_str(dynstr, "printf")
+    s_system = add_str(dynstr, "system")
+    s_runpath = add_str(dynstr, "/opt/lib")
+
+    dynsym = struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)  # [0] 空项
+    dynsym += struct.pack("<IBBHQQ", s_printf, 0x12, 0, 0, 0, 0)  # [1] GLOBAL FUNC UND
+    dynsym += struct.pack("<IBBHQQ", s_system, 0x12, 0, 0, 0, 0)  # [2]
+
+    rela_plt = struct.pack("<QQq", 0x404018, (1 << 32) | 7, 0)  # printf  JUMP_SLOT
+    rela_plt += struct.pack("<QQq", 0x404020, (2 << 32) | 7, 0)  # system JUMP_SLOT
+    rela_dyn = struct.pack("<QQq", 0x404028, 8, 0x1200)  # 无符号 RELATIVE
+
+    dynamic = struct.pack("<qQ", 1, s_libc)  # DT_NEEDED
+    dynamic += struct.pack("<qQ", 29, s_runpath)  # DT_RUNPATH
+    dynamic += struct.pack("<qQ", 3, 0x404000)  # DT_PLTGOT
+    dynamic += struct.pack("<qQ", 24, 0)  # DT_BIND_NOW
+    dynamic += struct.pack("<qQ", 0x6FFFFFFB, 0x8000000)  # DT_FLAGS_1 = PIE
+    dynamic += struct.pack("<qQ", 0, 0)  # DT_NULL
+
+    text = b"\x55\x48\x89\xe5\x5f\xc3"  # push rbp; mov rbp,rsp; pop rdi; ret
+
+    shstr = bytearray(b"\0")
+    name_off = {nm: add_str(shstr, nm) for nm in
+                (".dynstr", ".dynsym", ".rela.plt", ".rela.dyn", ".dynamic", ".text", ".shstrtab")}
+
+    blobs = [bytes(dynstr), dynsym, rela_plt, rela_dyn, dynamic, text]
+    offsets, cur = [], 0x40
+    for blob in blobs:
+        offsets.append(cur)
+        cur += len(blob)
+    shstr_off = cur
+    shoff = (cur + len(shstr) + 7) // 8 * 8
+
+    def shdr(name, typ, flags, addr, offset, size, link=0, info=0, align=1, entsize=0):
+        return struct.pack("<IIQQQQIIQQ", name, typ, flags, addr, offset, size, link, info, align, entsize)
+
+    rows = [
+        b"\0" * 64,
+        shdr(name_off[".dynstr"], 3, 2, 0x400000, offsets[0], len(dynstr)),
+        shdr(name_off[".dynsym"], 11, 2, 0x400000, offsets[1], len(dynsym), link=1, info=1, align=8, entsize=24),
+        shdr(name_off[".rela.plt"], 4, 2, 0x400000, offsets[2], len(rela_plt), link=2, info=6, align=8, entsize=24),
+        shdr(name_off[".rela.dyn"], 4, 2, 0x400000, offsets[3], len(rela_dyn), link=2, info=0, align=8, entsize=24),
+        shdr(name_off[".dynamic"], 6, 3, 0x400000, offsets[4], len(dynamic), link=1, align=8, entsize=16),
+        shdr(name_off[".text"], 1, 6, 0x400078, offsets[5], len(text), align=16),
+        shdr(name_off[".shstrtab"], 3, 0, 0, shstr_off, len(shstr)),
+    ]
+
+    data = bytearray(shoff + 8 * 64)
+    for off, blob in zip(offsets, blobs):
+        data[off:off + len(blob)] = blob
+    data[shstr_off:shstr_off + len(shstr)] = shstr
+    data[:64] = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\x00" * 8,
+        2, 62, 1, 0, 0, shoff, 0, 64, 56, 0, 64, 8, 7,
+    )
+    for i, row in enumerate(rows):
+        data[shoff + i * 64:shoff + (i + 1) * 64] = row
+    p = TMP / "dyn.elf"
+    p.write_bytes(bytes(data))
+    return p
+
+
 def build_utf16() -> Path:
     data = b"RT" + "flag{wide_8848}".encode("utf-16-le") + b"\x00\x00" + b"plain-ascii-not-wide"
     p = TMP / "wide.bin"
@@ -236,6 +312,49 @@ def case_dispatch_info_regression():
     direct = elfpeek(str(p), view="info")
     via = call_domain("elfpeek", {"path": str(p)})
     assert direct == via, "派发结果应与直调一致"
+
+
+@case
+def case_relocs_plt_got():
+    """[rev-toolbox 2026-11-02] relocs 视图：JUMP_SLOT→foo@got 映射 + RELATIVE 的 addend。"""
+    out = elfpeek(str(build_elf64_dyn()), view="relocs")
+    for needle in (".rela.plt", "JUMP_SLOT", "printf", "system", "@0x404018", "@0x404020"):
+        assert needle in out, "relocs 缺 %r：\n%s" % (needle, out[:500])
+    assert "RELATIVE" in out and "addend=0x1200" in out, out[:500]
+    assert "PLT stub" in out, "应给出 JUMP_SLOT 语义提示：\n%s" % out[:500]
+
+
+@case
+def case_dynamic_needed_runpath():
+    """[rev-toolbox 2026-11-02] dynamic 视图：依赖库 / RUNPATH / BIND_NOW / FLAGS_1 PIE。"""
+    out = elfpeek(str(build_elf64_dyn()), view="dynamic")
+    for needle in ("libc.so.6", "RUNPATH", "/opt/lib", "PLTGOT", "BIND_NOW", "PIE"):
+        assert needle in out, "dynamic 缺 %r：\n%s" % (needle, out[:500])
+    assert "full RELRO" in out, "BIND_NOW 应提示 full RELRO：\n%s" % out[:500]
+
+
+@case
+def case_relocs_dynamic_static_hint():
+    """无节头（静态链接典型形态）时两个新视图必须给可执行建议，而不是空输出或报错。"""
+    p = build_elf64()
+    assert "重定位表为空" in elfpeek(str(p), view="relocs")
+    assert "没有 SHT_DYNAMIC" in elfpeek(str(p), view="dynamic")
+
+
+@case
+def case_elf32_nx_flags():
+    """32 位 Elf32_Phdr 布局回归：旧实现把 paddr 当 filesz、把 filesz 当 flags，
+    PT_GNU_STACK 的可执行栈（flags=7）被误判成 NX=True。"""
+    ehdr = struct.pack(
+        "<16sHHIIIIIHHHHHH",
+        b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\x00" * 8,
+        2, 3, 1, 0x8048000, 52, 0, 0, 52, 32, 1, 40, 0, 0,
+    )
+    phdr = struct.pack("<IIIIIIII", 0x6474E551, 0, 0, 0, 0, 0, 7, 16)  # PT_GNU_STACK, RWX
+    p = TMP / "tiny32.elf"
+    p.write_bytes(ehdr + phdr)
+    out = elfpeek(str(p), view="info")
+    assert "NX=False" in out, "可执行栈应判 NX=False：\n%s" % out[:500]
 
 
 @case

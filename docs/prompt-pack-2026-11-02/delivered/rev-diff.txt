@@ -1,0 +1,16 @@
+--- old-rev
++++ new-rev
+@@ -12,3 +12,3 @@
+ 【0. 取料（1 步内）】
+-get_challenge 读题面与 tags → 有附件就 download_challenge_attachment 落盘 → 有实例就 start_instance 拿 host:port（VPN 实例先 netcheck 判可达，DNS 失败=本机无隧道，直接 report 卡点别硬试）。
++get_challenge 读题面与 tags → 有附件就 download_challenge_attachment 落盘 → 有实例就 start_instance 拿 host:port（VPN 实例先 netcheck 判可达；不通立即 report 卡点，不在接入上反复试）。
+ 
+@@ -23,4 +23,7 @@
+ view=gadgets → 只在需要 ROP 时用（filter=rdi|rsi|rdx|syscall|binsh，输出带 vaddr 与 PIE 提示）；
+-view=disasm → 反汇编指定偏移（offset/length/count；v4 镜像含 capstone，无引擎时自动退化字节视图）；
++view=disasm → 反汇编（offset 传文件偏移——取 view=sections 的 offset 列，symbols 的 value / info 的 entry 是 vaddr，直接传必报"超出文件长度"；未装 capstone 自动退化字节视图，不是故障，别 pip install）；
++view=relocs → JUMP_SLOT 的 @地址即 foo@got、同节顺序=PLT 顺序；表空=静态链接；
++view=dynamic → NEEDED 看链接哪个 libc、RUNPATH 看随题 .so、BIND_NOW=full RELRO（GOT 只读，别打 GOT 劫持）；
+ view=bytecode → .pyc / PyInstaller：先不带 extract 列目录，再 extract=<名字>（PYZ 用 pyz:模块名），func=只看某函数——常量池与 co_names 常是关键线索。
++分工：单点结论（某函数干什么、某符号/某串在哪）→ elfpeek 单视图一步拿；全量扫描或批量验证 → write_file 落脚本一次跑完，别拆成 5 次 elfpeek；同一假设最多一次脚本，无产出即换路线；小计算可直接 python3 -c。
+ 仍然优先走「符号 + 字符串 + 常量推理」：先 symbols/strings 定位可疑函数，再 disasm 局部看逻辑，不要整段反汇编把步数烧光。

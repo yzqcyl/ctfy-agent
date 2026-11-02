@@ -238,6 +238,56 @@ def tcp_batch(host: str, port: int, payloads: list[str], hex_mode: bool = True,
 
 # ---------------------------------------------------------------- ELF
 
+# >>> [rev-toolbox 2026-11-02] 重定位 / 动态段：纯 stdlib 自研，不引入 pyelftools
+#     对标 ctf-forge 的 inspect_elf（它返回 relocations + dynamic 两个字段），思路借鉴、实现独立。
+
+# x86-64 / i386 常见重定位类型（其余机器回落成数字，不猜）
+_RELOC_NAMES = {
+    62: {0: "NONE", 1: "R_X86_64_64", 2: "PC32", 4: "PLT32", 5: "COPY", 6: "GLOB_DAT",
+         7: "JUMP_SLOT", 8: "RELATIVE", 9: "GOTPCREL", 16: "DTPMOD64", 17: "DTPOFF64",
+         18: "TPOFF64", 37: "IRELATIVE", 41: "GOTPCRELX", 42: "REX_GOTPCRELX"},
+    3: {0: "NONE", 1: "R_386_32", 2: "PC32", 4: "PLT32", 5: "COPY", 6: "GLOB_DAT",
+        7: "JUMP_SLOT", 8: "RELATIVE", 14: "TLS_TPOFF", 35: "TLS_DTPMOD32"},
+}
+
+# .dynamic 里 dt_tag 的含义（只列 CTF 用得上的）
+_DT_NAMES = {
+    0: "NULL", 1: "NEEDED", 2: "PLTRELSZ", 3: "PLTGOT", 4: "HASH", 5: "STRTAB", 6: "SYMTAB",
+    7: "RELA", 8: "RELASZ", 9: "RELAENT", 10: "STRSZ", 11: "SYMENT", 12: "INIT", 13: "FINI",
+    14: "SONAME", 15: "RPATH", 16: "SYMBOLIC", 17: "REL", 18: "RELSZ", 19: "RELENT",
+    20: "PLTREL", 21: "DEBUG", 22: "TEXTREL", 23: "JMPREL", 24: "BIND_NOW",
+    25: "INIT_ARRAY", 26: "FINI_ARRAY", 27: "INIT_ARRAYSZ", 28: "FINI_ARRAYSZ", 29: "RUNPATH",
+    30: "FLAGS", 0x6FFFFEF5: "GNU_HASH", 0x6FFFFFF0: "VERSYM", 0x6FFFFFFB: "FLAGS_1",
+    0x6FFFFFFE: "VERNEED", 0x6FFFFFFF: "VERNEEDNUM",
+}
+# 这两个 tag 的 d_val 是 .dynstr 里的偏移，要解成字符串
+_DT_STRING_TAGS = frozenset((1, 14, 15, 29))  # NEEDED / SONAME / RPATH / RUNPATH
+
+_FLAGS_1_BITS = ((0x1, "NOW"), (0x2, "GLOBAL"), (0x4, "GROUP"), (0x8, "NODELETE"),
+                 (0x10, "LOADFLTR"), (0x20, "INITFIRST"), (0x40, "NOOPEN"), (0x80, "ORIGIN"),
+                 (0x100, "DIRECT"), (0x8000000, "PIE"))
+_FLAGS_BITS = ((0x1, "ORIGIN"), (0x2, "SYMBOLIC"), (0x4, "TEXTREL"), (0x8, "BIND_NOW"),
+               (0x10, "STATIC_TLS"))
+
+
+def _cstr(data: bytes, off: int, cap: int = 160) -> str:
+    """从 off 读一个 NUL 结尾串（越界/无终止符都兜住，不抛错）。"""
+    if off <= 0 or off >= len(data):
+        return ""
+    end = data.find(b"\0", off, off + cap)
+    if end < 0:
+        end = min(off + cap, len(data))
+    return data[off:end].decode("latin-1", "replace")
+
+
+def _reloc_name(machine: int, r_type: int) -> str:
+    return _RELOC_NAMES.get(machine, {}).get(r_type, "type_%d" % r_type)
+
+
+def _flag_words(bits, value: int) -> str:
+    got = [nm for bit, nm in bits if value & bit]
+    return "+".join(got) if got else ""
+
 
 class _Elf:
     """纯 stdlib ELF 解析（只做 CTF 常用字段，不追求完整）。"""
@@ -348,8 +398,13 @@ class _Elf:
                 p_type, p_flags = struct.unpack_from(self.endian + "II", self.data, off)
                 p_vaddr, p_filesz = struct.unpack_from(self.endian + "QQ", self.data, off + 16)
             else:
-                p_type, p_offset = struct.unpack_from(self.endian + "II", self.data, off)
-                p_vaddr, p_filesz, p_flags = struct.unpack_from(self.endian + "III", self.data, off + 8)
+                # [rev-toolbox 2026-11-02] 修 32 位布局：Elf32_Phdr 是
+                # type(0) offset(4) vaddr(8) paddr(12) filesz(16) memsz(20) flags(24) align(28)。
+                # 旧写法在 off+8 解 3 个 I 再按 (vaddr, filesz, flags) 赋值，实际拿到
+                # (vaddr, paddr, filesz) → flags 读成 paddr、filesz 读成 filesz 的错位，
+                # 导致 32 位 ELF 的 NX 恒判 True（PT_GNU_STACK 的 flags 从未读到）。
+                (p_type, p_offset, p_vaddr, _pa, p_filesz, _msz, p_flags, _al) = struct.unpack_from(
+                    self.endian + "IIIIIIII", self.data, off)
             if p_type == 0x6474E551:  # PT_GNU_STACK
                 nx = not (p_flags & 1)  # 可执行栈 => NX 关
             if p_type == 0x6474E552:  # PT_GNU_RELRO
@@ -364,14 +419,116 @@ class _Elf:
         sec["NX"] = nx
         return sec
 
+    # -- [rev-toolbox 2026-11-02] 节头 / 符号表 / 重定位 / 动态段
+    def shdrs(self) -> list[tuple]:
+        """[(idx, name_off, type, flags, addr, offset, size, link, info, entsize)]"""
+        out: list[tuple] = []
+        if not self.e_shoff or not self.e_shnum:
+            return out
+        for i in range(self.e_shnum):
+            off = self.e_shoff + i * self.e_shentsize
+            if off + self.e_shentsize > len(self.data):
+                break
+            if self.is64:
+                fields = struct.unpack_from(self.endian + "IIQQQQIIQQ", self.data, off)
+            else:
+                fields = struct.unpack_from(self.endian + "IIIIIIIIII", self.data, off)
+            out.append((i,) + tuple(fields))
+        return out
+
+    def section_names(self) -> list[str]:
+        sh = self.shdrs()
+        names = [""] * len(sh)
+        if not sh or self.e_shstrndx >= len(sh):
+            return names
+        str_off = sh[self.e_shstrndx][5]
+        for row in sh:
+            names[row[0]] = _cstr(self.data, str_off + row[1])
+        return names
+
+    def _symtab(self, idx) -> list[str]:
+        """按符号表**下标**返回名字（空名保留为空串）——重定位按下标引用，不能像
+        symbols() 那样跳过空名，否则下标会整体错位。"""
+        sh = self.shdrs()
+        if not sh or idx is None or idx < 0 or idx >= len(sh):
+            return []
+        _i, _n, typ, _f, _a, offset, size, link, _info, _align, entsize = sh[idx]
+        if typ not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
+            return []
+        ent = entsize or (24 if self.is64 else 16)
+        str_off = sh[link][5] if link < len(sh) else 0
+        out: list[str] = []
+        for pos in range(offset, min(offset + size, len(self.data)), ent):
+            if pos + ent > len(self.data):
+                break
+            name = struct.unpack_from(self.endian + "I", self.data, pos)[0]
+            out.append(_cstr(self.data, str_off + name) if name else "")
+        return out
+
+    def relocs(self) -> list[tuple[str, str, str, int, int | None]]:
+        """[(节名, 类型名, 符号名, 应用位置, addend)]；覆盖 SHT_RELA(4) / SHT_REL(9)。"""
+        sh = self.shdrs()
+        if not sh:
+            return []
+        names = self.section_names()
+        out: list[tuple[str, str, str, int, int | None]] = []
+        for row in sh:
+            _i, _n, typ, _f, _a, offset, size, link, _info, _align, entsize = row
+            if typ not in (4, 9):
+                continue
+            rela = typ == 4
+            default_ent = ((24 if self.is64 else 12) if rela else (16 if self.is64 else 8))
+            ent = entsize or default_ent
+            if ent < default_ent:  # 坏节头保护：entsize 过小会死循环
+                ent = default_ent
+            syms = self._symtab(link)
+            sec_name = names[row[0]] if row[0] < len(names) else ""
+            for pos in range(offset, min(offset + size, len(self.data)), ent):
+                if pos + default_ent > len(self.data):
+                    break
+                if self.is64:
+                    r_off, r_info = struct.unpack_from(self.endian + "QQ", self.data, pos)
+                    addend = struct.unpack_from(self.endian + "q", self.data, pos + 16)[0] if rela else None
+                    sym_idx, r_type = r_info >> 32, r_info & 0xFFFFFFFF
+                else:
+                    r_off, r_info = struct.unpack_from(self.endian + "II", self.data, pos)
+                    addend = struct.unpack_from(self.endian + "i", self.data, pos + 8)[0] if rela else None
+                    sym_idx, r_type = r_info >> 8, r_info & 0xFF
+                sym = syms[sym_idx] if 0 < sym_idx < len(syms) else ""
+                out.append((sec_name, _reloc_name(self.e_machine, r_type), sym, r_off, addend))
+        return out
+
+    def dynamic(self) -> list[tuple[int, int, str]]:
+        """[(tag, val, 解码后的字符串)]——只读 SHT_DYNAMIC(6)；无节头时返回空（静态链接常见）。"""
+        sh = self.shdrs()
+        if not sh:
+            return []
+        out: list[tuple[int, int, str]] = []
+        for row in sh:
+            _i, _n, typ, _f, _a, offset, size, link, _info, _align, _entsize = row
+            if typ != 6:
+                continue
+            str_off = sh[link][5] if link < len(sh) else 0
+            ent = 16 if self.is64 else 8
+            for pos in range(offset, min(offset + size, len(self.data)), ent):
+                if pos + ent > len(self.data):
+                    break
+                if self.is64:
+                    tag, val = struct.unpack_from(self.endian + "qQ", self.data, pos)
+                else:
+                    tag, val = struct.unpack_from(self.endian + "iI", self.data, pos)
+                txt = _cstr(self.data, str_off + val) if tag in _DT_STRING_TAGS else ""
+                out.append((tag, val, txt))
+        return out
+
 
 # >>> [rev-toolbox 2026-10-30] elfpeek 升级：新增 disasm / bytecode 视图；gadgets v2；strings 支持 utf16。
-# 详细说明与验收见 docs/rev-toolbox-plan.md。capstone 为可选引擎（镜像 v4 起内置），缺失时走 stdlib 退化路径。
+# 详细说明与验收见 docs/rev-toolbox-plan.md。capstone 为可选引擎：**v5 起才装进镜像**（v4 及以前没有——R2 项漏做），缺失时走 stdlib 退化路径。
 def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60,
             offset: int = 0, length: int = 128, count: int = 40, arch: str = "",
             extract: str = "", func: str = "", utf16: bool = False, filt: str = "",
             symbol: str = "", search: str = "") -> str:
-    """ELF / 字节码静态探测：info / sections / symbols / strings / gadgets / disasm / bytecode。"""
+    """ELF / 字节码静态探测：info / sections / symbols / strings / gadgets / disasm / bytecode / relocs / dynamic。"""
     p = Path(path)
     if not p.exists():
         raise DomainToolError("文件不存在：%s（先用 download_*_attachment 落盘到沙盒）" % path)
@@ -425,12 +582,17 @@ def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60,
                             count=int(count or 40), arch=arch)
     if view == "lookup":  # [pwn-toolbox] 符号/字符串精确查询（ret2libc 辅助）
         return _view_lookup(data, elf, symbol=symbol, search=search)
-    raise DomainToolError("view 只支持 info/sections/symbols/strings/gadgets/disasm/bytecode/lookup，收到 %r" % view)
+    if view == "relocs":  # [rev-toolbox 2026-11-02] 重定位表（PLT/GOT 映射、静态链接判定）
+        return _view_relocs(elf, limit=int(limit))
+    if view == "dynamic":  # [rev-toolbox 2026-11-02] 动态段（依赖库/RUNPATH/BIND_NOW/PIE）
+        return _view_dynamic(elf, limit=int(limit))
+    raise DomainToolError(
+        "view 只支持 info/sections/symbols/strings/gadgets/disasm/bytecode/lookup/relocs/dynamic，收到 %r" % view)
 
 
 # >>> [rev-toolbox 2026-10-30] ===== rev 方向工具箱 v2 实现 =====
 # 本段（含文中 [rev-toolbox] 行内标记）均为 toolbox 会话新增；并行会话合并时按标记识别。
-# 依赖策略：capstone 为可选引擎（镜像 v4 起内置）；缺失时所有功能走 stdlib 退化路径，不抛错。
+# 依赖策略：capstone 为可选引擎（**v5 起才装进镜像**；v4 及以前实际没装，靠 stdlib 退化路径工作）；缺失时不抛错。
 
 
 def _phdrs(elf):
@@ -470,8 +632,9 @@ def _entry_line(elf):
 def _capstone_for(elf, arch=""):
     """[rev-toolbox] capstone 可选引擎：不可用返回 None，由调用方走退化路径。
 
-    用 importlib 动态加载而非静态 import：case_stdlib_only 静态扫描禁止第三方
-    import（v3 镜像无 pip）；capstone 到 v4 镜像才内置。缺失时永不 ImportError。
+    用 importlib 动态加载而非静态 import：case_stdlib_only 静态扫描禁止第三方 import。
+    capstone 自 v5 起装进镜像（v4 及以前实际没装，见 docs/rev-toolbox-plan.md 的 R2 项）；
+    缺失时永不 ImportError，一律走退化路径。
     """
     try:
         import importlib
@@ -530,7 +693,7 @@ def _view_disasm(data, elf, offset=0, length=128, count=40, arch=""):
     if md is None:
         chunk = data[target:target + length]
         lines = [
-            "本环境无 capstone（v4 镜像起内置）——退化为字节视图；优先走 symbols/strings 推理，"
+            "本环境无 capstone（v5 起镜像内置；v4 及以前没装）——退化为字节视图；优先走 symbols/strings 推理，"
             "或用 python3 按已知指令编码人工核对：",
             "文件偏移 0x%x 起 %d 字节（vaddr %s）：%s" % (
                 target, len(chunk), hex(va) if va is not None else "?", _hex_preview(chunk, 256)),
@@ -554,6 +717,69 @@ def _view_disasm(data, elf, offset=0, length=128, count=40, arch=""):
             break
     if n == 0:
         lines.append("（0 条可解码指令：偏移可能落在数据区或指令中间，换 offset 或先看 sections/symbols）")
+    return _clip("\n".join(lines))
+
+
+def _view_relocs(elf, limit=60):
+    """[rev-toolbox 2026-11-02] 重定位视图：PLT/GOT 映射、静态链接判定、构造函数定位。"""
+    rows = elf.relocs()
+    if not rows:
+        return _clip(
+            "重定位表为空：要么静态链接（没有 .rela.* / .rel.* 节），要么节头被删/被裁。\n"
+            "静态链接的 rev 题不需要 GOT 推断，直接 symbols/strings → disasm 定位校验逻辑。")
+    by_sec: dict[str, list] = {}
+    for sec, typ, sym, off, addend in rows:
+        by_sec.setdefault(sec or "(无名节)", []).append((typ, sym, off, addend))
+    order = sorted(by_sec, key=lambda s: (s != ".rela.plt", s))  # PLT 优先：rev/pwn 最常看这张
+    lines = ["重定位 %d 条，分 %d 节（JUMP_SLOT 的 @地址就是 foo@got；同一节内顺序 = PLT stub 顺序）："
+             % (len(rows), len(by_sec))]
+    shown = 0
+    for sec in order:
+        items = by_sec[sec]
+        lines.append("[%s] %d 条" % (sec, len(items)))
+        for typ, sym, off, addend in items:
+            if shown >= limit:
+                lines.append("  …（已到 limit=%d，加 limit 或换节看）" % limit)
+                break
+            row = "  %-28s %-11s @0x%x" % (sym or "(无符号)", typ, off)
+            if addend:
+                row += "  addend=0x%x" % (addend & 0xFFFFFFFFFFFFFFFF)
+            lines.append(row)
+            shown += 1
+    lines.append(
+        "RELATIVE 的 addend = 修正前的文件内 vaddr（重定位后 got=载入基址+addend）；"
+        "GLOB_DAT 多为数据导入（stdin/stdout/环境指针）；无符号 RELATIVE 常在 .init_array，可反推构造函数。")
+    return _clip("\n".join(lines))
+
+
+def _view_dynamic(elf, limit=40):
+    """[rev-toolbox 2026-11-02] 动态段视图：依赖库 / RUNPATH / BIND_NOW / PIE 位。"""
+    rows = elf.dynamic()
+    if not rows:
+        return _clip(
+            "没有 SHT_DYNAMIC（无节头，或节头被删）：多数是静态链接。\n"
+            "先用 info 看类型与入口段；静态题直接 symbols/strings → disasm。")
+    needed = [t for tg, _v, t in rows if tg == 1 and t]
+    lines = ["动态段 %d 条，NEEDED=%d（%s）" % (
+        len(rows), len(needed), "、".join(needed) if needed else "无 —— 极可能静态链接或自实现加载")]
+    for tag, val, txt in rows:
+        if tag == 0:
+            continue
+        if len(lines) > limit:
+            lines.append("…（已到 limit=%d）" % limit)
+            break
+        nm = _DT_NAMES.get(tag, "tag_0x%x" % (tag & 0xFFFFFFFF))
+        if txt:
+            lines.append("%-11s %s" % (nm, txt))
+        elif tag == 24:
+            lines.append("%-11s -    （立即绑定 → 通常 full RELRO，GOT 只读，无法改 GOT 劫持）" % nm)
+        elif tag in (30, 0x6FFFFFFB):
+            word = _flag_words(_FLAGS_BITS if tag == 30 else _FLAGS_1_BITS, val)
+            lines.append("%-11s 0x%x%s" % (nm, val, ("  (" + word + ")") if word else ""))
+        else:
+            lines.append("%-11s 0x%x" % (nm, val))
+    if any(tg == 15 for tg, _v, _t in rows):
+        lines.append("注意：出现 RPATH（旧字段）——库搜索路径被硬编码，rev 时可据此找随题分发的 .so。")
     return _clip("\n".join(lines))
 
 
@@ -1832,19 +2058,22 @@ ELFPEEK_SPEC = {
     "function": {
         "name": "elfpeek",
         "description": (
-            "纯 stdlib（镜像 v4 起含 capstone 引擎）的 ELF/字节码静态探测（容器里没有 objdump/file）。"
+            "纯 stdlib 的 ELF/字节码静态探测（容器里没有 objdump/file/readelf）。"
+            "反汇编走 capstone，v5 起镜像内置；缺失时 disasm/gadgets 自动退化（不报错）。"
             "view=info 看架构/入口/PIE/NX/canary/RELRO/入口段；sections/symbols 看节表与符号；"
             "strings 看字符串（utf16=true 扫宽字符串）；"
             "disasm 反汇编（offset/length/count/arch，无 capstone 自动退化字节视图）；"
             "gadgets 枚举 ROP 链（filter=rdi|rsi|rdx|syscall|binsh）；"
             "bytecode 处理 .pyc / PyInstaller（先不带 extract 列目录，再 extract=<名字>，PYZ 用 extract=pyz:<模块名>，func=只看某函数）；"
-            "lookup 精确查符号/字符串偏移（ret2libc：symbol=system、search=/bin/sh，附 libc 版本行）。"
+            "lookup 精确查符号/字符串偏移（ret2libc：symbol=system、search=/bin/sh，附 libc 版本行）；"
+            "relocs 看重定位表（JUMP_SLOT 的 @地址就是 foo@got、静态链接判定、.init_array 构造函数）；"
+            "dynamic 看动态段（NEEDED 依赖库、RUNPATH/RPATH、BIND_NOW→full RELRO、FLAGS_1 的 PIE 位）。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "沙盒内文件路径（相对沙盒根）"},
-                "view": {"type": "string", "enum": ["info", "sections", "symbols", "strings", "gadgets", "disasm", "bytecode", "lookup"]},
+                "view": {"type": "string", "enum": ["info", "sections", "symbols", "strings", "gadgets", "disasm", "bytecode", "lookup", "relocs", "dynamic"]},
                 "min_len": {"type": "integer", "description": "strings 视图的最小串长（默认 4）"},
                 "limit": {"type": "integer", "description": "最多输出条目数（默认 60）"},
                 "offset": {"type": "integer", "description": "disasm：起始文件偏移（默认吸附到可执行段起点）"},

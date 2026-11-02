@@ -69,7 +69,7 @@
 | digest | `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef` |
 | 构建 | Actions run `41304971894` @ `ccc6213` 全绿；匿名拉取三层 200（`tools/verify_image.py`）|
 | 形态 | 59.2 MB 压缩（上限 400）；uid 10001 非 root；`ENTRYPOINT ["python","-m","ctfy_agent","agent"]`；`ENV LLM_ENABLE_THINKING=0` |
-| 内置工具链 | ffuf 2.1.0（Apache-2.0）、SecLists 三表 @758fecf（MIT）、sqlmap 1.10.10（GPLv2+），版本/字节数/sha256 三钉死 + 构建期实跑自检；**capstone 不在镜像**（`elfpeek disasm` 自动退化字节视图）|
+| 内置工具链 | ffuf 2.1.0（Apache-2.0）、SecLists 三表 @758fecf（MIT）、sqlmap 1.10.10（GPLv2+）、**capstone 5.0.3（BSD-3-Clause，v5 起）**，版本/字节数/sha256 三钉死 + 构建期实跑自检；v4 及以前没有 capstone（`elfpeek disasm` 那时退化字节视图）|
 
 ### B.3 本地数据（.gitignore 忽略，**不随 git 走，需另行打包转移**）
 
@@ -146,6 +146,72 @@
 
 处置：想清理直接删（都在 `.gitignore` 之外但非源码）；**不要** `git add -A`，会把它们一起提交。
 后续若要彻底免疫，把它们加进 `.gitignore`（本轮未改 `.gitignore`，避免影响其他分支）。
+
+### B.7 本批增补（2026-11-02，rev 补强：capstone 进镜像 + relocs/dynamic 视图）
+
+来源：评估 `ctf-forge` 的 rev 能力时发现我们自己的两处短板，详见 `docs/rev-toolbox-plan.md §6`。
+
+**① 缺口 #12 关闭：capstone 终于进镜像。** 这是"承诺与实现不一致"，不是单纯缺功能——
+`docs/rev-toolbox-plan.md` 写着"随 v4 重建一起做"，v4 建了但这步漏了；而代码注释、退化提示语、
+`config/agent.json` 的 rev/pwn 提示词三处都写着"v4 镜像含 capstone"。结果模型按提示词去调
+`view=disasm`，拿到的是字节视图，14 步里白烧 1–2 步。
+
+| 落点 | 改动 |
+|---|---|
+| `Dockerfile` | 在"删 pip"那段**之前**加 `capstone==5.0.3`：`ARG` 钉版本 + `ARG` 钉 sha256（`a6b7f3ec…1040`，2921407 B），`pip install --require-hashes`，装完跑真实反汇编自检（`push rbp; mov rbp,rsp` 必须解出 2 条） |
+| `tools_domain_ext.py` | 三处"v4 起内置"改成"v5 起内置；v4 及以前没装" |
+| `THIRD_PARTY_NOTICES.md §3.5` | 新增 capstone 条目（BSD-3-Clause、wheel sha256、义务、以及"缺失时退化路径全绿≠镜像里可用"的提醒） |
+
+**② 新增 `elfpeek view=relocs` / `view=dynamic`（纯 stdlib）。** 之前完全没有重定位和动态段解析，
+判断"静态还是动态""哪个 import 对应哪次调用""GOT 在哪""链接哪个 libc"只能靠 `shell` 手写 python。
+借鉴 `ctf-forge` 的 `inspect_elf` 字段语义（它 AGPL-3.0，**未复制源码**），实现自研。
+
+- `relocs`：`.rela.plt` 直接给出 `printf → @0x601018` 的 `foo@got` 映射（节内顺序 = PLT stub 顺序）；
+  GLOB_DAT 是数据导入；RELATIVE 的 addend = 文件内 vaddr；无重定位表时明示"静态链接"。
+- `dynamic`：NEEDED / RUNPATH / RPATH / PLTGOT / INIT / INIT_ARRAY / BIND_NOW（→full RELRO）/
+  DT_FLAGS 与 FLAGS_1 位解码（含 PIE 位）。
+
+**③ 顺带修一个 32 位老 bug。** `security()` 的 32 位分支把 `Elf32_Phdr` 解成 (vaddr, paddr, filesz)
+却按 (vaddr, filesz, flags) 赋值 → **32 位 ELF 的 NX 恒判 True**（可执行栈也报 NX=True），
+`PT_GNU_STACK` 的 flags 从未读到。已改按完整 8 字布局解包。
+
+**验收**：`smoke_rev.py` **19/19**（原 15 + 新增 4：relocs / dynamic / 静态链接提示 / 32 位 NX）、
+`smoke_pwn.py` 24/24、`tests/smoke.py` **160/0**；真实 ELF 冒烟（`misc-bank/picture__lsb-2016HCTF/files/1`）
+正确列出 3 条 JUMP_SLOT + 1 条 GLOB_DAT + NEEDED=libc.so.6。
+
+**仍未做**：gdb 工具（+30MB，收益不划算）；A3 真机验收（要模型预算）。提示词补 relocs/dynamic 已于
+2026-11-02 21:1x 落地，见 §B.8。
+
+### B.8 提示词外包回收 + 落地（2026-11-02 21:1x，**已完成**）
+
+rev / pwn 两段 system 已换成外部交付版 + 我方 3 处微调。全过程证据在
+`docs/prompt-pack-2026-11-02/`：`README §八` 是落地记录，`delivered/` 是回收件原样留档
+（`agent.json.new` sha256 `d86e6e73…7313a9`）。
+
+| 角色 | 原文 | 交付件 | 落地后 | 硬上限 2600 |
+|---|---|---|---|---|
+| rev | 2223 | 2573 | **2580** | ✓ |
+| pwn | 2235 | 2526 | **2538** | ✓ |
+
+主要变化：① 删掉"v4 镜像含 capstone"的假话，改成条件式"未装 capstone 自动退化字节视图，不是故障，
+别 pip install"（v5 建不建都不用回改）；② `view=disasm` 写明 offset 是**文件偏移**（取 `view=sections`
+的 offset 列，`symbols.value`/`info.entry` 是 vaddr，直接传必报"超出文件长度"）；③ 补 `relocs`/`dynamic`
+两行；④ 新增"何时用工具、何时写脚本"的分工行（单点结论→单视图；全量扫描→一次脚本；同一假设最多一次脚本）；
+⑤ 删与 `UNAVAILABLE_RULE` 重复的"DNS 失败=本机无隧道"。
+
+我方在交付件上又改了 3 处（理由见 README §8.2）：rev 硬约束把"别用 shell 引号硬拼"改成
+"别在 python3 -c 里 open().write()"（引号守卫只在 Windows 生效，容器里 `-c` 可用，原措辞把
+"禁止用 -c 写文件"误写成了"禁止 -c"）；rev/pwn 的 `BIND_NOW=full RELRO` 都加"通常"
+（`BIND_NOW` 而无 `PT_GNU_RELRO` 只是 partial）；`07 §八` 的 ±15% 补口径澄清（硬门是脚本的 1900–2600）。
+
+**验收**：`check_prompt_assembly.py` 8/8 × 2 角色；`tests/smoke.py` **160/0**（换入候选跑一次、
+落最终版再跑一次，都绿）。**不宣称 solve rate 提升**——评测池 rev 3 道 / pwn 1 道，无法 A/B。
+
+**已知未修（单独一项）**：`【二进制/附件先落盘】`尾段让模型用 `http_request(...)` 和 `unpack_archive`，
+但 rev / crypto / pwn 的 `local` 里都没有这两个工具（web 有前者没后者），调了会返回 `[未知工具]`
+并计一步（`solver.py:700`）。538 份 transcript 里 rev/pwn 撞这个的记录是 **0 次**（模型靠【0 取料】
+那句正确的 `download_challenge_attachment` 绕开了），所以是潜伏缺陷。该段出现在 5 个角色
+（web/rev/crypto/pwn/misc），修它要动 4 个角色，留待单独批准。
 
 ---
 
@@ -294,7 +360,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 | 9 | 部分解被兜底翻成整题解出（完成度虚高）| **已修并提交** |
 | 10 | QA 提交通道不通 | **已修并提交**（MCQ 12/12）|
 | **11** | **总入口 `case_bench_stats` 依赖未入库的 `runs/bench_stats.py` → 干净 clone 必红 1 条**【实测 11-03，本次交接新发现】| 未修；修法：把 `runs/bench_stats.py`（6 KB）挪进 `tools/` 并改 import，或在用例里 try/except ImportError 跳过并标注 |
-| 12 | capstone 未进镜像（`elfpeek disasm` 退化字节视图）| 待批：随 v5 重建加 `-u pip install capstone==5.0.3`（约 +4–6 MB，需 `importlib` 动态加载，`case_stdlib_only` 才不红）|
+| 12 | capstone 未进镜像（`elfpeek disasm` 退化字节视图）| **已修（2026-11-02）**：Dockerfile 已加 `capstone==5.0.3`（sha256 钉死 + 构建期反汇编自检，位于删 pip 之前），v5 建出来即生效；v4 仍无（§B.7）|
 
 ### F.2 安全与合规（交接前逐项打勾）
 
@@ -352,7 +418,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 
 | 方向 | 新增能力（全部挂既有注册表，零 crew 改动）|
 |---|---|
-| rev | `elfpeek` 新视图：disasm（capstone 可选，缺失退化字节视图）/ bytecode（.pyc marshal+dis+常量池、PyInstaller CArchive/PYZ 提取）/ gadgets v2 / strings utf16 / info 补入口段 |
+| rev | `elfpeek` 新视图：disasm（capstone，v5 起镜像内置）/ bytecode（.pyc marshal+dis+常量池、PyInstaller CArchive/PYZ 提取）/ gadgets v2 / strings utf16 / info 补入口段 / **relocs（PLT-GOT 映射、静态链接判定）** / **dynamic（NEEDED/RUNPATH/BIND_NOW/PIE 位）** |
 | pwn | `pwngen`（cyclic De Bruijn / build 拼装 hex·raw·pad·int 小端·落盘）、`pwnfind`（回显 3~8 字节反查偏移、倒序、hex/文本）、`elfpeek view=lookup`（符号偏移+相近建议+ret2libc 提示）|
 | crypto | `rsatool`（small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor）、`aesblock`（纯 stdlib AES-128/192/256 ecb/cbc/ctr/xor/bitflip/pkcs7，FIPS-197+NIST 向量过）、`prng`（MT19937 状态恢复预测、LCG 参数恢复）|
 
@@ -363,7 +429,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 AI：`verify_exploit` 自校验、`allow_shell=true`+shell/decode_blob、步数 12→14、提示词补【工具面】。
 Web：侦察预算（http_map ≤2 次/轮、侦察 ≤1/3 步数）、evidence 条款细化（20–200 字符连续原文）、
 SQLi/上传靶场方法卡、multipart 原生支持（O-F，`files/form` 参数）。
-本地无法修复（登记）：003/004/012 平台占位或 VPN-only；capstone 随 v5（缺口 #12）。
+本地无法修复（登记）：003/004/012 平台占位或 VPN-only；capstone 已随 v5 进 Dockerfile（缺口 #12 关闭）。
 
 ## 附录 C. docs/ 索引（分类；★=接手先读的高价值篇目，均已入库）
 

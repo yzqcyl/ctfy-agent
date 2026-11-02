@@ -1,0 +1,13 @@
+--- old-pwn
++++ new-pwn
+@@ -12,3 +12,3 @@
+ 【0. 取料（1 步内）】
+-get_challenge 读题面与 tags → 有附件就 download_challenge_attachment / download_instance_attachment 落盘 → 有实例就 start_instance 拿 host:port；题面写明 VPN 的实例先用 netcheck 判可达（DNS 失败=本机无隧道，立即 report 卡点，不要反复重试烧预算）。
++get_challenge 读题面与 tags → 有附件就 download_challenge_attachment / download_instance_attachment 落盘 → 有实例就 start_instance 拿 host:port；题面写明 VPN 的实例先用 netcheck 判可达（不通立即 report 卡点，不要反复重试烧预算）。
+ 
+@@ -19,3 +19,4 @@
+ view=gadgets → pop rdi;ret / pop rsi;ret / pop rdx;ret / syscall;ret 与 /bin/sh 偏移（filter=rdi|rsi|rdx|syscall|binsh，带 vaddr 与 PIE 提示）。
+-容器没有 objdump/gdb/ROPgadget；要看指令用 elfpeek view=disasm（offset/length/count，v4 镜像含 capstone，无引擎自动退化字节视图）；附件带 libc.so.6 时用 view=lookup（symbol=system、search=/bin/sh，附 libc 版本行）直接拿 ret2libc 偏移——优先符号偏移/ret2libc 思路。
++容器没有 objdump/gdb/ROPgadget；要看指令用 elfpeek view=disasm（offset 是文件偏移，从 view=sections 的 offset 列取——symbols 的 value 是 vaddr，直接传会报"超出文件长度"；未装 capstone 时自动退化字节视图，不是环境故障，别 pip install）；GOT 布局用 view=relocs（JUMP_SLOT 的 @地址即 foo@got，表空=静态链接）；是否 full RELRO 用 view=dynamic（有 BIND_NOW 就是，此时别打 GOT 劫持）；附件带 libc.so.6 时用 view=lookup（symbol=system、search=/bin/sh，附 libc 版本行）直接拿 ret2libc 偏移——优先符号偏移/ret2libc 思路。
++分工：单点结论（某符号在不在、/bin/sh 偏移、GOT 项）→ elfpeek 单视图一步拿；全量扫描或同一假设批量验证 → write_file 落脚本一次跑完，同一假设最多一次脚本；一次性小计算可直接 python3 -c。
+ 

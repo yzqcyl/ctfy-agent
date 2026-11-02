@@ -56,6 +56,31 @@ Apache-2.0 全文：https://www.apache.org/licenses/LICENSE-2.0
 `import`），自有代码只通过子进程 argv 调用它。本仓库的 MIT 授权只覆盖自有代码，
 不覆盖上述第三方程序；反之这些第三方许可证也不延伸到本仓库自有代码。
 
+## 3.5 capstone 5.0.3 —— BSD-3-Clause（v5 起）
+
+| 项 | 值 |
+|---|---|
+| 上游 | https://www.capstone-engine.org（PyPI 包 `capstone`） |
+| 版本 | 5.0.3 |
+| 制品 | `capstone-5.0.3-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl`，2921407 B |
+| sha256 | `a6b7f3ec2346a60475d9d043b437ace5e6688fc9c4d45387476104bd2c231040` |
+| 许可证 | BSD 3-Clause（wheel 内 `LICENSE.TXT`，含 libcapstone 原生库） |
+| 安装位置 | `site-packages/capstone/`，随 wheel 打包 `libcapstone` |
+| 使用方式 | 仅由 `tools_domain_ext._capstone_for()` 经 `importlib` 动态加载，供 `elfpeek view=disasm/gadgets` 使用 |
+
+**为什么引入**：`docs/rev-toolbox-plan.md` 的 R2 项（v4 重建时漏做）；不装则 `disasm` 只能退化
+成字节视图，而 rev/pwn 角色提示词按「镜像含 capstone」写，两者不一致会白烧步数。
+
+**义务**：BSD-3-Clause 要求保留版权声明、许可全文、不得用作者名义背书。本仓库附
+[`LICENSE`](LICENSE) 为自有代码的 MIT；capstone 的 BSD 全文随 wheel 落在镜像内
+`site-packages/capstone/LICENSE.TXT`，分发镜像时一并携带即满足。本项目未修改 capstone 源码或
+原生库，仅按原样分发。
+
+**边界**：capstone 是**可选运行时依赖**，缺失时 `_capstone_for()` 返回 `None`、`elfpeek` 自动走
+stdlib 退化路径（永不 `ImportError`）。因此本地 `python tests/smoke_rev.py` 在无 capstone 环境下
+仍是 15/15 全绿——**注意这只能证明代码不炸，不能证明镜像里的反汇编可用**，镜像侧靠 Dockerfile
+的构建期自检（`capstone.__version__` + 真实反汇编 2 条指令）兜住。
+
 ## 4. 基础镜像与系统包
 
 | 组件 | 许可证 | 说明 |

@@ -167,9 +167,27 @@ ENV PYTHONUNBUFFERED=1 \
 # 注意：11-21 正式赛换官方智谱后若该字段不被接受，重建时去掉这行即可。
 ENV LLM_ENABLE_THINKING=0
 
+# ---------- rev/pwn 工具箱：capstone 反汇编引擎（v5 新增） ----------
+# 为什么现在才装：docs/rev-toolbox-plan.md 的 R2 项写着「capstone 进镜像，随 v4 重建一起做」，
+# v4 建了但这一步漏做，于是 elfpeek 的 disasm / gadgets 在镜像里一直走 stdlib 字节退化路径；
+# 更糟的是 rev/pwn 角色提示词和代码注释都写着「v4 镜像含 capstone」——提示词在骗模型，
+# 每个 rev 题会白烧 1–2 步去调一个注定退化的视图。v5 补上（HANDOFF 缺口 #12）。
+#
+# 为什么用 pip 装而不是拷 .so：wheel 自带 libcapstone，pip 解包最省事；但必须
+# 版本 + sha256 双钉死（与 ffuf/sqlmap 同口径），且**必须放在下面「删 pip」那段之前**。
+# --require-hashes 会强制校验下载到的产物：一旦 PyPI 换了包体，构建当场失败而不是静默装进坏的。
+ARG CAPSTONE_VERSION=5.0.3
+ARG CAPSTONE_WHEEL_SHA256=a6b7f3ec2346a60475d9d043b437ace5e6688fc9c4d45387476104bd2c231040
+RUN set -eux; \
+    printf 'capstone==%s --hash=sha256:%s\n' "${CAPSTONE_VERSION}" "${CAPSTONE_WHEEL_SHA256}" > /tmp/capstone-req.txt; \
+    python -m pip install --no-cache-dir --require-hashes -r /tmp/capstone-req.txt; \
+    rm -f /tmp/capstone-req.txt; \
+    python -c "import capstone; assert capstone.__version__=='5.0.3', capstone.__version__; cs=capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64); ins=list(cs.disasm(bytes([0x55,0x48,0x89,0xe5]), 0x1000)); assert len(ins)==2 and ins[0].mnemonic=='push', ins; print('capstone selftest ok:', capstone.__version__, len(ins), 'insns')"
+
 # 瘦身（主办方：镜像太大传不上去）。运行时只用 stdlib，下列都是死重量（约 20MB）：
 #   pip/setuptools/wheel/ensurepip（不安装依赖）、test 模块、idlelib/lib2to3/pydoc_data/turtledemo。
 # 另：.dockerignore 已排除 tests/docs/runs/__pycache__，ENV 里禁了运行时写 .pyc。
+# 注意顺序：上面 capstone 用的是 pip，必须在这段之前装完；这段删的是 pip 本身，不影响已装的包。
 RUN rm -rf /usr/local/lib/python3.12/ensurepip \
            /usr/local/lib/python3.12/test \
            /usr/local/lib/python3.12/idlelib \
