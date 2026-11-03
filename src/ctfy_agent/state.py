@@ -188,6 +188,10 @@ class Challenge:
     # 与 flags_tried 的分工：那个是幂等去重（哈希、永久），这个是给模型的负样本提示。
     rejected_answers: list[str] = field(default_factory=list)
     flag_value: str = ""          # 只在校验通过后记录
+    # 多问题题（slug+flag / flag+root 这类）：question_id → 已通过答案。
+    # 单值 flag_value 在第二问通过时会被覆盖，导致 result.json 的 answers 张冠李戴
+    # （实测 SAMPLE-001：slug 通过后 flag_value=slug，最终 answers 把 slug 当 flag 交上去）。
+    answers_by_qid: dict = field(default_factory=dict)
     next_question_id: str = ""    # 多问题题：下一道待提交的 question_id（per-challenge 隔离，不写 config.extra）
     notes: list[str] = field(default_factory=list)
     tool_counts: dict = field(default_factory=dict)  # 写操作频控计数（start/stop 实例等）
@@ -405,6 +409,12 @@ class Store:
             item.submitted_ok = True
         if disk.get("flag_value") and not item.flag_value:
             item.flag_value = disk.get("flag_value")
+        # answers_by_qid：按题号并集（每个题号的答案单调，先到先得，跨 lane 不回退）
+        disk_answers = disk.get("answers_by_qid") or {}
+        if isinstance(disk_answers, dict):
+            for qid, val in disk_answers.items():
+                if val and not item.answers_by_qid.get(str(qid)):
+                    item.answers_by_qid[str(qid)] = str(val)
         if disk.get("next_question_id") and not item.next_question_id:
             item.next_question_id = disk.get("next_question_id")
 
@@ -429,12 +439,16 @@ class Store:
             self.save()
         return "ok"
 
-    def mark_submitted(self, challenge_id: str, flag: str, *, accepted: bool, fully_solved: bool = True) -> None:
+    def mark_submitted(self, challenge_id: str, flag: str, *, accepted: bool, fully_solved: bool = True,
+                       question_id: str = "") -> None:
         """提交结果出来后回写通过状态（不回退 attempts / flags_tried）。
 
         [fix 2026-11-03 B-3] fully_solved=False 表示多问题题只过了当前题号（平台回执
         challenge_fully_solved=false）：只记 flag 不置 status="submitted"，让 precheck_fn
         不误判「已全解」而漏掉剩余题号的提交。submitted_ok 也只在全解时置 True。
+
+        [fix 2026-11-03 v6.3] question_id 记录到 answers_by_qid：多问题题每个题号各自留档，
+        最终 result.json 的 answers 才不会把第一问的答案写给第二问（SAMPLE-001 实测）。
         """
         if not accepted:
             return
@@ -442,7 +456,10 @@ class Store:
             item = self.require(challenge_id)
             if fully_solved:
                 item.submitted_ok = True
-            item.flag_value = flag
+            if question_id:
+                item.answers_by_qid[str(question_id)] = flag
+            if not item.flag_value:
+                item.flag_value = flag
             if fully_solved:
                 item.status = "submitted"
             item.touch()

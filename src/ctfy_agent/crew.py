@@ -281,6 +281,30 @@ def _strategy_nudge(prior: list[str]) -> str:
 MAX_DONE_BLOCKS = 2           # done 被候选闸门拦下的次数上限（有界，避免死循环）
 CONVERGENCE_STALL_ROUNDS = 3  # 连续 N 轮「无证据 + 无证伪 + 假设只增」才注入收敛刹车
 
+
+def _usage_delta(start: dict | None, end: dict | None) -> dict:
+    """本轮净增量 usage（OpenAI 形状）。
+
+    [v6.3] 两个口径分开：
+      - 刹车口径：snapshot 的 prompt_tokens（cache_discount=true 时缓存命中按 1/10 计）；
+      - 报表口径：raw_prompt_tokens（真实 input token，含缓存命中），写进 result.json 的 input_tokens。
+    否则启用缓存折价后平台报表的 input_tokens 只有真实的 1/5，赛后没法核对成本，
+    也会让「800k 预算怎么 40 次调用就没了」看起来像 bug。
+    """
+    start = start or {}
+    end = end or {}
+    completion = max(0, int(end.get("completion_tokens") or 0) - int(start.get("completion_tokens") or 0))
+    raw_prompt = max(0, int(end.get("raw_prompt_tokens") or 0) - int(start.get("raw_prompt_tokens") or 0))
+    billed_prompt = max(0, int(end.get("prompt_tokens") or 0) - int(start.get("prompt_tokens") or 0))
+    prompt = raw_prompt or billed_prompt
+    usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    cached = max(0, int(end.get("cached_tokens") or 0) - int(start.get("cached_tokens") or 0))
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    if billed_prompt and billed_prompt != prompt:
+        usage["prompt_tokens_billed"] = billed_prompt
+    return usage
+
 _NO_CANDIDATE_GATE = (
     "[候选闸门] 目前 attempts=0 且没有任何逐字候选被验证过，不能就此 done 收尾。\n"
     "要么把你最有把握的候选用 submit 提交（拿不准先 verify_answer 自校验，不消耗提交次数），\n"
@@ -402,6 +426,11 @@ COORDINATOR_PROMPT = """你是 CTF 解题**协调者**。你不亲自探测，�
    并提醒内部工具参数先试低编号（系统预置的 #1/#2），模型容易误对自己的新工单调用。
 - 专家回来会交一份结论；对照 done_when 判断是否达成，再决定继续派活、换方向、submit 或 done。
 - flag 只能通过 submit 提交；一旦平台确认通过就调用 done 收尾。
+- **多问题题（门控 / checker）**：平台回执 `challenge_fully_solved=false` 说明本题还有题号没交。流程：
+  ① 立刻 get_challenge 看剩余题面；② 只派一个专家去取**剩余那一问**的答案；③ 拿到新答案再 submit。
+  铁律：同一题号的答案只交 1 次，通过后不得再交；**已通过的答案不能拿去交别的题号**（会被直接拦下）；
+  checker 题没有 flag 串（题面写 no flag string / judge sidecar confirms）：做完整利用动作后调
+  `verify_exploit` 校验，别用 submit 蒙；通过一问后禁止连发 submit，下一动作只能是 delegate 或 done。
 - **先提交再补链路**：专家结论里只要出现「疑似成功值」（FLAG{...}、题面指定格式的串、响应回显里的 secret/token），下一动作**必须是 submit**——不要先 note、不要为「再确认一轮」再派活。链路没走完不影响提交；晚提交不加分，只多烧预算（历史失败题里 35/37 从未交过任何候选值）。
 - submit 被判错时：把该值记进 note 并标注「已提交-错误」，然后继续派活换路线；同一值最多提交 1 次，不同候选值可以再提交。
 - 不要臆造事实，不要重复派相同的活，不要连发 submit。
@@ -448,10 +477,16 @@ COORDINATOR_TOOLS = [    {
         "type": "function",
         "function": {
             "name": "submit",
-            "description": "提交答案（flag）。只有拿到确定的答案才调用。",
+            "description": "提交答案（flag）。只有拿到确定的答案才调用；多问题题用 question_id 指明交哪一问。",
             "parameters": {
                 "type": "object",
-                "properties": {"answer": {"type": "string"}},
+                "properties": {
+                    "answer": {"type": "string", "description": "候选答案原文"},
+                    "question_id": {
+                        "type": "string",
+                        "description": "多问题题的题号（如 slug / flag / root）。单问题题可省略。",
+                    },
+                },
                 "required": ["answer"],
             },
         },
@@ -748,8 +783,10 @@ class Crew:
                 "attempts": challenge.attempts,
                 "reason": "budget_exhausted",
                 "budget": spending.snapshot(),
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "tokens_spent": 0,
+                # [v6.3] 这里原先写死 0：cut_off 的题在平台报表里 token/usage 全 0，
+                # 看起来像「没跑过」，实际已经烧掉几十万 token（SAMPLE-001/003 实测）。
+                "usage": _usage_delta(start_usage, spending.snapshot()),
+                "tokens_spent": _usage_delta(start_usage, spending.snapshot())["total_tokens"],
                 "transcript": str(self.store.transcript_path(challenge_id)),
                 # 集群-B：切片用尽 ≠ 题级预算耗尽；wall_clock = 时间到（与钱无关，优先）
                 "reason": stop_reason_of(exc),
@@ -812,6 +849,10 @@ class Crew:
         last_refuted = -1
         convergence_stalls = 0
         flag_nudged = False
+        # [v6.3] 提交节流：多问题题实测被刷屏（SAMPLE-001 submit 70 次 / SAMPLE-009 44 次），
+        # 每次只是「同一旧答案再交一遍」，白烧调用。按题号计次 + 通过后必须先去拿新答案。
+        submit_counts: dict[str, int] = {}
+        needs_new_answer = False
 
         # 断点续跑（P0-1）：协调者上下文是本 run 最贵的状态，崩溃即清零（003 实测烧掉 135k token）。
         # 每轮开跑前把 messages/reports/ledger/plan 快照到 run_dir/checkpoints/；正常收尾删除，
@@ -1008,48 +1049,72 @@ class Crew:
                                 "delegate", {"role": role_name, "objective": objective}, text,
                                 role="coordinator", ok=True,  # 派活只用来去重，不参与「方向证伪」统计
                             )
+                            needs_new_answer = False  # 已经去拿新答案了，解除 submit 节流
                             reports.append(text)
                             # 只记摘要，别把完整报告塞进笔记（跨 run 复利膨胀，审计 B3）
                             self.store.add_note(challenge_id, text[:800])
                     elif name == "submit":
-                        text, accepted = solver._submit(args, challenge_id)
-                        if accepted:
-                            submitted = True
-                            reason = "flag_accepted"
-                            # 多问题/门控题：平台回执说尚未全解就继续，别在第一题就收尾。
-                            # （容器路径靠 task.json 的 gated_questions 提示；CLI/MCP 路径没有那份文件，
-                            #  这里用提交回执里的 challenge_fully_solved 兜住，避免漏掉后续题的分数。）
-                            verdict = self.platform._as_json(text)
-                            if isinstance(verdict, dict) and verdict.get("challenge_fully_solved") is False:
-                                submitted = False
-                                reason = "partial_solve"
-                                info = self._fetch_challenge(challenge_id, solver) or self._question_info
-                                self._question_info = info
-                                all_qids = self._question_ids(info)
-                                prompts = {
-                                    str(q.get("id")): str(q.get("prompt") or "").strip()[:200]
-                                    for q in (info.get("questions") or [])
-                                    if isinstance(q, dict) and q.get("id")
-                                }
-                                current = str(
-                                    args.get("question_id")
-                                    or challenge.next_question_id
-                                    or "flag"
-                                )
-                                rest = [qid for qid in all_qids if qid != current]
-                                if rest:
-                                    # 下一条 submit 若不显式给 question_id，默认打向另一道未交的题
-                                    # （per-challenge 落盘，别写共享 config——CLI 批量跑题会跨题污染，审计修复）
-                                    challenge.next_question_id = rest[0]
-                                    self.store.save()
-                                lines = [f"- 【问题 {qid}】{prompts.get(qid, '（门控/未解锁，需重新 get_challenge)')}" for qid in rest]
-                                text += (
-                                    "\n\n[多问题] 平台回执 challenge_fully_solved=false：本题尚未全解，"
-                                    f"刚通过的是 `{current}`，还有题没提交。\n"
-                                    + ("\n".join(lines) + "\n" if lines else "")
-                                    + (f"下一条 submit 的默认题号已设为 `{rest[0]}`，也可显式传 question_id；" if rest else "")
-                                    + "全部题答完之前不要调用 done。"
-                                )
+                        qid_hint = str(args.get("question_id") or challenge.next_question_id or "")
+                        tries = submit_counts.get(qid_hint, 0)
+                        if needs_new_answer and not submitted:
+                            # [v6.3] 通过一问之后，模型的惯性动作是「再交一次旧答案」（实测 70 次/44 次）。
+                            # 直接拦下并给出唯一合法下一步：派专家取剩余题的答案。
+                            text = (
+                                "[提交被拦截] 上一问刚通过，本题还没全解——现在缺的是**剩余题的新答案**，"
+                                "不是把旧答案再交一遍。\n下一步只能 delegate：把剩余题面交给专家去取答案"
+                                "（checker 题没有 flag 串，做完动作后用 verify_exploit 校验）。"
+                            )
+                        elif qid_hint and tries >= 2:
+                            text = (
+                                f"[提交被拦截] 题号 `{qid_hint}` 已经提交 {tries} 次。"
+                                "同一题反复 submit 不会有新结果：要么换答案来源（delegate），要么 done 收口。"
+                            )
+                        else:
+                            text, accepted = solver._submit(args, challenge_id)
+                            submit_counts[qid_hint] = tries + 1
+                            if accepted:
+                                submitted = True
+                                reason = "flag_accepted"
+                                # 多问题/门控题：平台回执说尚未全解就继续，别在第一题就收尾。
+                                verdict = self.platform._as_json(text)
+                                if isinstance(verdict, dict) and verdict.get("challenge_fully_solved") is False:
+                                    submitted = False
+                                    reason = "partial_solve"
+                                    needs_new_answer = True
+                                    info = self._fetch_challenge(challenge_id, solver) or self._question_info
+                                    self._question_info = info
+                                    all_qids = self._question_ids(info)
+                                    prompts = {
+                                        str(q.get("id")): str(q.get("prompt") or "").strip()[:200]
+                                        for q in (info.get("questions") or [])
+                                        if isinstance(q, dict) and q.get("id")
+                                    }
+                                    modes = {
+                                        str(q.get("id")): str(q.get("mode") or "")
+                                        for q in (info.get("questions") or [])
+                                        if isinstance(q, dict) and q.get("id")
+                                    }
+                                    accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
+                                    current = qid_hint or "flag"
+                                    rest = [qid for qid in all_qids if qid not in accepted_map]
+                                    if rest:
+                                        # 只提示下一题号，不鼓励立刻再 submit（要先去拿答案）
+                                        challenge.next_question_id = rest[0]
+                                        self.store.save()
+                                    lines = []
+                                    for qid in rest:
+                                        checker = "（checker 题：没有 flag 串，做动作后调 verify_exploit）" \
+                                            if modes.get(qid) == "checker" else ""
+                                        lines.append(
+                                            f"- 【问题 {qid}】{prompts.get(qid, '（门控/未解锁，先 get_challenge）')}{checker}"
+                                        )
+                                    text += (
+                                        "\n\n[多问题] 平台回执 challenge_fully_solved=false：本题尚未全解，"
+                                        f"刚通过的是 `{current}`。\n"
+                                        + ("\n".join(lines) + "\n" if lines else "")
+                                        + f"**下一步必须是 delegate**：把上面剩余题的题面交给对应专家去取答案；"
+                                        f"禁止把 `{current}` 的答案再提交给其它题号。全部题答完之前不要调用 done。"
+                                    )
                     elif name == "note":
                         self.store.add_note(challenge_id, str(args.get("text") or ""))
                         text = "已记录。"
@@ -1181,10 +1246,7 @@ class Crew:
         self.store.save()
         _ckpt_discard(ckpt_path)  # 正常收尾：清掉快照，避免下一跑误当崩溃残留而续跑
         end_usage = spending.snapshot()
-        usage = {
-            key: max(0, int(end_usage.get(key) or 0) - int(start_usage.get(key) or 0))
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-        }
+        usage = _usage_delta(start_usage, end_usage)
         # 账本快照落转录：M2（跨 delegate 重复）与 M3（open→refuted）都从这里取证
         self.store.append_transcript(
             challenge_id, {"role": "ledger", "stats": ledger.stats(), "render": ledger.render()}

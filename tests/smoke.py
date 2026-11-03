@@ -4613,6 +4613,111 @@ def case_ai_direction_dod(tmp: Path) -> None:
     ok("AI 安全方向 §9 DOB：角色契约 + 提示词纪律自动补 + 工具面收口 + delegate 枚举 + 方法卡")
 
 
+def case_v63_multi_answers(tmp: Path) -> None:
+    """v6.3 多问题题：答案按题号留档 → result.json 的 answers/solved 覆盖全部题号。
+
+    实测 SAMPLE-001（slug+flag）：slug 通过后 flag_value=slug，第二问没解出，
+    旧 _final_rollup 只写 answers={"flag": slug}，把第一问的答案当第二问交上去。
+    """
+    import types  # noqa: PLC0415
+
+    from ctfy_agent.agent_main import _final_rollup  # noqa: PLC0415
+    from ctfy_agent.crew import COORDINATOR_TOOLS  # noqa: PLC0415
+
+    # 1) submit 工具 schema 必须能指定题号（旧 schema 只有 answer，协调者无法按题号提交）
+    submit = next(t for t in COORDINATOR_TOOLS if t["function"]["name"] == "submit")
+    props = submit["function"]["parameters"]["properties"]
+    assert "question_id" in props, f"submit schema 缺 question_id：{props}"
+
+    store = Store(tmp / "v63m").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    store.mark_submitted("web-01", "slug-abc", accepted=True, fully_solved=False, question_id="slug")
+    item = store.require("web-01")
+    assert item.answers_by_qid == {"slug": "slug-abc"}, item.answers_by_qid
+    assert item.status != "submitted", item.status  # 未全解不置 submitted（B-3 语义保持）
+
+    store.mark_submitted("web-01", "FLAG{second}", accepted=True, fully_solved=True, question_id="flag")
+    item = store.require("web-01")
+    assert item.answers_by_qid.get("flag") == "FLAG{second}", item.answers_by_qid
+    assert item.submitted_ok is True
+
+    # 2) _final_rollup 按题号写全部答案（旧实现只会写一个 default_question_id）
+    cfg = types.SimpleNamespace(extra={})
+    rollup = _final_rollup(
+        store, "web-01",
+        {"submitted": True, "reason": "flag_accepted", "steps": 3, "budget": {"calls": 7}},
+        cfg,
+    )
+    assert rollup["answers"] == {"slug": "slug-abc", "flag": "FLAG{second}"}, rollup["answers"]
+    assert rollup["solved"] == ["flag", "slug"], rollup["solved"]
+    assert rollup["fully_solved"] is True
+
+    # 3) 落盘重载后仍在（跨进程/重跑不丢）
+    reloaded = Store(tmp / "v63m").load()
+    assert reloaded.require("web-01").answers_by_qid.get("slug") == "slug-abc"
+    ok("v6.3 多问题：answers_by_qid 逐题留档 + result.json 写全部题号答案")
+
+
+def case_v63_submit_guards(tmp: Path) -> None:
+    """v6.3 提交节流：已通过题号不许再交、已通过的值不许拿去交别的题号。
+
+    实测 SAMPLE-001 协调者 submit 调了 70 次、SAMPLE-009 调了 44 次，绝大多数是
+    把同一份旧答案反复再交一遍（白烧调用次数）。
+    """
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp / "v63g")
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store = Store(tmp / "v63g").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        solver = Solver(config, platform, fake_llm.ScriptedLLM([]), store)
+        store.mark_submitted("web-01", "flag{first}", accepted=True, fully_solved=False, question_id="slug")
+
+        # 同一题号重复提交 → 拦
+        text, accepted = solver._submit({"flag": "whatever", "question_id": "slug"}, "web-01")
+        assert accepted is False and "已经提交过" in text, text
+        # 已通过的值拿去交另一题号 → 拦（SAMPLE-001 的 5 次错交都属这类）
+        text, accepted = solver._submit({"flag": "flag{first}", "question_id": "flag"}, "web-01")
+        assert accepted is False and "不能拿去交" in text, text
+        ok("v6.3 提交节流：重复题号 / 复用旧答案都被拦下并给出下一步指令")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def case_v63_budget_and_pwn(tmp: Path) -> None:
+    """v6.3 预算口径 + pwn 黑盒纪律：折价刹车、报表仍按真实 token。"""
+    import pathlib  # noqa: PLC0415
+
+    from ctfy_agent.crew import _usage_delta  # noqa: PLC0415
+
+    cfg = load_config(pathlib.Path(__file__).resolve().parents[1] / "config" / "agent.json")
+    assert cfg.extra.get("budget_cache_discount") is True, "budget_cache_discount 未开启"
+    assert int(cfg.max_llm_calls) >= 200, cfg.max_llm_calls
+    pwn = str((cfg.extra.get("roles") or {}).get("pwn", {}).get("system") or "")
+    assert "黑盒服务题" in pwn and "4000" in pwn, "pwn 提示词缺黑盒纪律"
+    assert "list_instance_attachments" in pwn, "pwn 提示词缺实例附件检查"
+
+    b = Budget(max_tokens=800000, cache_discount=True)
+    start = b.snapshot()
+    b.record({
+        "prompt_tokens": 10000,
+        "completion_tokens": 100,
+        "prompt_tokens_details": {"cached_tokens": 9000},
+    })
+    end = b.snapshot()
+    assert end["prompt_tokens"] == 1000 + 900, end["prompt_tokens"]   # 未缓存全价 + 缓存 1/10
+    assert end["raw_prompt_tokens"] == 10000, end["raw_prompt_tokens"]
+    delta = _usage_delta(start, end)
+    assert delta["prompt_tokens"] == 10000, delta     # 报表口径 = 真实 token
+    assert delta["completion_tokens"] == 100, delta
+    assert delta.get("prompt_tokens_billed") == 1900, delta
+    ok("v6.3 预算：缓存折价只用于刹车，result.json 仍报真实 token；pwn 黑盒纪律已内置")
+
+
 def main() -> int:
     # 必须绝对路径：Linux/CI 没有 TEMP 环境变量，退回 "." 会让 tmp 变相对路径，
     # sandbox 里执行假 ffuf/sqlmap 时会拼成 <repo>/<sandbox>/ctfy_agent_smoke/fake_ffuf.py
@@ -4730,6 +4835,9 @@ def main() -> int:
         ("llm_timeout_retry", case_llm_timeout_retry),
         ("ctxopt", case_ctxopt),
         ("platform_seed", case_platform_seed),
+        ("v63_multi_answers", case_v63_multi_answers),
+        ("v63_submit_guards", case_v63_submit_guards),
+        ("v63_budget_and_pwn", case_v63_budget_and_pwn),
     ]
     for name, case in cases:
         try:

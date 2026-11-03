@@ -1,6 +1,32 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
-## ✅ v6.1 已构建、匿名可拉取（2026-11-03）——**提交用这个**
+## ✅ v6.2 已构建、匿名可拉取（2026-11-03）——**提交用这个**
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v6.2` |
+| digest | `sha256:183e0d1ec8d28c7305ce9f3d79d02816133f31d3b79bcb8f7335dd398e26aab9` |
+| 构建 | GitHub Actions run `41656534124`（branch `v3`、sha `2b381c1`）→ **14 步全绿** |
+| 本次变更 | ① 单题预算统一 **800k token**（agent.json / config.DEFAULTS / `_build_config` 三处此前打架，生效值本是硬写的 800k）；② **提高步数**：协调者 14→**24 轮**、web/ai/rev/crypto/pwn 14→**20 步**、misc 10→**16 步**；③ 提示词只改步数行（总步数+各阶段分配），方法/工具面/流程/安全底线未动；④ `roles/*.json`、`roles/*.system.txt`、`config/agent.json` 三处同步 |
+| 依据 | 官方规则提取件确认**平台不规定步数上限**：`docs/report-ctfy-rules.md:143/227/342`（`task.json.max_turns` 是预算，`null`=不限）、`qa-official-2026-10-28.md:20`（只有「并发 ≤ 3」）。v6.1 实测瓶颈是自定的 14 轮（SAMPLE-011 在 24 turns 撞 `step_limit`，token 仅用 22.9k/800k）|
+| 单测 | `tests/smoke.py` **167 passed / 0 failed**；全部 35 个 `tests/smoke_*.py` 全绿（`PYTHONPATH=src`）|
+| 体积/层数 | 17 层，匿名传输 **62.7 MB** |
+| 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app` / `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` |
+| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v6.2`）|
+
+### 下一步：跑 SAMPLE（浏览器，人工）
+
+1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v6.2`（**显式 tag，别填 latest**）→ 点「重新检查」
+2. 模型/provider/密钥沿用上次（DeepSeek V4 Flash + OpenAI + 自有 key）
+3. 提交审核 → 通过后「测评我的 Agent」→ 选 SAMPLE（questions/suite）跑，**留足 3 小时**且不要中途取消
+4. 结果观察点：
+   - `turns` 应明显高于 v6.1（14 轮 → 24 轮可跑），`stop_reason=max_turns` 不再出现在 20-25 turns 处
+   - token 用量上限 800k；预计单题 60–120k，`cut_off` 才说明真的花光预算
+   - 与 v6.1 对照的三题：SAMPLE-011（v6.1 `max_turns`）、SAMPLE-003（v6.1 35 轮未解）、SAMPLE-005（qa，应维持解出）
+
+---
+
+## 历史：v6.1 已构建（2026-11-03）——已被 v6.2 取代
 
 | 项 | 值 |
 |---|---|

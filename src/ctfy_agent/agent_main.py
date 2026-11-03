@@ -419,12 +419,14 @@ def _final_rollup(store: Store, challenge_id: str, summary: dict, config: Config
     challenge = store.get(challenge_id)
     qid = str(config.extra.get("default_question_id") or "flag")
 
-    answers: dict = {}
-    solved: list = []
-    if challenge is not None and challenge.flag_value:
-        answers[qid] = challenge.flag_value  # flag_value 只在平台校验通过后记录
-    if summary.get("submitted"):
-        solved = [qid]
+    # [v6.3] 多问题题：answers 按「题号 → 该题号通过的答案」逐条写回。
+    # 旧实现只写一个 default_question_id + 单值 flag_value，第二问通过时会把第一问的答案覆盖、
+    # 最终把第一问的值当 default 题号交上去（SAMPLE-001 实测：slug 已解但 flag 记成 slug）。
+    per_qid = dict(getattr(challenge, "answers_by_qid", {}) or {}) if challenge is not None else {}
+    answers: dict = {str(k): str(v) for k, v in per_qid.items() if v}
+    if not answers and challenge is not None and challenge.flag_value:
+        answers[qid] = challenge.flag_value  # 老路径兜底：flag_value 只在平台校验通过后记录
+    solved: list = sorted(answers) if (summary.get("submitted") or per_qid) else []
 
     usage = summary.get("usage") or {}
     budget = summary.get("budget") or {}

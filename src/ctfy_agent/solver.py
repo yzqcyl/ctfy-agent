@@ -733,6 +733,27 @@ class Solver:
         if qa_only and question_id == "flag":
             question_id = ""  # QA 题的题号不是 flag，交给平台默认，别硬塞瞎猜的值
 
+        # [fix 2026-11-03 v6.3] 多问题题防串味：同一题号已答对就别再交；
+        # 已答对某题的值也不能拿去交另一题（SAMPLE-001 实测：slug 通过后又被当 flag 交了 5 次）。
+        accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
+        if question_id and str(question_id) in accepted_map:
+            return (
+                f"[提交被拦截] 题号 `{question_id}` 已经提交过（已答对），平台不接受重复提交。"
+                f"\n已通过：{json.dumps(accepted_map, ensure_ascii=False)}"
+                "\n下一步：若平台仍显示未全解，去拿**剩余题号**的答案（delegate 专家），"
+                "不要再提交已通过的题。",
+                False,
+            )
+        for qid_accepted, value_accepted in accepted_map.items():
+            if str(value_accepted).strip() == answer and str(qid_accepted) != str(question_id):
+                rest = [q for q in (self.store.require(challenge_id).answers_by_qid or {}) if q != qid_accepted]
+                return (
+                    f"[提交被拦截] 这个值已经答对题号 `{qid_accepted}`，不能拿去交 `{question_id}`。"
+                    "\n多问题题每一问的答案不同：先 get_challenge 看清剩余题面，再派专家去取对应答案。"
+                    + (f"\n当前还没通过的题号：{rest}" if rest else ""),
+                    False,
+                )
+
         payload = dict(args)
         payload["answer" if "answer" in props else "flag"] = answer
         if "question_id" in props and question_id:
@@ -804,9 +825,15 @@ class Solver:
             # [fix 2026-11-03 B-3] 解析平台回执的 challenge_fully_solved：多问题题只过当前题号时
             # 传 fully_solved=False，让 mark_submitted 不置 status="submitted"，避免 precheck_fn 短路。
             fully_solved = self._fully_solved_from(result, text)
-            self.store.mark_submitted(challenge_id, answer, accepted=True, fully_solved=fully_solved)
-            self.on_event("flag_accepted", {"challenge_id": challenge_id})
-            return f"{text}\n\n[判定] 平台确认该答案通过。", True
+            self.store.mark_submitted(challenge_id, answer, accepted=True, fully_solved=fully_solved,
+                                      question_id=question_id)
+            self.on_event("flag_accepted", {"challenge_id": challenge_id, "question_id": question_id})
+            return (
+                f"{text}\n\n[判定] 平台确认该答案通过（题号 `{question_id or '默认'}`）。"
+                + ("" if fully_solved else "\n[注意] 平台回执说本题**尚未全解**：还有别的题号要交，"
+                                           "下一步派专家取剩余题的答案，不要重复交这一问。"),
+                True,
+            )
         verdict_text = "判定为未通过" if accepted is False else "无法判定是否通过"
         if accepted is False:
             # P2-4：记下这次错交，并回显全部已判错值——提交次数只有 3 次，错交一次就少 1/3
