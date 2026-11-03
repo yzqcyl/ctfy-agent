@@ -71,12 +71,12 @@ def case_ai_shell_and_decode():
 
 
 @case
-def case_ai_steps_14():
-    """步数还是 12 是短板：与 r/p/c 对齐到 14，且提示词与配置一致（防漂移）。"""
+def case_ai_steps_20():
+    """步数 14 → 20（与 r/p/c 同步抬高，平台无步数上限），提示词与配置一致（防漂移）。"""
     ai = _role_ai()
-    assert ai["max_steps"] == 14, ai["max_steps"]
+    assert ai["max_steps"] == 20, ai["max_steps"]
     prompt = open(ROOT / "roles" / "ai.system.txt", encoding="utf-8").read()
-    assert "上限 14 步" in prompt, "提示词步数预算没同步"
+    assert "上限 20 步" in prompt, "提示词步数预算没同步"
     assert "上限 12 步" not in prompt
 
 
@@ -192,7 +192,7 @@ def case_default_ai_fallback_sync():
 
     d = DEFAULT_ROLES["ai"]
     live = _role_ai()
-    assert d["max_steps"] == live["max_steps"] == 14, (d.get("max_steps"), live["max_steps"])
+    assert d["max_steps"] == live["max_steps"] == 20, (d.get("max_steps"), live["max_steps"])
     assert d["allow_shell"] is True, "兜底 allow_shell 必须 True（与活配置同步）"
     assert {"shell", "decode_blob", "chat", "http_request", "http_map"} <= set(d["local"]), d["local"]
     # 兜底 platform 用组名（oracle = verify_answer + verify_exploit），展开后校验通道必须在

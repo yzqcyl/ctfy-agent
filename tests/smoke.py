@@ -2733,7 +2733,7 @@ def case_web_playbook(tmp: Path) -> None:
 
     # 关键条款（行为依赖项，缺了就是提示词回退）
     for needle in (
-        "SPA 兜底", "不可信数据", "只有 14 步", "list_hints", "verify_answer",
+        "SPA 兜底", "不可信数据", "只有 20 步", "list_hints", "verify_answer",
         "你没有提交权", "ledger 拦截", "过滤矩阵", "回显三态", "command not found",
     ):
         assert needle in base, f"web 提示词缺关键条款: {needle}"

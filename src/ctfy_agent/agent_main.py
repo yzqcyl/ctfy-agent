@@ -34,7 +34,7 @@ from .state import Store
 
 SCHEMA_VERSION = 2
 DEFAULT_WORK_DIR = "/ctfy/work"
-DEFAULT_MAX_TURNS = 80          # task.json.max_turns 为 null（无预算）时的保守上限
+DEFAULT_MAX_TURNS = 160         # task.json.max_turns 为 null（无预算）时的保守上限（80→160：配合协调者 24 轮）
 DEFAULT_MAX_TOKENS = 8192       # 4096 会在 thinking 块截断、一步即「无动作结束」
 DEFAULT_MAX_CONTEXT = 32000  # 对齐 agent.json 与各角色提示词的「上下文 32k」承诺（原 16000 导致 16k 就丢旧步骤，模型按 32k 规划却提前失忆）
 DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
@@ -236,11 +236,19 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     config.llm_base_url = str(env.get("LLM_BASE_URL") or env.get("OPENAI_BASE_URL") or config.llm_base_url)
     config.model = str(env.get("LLM_MODEL") or env.get("OPENAI_MODEL") or config.model)
     config.max_tokens = _as_int(env.get("AGENT_MAX_TOKENS"), DEFAULT_MAX_TOKENS)
-    config.max_llm_calls = max_turns or _as_int(env.get("AGENT_MAX_TURNS"), DEFAULT_MAX_TURNS)
+    # 调用数预算：task.max_turns（平台下发）> env AGENT_MAX_TURNS > agent.json > 160。
+    # [fix 2026-11-03] 此前 agent.json 的 max_llm_calls 同样被忽略，与实际生效值不一致。
+    _calls_cap = config.max_llm_calls or DEFAULT_MAX_TURNS
+    config.max_llm_calls = max_turns or _as_int(env.get("AGENT_MAX_TURNS"), _calls_cap)
     config.max_context_tokens = _as_int(env.get("AGENT_MAX_CONTEXT_TOKENS"), DEFAULT_MAX_CONTEXT)
-    config.max_tokens_per_challenge = _as_int(
-        env.get("AGENT_MAX_TOKENS_PER_CHALLENGE"), DEFAULT_MAX_TOKENS_PER_CHALLENGE
-    )
+    # [fix 2026-11-03] 单题 token 上限统一：以 config/agent.json 为唯一权威值（800k），
+    # env AGENT_MAX_TOKENS_PER_CHALLENGE 可覆盖；0 仍表示「不限」（Budget 池语义）。
+    # 背景：此前 agent.json=1.2M / 本文件硬写 800k / config.DEFAULTS=300k 三处打架，
+    # 实际生效的只有本文件的硬写值，配置文件写了等于没写。
+    _tok_cap = config.max_tokens_per_challenge
+    if _tok_cap is None:
+        _tok_cap = DEFAULT_MAX_TOKENS_PER_CHALLENGE
+    config.max_tokens_per_challenge = _as_int(env.get("AGENT_MAX_TOKENS_PER_CHALLENGE"), _tok_cap)
     config.submit_limit = max(3, (len(questions) + gated) * 2)
     config.runs_dir = str(work_dir / "runs")
     # 读超时：长上下文+长输出的单次生成实测能挂满 300s（120s 默认太紧）。容器侧抬到 240s；

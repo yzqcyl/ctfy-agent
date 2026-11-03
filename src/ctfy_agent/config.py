@@ -36,7 +36,7 @@ DEFAULTS = {
     "allow_shell": False,
     "debug": False,
     # 费用/用量上限（硬刹车，防止跑飞烧钱）
-    "max_tokens_per_challenge": 300000,   # 单题累计 token 上限（跨进程继承，重跑接着算）
+    "max_tokens_per_challenge": 800000,   # 单题累计 token 上限（跨进程继承，重跑接着算）；与 agent.json 对齐
     "max_llm_calls": 20,                  # 单题累计模型调用次数上限
     "max_context_tokens": 16000,          # 单次请求上下文滑窗（估算 token），超窗丢最旧步骤
     "max_cost": 0.0,                      # 单题金额上限（0=不限；需同时配单价才生效）

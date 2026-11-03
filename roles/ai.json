@@ -1,7 +1,7 @@
 {
   "ai": {
     "model": "DeepSeek-V4.1-Flash-1017",
-    "max_steps": 14,
+    "max_steps": 20,
     "allow_shell": true,
     "max_tokens": 4096,
     "platform": [
