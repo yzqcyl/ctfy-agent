@@ -744,6 +744,69 @@ def case_state_machine(tmp: Path) -> None:
     ok("提交结果判定（accepted/拒绝/未知三态 + 裸布尔）")
 
 
+def case_concurrent_write(tmp: Path) -> None:
+    """B-5 第二/三层：同进程多 lane 并发 save 不半截、跨 lane 累加字段不回滚。"""
+    import threading
+
+    from ctfy_agent import state as state_mod  # noqa: PLC0415
+
+    # 第二层：多线程并发 save，tmp 名必须唯一，最终 state.json 一定是完整合法 JSON
+    store = Store(tmp / "cw").load()
+    store.challenges.clear()
+    seed_challenge(store)
+    errors: list[Exception] = []
+
+    def hammer(i: int) -> None:
+        try:
+            for _ in range(30):
+                store.set_tokens("web-01", {"prompt_tokens": i * 1000, "completion_tokens": i * 500})
+                store.save()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    # 最终文件必须是完整可解析的 JSON（不能是半截）
+    reloaded = Store(tmp / "cw").load()
+    assert "web-01" in reloaded.challenges
+    ok("B-5 第二层：多线程并发 save 无半截文件（tmp 名进程内唯一）")
+
+    # 第三层：模拟两个 lane 各自写不同累加字段后，refresh 合并不互相回滚
+    a = Store(tmp / "merge_lane").load()
+    a.challenges.clear()
+    a.upsert({"id": "web-01", "name": "Merge"})
+    a.save()
+
+    # lane A：写 tool_counts + tokens
+    lane_a = Store(tmp / "merge_lane").load()
+    la = lane_a.require("web-01")
+    la.tool_counts["start"] = 3
+    la.tokens = {"prompt_tokens": 5000, "completion_tokens": 2000}
+    la.oracle_calls = 2
+    lane_a.save()
+
+    # lane B：独立内存视图，写别的字段（不经过 refresh 直接改内存再 save 会覆盖 A）
+    lane_b = Store(tmp / "merge_lane").load()
+    lb = lane_b.require("web-01")
+    lb.tool_counts["stop"] = 1
+    lb.tokens = {"prompt_tokens": 1000, "completion_tokens": 500}
+    # 走锁内 refresh 再写：模拟 reserve_submit 的合并路径
+    with state_mod._lock_exclusive(lane_b._lock_path()):
+        lane_b._refresh_flags("web-01")
+        lane_b.save()
+    merged = Store(tmp / "merge_lane").load().require("web-01")
+    # A 的累加字段不能被 B 的覆写回滚
+    assert merged.tool_counts.get("start") == 3, merged.tool_counts
+    assert merged.tool_counts.get("stop") == 1, merged.tool_counts
+    assert merged.tokens.get("prompt_tokens") == 5000, merged.tokens  # max 语义
+    assert merged.oracle_calls == 2, merged.oracle_calls
+    ok("B-5 第三层：_refresh_flags 合并 tool_counts/tokens/oracle_calls 不回滚")
+
+
 def case_role_deep_merge(tmp: Path) -> None:
     """部分覆盖内置角色时，未写的键沿用默认值（浅合并会把整条默认吞掉，审计 B2）。"""
     from ctfy_agent.crew import Crew  # noqa: PLC0415
@@ -1322,7 +1385,7 @@ def case_instance_guard(tmp: Path) -> None:
         solver = Solver(config, platform, fake_llm.ScriptedLLM([]), store2)
         attempts: list[str] = []
 
-        def flaky_backoff(cid):
+        def flaky_backoff(cid, start_name=""):
             attempts.append(cid)
             return None if len(attempts) == 1 else {"id": "i-new", "challenge_id": "web-01"}
 
@@ -1344,7 +1407,7 @@ def case_instance_guard(tmp: Path) -> None:
         solver3 = Solver(config, platform, fake_llm.ScriptedLLM([]), store3)
         tries3: list[str] = []
 
-        def always_none(cid):
+        def always_none(cid, start_name=""):
             tries3.append(cid)
             return None
 
@@ -1738,6 +1801,43 @@ def case_submit_question_id(tmp: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def case_partial_solve_state(tmp: Path) -> None:
+    """B-3：多问题题第一题答对但 challenge_fully_solved=false 时，状态机不能误判整题已解。
+
+    修复前：mark_submitted 无条件置 status="submitted" + submitted_ok=True，
+    precheck_fn 见 submitted 直接短路 → 剩余题号永远不再提交，漏掉后续题分数。
+    """
+    from ctfy_agent.state import Store  # noqa: PLC0415
+
+    store = Store(tmp / "partial").load()
+    store.challenges.clear()
+    seed_challenge(store)
+
+    # 1) 全解提交：正常置 submitted + submitted_ok
+    store.mark_submitted("web-01", "flag{full}", accepted=True, fully_solved=True)
+    item = store.require("web-01")
+    assert item.status == "submitted" and item.submitted_ok is True, (item.status, item.submitted_ok)
+
+    # 2) 部分解提交：不置 submitted、不置 submitted_ok，只记 flag
+    store2 = Store(tmp / "partial2").load()
+    store2.challenges.clear()
+    seed_challenge(store2)
+    store2.mark_submitted("web-01", "flag{q1}", accepted=True, fully_solved=False)
+    item2 = store2.require("web-01")
+    assert item2.status != "submitted", f"部分解不应置 submitted，实际 {item2.status}"
+    assert item2.submitted_ok is False, "部分解不应置 submitted_ok"
+    assert item2.flag_value == "flag{q1}", item2.flag_value
+
+    # 3) accepted=False 时不落任何状态（沿用旧语义）
+    store3 = Store(tmp / "partial3").load()
+    store3.challenges.clear()
+    seed_challenge(store3)
+    store3.mark_submitted("web-01", "flag{wrong}", accepted=False, fully_solved=True)
+    item3 = store3.require("web-01")
+    assert item3.status != "submitted" and item3.submitted_ok is False, item3.status
+    ok("部分解状态机：fully_solved=False 不置 submitted/submitted_ok，剩余题号可继续提交")
 
 
 def case_qa_submit(tmp: Path) -> None:
@@ -4533,6 +4633,7 @@ def main() -> int:
         ("hardening", case_hardening),
         ("compact", case_compact),
         ("state_machine", case_state_machine),
+        ("concurrent_write", case_concurrent_write),
         ("role_deep_merge", case_role_deep_merge),
         ("submit_name", case_submit_name),
         ("release_on_submit", case_release_on_submit),
@@ -4555,6 +4656,7 @@ def main() -> int:
         ("challenge_meta", case_challenge_meta),
         ("multi_question", case_multi_question),
         ("submit_question_id", case_submit_question_id),
+        ("partial_solve_state", case_partial_solve_state),
         ("qa_submit", case_qa_submit),
         ("stdlib_only", case_stdlib_only),
         ("hint_scope", case_hint_scope),

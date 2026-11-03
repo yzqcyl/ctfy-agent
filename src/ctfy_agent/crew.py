@@ -1294,7 +1294,9 @@ class Crew:
 
         def precheck_fn(cid: str) -> bool:
             ch = store.require(cid)
-            if ch.status in ("submitted", "done") or getattr(ch, "submitted_ok", False):
+            # [fix 2026-11-03 B-3] partial_solve 时 mark_submitted(fully_solved=False) 不再置
+            # status="submitted"，这里只认「终态 done」或「全解 submitted_ok」，剩余题号可继续提交。
+            if ch.status == "done" or getattr(ch, "submitted_ok", False):
                 return True
             try:
                 return cid in self.platform.my_solved_ids()
@@ -1375,7 +1377,9 @@ class Crew:
 
     @staticmethod
     def _stateless_categories(cfg: dict) -> set[str]:
-        raw = (cfg or {}).get("cluster_a_categories") or "crypto,rev"
+        # 平台 category 实测是 "reverse"（非 "rev"）：11-03 全量 state.json 里 reverse 309 / rev 4，
+        # 老默认值 "crypto,rev" 让 309 道 reverse 题永远判不出无状态。保留 rev 只作历史兼容。
+        raw = (cfg or {}).get("cluster_a_categories") or "crypto,reverse,rev"
         return {s.strip().lower() for s in str(raw).split(",") if s.strip()}
 
     def _is_stateless(self, challenge_id: str, cfg: dict) -> bool:
@@ -1406,7 +1410,8 @@ class Crew:
         ch = store.require(challenge_id)
 
         # 预检：已解出（本 run 的 store 状态或平台提交记录）就不烧任何路（对齐集群-B precheck_fn）
-        if ch.status in ("submitted", "done") or getattr(ch, "submitted_ok", False):
+        # [fix 2026-11-03 B-3] 与 precheck_fn 同口径：只认终态 done 或全解 submitted_ok。
+        if ch.status == "done" or getattr(ch, "submitted_ok", False):
             return self._presolved_summary(challenge_id, ch)
         try:
             if challenge_id in self.platform.my_solved_ids():

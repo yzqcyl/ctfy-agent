@@ -36,7 +36,12 @@ def _lock_exclusive(path: Path):
     try:
         if os.fstat(fd).st_size == 0:
             os.write(fd, b"\0")
+        # [fix 2026-11-03] Windows msvcrt.locking 按「当前 fd 偏移」锁定 1 字节。
+        # 若本进程是第一个创建锁文件的（st_size==0 → 刚 write 过），fd 偏移停在 1，
+        # 而后到进程（st_size!=0 → 不写）偏移为 0，两进程锁的是不同字节 → 不互斥。
+        # 统一把偏移归零，让所有进程都锁 byte[0]。
         if msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
         elif fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -138,6 +143,26 @@ def normalize_solves(value) -> int | None:
         return None
 
 
+def _merge_append(mem: list, disk: list) -> list:
+    """保序去重合并两个「append 语义」的列表（solve_attempts）。
+
+    盘上内容在前、内存内容在后，按 JSON 序列化后的指纹去重——不同 lane 可能登记同一条
+    尝试记录，重复的只保留一份，且不改变先后顺序。
+    """
+    seen: set[str] = set()
+    out: list = []
+    for rec in list(disk) + list(mem):
+        try:
+            key = json.dumps(rec, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            key = repr(rec)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rec)
+    return out
+
+
 @dataclass
 class Challenge:
     id: str
@@ -225,6 +250,18 @@ class Store:
     # 串行化「打开-写-关」防单行交错（诊断数据，非关键路径但顺手收紧）。
     _transcript_lock = threading.Lock()
 
+    # [fix 2026-11-03 B-5] save() 的进程内互斥锁，按 state.json 路径分片。集群-A 同进程多 lane
+    # 各自持有独立 Store 实例但指向同一 run_dir/state.json：tmp 名唯一只能保证「写 tmp」不冲突，
+    # 但最终 os.replace(tmp, path) 并发替换同一目标在 Windows 上会抛 PermissionError(13)。
+    # 这里串行化同一目标文件的整个「写 tmp + replace」过程。
+    _save_locks: dict[str, threading.Lock] = {}
+    _save_locks_guard = threading.Lock()
+
+    @classmethod
+    def _save_lock(cls, path: str) -> threading.Lock:
+        with cls._save_locks_guard:
+            return cls._save_locks.setdefault(path, threading.Lock())
+
     def __init__(self, run_dir: Path):
         self.run_dir = Path(run_dir)
         self.path = self.run_dir / "state.json"
@@ -249,9 +286,14 @@ class Store:
             "meta": {**self.meta, "saved_at": now()},
             "challenges": {key: value.to_dict() for key, value in self.challenges.items()},
         }
-        tmp = self.path.with_suffix(f".json.tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        # [fix 2026-11-03 B-5] 进程内按路径串行化「写 tmp + replace」：并发 replace 同一目标
+        # 在 Windows 上会 PermissionError。锁内重读磁盘做一次 merge 兜底（见下）。
+        with self._save_lock(str(self.path)):
+            # [fix 2026-11-03 B-5] tmp 名必须进程内唯一：集群-A 同进程多 lane 并发 save，
+            # 若只用 pid，各 lane 抢同一 tmp 文件，可能互相覆盖/写出半截。pid + 线程 id 唯一化。
+            tmp = self.path.with_suffix(f".json.tmp.{os.getpid()}.{threading.get_ident()}")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)
 
     # ---------- 题目 ----------
 
@@ -271,6 +313,11 @@ class Store:
             value = data.get(field_name)
             if value not in (None, ""):
                 setattr(item, field_name, value)
+        # [fix 2026-11-03 B-4b] is_qa_only 是 bool，False 也是合法值，不能用 `not in (None,"")` 判空，
+        # 单独处理：cli.py 已归一化该字段，此处落地即丢会致 solver 只能靠 tags 兜底识别 QA 题。
+        qa = data.get("is_qa_only")
+        if qa is not None:
+            item.is_qa_only = bool(qa)
         # 题型先验：tags 是列表，用并集合并（不同来源可能各给一部分，一次给不全也不丢）
         tags = normalize_tags(data.get("tags"))
         if tags:
@@ -301,7 +348,14 @@ class Store:
         return self.run_dir / "state.lock"
 
     def _refresh_flags(self, challenge_id: str) -> None:
-        """锁内调用：把磁盘上其他进程写入的 flags_tried / attempts 合并进内存。"""
+        """锁内调用：把磁盘上其他进程/lane 写入的累加字段合并进内存。
+
+        [fix 2026-11-03 B-5 第三层] 原先只合并 flags_tried/attempts/submitted_ok 三字段，
+        但 save() 是全量覆写（tmp+replace），并发下后写者会把先写者的 tool_counts / oracle_calls /
+        tokens / rejected_answers / solve_attempts / notes / next_question_id / flag_value 全部回滚。
+        尤其 tokens 被回滚会让费用刹车低估已花金额 → 可能超预算。这里把「跨 lane 单调累加」的
+        字段全部按各自语义合并，其余非累加字段（status/instance/description 等）仍以磁盘为准。
+        """
         if not self.path.is_file():
             return
         try:
@@ -315,11 +369,44 @@ class Store:
         if item is None:
             self.challenges[challenge_id] = Challenge.from_dict(disk)
             return
-        merged = list(dict.fromkeys(list(item.flags_tried) + list(disk.get("flags_tried") or [])))
-        item.flags_tried = merged
+        # 并集（去重保序）
+        item.flags_tried = list(dict.fromkeys(list(item.flags_tried) + list(disk.get("flags_tried") or [])))
+        item.rejected_answers = list(dict.fromkeys(list(item.rejected_answers) + list(disk.get("rejected_answers") or [])))
+        # 单调取 max
         item.attempts = max(item.attempts, int(disk.get("attempts") or 0))
+        item.oracle_calls = max(item.oracle_calls, int(disk.get("oracle_calls") or 0))
+        # tool_counts：每 key 取 max（不同 lane 各自计数，不该互相覆盖）
+        disk_tc = disk.get("tool_counts") or {}
+        for name, cnt in disk_tc.items():
+            try:
+                item.tool_counts[name] = max(item.tool_counts.get(name, 0), int(cnt))
+            except (TypeError, ValueError):
+                continue
+        # tokens：每 key 取 max（token 计数单调递增，跨 lane 累计）
+        disk_tokens = disk.get("tokens") or {}
+        if isinstance(disk_tokens, dict):
+            for k, v in disk_tokens.items():
+                try:
+                    item.tokens[k] = max(int(item.tokens.get(k) or 0), int(v))
+                except (TypeError, ValueError):
+                    continue
+        # solve_attempts：append 语义，按「盘上有、内存没有」补齐（保序去重，避免重跑重复登记）
+        if item.solve_attempts and disk.get("solve_attempts"):
+            item.solve_attempts = _merge_append(item.solve_attempts, disk.get("solve_attempts"))
+        elif not item.solve_attempts and disk.get("solve_attempts"):
+            item.solve_attempts = list(disk.get("solve_attempts"))
+        # notes：append 语义，并集去重
+        if item.notes and disk.get("notes"):
+            item.notes = list(dict.fromkeys(list(disk.get("notes")) + list(item.notes)))
+        elif not item.notes and disk.get("notes"):
+            item.notes = list(disk.get("notes"))
+        # 布尔/单值：磁盘有真值则采纳（全解标志、已解出的 flag、下一题号不回退）
         if disk.get("submitted_ok"):
             item.submitted_ok = True
+        if disk.get("flag_value") and not item.flag_value:
+            item.flag_value = disk.get("flag_value")
+        if disk.get("next_question_id") and not item.next_question_id:
+            item.next_question_id = disk.get("next_question_id")
 
     def reserve_submit(self, challenge_id: str, flag: str, limit: int) -> str:
         """原子地预留一次提交（并发下同一条 flag 只会成功预留一次）。
@@ -342,15 +429,22 @@ class Store:
             self.save()
         return "ok"
 
-    def mark_submitted(self, challenge_id: str, flag: str, *, accepted: bool) -> None:
-        """提交结果出来后回写通过状态（不回退 attempts / flags_tried）。"""
+    def mark_submitted(self, challenge_id: str, flag: str, *, accepted: bool, fully_solved: bool = True) -> None:
+        """提交结果出来后回写通过状态（不回退 attempts / flags_tried）。
+
+        [fix 2026-11-03 B-3] fully_solved=False 表示多问题题只过了当前题号（平台回执
+        challenge_fully_solved=false）：只记 flag 不置 status="submitted"，让 precheck_fn
+        不误判「已全解」而漏掉剩余题号的提交。submitted_ok 也只在全解时置 True。
+        """
         if not accepted:
             return
         with _lock_exclusive(self._lock_path()):
             item = self.require(challenge_id)
-            item.submitted_ok = True
+            if fully_solved:
+                item.submitted_ok = True
             item.flag_value = flag
-            item.status = "submitted"
+            if fully_solved:
+                item.status = "submitted"
             item.touch()
             self.save()
 

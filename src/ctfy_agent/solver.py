@@ -498,15 +498,24 @@ class Solver:
         self.store.meta.pop("competition_id", None)
         self.store.meta.pop("competition_scoped_to", None)
 
-    def _start_with_backoff(self, challenge_id: str) -> dict | None:
+    def _start_with_backoff(self, challenge_id: str, start_name: str = "") -> dict | None:
         """start_instance 是写操作、无内置重试；限流/5xx 按 (5,15,30)s 逐级等待，
-        陈旧 meta 导致 challenge_not_found 则清缓存反查后重试。"""
+        陈旧 meta 导致 challenge_not_found 则清缓存反查后重试。
+
+        每次真正发出 start_instance 前都 record_call，使本地配额与平台真实调用次数一致，
+        避免「重试 5 次但配额只记 1 次」打穿平台每题 5 次硬上限（审计 B-2）。
+        """
         waits = (5, 15, 30)
         for attempt in range(len(waits) + 2):
+            if start_name and not self.store.record_call(challenge_id, start_name, self.config.instance_ops_limit):
+                self.on_event("instance_start_failed", {"error": "实例启动配额用尽"})
+                return None
             try:
                 info = self.platform.start_instance(challenge_id, self._competition_id(challenge_id))
             except Exception as exc:  # noqa: BLE001 - MCP 超时/断连按瞬时失败处理，别崩掉 auto-start
-                info = f"start_instance 调用异常：{exc}（timeout）"
+                # [fix 2026-11-03] 不再硬编码「（timeout）」标签：真实异常类别（限流/断连/超时）
+                # 应原样进入下方 transient 判定，避免把一切异常都误判成「超时」而漏掉可重试的限流。
+                info = f"start_instance 调用异常：{exc}"
             if isinstance(info, dict):
                 return info
             text = str(info).lower()
@@ -514,11 +523,12 @@ class Solver:
                 # meta 陈旧把题塞进了错误场次：作废缓存，下轮反查正确场次
                 self._reset_competition_scope()
                 continue
-            transient = (
-                "rate limit" in text or "429" in text or "500" in text
-                or "502" in text or "503" in text or "504" in text
-                or "please retry" in text or "timeout" in text or "temporarily" in text
-            )
+            # 瞬时失败 = 上游限流/5xx + 「槽位被占」类（409/conflict/quota/already have/too many）。
+            # 后者用 instance_guard.looks_rate_limited 判：配额只有 1 时，残留实例占住槽位也报这类错，
+            # 属于「清扫后重试有意义」而非「等再久也没用」，必须计入可重试，否则直接放弃本题。
+            from .instance_guard import looks_rate_limited  # noqa: PLC0415 - 与 _recover_instance_slot 同款延迟导入
+
+            transient = self._is_transient(text) or looks_rate_limited(str(info))
             if transient and attempt < len(waits):
                 # 平台上游限流是真实存在的（实测），等待要够长，否则等于直接放弃本题
                 time.sleep(waits[attempt])
@@ -565,9 +575,8 @@ class Solver:
         self.on_event("instance_guard", {"note": summarize(guard), "detail": guard})
         if not guard.get("stopped"):
             return None  # 槽位不是被残留实例占着，重试没有意义
-        if not self.store.record_call(challenge_id, start_name, self.config.instance_ops_limit):
-            return None
-        return self._start_with_backoff(challenge_id)
+        # [fix 2026-11-03] 记账下沉到 _start_with_backoff，此处不再前置 record_call（审计 B-2）。
+        return self._start_with_backoff(challenge_id, start_name)
 
     def _ensure_instance(self, challenge_id: str) -> dict | None:
         """幂等地确保本题有一个运行中实例：已有复用；没有先查平台再 start（带退避）。
@@ -583,9 +592,9 @@ class Solver:
             return None
         info = self._find_live_instance(challenge_id)
         if info is None:
-            if not self.store.record_call(challenge_id, start_name, self.config.instance_ops_limit):
-                return None
-            info = self._start_with_backoff(challenge_id)
+            # [fix 2026-11-03] 记账下沉到 _start_with_backoff：每次真实 start 前都 record_call，
+            # 避免此处只记 1 次而重试 5 次打穿平台硬上限（审计 B-2）。
+            info = self._start_with_backoff(challenge_id, start_name)
             if not info:
                 info = self._recover_instance_slot(challenge_id, start_name)
         if not info:
@@ -729,8 +738,10 @@ class Solver:
         if "question_id" in props and question_id:
             payload["question_id"] = question_id
         if "competition_id" in props:
-            # submit_qa_answer 等 QA 工具按 (competition_id, challenge_id) 定位，缺一个就 400
-            comp = str((getattr(self.store, "meta", {}) or {}).get("competition_id") or "")
+            # submit_qa_answer 等 QA 工具按 (competition_id, challenge_id) 定位，缺一个就 400。
+            # [fix 2026-11-03 B-4a] 不能只读 meta——纯 QA 题从不走实例路径，meta.competition_id
+            # 从未被写入，必然缺参。改走 _competition_id(challenge_id) 主动反查（自带缓存）。
+            comp = str(self._competition_id(challenge_id) or "")
             if comp:
                 payload["competition_id"] = comp
         if instance_mode:
@@ -790,7 +801,10 @@ class Solver:
             accepted = looks_accepted(text)
 
         if accepted is True:
-            self.store.mark_submitted(challenge_id, answer, accepted=True)
+            # [fix 2026-11-03 B-3] 解析平台回执的 challenge_fully_solved：多问题题只过当前题号时
+            # 传 fully_solved=False，让 mark_submitted 不置 status="submitted"，避免 precheck_fn 短路。
+            fully_solved = self._fully_solved_from(result, text)
+            self.store.mark_submitted(challenge_id, answer, accepted=True, fully_solved=fully_solved)
             self.on_event("flag_accepted", {"challenge_id": challenge_id})
             return f"{text}\n\n[判定] 平台确认该答案通过。", True
         verdict_text = "判定为未通过" if accepted is False else "无法判定是否通过"
@@ -798,6 +812,27 @@ class Solver:
             # P2-4：记下这次错交，并回显全部已判错值——提交次数只有 3 次，错交一次就少 1/3
             self.store.note_rejected(challenge_id, answer)
         return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
+
+    def _fully_solved_from(self, result, text: str) -> bool:
+        """从提交回执里解析 challenge_fully_solved，判断多问题题是否已全解。
+
+        [fix 2026-11-03 B-3] 平台可能把该字段放在 result 顶层、structuredContent 里，
+        或 content 文本的 JSON 里（crew.py 用 _as_json 反解的那条路径）。三处都试，
+        只有明确读到 False 才返回 False（默认按全解 True，避免误伤单问题题的提交）。
+        """
+        if isinstance(result, dict):
+            if result.get("challenge_fully_solved") is False:
+                return False
+            sc = result.get("structuredContent")
+            if isinstance(sc, dict) and sc.get("challenge_fully_solved") is False:
+                return False
+        try:
+            parsed = self.platform._as_json(text)
+        except Exception:  # noqa: BLE001 - 解析失败不影响提交判定
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("challenge_fully_solved") is False:
+            return False
+        return True
 
     def _rejected_hint(self, challenge_id: str) -> str:
         """回显「平台已判错的答案」（P2-4）。读不到就什么都不加，绝不因此中断提交。"""

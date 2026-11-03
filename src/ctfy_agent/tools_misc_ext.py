@@ -766,8 +766,15 @@ try:
 
     MISC_EXT_SPECS = [*MISC_EXT_SPECS, *_DOMAIN_SPECS]
     NAMES = NAMES | {s["function"]["name"] for s in _DOMAIN_SPECS}
-except Exception:  # noqa: BLE001 - 领域扩展缺失不应阻断 misc 基础工具
-    pass
+except Exception as exc:  # noqa: BLE001 - 领域扩展缺失不应阻断 misc 基础工具
+    # 但也不能无声降级：rev/pwn 的 elfpeek/tcp/netcheck 因此整体消失时，至少要留一行可查的痕迹，
+    # 否则线上 rev/pwn 题会「看起来有工具、调起来全报未知」，且没有任何日志能定位。
+    import sys
+
+    print(
+        f"[ctfy_agent] 领域扩展(tools_domain_ext)加载失败，elfpeek/tcp/tcp_batch/netcheck 将不可用：{exc!r}",
+        file=sys.stderr,
+    )
 
 _IMPL = {
     "decode_blob": decode_blob,

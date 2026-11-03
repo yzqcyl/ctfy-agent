@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import asdict
 from pathlib import Path
 
@@ -121,7 +122,9 @@ def save(path: Path, *, challenge_id: str, next_round: int, messages: list, repo
         "plan": plan_to_dict(plan),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    # [fix 2026-11-03 B-5] tmp 名必须进程内唯一：集群-A 同进程多 lane 同题并发 save，
+    # 固定 ".tmp" 会被多 lane 抢写、互相覆盖。pid + 线程 id 唯一化。
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}.{threading.get_ident()}")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 

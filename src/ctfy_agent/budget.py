@@ -205,11 +205,6 @@ class Budget:
         hit = self._exceeded()
         return hit[1] if hit else None
 
-    def exceeded_kind(self) -> str:
-        """题级超限的机器可读分类（wall_clock/calls/tokens/cost）；未超返回空串。"""
-        hit = self._exceeded()
-        return hit[0] if hit else ""
-
     def check(self) -> None:
         # 尝试级切片优先：命中表示「本次尝试该停了」，但题还有后续尝试机会
         a = self.attempt_exceeded()

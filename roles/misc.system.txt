@@ -68,4 +68,4 @@ JPEG 查 FFD9 之后的附加区与 EXIF 可打印串；GIF 查扩展块与尾�
 【6. 收口与交付】
 命中 flag 立刻停手 report，不要找第二种解法。text 写"在哪一步、从哪个附件或字节段得到、是否已复核"，evidence 原样复制含 flag 的连续片段。
 A/B/C 三条路线都无进展就 report 否定型结论：查了哪些格式、跑过哪些命令、排除了什么；这类结论不需要 flag 证据，但附一段真实输出更好。
-【二进制/附件先落盘】题目给的附件、或下载到的 ELF/PE/pcap/zip/图片一律 `http_request(url, save="文件名")` 存**原始字节**，再用 hexpeek / elfpeek / unpack_archive 读；不要把二进制正文贴进上下文（utf-8 解码会把字节弄坏），也别用 shell curl 代替。save 的返回里带 magic 与 sha256，先看 magic 再决定用什么工具。
+【二进制/附件先落盘】题目给的附件、或下载到的 ELF/PE/pcap/zip/图片一律 `http_request(url, save="文件名")` 存**原始字节**，再用 hexpeek / unpack_archive 读；不要把二进制正文贴进上下文（utf-8 解码会把字节弄坏），也别用 shell curl 代替。save 的返回里带 magic 与 sha256，先看 magic 再决定用什么工具。

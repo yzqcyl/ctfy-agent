@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import marshal  # [rev-toolbox] bytecode 视图：.pyc / PyInstaller 的 marshal 载荷
 import math  # [crypto-toolbox] isqrt/gcd（纯 stdlib 大数算法）
@@ -293,10 +294,14 @@ class _Elf:
     """纯 stdlib ELF 解析（只做 CTF 常用字段，不追求完整）。"""
 
     def __init__(self, data: bytes):
-        if len(data) < 52 or data[:4] != b"\x7fELF":
+        if len(data) < 16 or data[:4] != b"\x7fELF":
             raise DomainToolError("不是 ELF 文件（魔数不符）")
         self.data = data
         self.is64 = data[4] == 2
+        # 64 位 ELF 头需 64 字节（e_shentsize 等字段在 54..64），32 位需 52 字节；不足则拒，避免 struct.error。
+        need = 64 if self.is64 else 52
+        if len(data) < need:
+            raise DomainToolError("ELF 头不完整（%d 位需 %d 字节，实际 %d）" % (64 if self.is64 else 32, need, len(data)))
         self.endian = "<" if data[5] == 1 else ">"
         self.e_type = struct.unpack_from(self.endian + "H", data, 16)[0]
         self.e_machine = struct.unpack_from(self.endian + "H", data, 18)[0]
@@ -1325,13 +1330,27 @@ def _int_of(value) -> int:
     text = str(value).strip().replace(" ", "").replace("_", "")
     if not text:
         raise DomainToolError("整数参数为空")
+    neg = text.startswith("-")
+    body = text[1:] if neg else text
+    # 明确 0x/0X 前缀 → 十六进制；否则按十进制，禁止把前导 0 的十进制（如 "0123"）误当十六进制。
+    if body.lower().startswith("0x"):
+        radix = 16
+        body = body[2:]
+    else:
+        radix = 10
     try:
-        return int(text, 0)
+        val = int(body, radix)
     except ValueError:
-        try:
-            return int(text, 16)
-        except ValueError:
+        # 仅当十进制解析失败且文本像纯十六进制（0-9a-f，且不含前导 0 的十进制歧义）时回退十六进制
+        stripped = body.lstrip("0") or "0"
+        if radix == 10 and re.fullmatch(r"[0-9a-fA-F]+", body) and any(c in "abcdefABCDEF" for c in body):
+            try:
+                val = int(body, 16)
+            except ValueError:
+                raise DomainToolError("不是合法整数：%r" % text[:40])
+        else:
             raise DomainToolError("不是合法整数：%r" % text[:40])
+    return -val if neg else val
 
 
 def _to_int(value, default: int, what: str) -> int:  # [toolbox-fix 2026-10-30] 整数参数统一入口：None/空→默认值，垃圾→DomainToolError（顺带支持 0x 前缀）
@@ -1901,10 +1920,11 @@ def prng(op: str = "mt_predict", seed: int = 0, count: int = 10, outputs=None,
     vals = [_int_of(x) for x in (outputs or [])]
     cnt = max(1, min(_to_int(count, 10, "count"), 2000))  # [toolbox-fix 2026-10-30]
     if op == "mt_seed":
-        gen = _MT19937(_to_int(seed, 0, "seed"))  # [toolbox-fix 2026-10-30]
+        seed_int = _to_int(seed, 0, "seed")  # [toolbox-fix 2026-10-30]
+        gen = _MT19937(seed_int)
         outs = [gen.next() for _ in range(cnt)]
         # [toolbox-fix 2026-10-30] 大 count 会生成 20KB 文本直灌上下文，必须 _clip（平台 6000 字符契约）
-        return _clip("MT19937(seed=%d) 前 %d 个输出：\n%s" % (seed, cnt, ", ".join(str(v) for v in outs)))
+        return _clip("MT19937(seed=%d) 前 %d 个输出：\n%s" % (seed_int, cnt, ", ".join(str(v) for v in outs)))
     if op == "mt_predict":
         if len(vals) < 624:
             raise DomainToolError("MT19937 状态恢复需要 ≥624 个连续 32-bit 输出（当前 %d）" % len(vals))
@@ -2344,4 +2364,8 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
                             tls=bool(args.get("tls", False)))
     except DomainToolError as exc:
         _fail(str(exc))
+    except (ValueError, TypeError, struct.error, OverflowError) as exc:
+        # [toolbox-fix 2026-11-03] 畸形参数/畸形输入（如 60 字节 ELF 头、port="80abc"、seed="123"）
+        # 会触发裸异常穿透到模型层，统一包装成可回显的工具错误。
+        _fail("参数或输入非法：%s" % exc)
     _fail("未知领域工具：%s（可用：%s）" % (name, ", ".join(sorted(DOMAIN_NAMES))))
