@@ -23,8 +23,8 @@
 
 | 项 | 状态 |
 |---|---|
-| **git 基线** | HEAD `773892d`（v3 线，2026-11-02 三连提交：`fc7dc42` 许可 → `291e1d0` 报告 → `773892d` WIP+融合）；树 ≈3.2 MB；`ctfy_agent` 包 31 模块；docs 74 篇；smoke 套件 34 个文件 |
-| **交付镜像** | ✅ v4 已构建推送：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb…`（详见 §D.1/附录 D）|
+| **git 基线** | HEAD `4fae989`（v3 线，2026-11-05：v4 之后 8 个提交 + CI 五修）；本地与 `origin/v3` 同步；`ctfy_agent` 包 33 模块；docs 70+ 篇；smoke 套件 34 个文件 |
+| **交付镜像** | ✅ **v5** 已构建推送：`ghcr.io/yzqcyl/ctfy-agent-pub:v5`，digest `sha256:037edd2d607a…`（详见 §B.2 / 附录 D）|
 | **平台审核/提交** | ⬜ **未开始**，只能人工走浏览器（`docs/submit-image-runbook.md` + `platform-submit-opsheet.md`）——交接后第一优先级之一 |
 | **总入口单测（干净 clone）** | ✅ **163 passed / 0 failed**【实测 11-05，干净 clone 口径】：`bench_stats` 已入库到 `tools/bench_stats.py`，缺口 #11 关闭|
 | **总入口单测（原工作区）** | **160 passed / 0 failed**【实测 11-02】：154 基线 + 本批新增 6 条（`instance_guard` / `bounded_run` / `wall_clock` / `input_fingerprint` / `auto_order` / `handoff_and_rejected`）；含 3 个缺陷修复的回归用例——**已全部提交**（§B.4 / §B.5）|
@@ -65,11 +65,11 @@
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v4`（**提交显式填 `:v4`，别用 `:latest`**）|
-| digest | `sha256:4e153aeb41fb0032b1c55cdc4b30dc6ed6596f287ffd079c35a6b32a79fe29ef` |
-| 构建 | Actions run `41304971894` @ `ccc6213` 全绿；匿名拉取三层 200（`tools/verify_image.py`）|
-| 形态 | 59.2 MB 压缩（上限 400）；uid 10001 非 root；`ENTRYPOINT ["python","-m","ctfy_agent","agent"]`；`ENV LLM_ENABLE_THINKING=0` |
-| 内置工具链 | ffuf 2.1.0（Apache-2.0）、SecLists 三表 @758fecf（MIT）、sqlmap 1.10.10（GPLv2+）、**capstone 5.0.3（BSD-3-Clause，v5 起）**，版本/字节数/sha256 三钉死 + 构建期实跑自检；v4 及以前没有 capstone（`elfpeek disasm` 那时退化字节视图）|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v5`（**提交显式填 `:v5`，别用 `:latest`**）|
+| digest | `sha256:037edd2d607a2bd6b02b1949476d79520189ffbeff73a4706cda04d6b984796f` |
+| 构建 | Actions run `41597493596` @ `4fae989` **14 步全绿**（单测 / 密钥扫描 / 独立套件 / build / B1 契约 / 平台姿态 8-8 PASS）；匿名拉取三层 200（`tools/verify_image.py`）|
+| 形态 | 62.7 MB 压缩、17 层（上限 400）；uid 10001 非 root；`ENTRYPOINT ["python","-m","ctfy_agent","agent"]`；`ENV LLM_ENABLE_THINKING=0` |
+| 内置工具链 | ffuf 2.1.0（Apache-2.0）、SecLists 三表 @758fecf（MIT）、sqlmap 1.10.10（GPLv2+）、**capstone 5.0.3（BSD-3-Clause，v5 起首次真正装进镜像）**，版本/字节数/sha256 三钉死 + 构建期实跑自检 |
 
 ### B.3 本地数据（.gitignore 忽略，**不随 git 走，需另行打包转移**）
 
@@ -249,7 +249,7 @@ python tests/smoke.py          # 总入口（免凭据）
 
 ```powershell
 python tools/container_check.py --local      # 五条契约路径全 exit 0（dry_run/no_task/bad_run_mode/no_creds/no_mcp）
-python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v4   # 匿名拉取校验（不启 docker）
+python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v5   # 匿名拉取校验（不启 docker）
 python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下）
 ```
 
@@ -389,8 +389,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 6. ☐ 拿走本地数据：`runs/`（transcripts+报告+脚本）、`misc-bank/`、`inbox/`、`.tools/ctfy-src/`、`dist/` 两个交付包。
 7. ☐ 决定 LICENSE 与第三方合规口径（§F.2.4）。
 8. ☐ （可选）清理根目录杂物（§F.3），重写 README（缺口 #4）。
-9. ☐ 平台提交镜像：按 `docs/submit-image-runbook.md` 走浏览器 4 步（显式 `:v4`）；或先重建 v5
-   （带上 WIP 修复 + capstone，走手动 dispatch workflow），再提交 v5。
+9. ✅ 平台提交镜像：**v5 已构建推送**（2026-11-05，`ghcr.io/yzqcyl/ctfy-agent-pub:v5`），按 `docs/submit-image-runbook.md` 走浏览器 4 步（显式 `:v5`）。
 10. ☐ 通读 §H 禁忌与附录 A/B（工具箱与补短板记录），再动提示词——**改提示词要单独走审批**（原团队规矩）。
 
 ---

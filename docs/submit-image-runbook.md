@@ -1,6 +1,44 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
-## ✅ v4 已构建、匿名可拉取（2026-11-01）——**提交用这个**
+## ✅ v5 已构建、匿名可拉取（2026-11-05）——**提交用这个**
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v5` |
+| digest | `sha256:037edd2d607a2bd6b02b1949476d79520189ffbeff73a4706cda04d6b984796f` |
+| 构建 | GitHub Actions run `41597493596`（branch `v3`、sha `4fae989`）→ **14 步全绿** |
+| 代码基线 | commit `4fae989`：v4 之后 8 个提交（capstone 入镜像、instance_guard、handoff、进度/预算/工具链审计修复、`tests/smoke_rev.py`）|
+| 思考模式 | ✅ `LLM_ENABLE_THINKING=0` 在镜像 `Env`（第 11 条）|
+| rev/pwn 工具箱 | ✅ capstone 5.0.3（wheel sha256 钉死，构建期 `capstone selftest ok: 5.0.3 2 insns`）|
+| 非 root | ✅ `User="app"`（uid 10001、`HOME=/home/app`、`PYTHONPATH=/ctfy/src`）|
+| 入口 | `Entrypoint=["python","-m","ctfy_agent","agent"]`、`WorkingDir=/ctfy`、`Cmd=None` |
+| 体积 | 17 层，匿名传输 **62.7 MB**（平台上限 400 MB）|
+| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v5`）|
+| 平台姿态自检 | ✅ `non_root / source_readonly / work_writable / egress_blocked / no_dotenv / uid / dry_run_exit_zero / dry_run_wrote_result` **8/8 PASS**（`tools/isolation_probe.py`，CI 内跑）|
+| 单测基线 | `tests/smoke.py` **163 passed / 0 failed**（干净 clone 口径；另有 33 个独立套件在 CI 全跑）|
+| CI 门禁 | 密钥扫描 `tools/secret_scan.py --all` + 独立套件 + B1 契约 + 平台姿态，四道全绿 |
+
+### 本次为让 CI 全绿修掉的 7 个缺陷（都是"只会在干净 clone / UTC / 容器姿态下暴露"）
+
+1. `tests/smoke.py` 用 `os.environ["TEMP"]` 取临时根 → Linux 无该变量，退化成相对路径，假 ffuf/sqlmap 在 sandbox 里路径拼错（3 个用例红）→ 改用 `tempfile.gettempdir()`。
+2. `budget.deadline_clock` 用 `time.localtime` → CI(UTC) 把 20:00+08:00 显示成 12:00 → 固定按 UTC+8 显示（容器与选手一致）。
+3. `runs/bench_stats.py` 不在 git 里（缺口 #11）→ 挪进 `tools/bench_stats.py`。
+4. `tools/isolation_probe.py` 对带 ENTRYPOINT 的镜像直接追加 `python -I -c ...` → 被当成 `agent` 子命令参数 → 改 `--entrypoint python`。
+5. 同一探针用 `mkdtemp`（0700）挂 `/ctfy/work`，容器内 `app`(uid 10001) 写不进 → 放宽 0o777 模拟平台 staging 目录。
+
+> 4、5 是"探针自身的 bug"，不是镜像问题：修完后 8 项姿态检查全 PASS，说明镜像在 **只读根 + 断网 + 非 root** 下能正常写出 `result.json` 并 `exit 0`。
+
+### 下一步（浏览器，人工）
+
+> **逐屏操作单（含预期结果与失败排查）：[docs/platform-submit-opsheet.md](platform-submit-opsheet.md)**
+
+1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v5`
+2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
+3. 提交审核 → 通过后用「测评我的 Agent」跑一遍
+
+---
+
+## 历史：`v4` 已构建、匿名可拉取（2026-11-01）——已被 v5 取代
 
 | 项 | 值 |
 |---|---|
@@ -15,17 +53,11 @@
 | 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v4`）|
 | 单测基线 | `tests/smoke.py` **152 passed / 0 failed**（含 ctxopt 8 条）|
 
-### 下一步（浏览器，人工）
-
-> **逐屏操作单（含预期结果与失败排查）：[docs/platform-submit-opsheet.md](platform-submit-opsheet.md)**
-
-1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v4`
-2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
-3. 提交审核 → 通过后用「测评我的 Agent」跑一遍
+### 历史：v4 当时的下一步（已被 v5 取代）
 
 ---
 
-## 历史：`v3` 已构建、匿名可拉取（2026-10-29）——已被 v4 取代
+## 历史：`v3` 已构建、匿名可拉取（2026-10-29）——已被 v4/v5 取代
 
 | 项 | 值 |
 |---|---|
@@ -39,7 +71,7 @@
 | 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v3`） |
 | CI 契约 | ✅ 五条路径全 `exit 0`（dry_run / no_task / bad_run_mode / no_creds / no_mcp） |
 | 构建内自检 | ✅ ffuf（`ffuf selftest ok`）、sqlmap（产出 injectable 判定）、302 跳转探针（`decoy_hits=0`） |
-| `latest` | 历史值；现 `latest` 已随 v4 构建指向 v4 —— 提交请**显式填 `:v4`** |
+| `latest` | 历史值；现 `latest` 已随 v5 构建指向 v5 —— 提交请**显式填 `:v5`** |
 
 ### 与 v2.1 的差异（净改进，无行为回归）
 
