@@ -1,6 +1,28 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
-## ✅ v5 已构建、匿名可拉取（2026-11-05）——**提交用这个**
+## ✅ v6.1 已构建、匿名可拉取（2026-11-03）——**提交用这个**
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v6.1` |
+| digest | `sha256:66bb6119bfe696cc163fdc8be358c5734c0c4d0f0dd0f231b30e26ffc673b7d4` |
+| 构建 | GitHub Actions run `41645836289`（branch `v3`、sha `962017d`）→ **14 步全绿** |
+| 本次唯一变更 | 容器入口放开 `run_mode=qa`：qa 置 `qa_mode=True` + `auto_start_instance=False`，落库 `is_qa_only=True` → 提交走 `submit_qa_answer`（此前 qa 一律 `refused`，SAMPLE 的问答/静态分析题直接 0 分）；`defence/engagement/awd` 仍显式拒跑 |
+| 单测 | `tests/smoke.py` 全绿；新增 `tests/smoke_agent_qa.py` 4/4 |
+| 体积/层数 | 17 层，匿名传输 **62.7 MB** |
+| 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app` / `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` |
+| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v6.1`）|
+
+### 下一步：跑 SAMPLE（浏览器，人工）
+
+1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v6.1`（**显式 tag，别填 latest**）→ 点「重新检查」
+2. 模型/provider/密钥沿用上次（DeepSeek V4 Flash + OpenAI + 自有 key）
+3. 提交审核 → 通过后「测评我的 Agent」→ 选 SAMPLE（questions/suite）跑
+4. 结果观察点：SAMPLE-005（ZIP Bomb Inspector）等问答/静态分析题**不应再出现** `stop_reason=refused` / `unsupported run_mode='qa'`；`result.json` 应有非空 `answers`。web/pwn/rev 等实例题行为不变
+
+---
+
+## 历史：`v5` 已构建（2026-11-05）——已被 v6.1 取代
 
 | 项 | 值 |
 |---|---|
