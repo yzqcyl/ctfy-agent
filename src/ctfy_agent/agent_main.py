@@ -24,6 +24,7 @@ import re
 import signal
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .config import Config, load
 from .crew import Crew
@@ -84,6 +85,29 @@ def _as_float(value, default):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _split_host_port(value: str) -> tuple[str, int | None]:
+    """把平台端点的 `host:port` 或 `scheme://host:port/path` 解析成 (host, port)。
+
+    平台的 `target_endpoints[].url` 两种形态都出现过（tcp 题给 `host:port`，web 题给 URL），
+    这里统一处理；端口解析失败返回 None（不猜默认端口，免得登记出一堆假可访问端点）。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "", None
+    if "://" not in text:
+        text = "tcp://" + text
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return "", None
+    host = (parsed.hostname or "").strip()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    return host, port
 
 
 # ---------- rollup ----------
@@ -234,6 +258,14 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     config.extra["keep_instance_on_success"] = True
     config.extra["keep_instance_on_fail"] = True
 
+    # 平台「预下发实例」模式（2026-11-03 实测 SAMPLE-004）：task.json 直接给 target_instance /
+    # target_endpoints，token 无权 start_instance。标记后全链路禁止自启，避免拿 403 白烧预算。
+    task_data = task or {}
+    config.extra["instance_preissued"] = bool(
+        str(task_data.get("target_instance") or "").strip()
+        or (task_data.get("target_endpoints") or [])
+    )
+
     competition_id = (task or {}).get("competition_id") or env.get("CTFY_EVAL_COMPETITION_ID", "")
     if competition_id:
         config.extra["competition_id"] = str(competition_id)
@@ -269,13 +301,65 @@ def _seed_challenge(store: Store, task: dict | None, env) -> str:
     if blocks:
         desc = (desc + "\n\n" if desc else "") + "\n".join(blocks)
 
-    store.upsert(
+    # ---------- 平台预下发的运行环境（P0，2026-11-03） ----------
+    # task.json 直接给了已启动实例 / 可达端点 / 附件路径 / 访问范围；旧实现只写 id/name/description，
+    # 于是容器内 agent 去调 start_instance（平台 token 不允许）→ 403 → 判定「没有实例」→ 收口。
+    # 实测代价：SAMPLE-004 44 轮 / 649,031 token / $0.0715，一次都没连上真实服务。
+    instance_id = str(task.get("target_instance") or "").strip()
+    endpoints: list[dict] = []
+    for raw in task.get("target_endpoints") or []:
+        if not isinstance(raw, dict):
+            continue
+        host, port = _split_host_port(str(raw.get("url") or ""))
+        if not host:
+            continue
+        endpoints.append(
+            {
+                "label": str(raw.get("label") or ""),
+                "type": str(raw.get("type") or ""),
+                "host": host,
+                "port": port,
+                "url": str(raw.get("url") or ""),
+            }
+        )
+    attachments = [
+        {"name": str(a.get("name") or ""), "path": str(a.get("path") or ""), "size": a.get("size")}
+        for a in (task.get("attachments") or [])
+        if isinstance(a, dict)
+    ]
+    scope = [str(item) for item in (task.get("scope") or []) if str(item).strip()]
+    platform_env = bool(instance_id or endpoints or attachments)
+    if platform_env:
+        lines = ["【平台已下发的运行环境（权威信息，直接使用，不要重复申请）】"]
+        if instance_id:
+            lines.append(f"- 实例已启动：id={instance_id}。禁止调用 start_instance（本 token 无权，会 403）。")
+        for ep in endpoints:
+            target = f"{ep['host']}:{ep['port']}" if ep["port"] else ep["host"]
+            lines.append(f"- 可达端点（{ep['label'] or ep['type'] or 'target'}）：{target}（可直接连）")
+        for att in attachments:
+            lines.append(f"- 附件已就位：{att['path']}（直接读本地文件，不要调下载接口）")
+        if scope:
+            lines.append(f"- 允许访问范围：{', '.join(scope)}")
+        desc = (desc + "\n\n" if desc else "") + "\n".join(lines)
+
+    item = store.upsert(
         {
             "id": cid,
             "name": str(challenge.get("name") or ""),
             "description": desc,
         }
     )
+    if platform_env:
+        instance = item.instance if isinstance(item.instance, dict) else {}
+        if instance_id:
+            instance["id"] = instance_id
+        instance.setdefault("source", "platform")
+        instance["endpoints"] = endpoints
+        instance["attachments"] = attachments
+        instance["scope"] = scope
+        item.instance = instance
+        if instance_id:
+            item.instance_id = instance_id
     store.save()
     return cid
 

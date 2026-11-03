@@ -1036,7 +1036,13 @@ class Solver:
             local.allow_many(challenge.instance)
 
         # 实例能自动起就自动起，省掉模型一次摸索（真实平台一次只允许一个实例）
-        if not challenge.instance and not challenge.instance_id and self.config.extra.get("auto_start_instance", True):
+        # 平台预下发实例时禁止自启：token 无权 start_instance，调了只会 403（实测 SAMPLE-004）。
+        if (
+            not self.config.extra.get("instance_preissued")
+            and not challenge.instance
+            and not challenge.instance_id
+            and self.config.extra.get("auto_start_instance", True)
+        ):
             try:
                 info = self._ensure_instance(challenge_id)
                 if info:
