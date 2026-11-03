@@ -95,6 +95,13 @@ def probe(image: str) -> dict:
     if not ready:
         return {"passed": False, "skipped": True, "checks": {}, "error": info}
     work = Path(tempfile.mkdtemp(prefix="ctfy-posture-"))
+    # 平台把 /ctfy/work 当 0o777 staging 目录挂进来；mkdtemp 默认 0700 且属 CI 用户，
+    # 容器内 app（uid 10001）写不进去 → 会把 work_writable / dry_run_wrote_result 误判为失败
+    # （实测 CI run 41597147764）。这里显式放宽，模拟平台真实姿态。
+    try:
+        work.chmod(0o777)
+    except OSError:
+        pass
     common = [
         binary, "run", "--rm", "--network", "none", "--read-only",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m,mode=1777",
