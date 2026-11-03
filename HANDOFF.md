@@ -26,7 +26,7 @@
 | **git 基线** | HEAD `773892d`（v3 线，2026-11-02 三连提交：`fc7dc42` 许可 → `291e1d0` 报告 → `773892d` WIP+融合）；树 ≈3.2 MB；`ctfy_agent` 包 31 模块；docs 74 篇；smoke 套件 34 个文件 |
 | **交付镜像** | ✅ v4 已构建推送：`ghcr.io/yzqcyl/ctfy-agent-pub:v4`，digest `sha256:4e153aeb41fb…`（详见 §D.1/附录 D）|
 | **平台审核/提交** | ⬜ **未开始**，只能人工走浏览器（`docs/submit-image-runbook.md` + `platform-submit-opsheet.md`）——交接后第一优先级之一 |
-| **总入口单测（干净 clone）** | ⚠️ **151 passed / 1 failed**【实测 11-03】：`case_bench_stats` import 未入库的 `runs/bench_stats.py`（见缺口 #11）|
+| **总入口单测（干净 clone）** | ✅ **163 passed / 0 failed**【实测 11-05，干净 clone 口径】：`bench_stats` 已入库到 `tools/bench_stats.py`，缺口 #11 关闭|
 | **总入口单测（原工作区）** | **160 passed / 0 failed**【实测 11-02】：154 基线 + 本批新增 6 条（`instance_guard` / `bounded_run` / `wall_clock` / `input_fingerprint` / `auto_order` / `handoff_and_rejected`）；含 3 个缺陷修复的回归用例——**已全部提交**（§B.4 / §B.5）|
 | **最新实测能力** | 六题型 52 题：解出 **51.9%**，剔环境阻塞 **65.9%**，能力口径 **75.6%**；qa 12/12、web 7/11、misc 4/6、crypto 2/8、rev 2/3、pwn 0/1（样本无效）【实测 11-03】|
 | **CI** | workflow **已跑单元测试**：总入口单测 + 25 个免凭据套件 + 密钥扫描 + 镜像姿态探针（§B.4 / §B.5，已提交）|
@@ -237,8 +237,9 @@ Windows 坑：先 `$env:PYTHONIOENCODING="utf-8"`；**本机有代理时必须 `
 python tests/smoke.py          # 总入口（免凭据）
 ```
 
-- **干净 clone 期望 151 passed / 1 failed**：`case_bench_stats` import 的 `runs/bench_stats.py` 不在 git 里
-  （缺口 #11）。先从 `runs/` 拷入该文件（或按 F.1 建议挪进 `tools/`）即可全绿；原工作区口径 154/0。
+- **干净 clone 期望 163 passed / 0 failed**（11-05）：`bench_stats.py` 已挪进 `tools/` 入库（缺口 #11 关闭）；
+  同时修掉 `TEMP` 未设导致假 ffuf/sqlmap 脚本路径相对化的 3 个 CI 红（fuzz_functional / sqli_functional / misc_ext）、
+  以及 `deadline_clock` 用机器本地时区显示导致的 wall_clock 红（改为固定 UTC+8 显示）。
 - 33 个独立套件：25 个免凭据（`smoke_rev 15` / `smoke_pwn 24` / `smoke_crypto 27` / `smoke_webai_gap 12` /
   `smoke_ctxopt` / `smoke_http_*` / `smoke_ai_*` …），8 个要真实 `.env`
   （`smoke_ai_role / brake / clustera / clusterb_crew / ctxopt / p1 / p2 / p21`）——CI 里显式 SKIP。
@@ -359,7 +360,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 | 8 | 多问题题提交回落 `flag` → 422 丢分 | **已修并提交**（A/B 验证 CTFARENA-048 转 correct）|
 | 9 | 部分解被兜底翻成整题解出（完成度虚高）| **已修并提交** |
 | 10 | QA 提交通道不通 | **已修并提交**（MCQ 12/12）|
-| **11** | **总入口 `case_bench_stats` 依赖未入库的 `runs/bench_stats.py` → 干净 clone 必红 1 条**【实测 11-03，本次交接新发现】| 未修；修法：把 `runs/bench_stats.py`（6 KB）挪进 `tools/` 并改 import，或在用例里 try/except ImportError 跳过并标注 |
+| **11** | ~~总入口 `case_bench_stats` 依赖未入库的 `runs/bench_stats.py` → 干净 clone 必红 1 条~~【11-05 已修】| ✅ 已挪进 `tools/bench_stats.py` 并改 import；干净 clone 163/0 |
 | 12 | capstone 未进镜像（`elfpeek disasm` 退化字节视图）| **已修（2026-11-02）**：Dockerfile 已加 `capstone==5.0.3`（sha256 钉死 + 构建期反汇编自检，位于删 pip 之前），v5 建出来即生效；v4 仍无（§B.7）|
 
 ### F.2 安全与合规（交接前逐项打勾）
@@ -382,7 +383,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 
 1. ☐ 转移 git 仓库访问权（v3 为当前线）；`git clone` 后核对 HEAD `773892d`。
 2. ☑ **处置未提交 WIP**（§B.4）：2026-11-02 已 review 并提交（`773892d`；160/0 与密钥扫描均通过）。
-3. ☐ 把 `runs/bench_stats.py` 挪进 `tools/` 修掉缺口 #11，总入口单测恢复全绿（干净 clone 口径）。
+3. ✅ 已把 `runs/bench_stats.py` 挪进 `tools/` 修掉缺口 #11，干净 clone 单测 163/0。
 4. ☐ 本地起环境：`.env` 填新令牌 → `run.cmd doctor` → `python tests/smoke.py`（记得 NO_PROXY）。
 5. ☐ **吊销旧 GitHub PAT、轮换 CTFY_TOKEN/模型 Key**（§F.2）。
 6. ☐ 拿走本地数据：`runs/`（transcripts+报告+脚本）、`misc-bank/`、`inbox/`、`.tools/ctfy-src/`、`dist/` 两个交付包。
@@ -406,7 +407,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 7. 不要断言 CTFARENA-035 的凭据路线是死路（~1202 次全 401 只是候选覆盖不足，tags 指明方向对）。
 8. 未经批准不要改角色提示词内容（web/crypto/rev 的调教是资产）；改 config 的 roles 必须同步 `roles/*.json`
    （零漂移契约有 smoke 硬断言）。
-9. 干净 clone 上跑总入口会红 1 条（缺口 #11），先修再判回归。
+9. 干净 clone 单测已 163/0（缺口 #11 关闭）；另注意 `tests/smoke_http_cache.py` 在 Windows 上偶发 WinError 10053（连接复用），Linux CI 不复现。
 10. 本地跑题务必锚定沙箱/run 目录，防根目录污染与多题串数据（§F.3 就是这么来的）。
 
 **与原作者协作偏好**（继续有效）：只认实验数据，写数字先核实；方案先批准再实施，提示词改动单独批准；

@@ -106,7 +106,10 @@ class Budget:
     def deadline_clock(self) -> str:
         if self.deadline_at is None:
             return ""
-        return time.strftime("%H:%M", time.localtime(self.deadline_at))
+        # 统一按北京时间（UTC+8）显示：比赛时段是 10:00–20:00 北京时间，而容器/CI 常跑在 UTC。
+        # 用 time.localtime 会随机器时区变（CI 上 20:00+08:00 会显示成 12:00），提示词里的
+        # 「截止 HH:MM」就和选手对不上；这里固定偏移，跨机器一致（绝对截止时刻本来就用 epoch）。
+        return time.strftime("%H:%M", time.gmtime(self.deadline_at + 8 * 3600))
 
     def set_deadline(self, seconds_from_now: float | None = None, *, at: float | None = None) -> "Budget":
         """挂一个墙钟截止：给相对秒数或绝对 epoch。传 None 表示解除。"""

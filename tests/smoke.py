@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -3361,7 +3362,7 @@ def case_bench_stats(tmp: Path) -> None:
     """P2：离线统计工具从 run_dir 读出 状态/轮数/调用/token/峰值/救援/续跑/账本重复拦截。"""
     import sys as _sys
 
-    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runs"))
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
     from bench_stats import analyze_run  # noqa: PLC0415
 
     run_dir = tmp / "bench"
@@ -4612,7 +4613,10 @@ def case_ai_direction_dod(tmp: Path) -> None:
 
 
 def main() -> int:
-    tmp = Path(os.environ.get("TEMP", ".")) / "ctfy_agent_smoke"
+    # 必须绝对路径：Linux/CI 没有 TEMP 环境变量，退回 "." 会让 tmp 变相对路径，
+    # sandbox 里执行假 ffuf/sqlmap 时会拼成 <repo>/<sandbox>/ctfy_agent_smoke/fake_ffuf.py
+    # ，于是 case_fuzz_functional / case_sqli_functional / case_misc_ext 在 CI 必红（实测 11-05）。
+    tmp = Path(tempfile.gettempdir()) / "ctfy_agent_smoke"
     tmp.mkdir(parents=True, exist_ok=True)
 
     cases = [
