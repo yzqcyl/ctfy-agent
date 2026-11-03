@@ -104,7 +104,10 @@ def probe(image: str) -> dict:
     ]
     try:
         # 1–5：纯粹的环境事实
-        base = run([*common, image, "python", "-I", "-c", PROBE_SCRIPT])
+        # 必须显式覆盖 entrypoint：镜像自带 ENTRYPOINT=["python","-m","ctfy_agent","agent"]，
+        # 直接追加 "python -I -c ..." 会被当成 agent 子命令的参数（实测 CI 报
+        # `ctfy_agent: error: unrecognized arguments: python -I -c`）。
+        base = run([*common, "--entrypoint", "python", image, "-I", "-c", PROBE_SCRIPT])
         if base.returncode != 0:
             return {"passed": False, "checks": {}, "error":
                     f"容器内探测脚本退出 {base.returncode}：{(base.stderr or base.stdout)[-800:]}"}
