@@ -234,8 +234,8 @@ def contract_cases(tag: str, local: bool = False) -> None:
     run_case(tag, "dry_run", {**inst, "dry_run": True}, {"CTFY_EVAL_DRY_RUN": "1"}, "dry_run", local)
     # 4.2 task.json 缺失、且没有任何 env 兜底
     run_case(tag, "no_task", None, {}, "halted", local)
-    # 4.3 不支持的 run_mode（本适配器只做 instance）
-    run_case(tag, "bad_run_mode", {"schema_version": 2, "run_mode": "qa", "challenge": {"id": "x"}}, {}, "refused", local)
+    # 4.3 不支持的 run_mode（本适配器只做 instance/qa，其余如 defence 显式拒跑）
+    run_case(tag, "bad_run_mode", {"schema_version": 2, "run_mode": "defence", "challenge": {"id": "x"}}, {}, "refused", local)
     # 4.4 凭证缺失：必须 fail loudly，不许烧钱
     run_case(tag, "no_creds", inst, {"LLM_FLAVOR": "openai"}, "refused", local)
     # 4.5 没有 MCP 端点（没有 mcp.json，也没给 CTFY_PLATFORM_URL）

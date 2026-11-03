@@ -271,6 +271,11 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
         config.extra["competition_id"] = str(competition_id)
     if questions:
         config.extra["default_question_id"] = str(questions[0].get("id") or "flag")
+    # QA 模式（run_mode=qa）：纯问答/静态分析题，没有实例。禁用自启实例，否则
+    # 白烧一轮 403（实测 SAMPLE-005）；提交由 solver 的 is_qa_only → submit_qa_answer 分支接管。
+    if str((task or {}).get("run_mode") or "") == "qa":
+        config.extra["qa_mode"] = True
+        config.extra["auto_start_instance"] = False
     return config
 
 
@@ -347,6 +352,9 @@ def _seed_challenge(store: Store, task: dict | None, env) -> str:
             "id": cid,
             "name": str(challenge.get("name") or ""),
             "description": desc,
+            # QA 模式无实例：is_qa_only 让 _submit 走 submit_qa_answer，而不是 instance 分支
+            # （否则会被「本题还没有实例」拦死）。tags 里通常没有 qa/mcq 字样，必须显式标记。
+            "is_qa_only": str((task or {}).get("run_mode") or "") == "qa",
         }
     )
     if platform_env:
@@ -491,9 +499,9 @@ def run_agent(
         )
         return 0
 
-    # 3) 只支持 instance 模式
+    # 3) 只支持 instance / qa 模式（defence/engagement/awd 显式拒绝，不烧钱）
     run_mode = str(task.get("run_mode") or "")
-    if run_mode != "instance":
+    if run_mode not in ("instance", "qa"):
         _write_rollup(
             result_path,
             _rollup(challenge_id=challenge_id, stop_reason="refused",

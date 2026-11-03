@@ -3515,7 +3515,7 @@ def case_agent_degraded(tmp: Path) -> None:
     }
     # (fixture 名, env_extra, 期望 stop_reason, writeup 关键词)
     scenarios = [
-        ("task_qa.json", {}, "refused", "run_mode"),     # 非 instance 模式
+        ("task_qa.json", {}, "halted", "MCP"),     # qa 模式已支持：过了闸门，卡在无 MCP 端点
         (None, {}, "halted", "task.json"),               # task.json 缺失
         ("task_broken.json", {}, "halted", "task.json"),  # task.json 坏 JSON
         ("task_instance.json", {"LLM_FLAVOR": "anthropic"}, "refused", "anthropic"),
