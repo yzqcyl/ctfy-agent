@@ -4831,14 +4831,14 @@ def case_v66_answer_status(tmp: Path) -> None:
 
         # 3) 重复提交已通过题号：必须被拦下且**不触达平台**（旧文案「已经提交 2 次」让模型以为没成功）
         submits: list = []
-        orig = platform.call_text
+        orig_raw = platform.call_raw
 
-        def spy(name, args=None):
+        def spy_raw(name, arguments=None, *a, **kw):
             if name == "submit_flag":
-                submits.append(args)
-            return orig(name, args)
+                submits.append(dict(arguments or {}))
+            return orig_raw(name, arguments, *a, **kw)
 
-        platform.call_text = spy
+        platform.call_raw = spy_raw
         script = [
             {"content": "交 slug", "tool_calls": [tool_call("submit", {"answer": "slug-abc", "question_id": "slug"})]},
             {"content": "再交", "tool_calls": [tool_call("submit", {"answer": "slug-abc", "question_id": "slug"})]},
@@ -4854,9 +4854,34 @@ def case_v66_answer_status(tmp: Path) -> None:
             if '"result"' in ln
         ]
         blocked = [ln["result"] for ln in lines if "提交被拦截" in str(ln.get("result") or "")]
-        assert len(blocked) >= 2, blocked
-        assert all("已经通过并由平台记录" in b for b in blocked), blocked
-        ok("v6.6 已通过题号硬状态 + 重复提交准确拦截（不触达平台）+ 协调者 40 轮")
+        slug_blocked = [b for b in blocked if "已经通过并由平台记录" in b]
+        assert len(slug_blocked) >= 2, blocked
+
+        # 4) [v6.7] 同一题号的新候选值不能被拦死（001 实测第 3 个候选会被旧规则「≥2 次」拦掉，
+        #    等于自断后路）；只有「同一个值再交一遍」才该拦。
+        store.transcript_path("web-01").unlink(missing_ok=True)
+        submits2: list = []
+
+        def spy_raw2(name, arguments=None, *a, **kw):
+            if name == "submit_flag":
+                submits2.append(dict(arguments or {}))
+            return orig_raw(name, arguments, *a, **kw)
+
+        platform.call_raw = spy_raw2
+        script2 = [
+            {"content": "候选1", "tool_calls": [tool_call("submit", {"answer": "GUESS-1", "question_id": "flag"})]},
+            {"content": "同一个再交", "tool_calls": [tool_call("submit", {"answer": "GUESS-1", "question_id": "flag"})]},
+            {"content": "候选2", "tool_calls": [tool_call("submit", {"answer": "GUESS-2", "question_id": "flag"})]},
+            {"content": "收工", "tool_calls": [tool_call("done", {})]},
+        ]
+        crew3 = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script2))
+        crew3._question_info = {"flag_solves": {"slug": True, "flag": False}}
+        crew3.solve("web-01")
+        vals = [str(a.get("answer") or a.get("flag") or "") for a in submits2]
+        assert vals == ["GUESS-1", "GUESS-2"], vals
+        txt = store.transcript_path("web-01").read_text(encoding="utf-8")
+        assert "这个答案在题号 `flag` 上已经交过了" in txt, txt[-2000:]
+        ok("v6.6/v6.7 逐题状态每轮回灌 + 只拦重复值（新候选放行）+ 协调者 40 轮")
     finally:
         server.shutdown()
         server.server_close()

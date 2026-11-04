@@ -877,6 +877,7 @@ class Crew:
         # [v6.3] 提交节流：多问题题实测被刷屏（SAMPLE-001 submit 70 次 / SAMPLE-009 44 次），
         # 每次只是「同一旧答案再交一遍」，白烧调用。按题号计次 + 通过后必须先去拿新答案。
         submit_counts: dict[str, int] = {}
+        submit_seen: dict[str, set] = {}
         needs_new_answer = False
 
         # 断点续跑（P0-1）：协调者上下文是本 run 最贵的状态，崩溃即清零（003 实测烧掉 135k token）。
@@ -1091,6 +1092,10 @@ class Crew:
                         qid_hint = str(args.get("question_id") or challenge.next_question_id or "")
                         tries = submit_counts.get(qid_hint, 0)
                         accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
+                        answer_val = str(
+                            args.get("answer") or args.get("flag") or args.get("value") or ""
+                        ).strip()
+                        tried_vals = submit_seen.get(qid_hint) or set()
                         if qid_hint and qid_hint in accepted_map:
                             # [v6.6] 已通过的题号再提交是纯浪费：SAMPLE-001 实测连续 4 轮被这条拦下
                             # （旧文案说「已经提交 2 次」，模型以为还没成功，于是一直重试）。
@@ -1099,22 +1104,23 @@ class Crew:
                                 "「逐题状态」），再交一次不会有任何收益。本题若还有未通过题号，下一步只能 delegate "
                                 "去取那些题的答案；全部通过就 done 收口。"
                             )
-                        elif needs_new_answer and not submitted:
-                            # [v6.3] 通过一问之后，模型的惯性动作是「再交一次旧答案」（实测 70 次/44 次）。
-                            # 直接拦下并给出唯一合法下一步：派专家取剩余题的答案。
+                        elif answer_val and answer_val in tried_vals:
+                            # [v6.7] 只拦「同一个答案再交一遍」：SAMPLE-001 实测第 3 个新候选
+                            # （可能是对的那个）会被旧规则「同一题号 ≥2 次」直接拦死，等于自断后路。
                             text = (
-                                "[提交被拦截] 上一问刚通过，本题还没全解——现在缺的是**剩余题的新答案**，"
-                                "不是把旧答案再交一遍。\n下一步只能 delegate：把剩余题面交给专家去取答案"
-                                "（checker 题没有 flag 串，做完动作后用 verify_exploit 校验）。"
+                                f"[提交被拦截] 这个答案在题号 `{qid_hint}` 上已经交过了（结果不会变）。"
+                                "换答案来源：delegate 去取新证据，或换一个候选值再试。"
                             )
-                        elif qid_hint and tries >= 2:
+                        elif qid_hint and tries >= 6:
                             text = (
-                                f"[提交被拦截] 题号 `{qid_hint}` 已经提交 {tries} 次。"
+                                f"[提交被拦截] 题号 `{qid_hint}` 已提交 {tries} 次（上限 6）。"
                                 "同一题反复 submit 不会有新结果：要么换答案来源（delegate），要么 done 收口。"
                             )
                         else:
                             text, accepted = solver._submit(args, challenge_id)
                             submit_counts[qid_hint] = tries + 1
+                            if answer_val:
+                                submit_seen.setdefault(qid_hint, set()).add(answer_val)
                             if accepted:
                                 submitted = True
                                 reason = "flag_accepted"
