@@ -1741,7 +1741,18 @@ class Crew:
         return base
 
     def _presolved_summary(self, challenge_id: str, ch) -> dict:
-        """集群-A 预检命中（已解出）时的零成本收口汇总，语义对齐 solve() 的 already_solved 分支。"""
+        """预检命中（已解出）时的零成本收口汇总，语义对齐 solve() 的 already_solved 分支。
+
+        [fix 2026-11-05 CTFARENA-003/004] 旧实现只改内存 status、不落盘：runner/结果文件看到
+        state 还是 new，把「平台已解」误记成失败。这里持久化终态 + submitted_ok。
+        """
+        try:
+            if ch.status not in ("submitted", "done"):
+                ch.status = "submitted"
+            ch.submitted_ok = True
+            self.store.save()
+        except Exception:  # noqa: BLE001 - 收口记账失败不拦返回
+            pass
         summary = {
             "challenge_id": challenge_id,
             "status": ch.status,
