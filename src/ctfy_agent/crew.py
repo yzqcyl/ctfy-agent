@@ -392,14 +392,17 @@ def _convergence_stalled(stats: dict, last_open: int, last_refuted: int,
     return stalls, opn, ref
 
 
-def _chat_with_recovery(agent, messages: list, tools: list | None, *, attempts: int = 2,
-                        delay: float = 20.0):
+def _chat_with_recovery(agent, messages: list, tools: list | None, *, attempts: int = 3,
+                        delay: float = 30.0):
     """协调者 LLM 调用兜底恢复。
 
     [v6.4] 实测 SAMPLE-009：平台换节点后 agent 重启，首轮调用撞上持续限速窗口，
     llm 客户端 3 次退避（合计 14s）不够 → LLMError 视作致命 → 整题 halted，149 次调用的
-    工作全废。客户端已改为 5 次退避 + Retry-After；这里再给一层「整轮重试」，
-    因为协调者一挂整题就结束，代价远大于多等 20 秒。
+    工作全废。
+    [v6.5] 实测 SAMPLE-001/003/012：平台侧整体重启（事件 `reattached the server restarted`）
+    期间 LLM 网关短暂不可用，客户端 5 次退避（约 60s）仍不够 —— 三题都在重启后 30–50s 内
+    `halted`。这里给 3 轮 × 30s 的整轮重试（叠加客户端退避 ≈ 最多 4 分钟），
+    足以跨过一次平台重启；每次重试前记 transcript，避免把「等平台」误算成推理进度。
     """
     last = None
     for i in range(max(1, attempts)):
