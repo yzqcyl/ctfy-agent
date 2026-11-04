@@ -908,6 +908,7 @@ class Crew:
 
         # 候选闸门 / 假设收敛 状态（v3 P0）
         done_blocks = 0
+        idle_nudges = 0  # [fix 2026-11-05 P1] 空动作早停守卫计数
         last_open = -1
         last_refuted = -1
         convergence_stalls = 0
@@ -1057,6 +1058,31 @@ class Crew:
                 )
 
                 if not calls:
+                    # [fix 2026-11-05 P1] 空动作守卫：预算大量剩余时禁止直接收口。
+                    # 实证：CTFARENA-002/005/008 重跑在 8~66 次调用、15k~257k token 处就
+                    # no_more_actions/coordinator_done 收口，剩余 40%~96% 预算白白作废。
+                    snap = spending.snapshot()
+                    tok_left = max(0, int(snap.get("max_tokens") or 0) - int(snap.get("total_tokens") or 0))
+                    calls_left = max(0, int(snap.get("max_calls") or 0) - int(snap.get("calls") or 0))
+                    if (not submitted) and idle_nudges < 2 and (tok_left > 60000 or calls_left > 12):
+                        idle_nudges += 1
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "coordinator", "step": rnd,
+                             "note": f"[空动作守卫] 无 tool_calls；剩余 {tok_left} tok/{calls_left} calls，"
+                                     f"注入继续指令（{idle_nudges}/2）"},
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[空动作守卫] 你这一轮没有调用任何工具，但本题未解、预算还剩约 {tok_left} tok / "
+                                f"{calls_left} 次调用。禁止现在收口。下一步必须从下面三个里选一个并立即执行：\n"
+                                "① delegate 一个与已试路线不同的增量目标（从账本「未验证事实」里挑一条去验证）；\n"
+                                "② 用当前最有把握的候选先 verify_answer 自校验，通过就 submit；\n"
+                                "③ 读取并分析当前最有价值但还没读的产物（前端 JS / 附件 / 响应原文的未读片段）。"
+                            ),
+                        })
+                        continue
                     reason = "no_more_actions"
                     break
 

@@ -514,6 +514,18 @@ class Store:
         item.touch()
         return True
 
+    def refund_call(self, challenge_id: str, name: str) -> None:
+        """回滚一次写操作登记：被配额拒绝/上游限流拒绝的调用不该占用上限。
+
+        [fix 2026-11-05 P3] CTFARENA-001 实证：start_instance 前两次被 429 team_capacity_exceeded
+        拒掉，却照样计入 instance_ops_limit=5，随后真正可用的调用被本地上限封死。
+        """
+        item = self.require(challenge_id)
+        count = int(item.tool_counts.get(name, 0) or 0)
+        if count > 0:
+            item.tool_counts[name] = count - 1
+            item.touch()
+
     def bump_oracle(self, challenge_id: str, limit: int) -> bool:
         """登记一次 oracle 探针；返回 False 表示已达上限。"""
         item = self.require(challenge_id)

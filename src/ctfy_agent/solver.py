@@ -15,6 +15,8 @@ import os
 import hashlib
 import json
 import time
+import urllib.error
+import urllib.request
 from json import JSONDecodeError
 
 from .artifacts import DOWNLOAD_TOOLS, persist_download
@@ -551,6 +553,12 @@ class Solver:
                 # 平台上游限流是真实存在的（实测），等待要够长，否则等于直接放弃本题
                 time.sleep(waits[attempt])
                 continue
+            # [fix 2026-11-05 P3] 被上游限流/配额拒绝的调用不该占用本地 instance_ops 配额
+            if transient:
+                try:
+                    self.store.refund_call(challenge_id, start_name)
+                except Exception:  # noqa: BLE001
+                    pass
             self.on_event("instance_start_failed", {"error": str(info)})
             return None
         return None
@@ -565,6 +573,13 @@ class Solver:
             self.store.set_status(challenge_id, "instance_up")
         self.store.save()
         self.on_event("instance_started", {"challenge_id": challenge_id, "instance": info})
+        # [fix 2026-11-05 P2] 平台边缘会比容器先就绪：刚 start 的实例早期请求统一返回
+        # 19 字节 Go 404（实测 CTFARENA-001/002/008），agent 会误判「应用挂了」并大量空转探测。
+        # 这里做一次有界就绪等待（最多 45s），结果只写转录，绝不影响主流程。
+        try:
+            self._wait_instance_ready(challenge_id, info)
+        except Exception:  # noqa: BLE001 - 就绪等待是增强项
+            pass
         return info
 
     _DEAD_INSTANCE_MARKERS = (
@@ -725,7 +740,33 @@ class Solver:
                         break
                     time.sleep(wait)
                     text = self.platform.call_text(name, args)
-                if self._is_transient(text):
+                if self._is_capacity_error(text):
+                    # [fix 2026-11-05 P3] 团队实例配额=1（实测 429 team_capacity_exceeded /
+                    # "Max 1 concurrent instances per team"）。旧逻辑把失败调用也计入
+                    # instance_ops_limit=5，两三次失败就把额度烧光。这里：回滚计数 -> 清掉
+                    # 不属于本题的残留实例 -> 重试一次，仍失败才把排查动作写给模型。
+                    try:
+                        self.store.refund_call(challenge_id, name)
+                    except Exception:  # noqa: BLE001 - 计数回滚是增强项
+                        pass
+                    cleaned = self._evict_stale_instances(challenge_id)
+                    if cleaned:
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "tool", "note": f"[实例守卫] 清掉 {cleaned} 个不属于本题的残留实例后重试 {name}"},
+                        )
+                        text = self.platform.call_text(name, args)
+                        if self._is_capacity_error(text):
+                            text += (
+                                f"\n[实例守卫] 已清理 {cleaned} 个残留实例仍被拒：平台团队配额只有 1 个实例，"
+                                "确认没有其它题在用实例后再试；不要连续重试（本地已回滚本次计数）。"
+                            )
+                    else:
+                        text += (
+                            "\n[实例守卫] 平台团队实例配额只有 1 个（429 team_capacity_exceeded），"
+                            "且当前没有可清理的残留实例；确认无其它题占用后再试。"
+                        )
+                elif self._is_transient(text):
                     # 实测：团队实例配额=1，泄漏/另开的实例会让 start_instance 长期报「Rate limited」。
                     # 这不是时间限流，等再久也没用——把排查动作直接写给模型。
                     text += (
@@ -791,6 +832,91 @@ class Solver:
                 return f"[工具被拒绝] {exc}", False
 
         return f"[未知工具] {name}，可用：{', '.join(sorted(platform_names | local.names()))}", False
+
+    @staticmethod
+    def _is_capacity_error(text: str) -> bool:
+        """平台团队实例配额拒绝（429）判定。"""
+        low = str(text or "").lower()
+        return (
+            "team_capacity_exceeded" in low
+            or "max 1 concurrent instances" in low
+            or "concurrent instances per team" in low
+        )
+
+    def _evict_stale_instances(self, challenge_id: str) -> int:
+        """清掉不属于本题的实例（团队配额=1，残留实例会堵死 start_instance）。返回停掉数量。"""
+        list_name = self.platform.try_resolve("list_instances")
+        stop_name = self.platform.try_resolve("stop_instance")
+        if not list_name or not stop_name:
+            return 0
+        try:
+            data = self.platform._as_json(self.platform.call_text(list_name, {}))
+        except Exception:  # noqa: BLE001 - 守卫失败不拦主流程
+            return 0
+        items = (data.get("items") if isinstance(data, dict) else data) or []
+        stopped = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            other = str(item.get("challenge_id") or "")
+            iid = str(item.get("id") or "")
+            if not iid or other == challenge_id:
+                continue
+            try:
+                self.platform.call_text(stop_name, {"instance_id": iid})
+                stopped += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return stopped
+
+    def _wait_instance_ready(self, challenge_id: str, info) -> None:
+        """有界等待实例应用就绪：Go 网关 404 / 连接失败视为未就绪，其它状态码视为就绪。"""
+        services = ((info or {}).get("surface") or {}).get("services") if isinstance(info, dict) else None
+        svc = None
+        for item in services or []:
+            if isinstance(item, dict) and item.get("host"):
+                svc = item
+                break
+        if not svc:
+            return
+        host = str(svc.get("host"))
+        port = svc.get("port") or (443 if str(svc.get("service_type")) == "https" else 80)
+        scheme = "https" if str(port) not in ("80", "8080") else "http"
+        url = f"{scheme}://{host}/"
+        deadline = time.time() + 45
+        attempt = 0
+        last = "（未探测）"
+        while time.time() < deadline:
+            attempt += 1
+            code = 0
+            body = b""
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    code = resp.status
+                    body = resp.read(120)
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                try:
+                    body = exc.read(120)
+                except Exception:  # noqa: BLE001
+                    body = b""
+            except Exception as exc:  # noqa: BLE001
+                last = f"{type(exc).__name__}: {exc}"
+            if code:
+                last = f"HTTP {code}（{len(body)}B）"
+                gateway_404 = code == 404 and len(body) <= 60 and b"page not found" in body.lower()
+                if not gateway_404:
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "instance", "note": f"[就绪等待] {host} 第 {attempt} 次探测 {last}，视为就绪"},
+                    )
+                    return
+            time.sleep(3)
+        self.store.append_transcript(
+            challenge_id,
+            {"role": "instance", "note": f"[就绪等待] {host} 45s 内未见应用就绪（最后 {last}），继续按平台状态推进"},
+        )
 
     def _submit(self, args: dict, challenge_id: str) -> tuple[str, bool]:
         answer = str(args.get("answer") or args.get("flag") or args.get("value") or "").strip()
