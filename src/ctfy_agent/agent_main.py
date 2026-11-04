@@ -153,6 +153,7 @@ _STOP_MAP = {
     "budget_exhausted": "cut_off",
     "wall_clock": "cut_off",   # P0-3：时间到与预算耗尽对平台是同一类（都是"没做完"）
     "llm_error": "halted",
+    "environment_error": "halted",  # [v6.4] 连续 N 次专家结论指向环境侧故障（实例/网关/节点不可达）
 }
 
 

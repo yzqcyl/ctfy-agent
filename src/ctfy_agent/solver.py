@@ -817,25 +817,9 @@ class Solver:
         else:
             payload["challenge_id"] = challenge_id
 
-        # 若平台提供 oracle 探针（verify_answer 不写提交记录），先免费验一次，避免白烧提交次数
-        oracle = self.platform.try_resolve("verify_answer")
-        if oracle and instance_mode:
-            oracle_props = self.platform.prop_names(oracle)
-            if "answer" in oracle_props and self.store.bump_oracle(challenge_id, self.config.oracle_limit):
-                probe = {"instance_id": payload["instance_id"], "answer": answer}
-                if "question_id" in oracle_props:
-                    probe["question_id"] = question_id
-                try:
-                    oracle_text = self.platform.call_text(oracle, probe)
-                except Exception:  # 探针不可用不影响主流程
-                    oracle_text = ""
-                verdict = looks_accepted(oracle_text) if oracle_text else None
-                if verdict is False:
-                    return (
-                        f"{oracle_text}\n\n[判定] oracle 预检未通过（未消耗提交次数，可继续试）。",
-                        False,
-                    )
-
+        # [v6.4 回滚] 不再用 verify_answer 做提交前预检：实测对门控/多问题题它会在「答案其实正确、
+        # 门已开」时仍返回 false，导致 SAMPLE-001 的 flag 候选四版从未真正提交（platform wrong_attempts=0）。
+        # 预检的价值只剩「拦 false」，去掉它，直接真实提交，让平台判定；额度由 can_submit/reserve_submit 兜底。
         # 友好预判；真正的原子防重/防超在 reserve_submit 里（并发安全）
         if not self.store.can_submit(challenge_id, self.config.submit_limit):
             return (

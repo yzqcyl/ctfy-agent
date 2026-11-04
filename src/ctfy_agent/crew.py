@@ -336,6 +336,32 @@ def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: 
     return "协调结束。", True, False
 
 
+# [v6.4] 环境故障收敛：连续 ENV_FAIL_LIMIT 次专家结论都命中下面任一字样，就判定平台侧故障收口。
+ENV_FAIL_LIMIT = 3
+_ENV_FAILURE_MARKERS = (
+    "未登记实例",
+    "请求发不出去",
+    "实例不可达",
+    "node_unreachable",
+    "node unreachable",
+    "instance_not_found",
+    "no port range",
+    "port range it can publish",
+    "temporary failure in name resolution",
+    "name resolution",
+    "connection refused",
+    "connection reset",
+    "504 gateway timeout",
+    "502 bad gateway",
+)
+
+
+def _looks_env_failure(text: str) -> bool:
+    """专家结论是否整体指向「环境侧故障」（实例/网关/节点不可达），而非单一路径 404。"""
+    low = str(text or "").lower()
+    return any(mark in low for mark in _ENV_FAILURE_MARKERS)
+
+
 def _ledger_facts(ledger, limit: int = 12) -> list[str]:
     """集群-B 黑板：从账本挑「结论级事实」给下一次尝试继承。
 
@@ -870,16 +896,14 @@ class Crew:
 
         # 候选闸门 / 假设收敛 状态（v3 P0）
         done_blocks = 0
-        checker_blocks = 0
         last_open = -1
         last_refuted = -1
         convergence_stalls = 0
         flag_nudged = False
-        # [v6.3] 提交节流：多问题题实测被刷屏（SAMPLE-001 submit 70 次 / SAMPLE-009 44 次），
-        # 每次只是「同一旧答案再交一遍」，白烧调用。按题号计次 + 通过后必须先去拿新答案。
-        submit_counts: dict[str, int] = {}
-        submit_seen: dict[str, set] = {}
-        needs_new_answer = False
+        # [v6.4 回滚] 删掉 submit_counts/submit_seen/needs_new_answer 三道节流：
+        # 实测它们把「已通过题号再交」和「同值再交」的正确拦截，变成了让模型误以为「没交成功」的
+        # 循环诱因（001 v6.5 s4→s24 重交 slug）。提交闸门只保留一条硬事实拦截（见 submit 分支）。
+        env_fail_streak = 0
 
         # 断点续跑（P0-1）：协调者上下文是本 run 最贵的状态，崩溃即清零（003 实测烧掉 135k token）。
         # 每轮开跑前把 messages/reports/ledger/plan 快照到 run_dir/checkpoints/；正常收尾删除，
@@ -1085,18 +1109,30 @@ class Crew:
                                 "delegate", {"role": role_name, "objective": objective}, text,
                                 role="coordinator", ok=True,  # 派活只用来去重，不参与「方向证伪」统计
                             )
-                            needs_new_answer = False  # 已经去拿新答案了，解除 submit 节流
                             reports.append(text)
                             # 只记摘要，别把完整报告塞进笔记（跨 run 复利膨胀，审计 B3）
                             self.store.add_note(challenge_id, text[:800])
+                            # [v6.4] 环境故障收敛：连续 N 次专家结论都指向「实例不可达/路由 404/请求发不出去」，
+                            # 就判定为平台侧故障并收口，不再 delegate 空转（实测 v6.7 SAMPLE-007 烧了 209 轮）。
+                            if _looks_env_failure(text):
+                                env_fail_streak += 1
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "env", "step": rnd,
+                                     "note": f"环境故障信号第 {env_fail_streak} 次（阈值 {ENV_FAIL_LIMIT}）"},
+                                )
+                            else:
+                                env_fail_streak = 0
+                            if env_fail_streak >= ENV_FAIL_LIMIT:
+                                stop = True
+                                reason = "environment_error"
+                                text += (
+                                    "\n\n[环境故障收口] 连续 %d 次专家结论都指向同一环境侧故障（实例不可达/路由 404/"
+                                    "请求发不出去/节点失联），继续 delegate 不会改变结果，本题判定为环境故障并收口。"
+                                ) % env_fail_streak
                     elif name == "submit":
                         qid_hint = str(args.get("question_id") or challenge.next_question_id or "")
-                        tries = submit_counts.get(qid_hint, 0)
                         accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
-                        answer_val = str(
-                            args.get("answer") or args.get("flag") or args.get("value") or ""
-                        ).strip()
-                        tried_vals = submit_seen.get(qid_hint) or set()
                         if qid_hint and qid_hint in accepted_map:
                             # [v6.6] 已通过的题号再提交是纯浪费：SAMPLE-001 实测连续 4 轮被这条拦下
                             # （旧文案说「已经提交 2 次」，模型以为还没成功，于是一直重试）。
@@ -1105,34 +1141,8 @@ class Crew:
                                 "「逐题状态」），再交一次不会有任何收益。本题若还有未通过题号，下一步只能 delegate "
                                 "去取那些题的答案；全部通过就 done 收口。"
                             )
-                        elif answer_val and answer_val in tried_vals:
-                            # [v6.7] 只拦「同一个答案再交一遍」：SAMPLE-001 实测第 3 个新候选
-                            # （可能是对的那个）会被旧规则「同一题号 ≥2 次」直接拦死，等于自断后路。
-                            text = (
-                                f"[提交被拦截] 这个答案在题号 `{qid_hint}` 上已经交过了（结果不会变）。"
-                                "换答案来源：delegate 去取新证据，或换一个候选值再试。"
-                            )
-                        elif qid_hint and tries >= 6:
-                            text = (
-                                f"[提交被拦截] 题号 `{qid_hint}` 已提交 {tries} 次（上限 6）。"
-                                "同一题反复 submit 不会有新结果：要么换答案来源（delegate），要么 done 收口。"
-                            )
                         else:
                             text, accepted = solver._submit(args, challenge_id)
-                            # [v6.8] 只有**真的送达平台**的提交才记进「已交过的值」。
-                            # SAMPLE-001 实测 v6.7 自伤：门控未解锁时 oracle 预检判 false（不算提交），
-                            # 却也记进了去重表，于是 slug 通过、门控解锁后同一个 flag 值的重试被自己拦死 30+ 轮。
-                            real_submit = "oracle 预检未通过" not in str(text) and "未消耗提交次数" not in str(text)
-                            submit_counts[qid_hint] = tries + 1
-                            if answer_val and real_submit:
-                                submit_seen.setdefault(qid_hint, set()).add(answer_val)
-                            if not accepted and real_submit and "提交被拦截" not in str(text):
-                                # [v6.8] 该值被平台判错：门控题的题面可能随前置题通过而变化，提示重新取源。
-                                text = (
-                                    f"{text}\n\n[重新取源] 题号 `{qid_hint}` 的这个值平台判错。若这是门控题，"
-                                    "前置题通过后题面/页面内容已经变了：重新 get_challenge，再让专家 fresh=1 "
-                                    "重新抓一次源（不要复用旧字节），拿到新值再交。"
-                                )
                             if accepted:
                                 submitted = True
                                 reason = "flag_accepted"
@@ -1141,7 +1151,6 @@ class Crew:
                                 if isinstance(verdict, dict) and verdict.get("challenge_fully_solved") is False:
                                     submitted = False
                                     reason = "partial_solve"
-                                    needs_new_answer = True
                                     info = self._fetch_challenge(challenge_id, solver) or self._question_info
                                     self._question_info = info
                                     all_qids = self._question_ids(info)
@@ -1180,33 +1189,7 @@ class Crew:
                         self.store.add_note(challenge_id, str(args.get("text") or ""))
                         text = "已记录。"
                     elif name == "done":
-                        # [v6.8] checker 题（没有 flag 串，靠 verify_exploit 让平台判分）不许空口 done：
-                        # 实测 v6.7 SAMPLE-006（deface checker）finish 时直接 done，白丢一题。
-                        checker_left: list[str] = []
-                        try:
-                            info_now = self._fetch_challenge(challenge_id, solver) or {}
-                        except Exception:  # noqa: BLE001 - 拿不到题面就按原逻辑走
-                            info_now = {}
-                        accepted_now = dict(getattr(challenge, "answers_by_qid", {}) or {})
-                        for q in info_now.get("questions") or []:
-                            if isinstance(q, dict) and str(q.get("mode") or "") == "checker":
-                                qid = str(q.get("id") or "")
-                                if qid and qid not in accepted_now:
-                                    checker_left.append(qid)
-                        if checker_left and checker_blocks < 2:
-                            checker_blocks += 1
-                            stop = False
-                            text = (
-                                f"[done 被拦] 题号 {', '.join('`' + q + '`' for q in checker_left)} 是 checker 题"
-                                "（没有 flag 串，平台靠判分 sidecar 认结果），还没通过。\n"
-                                "下一步只能 delegate：让专家把利用动作做完（改页面/触发效果），再调 `verify_exploit` "
-                                "让平台判分；通过后再 done。"
-                            )
-                            self.store.append_transcript(
-                                challenge_id,
-                                {"role": "gate", "step": rnd, "note": f"done 被 checker 闸门拦下（第 {checker_blocks} 次）"},
-                            )
-                        elif self.config.extra.get("candidate_gate", True):
+                        if self.config.extra.get("candidate_gate", True):
                             text, stop, no_cand = _done_gate(
                                 submitted, challenge.attempts, ledger.observations, done_blocks
                             )

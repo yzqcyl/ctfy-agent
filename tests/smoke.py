@@ -4689,17 +4689,16 @@ def case_v63_submit_guards(tmp: Path) -> None:
 
 
 def case_v63_budget_and_pwn(tmp: Path) -> None:
-    """v6.3 预算口径 + pwn 黑盒纪律：折价刹车、报表仍按真实 token。"""
+    """v6.4 回滚后：预算折价口径保留，pwn 提示词回滚到 v6.2（无黑盒纪律段）。"""
     import pathlib  # noqa: PLC0415
 
     from ctfy_agent.crew import _usage_delta  # noqa: PLC0415
 
     cfg = load_config(pathlib.Path(__file__).resolve().parents[1] / "config" / "agent.json")
     assert cfg.extra.get("budget_cache_discount") is True, "budget_cache_discount 未开启"
-    assert int(cfg.max_llm_calls) >= 200, cfg.max_llm_calls
+    assert int(cfg.max_llm_calls) == 160, cfg.max_llm_calls
     pwn = str((cfg.extra.get("roles") or {}).get("pwn", {}).get("system") or "")
-    assert "黑盒服务题" in pwn and "4000" in pwn, "pwn 提示词缺黑盒纪律"
-    assert "list_instance_attachments" in pwn, "pwn 提示词缺实例附件检查"
+    assert "黑盒服务题" not in pwn, "pwn 提示词应回滚到 v6.2（无黑盒纪律段）"
 
     b = Budget(max_tokens=800000, cache_discount=True)
     start = b.snapshot()
@@ -4715,7 +4714,7 @@ def case_v63_budget_and_pwn(tmp: Path) -> None:
     assert delta["prompt_tokens"] == 10000, delta     # 报表口径 = 真实 token
     assert delta["completion_tokens"] == 100, delta
     assert delta.get("prompt_tokens_billed") == 1900, delta
-    ok("v6.3 预算：缓存折价只用于刹车，result.json 仍报真实 token；pwn 黑盒纪律已内置")
+    ok("v6.4 回滚：预算折价保留，max_llm_calls=160，pwn 提示词回到 v6.2")
 
 
 def case_v64_llm_and_instance(tmp: Path) -> None:
@@ -4857,8 +4856,8 @@ def case_v66_answer_status(tmp: Path) -> None:
         slug_blocked = [b for b in blocked if "已经通过并由平台记录" in b]
         assert len(slug_blocked) >= 2, blocked
 
-        # 4) [v6.7] 同一题号的新候选值不能被拦死（001 实测第 3 个候选会被旧规则「≥2 次」拦掉，
-        #    等于自断后路）；只有「同一个值再交一遍」才该拦。
+        # 4) [v6.4] 未通过题号的新候选必须直通平台：只有 solver 自己的幂等保护拦「同一个值再交一遍」，
+        #    crew 层不再有任何按值/按次数的去重（v6.7 实测把 001 正确候选拦死 30+ 轮）。
         store.transcript_path("web-01").unlink(missing_ok=True)
         submits2: list = []
 
@@ -4880,35 +4879,27 @@ def case_v66_answer_status(tmp: Path) -> None:
         vals = [str(a.get("answer") or a.get("flag") or "") for a in submits2]
         assert vals == ["GUESS-1", "GUESS-2"], vals
         txt = store.transcript_path("web-01").read_text(encoding="utf-8")
-        assert "这个答案在题号 `flag` 上已经交过了" in txt, txt[-2000:]
+        assert "幂等保护" in txt, txt[-2000:]  # GUESS-1 的第二次被 solver 幂等拦截，而非 crew 去重
 
-        # 5) [v6.8] oracle 预检 false（门控未解锁，不算提交）不能进「已交过的值」：
-        #    解锁后同一个值必须能真正提交（v6.7 实测自伤：同值被自己拦死 30+ 轮）
-        from ctfy_agent import solver as solver_mod  # noqa: PLC0415
+        # 5) [v6.4] 环境故障收敛：连续 3 次专家结论指向实例/网关不可达 → 收口 environment_error
+        from ctfy_agent import crew as crew_mod  # noqa: PLC0415
 
+        assert crew_mod._looks_env_failure("[web 结论] 请求发不出去：未登记实例"), "marker 未命中"
+        assert not crew_mod._looks_env_failure("[web 结论] /admin 返回 404，/api 返回 200，flag 已拿到"), "误伤普通 404"
         store.transcript_path("web-01").unlink(missing_ok=True)
-        submit_calls: list = []
-        orig_solver_submit = solver_mod.Solver._submit
-
-        def fake_submit(self, args, cid):
-            submit_calls.append(dict(args))
-            if len(submit_calls) == 1:
-                return "[判定] oracle 预检未通过（未消耗提交次数，可继续试）。", False
-            return json.dumps({"accepted": True}), True
-
-        solver_mod.Solver._submit = fake_submit
-        try:
-            script4 = [
-                {"content": "门控态", "tool_calls": [tool_call("submit", {"answer": "FLAG-REAL", "question_id": "flag"})]},
-                {"content": "解锁后重交", "tool_calls": [tool_call("submit", {"answer": "FLAG-REAL", "question_id": "flag"})]},
-                {"content": "收工", "tool_calls": [tool_call("done", {})]},
-            ]
-            crew5 = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script4))
-            crew5._question_info = {"flag_solves": {"slug": True, "flag": False}}
-            crew5.solve("web-01")
-        finally:
-            solver_mod.Solver._submit = orig_solver_submit
-        assert len(submit_calls) == 2, submit_calls
+        script_env = [
+            {"content": "d1", "tool_calls": [tool_call("delegate", {"role": "web", "objective": "探可达 A"})]},
+            {"content": "d2", "tool_calls": [tool_call("delegate", {"role": "web", "objective": "探可达 B"})]},
+            {"content": "d3", "tool_calls": [tool_call("delegate", {"role": "web", "objective": "探可达 C"})]},
+            {"content": "d4", "tool_calls": [tool_call("delegate", {"role": "web", "objective": "探可达 D"})]},
+        ]
+        crew_env = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script_env))
+        crew_env._question_info = {"flag_solves": {"flag": False}}
+        crew_env._delegate = lambda *a, **k: "[web 结论] 请求发不出去：http_request 仍被「未登记实例」硬拒。"
+        summary_env = crew_env.solve("web-01")
+        assert summary_env.get("reason") == "environment_error", summary_env
+        t_env = store.transcript_path("web-01").read_text(encoding="utf-8")
+        assert "环境故障收口" in t_env, t_env[-1200:]
 
         # 6) [v6.8] MCP 连不上时 result.json 必须保留 state 里已通过的题号（不能写空 answers 覆盖）
         from ctfy_agent import agent_main as agent_mod  # noqa: PLC0415
@@ -4925,19 +4916,7 @@ def case_v66_answer_status(tmp: Path) -> None:
         assert solved == ["slug"], solved
         assert inst == "inst-1", inst
 
-        # 7) [v6.8] checker 题（无 flag 串，平台靠 verify_exploit 判分）没判分前不许 done：
-        #    实测 v6.7 SAMPLE-006 deface 直接 done，白丢一题。
-        store.transcript_path("web-01").unlink(missing_ok=True)
-        script5 = [{"content": "done", "tool_calls": [tool_call("done", {})]} for _ in range(4)]
-        crew6 = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script5))
-        crew6._question_info = {"questions": [{"id": "deface", "mode": "checker"}]}
-        crew6._fetch_challenge = lambda cid, solver: {
-            "questions": [{"id": "deface", "mode": "checker", "prompt": "Change the banner."}]
-        }
-        crew6.solve("web-01")
-        t2 = store.transcript_path("web-01").read_text(encoding="utf-8")
-        assert "done 被 checker 闸门拦下" in t2, t2[-1500:]
-        ok("v6.6/v6.7/v6.8 逐题状态回灌 + 只拦真实重复提交 + 连不上平台也保住已得分 + checker 闸门")
+        ok("v6.4 回滚：逐题状态回灌 + 只拦已通过题号 + 未通过直通平台 + 环境故障收敛 + MCP 重连保分")
     finally:
         server.shutdown()
         server.server_close()
