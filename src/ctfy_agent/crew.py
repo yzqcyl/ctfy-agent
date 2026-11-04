@@ -791,6 +791,18 @@ class Crew:
                         轮粒度真取消。
         """
         challenge = self.store.require(challenge_id)
+        # [fix 2026-11-05 CTFARENA-001] 已解出的题绝不再跑：旧行为在 CLI 重跑/续跑时会把已解
+        # 题完整重烧一遍（实测 001 重跑又烧 9 万 token，且平台新实例未就绪 → 继续空转探测）。
+        # 与 _solve_clustera 预检同口径：只认终态 done 或全解 submitted_ok；平台 my_solved_ids
+        # 作为事实兜底（容器/多进程场景 state 可能落后）。
+        if challenge.status == "done" or getattr(challenge, "submitted_ok", False):
+            return self._presolved_summary(challenge_id, challenge)
+        try:
+            if challenge_id in self.platform.my_solved_ids():
+                challenge.status = "submitted"
+                return self._presolved_summary(challenge_id, challenge)
+        except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不拦解题
+            pass
         # P2-2：按域编排档位（只动编排参数；未识别题型 → {} 即旧行为）
         self._profile = domain_profile(
             self.config.extra, challenge,
