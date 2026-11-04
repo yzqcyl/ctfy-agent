@@ -141,6 +141,10 @@ class CtfyPlatform:
         self._active_instance_id: str = ""
         self._active_challenge_id: str = ""
         self._question_meta: dict[str, dict[str, dict]] = {}
+        # 平台报告的「完整合法题号集合」= questions 的 id ∪ flag_solves 的 key（含门控题号，
+        # 如 SAMPLE-001 的 "flag"、SAMPLE-009 的 "root"，它们不在 questions 里）。用于判「显式
+        # 题号是否幻觉」；与 _question_meta（只记 questions 的 mode/prompt）分开，避免污染选题逻辑。
+        self._question_ids: dict[str, set[str]] = {}
         # 最近一次 verify_* 判过 true 的 question_id；多问题题提交时优先用它当默认题号
         self._verified_qid: str = ""
 
@@ -280,25 +284,38 @@ class CtfyPlatform:
     # ---------- 运行时事实修正（防模型编造 instance_id / question_id） ----------
 
     def _remember_questions(self, challenge_id, data) -> None:
-        """从 get_challenge / start_instance / get_instance 的返回里记下题目 questions。"""
+        """从 get_challenge / start_instance / get_instance 的返回里记下题目信息。
+
+        记两样：
+        1) _question_meta：questions 数组里每个题的 mode/prompt（供 _pick_question_id 选题）。
+        2) _question_ids：平台报告的「完整合法题号集合」= questions 的 id ∪ flag_solves 的 key。
+           flag_solves 会列出被门控、不出现在 questions 里的题号（SAMPLE-001 的 "flag"、
+           SAMPLE-009 的 "root"），作为判「显式题号是否幻觉」的权威来源，避免把合法门控题号当幻觉改写。
+        """
         if not isinstance(challenge_id, str) or not challenge_id or not isinstance(data, dict):
             return
-        questions = data.get("questions") or []
-        if not isinstance(questions, list) or not questions:
-            return
         meta: dict[str, dict] = {}
-        for q in questions:
-            if not isinstance(q, dict):
-                continue
-            qid = q.get("id") or q.get("question_id")
-            if not qid:
-                continue
-            meta[str(qid)] = {
-                "mode": str(q.get("mode") or ""),
-                "prompt": str(q.get("prompt") or "")[:160],
-            }
+        questions = data.get("questions")
+        if isinstance(questions, list):
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                qid = q.get("id") or q.get("question_id")
+                if not qid:
+                    continue
+                meta[str(qid)] = {
+                    "mode": str(q.get("mode") or ""),
+                    "prompt": str(q.get("prompt") or "")[:160],
+                }
         if meta:
             self._question_meta[challenge_id] = meta
+        # 完整合法题号集合（含门控题号）
+        ids: set[str] = set(meta.keys())
+        flag_solves = data.get("flag_solves")
+        if isinstance(flag_solves, dict):
+            ids.update(str(k) for k in flag_solves.keys())
+        if ids:
+            self._question_ids[challenge_id] = ids
 
     def _learn_from_result(self, name: str, arguments: dict, result) -> None:
         """把工具返回里的事实沉淀下来；只认 dict 返回值，解析失败静默跳过。"""
@@ -364,15 +381,19 @@ class CtfyPlatform:
         if "question_id" in props and name in _QUESTION_TOOLS:
             qid = args.get("question_id")
             current = self._question_meta.get(self._active_challenge_id) or {}
+            valid = self._question_ids.get(self._active_challenge_id) or set()
             if not qid and current:
                 # 没给题号时才自动补：别让平台落到默认 "flag"（本题真实题号可能是 user/outage/…）。
                 better = self._pick_question_id(name)
                 if better:
                     args["question_id"] = better
-            # [v6.4] 显式给的题号一律信任，不再改写成「已知唯一题号」：门控题（SAMPLE-001）的 flag 题
-            # 不在 get_challenge 的 questions 里，旧逻辑会把 question_id="flag" 改写成 "slug"，
-            # 导致正确答案被当成 slug 判错、flag 题从未真正提交（001 实测 wrong_attempts=0）。
-            # 真写错题号时平台会回明确的 422 unknown_question_id，模型自己会纠，比静默错投更安全。
+            elif isinstance(qid, str) and qid and valid and qid not in valid:
+                # 显式给了、却不在平台报告的「完整题号集合」里 → 视为幻觉，纠成已知唯一题号。
+                # 门控题（SAMPLE-001 的 "flag"、SAMPLE-009 的 "root"）在 flag_solves 里、属于 valid，不会被改；
+                # 真写错题号（既不在 questions 也不在 flag_solves）仍会纠回唯一题号，避免 422 丢答案。
+                better = self._pick_question_id(name)
+                if better:
+                    args["question_id"] = better
         return args
 
     # ---------- 调用 ----------

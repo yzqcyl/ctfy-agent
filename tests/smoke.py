@@ -1800,19 +1800,88 @@ def case_submit_question_id(tmp: Path) -> None:
         assert platform.preferred_question_id() == "outage"
         assert platform._repair_runtime_args("submit_answer", {})["question_id"] == "outage"
 
-        # [v6.4] 显式给的题号一律信任，不改写成「已知唯一题号」：门控题（SAMPLE-001）的 flag 题
-        # 不在 get_challenge 的 questions 里，旧逻辑会把 question_id="flag" 改写成 "slug"，
-        # 把正确答案错投到 slug 题判错（001 实测 flag wrong_attempts=0）。
+        # [v6.4] 显式题号按「完整合法题号集合」判定：门控题（SAMPLE-001）的 "flag" 不在 questions、
+        # 但在 flag_solves 里 → 合法，不改写；真幻觉题号（既不在 questions 也不在 flag_solves）→ 纠回唯一题号。
         platform._active_challenge_id = "SAMPLE-001"
         platform._question_meta["SAMPLE-001"] = {"slug": {"mode": "dynamic", "prompt": "32-hex slug"}}
+        platform._question_ids["SAMPLE-001"] = {"slug", "flag"}
         repaired = platform._repair_runtime_args(
             "submit_answer", {"answer": "FLAG{x}", "question_id": "flag"}
         )
         assert repaired.get("question_id") == "flag", repaired
-        ok("多问题题默认题号：verify 通过后沿用该题号，单问题题不回落到 flag；显式题号不再被改写")
+        repaired = platform._repair_runtime_args(
+            "submit_answer", {"answer": "x", "question_id": "nonesuch"}
+        )
+        assert repaired.get("question_id") == "slug", repaired
+        ok("多问题题默认题号：verify 通过后沿用该题号，单问题题不回落到 flag；门控题号不改写、幻觉题号被纠回")
     finally:
         server.shutdown()
         server.server_close()
+
+
+def case_gated_flag_question_id(tmp: Path) -> None:
+    """门控题：合法题号集合 = questions ∪ flag_solves keys。
+
+    get_challenge 的 questions 只列 slug，但 flag_solves 含 "flag"（SAMPLE-001 实测）。
+    据此判显式题号是否幻觉："flag" 合法不改写、verify_answer 也不被毒化；"nonesuch" 幻觉才纠回唯一题号。
+    v6.4 之前旧逻辑只看 questions，会把 "flag" 错改成 "slug"（001 实测 flag wrong_attempts=0，
+    且 verify_answer(question_id=flag) 被改写后永远 false，连锁毒化 oracle 预检）。
+    """
+    platform = CtfyPlatform("http://127.0.0.1:1", "pf_test_token_123456")
+    qid_schema = {
+        "type": "object",
+        "properties": {"instance_id": {}, "answer": {}, "question_id": {}},
+    }
+    platform._by_name["verify_answer"] = {"name": "verify_answer", "inputSchema": qid_schema}
+    platform._by_name["submit_answer"] = {"name": "submit_answer", "inputSchema": qid_schema}
+
+    def learn_get_challenge(cid: str, obj: dict) -> None:
+        platform._learn_from_result(
+            "get_challenge",
+            {"challenge_id": cid},
+            {"content": [{"type": "text", "text": json.dumps(obj, ensure_ascii=False)}]},
+        )
+
+    # SAMPLE-001：questions 只有 slug，flag_solves 含 flag → 合法集 {slug, flag}
+    learn_get_challenge("SAMPLE-001", {
+        "id": "SAMPLE-001",
+        "questions": [{"id": "slug", "mode": "dynamic", "prompt": "32-hex slug"}],
+        "flag_solves": {"slug": 49, "flag": 40},
+    })
+    assert platform._question_meta["SAMPLE-001"] == {
+        "slug": {"mode": "dynamic", "prompt": "32-hex slug"}
+    }
+    assert platform._question_ids["SAMPLE-001"] == {"slug", "flag"}
+
+    # 显式 flag 不改写（submit 和 verify 都别毒化）
+    assert platform._repair_runtime_args(
+        "submit_answer", {"answer": "FLAG{x}", "question_id": "flag"}
+    ).get("question_id") == "flag"
+    assert platform._repair_runtime_args(
+        "verify_answer", {"answer": "FLAG{x}", "question_id": "flag"}
+    ).get("question_id") == "flag"
+    # 幻觉题号才纠回唯一已知题
+    assert platform._repair_runtime_args(
+        "submit_answer", {"answer": "x", "question_id": "nonesuch"}
+    ).get("question_id") == "slug"
+
+    # SAMPLE-009：门控题号 root 也在 flag_solves 里 → 不改写
+    learn_get_challenge("SAMPLE-009", {
+        "id": "SAMPLE-009",
+        "questions": [{"id": "flag", "mode": "dynamic", "prompt": "service token"}],
+        "flag_solves": {"flag": 10, "root": 3},
+    })
+    assert platform._repair_runtime_args(
+        "submit_answer", {"answer": "rootpw", "question_id": "root"}
+    ).get("question_id") == "root"
+
+    # flag_solves 缺失/为空 → 合法集退化为 questions-only（同旧版，不更糟）
+    learn_get_challenge("SAMPLE-005", {
+        "id": "SAMPLE-005",
+        "questions": [{"id": "flag", "mode": "flag", "prompt": "x"}],
+    })
+    assert platform._question_ids["SAMPLE-005"] == {"flag"}
+    ok("门控题号按 questions ∪ flag_solves 判定：合法不改写、幻觉才纠回")
 
 
 def case_partial_solve_state(tmp: Path) -> None:
@@ -4980,6 +5049,7 @@ def main() -> int:
         ("challenge_meta", case_challenge_meta),
         ("multi_question", case_multi_question),
         ("submit_question_id", case_submit_question_id),
+        ("gated_flag_question_id", case_gated_flag_question_id),
         ("partial_solve_state", case_partial_solve_state),
         ("qa_submit", case_qa_submit),
         ("stdlib_only", case_stdlib_only),
