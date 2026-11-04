@@ -306,6 +306,17 @@ def _usage_delta(start: dict | None, end: dict | None) -> dict:
         usage["prompt_tokens_billed"] = billed_prompt
     return usage
 
+# [fix 2026-11-05 P4] 预算闸门：协调者 done 时若预算充足且账本仍有大量未验证假设，拦下并逼它继续。
+# 实证：CTFARENA-002 Run2 只 2 轮、75k/80calls 就 coordinator_done（23 条 open 假设未验证）；
+# CTFARENA-010 Run2 5 轮、385k 就收口，plan 自己写「收敛期只剩 ~24 次调用」却选择收口。
+_BUDGET_DONE_GATE = (
+    "[done 被预算闸门拦下] 本题未解，但预算仍充足（剩余调用/预算见上一条 system 状态），"
+    "账本里还有未验证的假设。现在收口等于白扔预算。下一步必须二选一：\n"
+    "1) delegate 一个**具体增量目标**去验证账本里排在前面的未验证假设（写明 done_when）；\n"
+    "2) 用当前最有把握的候选先 verify_answer 自校验，通过立刻 submit。\n"
+    "禁止再重复已做过的侦察；也禁止在验证完候选前再次 done。"
+)
+
 _NO_CANDIDATE_GATE = (
     "[候选闸门] 目前 attempts=0 且没有任何逐字候选被验证过，不能就此 done 收尾。\n"
     "要么把你最有把握的候选用 submit 提交（拿不准先 verify_answer 自校验，不消耗提交次数），\n"
@@ -323,16 +334,30 @@ _FLAG_CANDIDATE_HINT = (
 
 
 def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: int,
-               max_blocks: int = MAX_DONE_BLOCKS) -> tuple[str, bool, bool]:
-    """候选闸门：零候选（未提交、零尝试、零逐字证据）时拦 done 至多 max_blocks 次。
+               max_blocks: int = MAX_DONE_BLOCKS, calls_left: int | None = None,
+               tokens_left: int | None = None, open_count: int = 0) -> tuple[str, bool, bool]:
+    """候选/预算闸门：拦 done 至多 max_blocks 次。
 
     返回 (text, stop, no_candidate)。stop=False 表示拦下（本轮不结束，把闸门文案回灌给协调者），
     stop=True 且 no_candidate=True 表示「多次拦截后放行，并记为 no_candidate」。
+
+    [fix 2026-11-05 P4] 新增预算闸门（仅当调用方传入预算快照时生效，旧调用行为不变）：预算充足
+    （剩余调用 > 15 或剩余 token > 12 万）且未提交时，纵容「有观察就当解完」的 done 会直接把
+    可解题白扔（Run1/Run2 多题实证：2~7 轮、预算剩 40%~90% 就 coordinator_done）。
     """
     if not submitted and attempts == 0 and not observations:
         if done_blocks < max_blocks:
             return _NO_CANDIDATE_GATE, False, False
         return "协调结束（无候选，候选闸门放行并记为 no_candidate）。", True, True
+    budget_left = calls_left is not None or tokens_left is not None
+    if (
+        not submitted
+        and budget_left
+        and done_blocks < max_blocks
+        and (open_count >= 2 or (tokens_left or 0) > 120_000)
+        and (calls_left is None or calls_left > 15)
+    ):
+        return _BUDGET_DONE_GATE, False, False
     return "协调结束。", True, False
 
 
@@ -1247,8 +1272,14 @@ class Crew:
                         text = "已记录。"
                     elif name == "done":
                         if self.config.extra.get("candidate_gate", True):
+                            _snap = spending.snapshot()
+                            _left_tok = max(0, int(_snap.get("max_tokens") or 0) - int(_snap.get("total_tokens") or 0))
+                            _left_calls = max(0, int(_snap.get("max_calls") or 0) - int(_snap.get("calls") or 0))
+                            _lstat = ledger.stats() if hasattr(ledger, "stats") else {}
                             text, stop, no_cand = _done_gate(
-                                submitted, challenge.attempts, ledger.observations, done_blocks
+                                submitted, challenge.attempts, ledger.observations, done_blocks,
+                                calls_left=_left_calls, tokens_left=_left_tok,
+                                open_count=int(_lstat.get("open") or 0),
                             )
                             if not stop:
                                 done_blocks += 1
