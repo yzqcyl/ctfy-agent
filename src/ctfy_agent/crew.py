@@ -956,6 +956,15 @@ class Crew:
                     _every = max(1, int(self.config.extra.get("instance_reap_every") or 3))
                     if rnd % _every == 0:
                         self._instance_sweep(challenge_id, rnd)
+                # [v6.6] 逐题状态强制回灌：SAMPLE-001 实测 slug 通过后，轮间会话重置只剩「摘要卡」，
+                # 摘要里没有「已通过题号」→ 协调者连 4 轮重交已通过的 slug，被提交闸门拦下，
+                # 白烧到 step_limit（reason=step_limit），Q2 根本没机会做。
+                # 把状态放回每轮头部（messages[1]），压缩/重置都丢不掉。
+                if len(messages) > 1:
+                    base = str(messages[1].get("content") or "")
+                    base = base.split("## 逐题状态")[0].rstrip()
+                    status = self._answers_status(challenge)
+                    messages[1] = {"role": "user", "content": (base + "\n\n" + status).strip() if status else base}
                 # P0-2：预算阶段每轮注入协调者（实测 500k ≈ 40 次调用，agent 需要剩余量感知）
                 budget_line = BudgetPhase.line(getattr(coordinator, "budget", None))
                 if budget_line:
@@ -1081,7 +1090,16 @@ class Crew:
                     elif name == "submit":
                         qid_hint = str(args.get("question_id") or challenge.next_question_id or "")
                         tries = submit_counts.get(qid_hint, 0)
-                        if needs_new_answer and not submitted:
+                        accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
+                        if qid_hint and qid_hint in accepted_map:
+                            # [v6.6] 已通过的题号再提交是纯浪费：SAMPLE-001 实测连续 4 轮被这条拦下
+                            # （旧文案说「已经提交 2 次」，模型以为还没成功，于是一直重试）。
+                            text = (
+                                f"[提交被拦截] 题号 `{qid_hint}` **已经通过并由平台记录了**（硬事实，见本轮头部"
+                                "「逐题状态」），再交一次不会有任何收益。本题若还有未通过题号，下一步只能 delegate "
+                                "去取那些题的答案；全部通过就 done 收口。"
+                            )
+                        elif needs_new_answer and not submitted:
                             # [v6.3] 通过一问之后，模型的惯性动作是「再交一次旧答案」（实测 70 次/44 次）。
                             # 直接拦下并给出唯一合法下一步：派专家取剩余题的答案。
                             text = (
@@ -1703,6 +1721,31 @@ class Crew:
     def _question_ids(info: dict) -> list[str]:
         """本题全部题号（平台 flag_solves 的键就是题号全集，含门控题）。"""
         return [str(key) for key in (info.get("flag_solves") or {})]
+
+    def _answers_status(self, challenge) -> str:
+        """[v6.6] 「平台已通过题号」的每轮硬状态（多问题题专用）。
+
+        SAMPLE-001 实测：slug 通过后协调者连续 4 轮重交同一个已通过答案 → step_limit，
+        Q2 没机会。根因是轮间会话重置只带摘要卡，而摘要卡不含逐题通过状态。
+        这里从 `challenge.answers_by_qid`（提交成功即落库，与平台回执一致）重建状态，
+        每轮注入 messages[1] 头部，任何压缩/重置都丢不掉。
+        """
+        accepted = dict(getattr(challenge, "answers_by_qid", {}) or {})
+        if not accepted:
+            return ""
+        info = getattr(self, "_question_info", None) or {}
+        all_qids = self._question_ids(info) or list(accepted)
+        rest = [qid for qid in all_qids if qid not in accepted]
+        lines = ["## 逐题状态（平台回执，硬事实，每轮刷新）"]
+        lines.append("已通过（已锁定，**绝不要再 submit**）：" + "、".join(f"`{q}`" for q in accepted))
+        if rest:
+            lines.append(
+                "未通过：" + "、".join(f"`{q}`" for q in rest)
+                + " —— 下一步必须 delegate 针对这些题号取证；全部通过前不要 done。"
+            )
+        else:
+            lines.append("全部题号已通过 → 直接 done 收口。")
+        return "\n".join(lines)
 
     def _brief(self, challenge) -> str:
         parts = [f"## 题目 {challenge.id}" + (f"（{challenge.name}）" if challenge.name else "")]

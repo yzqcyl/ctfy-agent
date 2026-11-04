@@ -25,7 +25,7 @@
   "roles": {
     "coordinator": {
       "model": "DeepSeek-V4.1-Flash-1017",
-      "max_steps": 24,
+      "max_steps": 40,
       "platform": [
         "read",
         "instance",

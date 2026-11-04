@@ -4787,6 +4787,81 @@ def case_v64_llm_and_instance(tmp: Path) -> None:
         server.server_close()
 
 
+def case_v66_answer_status(tmp: Path) -> None:
+    """v6.6：已通过题号的硬状态每轮回灌 + 重复提交被准确拦截 + 协调者轮数上限。
+
+    实测 SAMPLE-001（v6.5）：slug 通过后轮间会话重置只带摘要卡，摘要没有「已通过题号」，
+    协调者连续 4 轮重交已通过的 slug（被闸门拦下），白烧到 step_limit；Q2 没机会做。
+    """
+    from ctfy_agent.crew import Crew  # noqa: PLC0415
+
+    # 1) 协调者轮数上限：24 轮对「门控/两问题」题不够（001 实测 24 轮用完只做完 Q1）
+    import pathlib  # noqa: PLC0415
+
+    raw_cfg = json.loads(
+        (pathlib.Path(__file__).resolve().parents[1] / "config" / "agent.json").read_text(encoding="utf-8")
+    )
+    assert int(raw_cfg["roles"]["coordinator"]["max_steps"]) >= 40, raw_cfg["roles"]["coordinator"]["max_steps"]
+
+    # 2) _answers_status：逐题状态必须明确列出「已通过/未通过」并给出唯一合法下一步
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp / "v66")
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store = Store(tmp / "v66").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        item = store.require("web-01")
+        item.answers_by_qid = {"slug": "slug-abc"}
+        item.next_question_id = "slug"
+        store.save()
+
+        crew = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM([]))
+        crew._question_info = {"flag_solves": {"slug": True, "flag": False}}
+        status = crew._answers_status(item)
+        assert "已通过" in status and "`slug`" in status, status
+        assert "未通过" in status and "`flag`" in status and "delegate" in status, status
+
+        item.answers_by_qid = {"slug": "slug-abc", "flag": "FLAG{x}"}
+        status_all = crew._answers_status(item)
+        assert "done" in status_all, status_all
+        item.answers_by_qid = {"slug": "slug-abc"}
+        store.save()
+
+        # 3) 重复提交已通过题号：必须被拦下且**不触达平台**（旧文案「已经提交 2 次」让模型以为没成功）
+        submits: list = []
+        orig = platform.call_text
+
+        def spy(name, args=None):
+            if name == "submit_flag":
+                submits.append(args)
+            return orig(name, args)
+
+        platform.call_text = spy
+        script = [
+            {"content": "交 slug", "tool_calls": [tool_call("submit", {"answer": "slug-abc", "question_id": "slug"})]},
+            {"content": "再交", "tool_calls": [tool_call("submit", {"answer": "slug-abc", "question_id": "slug"})]},
+            {"content": "收工", "tool_calls": [tool_call("done", {})]},
+        ]
+        crew2 = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script))
+        crew2._question_info = {"flag_solves": {"slug": True, "flag": False}}
+        crew2.solve("web-01")
+        assert submits == [], submits
+        lines = [
+            json.loads(ln)
+            for ln in store.transcript_path("web-01").read_text(encoding="utf-8").splitlines()
+            if '"result"' in ln
+        ]
+        blocked = [ln["result"] for ln in lines if "提交被拦截" in str(ln.get("result") or "")]
+        assert len(blocked) >= 2, blocked
+        assert all("已经通过并由平台记录" in b for b in blocked), blocked
+        ok("v6.6 已通过题号硬状态 + 重复提交准确拦截（不触达平台）+ 协调者 40 轮")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def main() -> int:
     # 必须绝对路径：Linux/CI 没有 TEMP 环境变量，退回 "." 会让 tmp 变相对路径，
     # sandbox 里执行假 ffuf/sqlmap 时会拼成 <repo>/<sandbox>/ctfy_agent_smoke/fake_ffuf.py
@@ -4908,6 +4983,7 @@ def main() -> int:
         ("v63_submit_guards", case_v63_submit_guards),
         ("v63_budget_and_pwn", case_v63_budget_and_pwn),
         ("v64_llm_and_instance", case_v64_llm_and_instance),
+        ("v66_answer_status", case_v66_answer_status),
     ]
     for name, case in cases:
         try:
