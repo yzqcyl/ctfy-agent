@@ -1146,14 +1146,21 @@ class Crew:
                             if accepted:
                                 submitted = True
                                 reason = "flag_accepted"
-                                # 多问题/门控题：平台回执说尚未全解就继续，别在第一题就收尾。
+                                # 多问题/门控题：平台回执 challenge_fully_solved=false 要续答；
+                                # 还有 checker 门控题（SAMPLE-009 的 "root"）：flag 提交后回执是 true，
+                                # 但 flag_solves 里仍有未通过题号，也必须续答，别在第一题就收尾。
                                 verdict = self.platform._as_json(text)
-                                if isinstance(verdict, dict) and verdict.get("challenge_fully_solved") is False:
+                                not_fully = isinstance(verdict, dict) and \
+                                    verdict.get("challenge_fully_solved") is False
+                                info = self._fetch_challenge(challenge_id, solver) or self._question_info
+                                self._question_info = info
+                                all_qids = self._question_ids(info)
+                                accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
+                                current = qid_hint or "flag"
+                                rest = [qid for qid in all_qids if qid not in accepted_map]
+                                if not_fully or rest:
                                     submitted = False
                                     reason = "partial_solve"
-                                    info = self._fetch_challenge(challenge_id, solver) or self._question_info
-                                    self._question_info = info
-                                    all_qids = self._question_ids(info)
                                     prompts = {
                                         str(q.get("id")): str(q.get("prompt") or "").strip()[:200]
                                         for q in (info.get("questions") or [])
@@ -1164,9 +1171,6 @@ class Crew:
                                         for q in (info.get("questions") or [])
                                         if isinstance(q, dict) and q.get("id")
                                     }
-                                    accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
-                                    current = qid_hint or "flag"
-                                    rest = [qid for qid in all_qids if qid not in accepted_map]
                                     if rest:
                                         # 只提示下一题号，不鼓励立刻再 submit（要先去拿答案）
                                         challenge.next_question_id = rest[0]
@@ -1176,11 +1180,18 @@ class Crew:
                                         checker = "（checker 题：没有 flag 串，做动作后调 verify_exploit）" \
                                             if modes.get(qid) == "checker" else ""
                                         lines.append(
-                                            f"- 【问题 {qid}】{prompts.get(qid, '（门控/未解锁，先 get_challenge）')}{checker}"
+                                            f"- 【问题 {qid}】{prompts.get(qid, '（门控/未解锁：flag_solves 里有它、questions 没给题面，先 get_challenge，从题面推断答案渠道）')}{checker}"
                                         )
-                                    text += (
+                                    head = (
                                         "\n\n[多问题] 平台回执 challenge_fully_solved=false：本题尚未全解，"
                                         f"刚通过的是 `{current}`。\n"
+                                        if not_fully else
+                                        "\n\n[多问题] 平台回执 challenge_fully_solved=true，但 flag_solves "
+                                        f"里还有未通过题号，刚通过的是 `{current}`（其余题号已在 flag 后解锁，"
+                                        "大概率是 checker/proof-of-exploitation 题）。\n"
+                                    )
+                                    text += (
+                                        head
                                         + ("\n".join(lines) + "\n" if lines else "")
                                         + f"**下一步必须是 delegate**：把上面剩余题的题面交给对应专家去取答案；"
                                         f"禁止把 `{current}` 的答案再提交给其它题号。全部题答完之前不要调用 done。"

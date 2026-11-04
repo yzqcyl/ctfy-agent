@@ -1884,6 +1884,57 @@ def case_gated_flag_question_id(tmp: Path) -> None:
     ok("门控题号按 questions ∪ flag_solves 判定：合法不改写、幻觉才纠回")
 
 
+def case_gated_checker_followthrough(tmp: Path) -> None:
+    """v6.9：checker 门控题——flag 提交回执 challenge_fully_solved=true，但 flag_solves 还有未通过题号
+    （SAMPLE-009 的 root），协调者不能收尾，必须继续追剩余题号。
+
+    实测 SAMPLE-009：flag 提交后平台回执 challenge_fully_solved=true，旧逻辑据此直接
+    flag_accepted 收尾，门控的 root（proof-of-exploitation）没做。修法：submit 通过后回查
+    flag_solves 键 vs answers_by_qid，还有未通过题号就继续。
+    """
+    from ctfy_agent.crew import Crew  # noqa: PLC0415
+
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp / "v69")
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store = Store(tmp / "v69").load()
+        store.challenges.clear()
+        seed_challenge(store)
+
+        submits: list = []
+        orig_call = platform.call
+
+        def fake_call(name, arguments=None, *a, **kw):
+            if name == "submit_flag":
+                submits.append(dict(arguments or {}))
+                return {"content": [{"type": "text", "text":
+                                     '{"correct": true, "challenge_fully_solved": true}'}]}
+            if name == "get_challenge":
+                return {"content": [{"type": "text", "text": json.dumps(
+                    {"id": "web-01", "flag_solves": {"flag": 5, "root": 3}}, ensure_ascii=False)}]}
+            return orig_call(name, arguments, *a, **kw)
+
+        platform.call = fake_call
+        script = [
+            {"content": "交 flag", "tool_calls": [tool_call("submit", {"answer": "FLAG{x}", "question_id": "flag"})]},
+            {"content": "交 root", "tool_calls": [tool_call("submit", {"answer": "ROOT-PROOF", "question_id": "root"})]},
+        ]
+        crew = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script))
+        summary = crew.solve("web-01")
+
+        # 两个提交都到了平台 → flag 提交虽回执 fully_solved=true，但循环没中断、继续交了 root
+        assert [s.get("question_id") for s in submits] == ["flag", "root"], submits
+        txt = store.transcript_path("web-01").read_text(encoding="utf-8")
+        assert "但 flag_solves 里还有未通过题号" in txt, txt[-2000:]
+        assert summary.get("reason") == "flag_accepted", summary
+        ok("checker 门控题：flag 回执 true 但 flag_solves 有未通过题号时继续追题，不提前收尾")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def case_partial_solve_state(tmp: Path) -> None:
     """B-3：多问题题第一题答对但 challenge_fully_solved=false 时，状态机不能误判整题已解。
 
@@ -5050,6 +5101,7 @@ def main() -> int:
         ("multi_question", case_multi_question),
         ("submit_question_id", case_submit_question_id),
         ("gated_flag_question_id", case_gated_flag_question_id),
+        ("gated_checker_followthrough", case_gated_checker_followthrough),
         ("partial_solve_state", case_partial_solve_state),
         ("qa_submit", case_qa_submit),
         ("stdlib_only", case_stdlib_only),
