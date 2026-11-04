@@ -1155,9 +1155,17 @@ class Crew:
                                 info = self._fetch_challenge(challenge_id, solver) or self._question_info
                                 self._question_info = info
                                 all_qids = self._question_ids(info)
+                                challenge = self.store.require(challenge_id)
                                 accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
                                 current = qid_hint or "flag"
-                                rest = [qid for qid in all_qids if qid not in accepted_map]
+                                # [fix 2026-11-05 CTFARENA-001] 平台 my_solved_question_ids 是「已解
+                                # 题号」的权威事实：verify_answer / verify_exploit / 其它路径通过的
+                                # 题号都必须算已过。旧逻辑只看本地 answers_by_qid，导致 verify_answer
+                                # 通过的题号被当成未通过，整题完成后协调者继续 delegate 空转（实测
+                                # 多烧 10 万+ token，实例被平台回收后还继续 404 探测）。
+                                solved_all = set(accepted_map) | self._solved_qids(info)
+                                solved_all.add(str(current))
+                                rest = [qid for qid in all_qids if qid not in solved_all]
                                 if not_fully or rest:
                                     submitted = False
                                     reason = "partial_solve"
@@ -1760,22 +1768,40 @@ class Crew:
         """本题全部题号（平台 flag_solves 的键就是题号全集，含门控题）。"""
         return [str(key) for key in (info.get("flag_solves") or {})]
 
+    @staticmethod
+    def _solved_qids(info: dict) -> set[str]:
+        """平台侧「我队已解出的题号」（get_challenge.my_solved_question_ids）权威事实。
+
+        flag_solves 是**全平台解出人数**，不能当「我已解」用；my_solved_question_ids 才是
+        本队逐题状态。旧代码完全没有用它，CTFARENA-001 因此把已通过题号当未通过续跑。
+        """
+        out: set[str] = set()
+        if not isinstance(info, dict):
+            return out
+        for key in ("my_solved_question_ids", "solved_question_ids", "my_solved_qids"):
+            value = info.get(key)
+            if isinstance(value, (list, tuple, set)):
+                out.update(str(item) for item in value)
+        return out
+
     def _answers_status(self, challenge) -> str:
         """[v6.6] 「平台已通过题号」的每轮硬状态（多问题题专用）。
 
         SAMPLE-001 实测：slug 通过后协调者连续 4 轮重交同一个已通过答案 → step_limit，
         Q2 没机会。根因是轮间会话重置只带摘要卡，而摘要卡不含逐题通过状态。
-        这里从 `challenge.answers_by_qid`（提交成功即落库，与平台回执一致）重建状态，
-        每轮注入 messages[1] 头部，任何压缩/重置都丢不掉。
+        这里从 `challenge.answers_by_qid`（提交成功即落库）∪ 平台 `my_solved_question_ids`
+        （verify_answer/verify_exploit 通过的题号也在这里）重建状态，每轮注入 messages[1] 头部，
+        任何压缩/重置都丢不掉。
         """
-        accepted = dict(getattr(challenge, "answers_by_qid", {}) or {})
-        if not accepted:
-            return ""
         info = getattr(self, "_question_info", None) or {}
-        all_qids = self._question_ids(info) or list(accepted)
-        rest = [qid for qid in all_qids if qid not in accepted]
+        accepted = set(getattr(challenge, "answers_by_qid", {}) or {})
+        solved = accepted | self._solved_qids(info)
+        if not solved:
+            return ""
+        all_qids = self._question_ids(info) or sorted(solved)
+        rest = [qid for qid in all_qids if qid not in solved]
         lines = ["## 逐题状态（平台回执，硬事实，每轮刷新）"]
-        lines.append("已通过（已锁定，**绝不要再 submit**）：" + "、".join(f"`{q}`" for q in accepted))
+        lines.append("已通过（已锁定，**绝不要再 submit**）：" + "、".join(f"`{q}`" for q in sorted(solved)))
         if rest:
             lines.append(
                 "未通过：" + "、".join(f"`{q}`" for q in rest)

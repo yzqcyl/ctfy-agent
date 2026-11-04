@@ -45,6 +45,24 @@ def _untrusted(text: str) -> str:
     return UNTRUSTED_PREFIX + text
 
 
+def _verify_passed(text: str) -> bool:
+    """判断 verify_answer 回执是否为「通过」。
+
+    平台回执形态不稳定：裸布尔 `true`、`{"result": true}`、或带说明的混合文本都见过
+    （CTFARENA-001 实测 `----- 工具返回 ----- true   { "result": true }`）。只认明确 true，
+    宁可漏记（下次 refetch 用 my_solved_question_ids 兜底）也不把 false 当通过。
+    """
+    low = str(text or "").strip().lower()
+    if not low:
+        return False
+    if low.startswith("true"):
+        return True
+    for needle in ('"result": true', '"correct": true', '"passed": true', '"ok": true'):
+        if needle in low:
+            return True
+    return False
+
+
 def _est_tokens(messages: list[dict]) -> int:
     """粗略估算一批消息的 token 量（中英混合按 3 字符/token）。"""
     return sum(max(1, len(json.dumps(m, ensure_ascii=False)) // 3) for m in messages)
@@ -735,13 +753,35 @@ class Solver:
                 # proof-of-exploitation 题没有 flag：平台侧 judge 判定通过后，本题记为解出。
                 # 判定不用回执文案猜，直接问 get_my_solves（确定性事实源）。
                 if challenge_id in self.platform.my_solved_ids():
+                    qid = str(args.get("question_id") or "")
                     try:
+                        item = self.store.require(challenge_id)
+                        if qid:
+                            # [fix 2026-11-05] checker 题通过后也落库到逐题状态，否则协调者
+                            # 的「剩余题号」永远算不干净（CTFARENA-001 实证：整题完成后又续跑）。
+                            item.answers_by_qid[qid] = f"verified:{qid}"
                         self.store.set_status(challenge_id, "submitted")
                         self.store.save()
                     except ValueError:
                         pass
                     return f"{text}\n[判定通过] verify_exploit 已验证，本题在平台记为解出，无需再找 flag。", True
                 return text, False
+            # [fix 2026-11-05 CTFARENA-001] verify_answer 通过是「平台已记该题号解出」的硬事实。
+            # 旧代码只看 verify_exploit，verify_answer 成功不落库 → 协调者把已通过题号当未通过，
+            # 整题完成后继续 delegate（实测多烧 10 万+ token，且实例被平台回收后继续 404 空转）。
+            verify_ans_name = self.platform.try_resolve("verify_answer")
+            if verify_ans_name and name == verify_ans_name and _verify_passed(text):
+                qid = str(args.get("question_id") or "")
+                answer = str(args.get("answer") or args.get("flag") or "").strip()
+                try:
+                    item = self.store.require(challenge_id)
+                    if qid:
+                        item.answers_by_qid[qid] = answer or f"verified:{qid}"
+                        if qid == "flag" and answer and not item.flag_value:
+                            item.flag_value = answer
+                    self.store.save()
+                except Exception:  # noqa: BLE001 - 增强项，失败不影响主流程
+                    pass
             return text, False
 
         if name in local.names():
