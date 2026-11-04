@@ -549,6 +549,50 @@ class Solver:
         self.on_event("instance_started", {"challenge_id": challenge_id, "instance": info})
         return info
 
+    _DEAD_INSTANCE_MARKERS = (
+        "instance_not_found",
+        "instance does not exist",
+        "no such instance",
+        "instance_gone",
+        "instance_expired",
+        "实例不存在",
+    )
+
+    def _maybe_recover_instance(self, challenge_id: str, text: str) -> str:
+        """实例被平台换节点/回收后自愈：作废旧 UUID → 重新 start_instance → 把新端点回灌给模型。
+
+        [v6.4] 实测 SAMPLE-009：平台 `node_unreachable` 后重建了实例，旧 UUID 调什么都回
+        `instance_not_found`，agent 又在「反代 404」上烧掉 130+ 次调用。这里在工具回执层确定性兜住：
+        命中「实例已失效」字样就清状态并重建一次，同时把新 host:port 明确回灌给模型，
+        避免它继续拿旧端点/旧 UUID 撞墙。每题最多自愈 2 次，防止平台持续故障时打穿实例配额。
+        """
+        low = str(text).lower()
+        if not any(mark in low for mark in self._DEAD_INSTANCE_MARKERS):
+            return text
+        challenge = self.store.require(challenge_id)
+        if not challenge.instance_id:
+            return text
+        if not self.config.extra.get("auto_start_instance", True):
+            return text
+        limit = int(self.config.extra.get("instance_recover_limit", 2) or 2)
+        used = int((challenge.tool_counts or {}).get("instance_recover", 0) or 0)
+        if used >= limit:
+            return text + "\n[实例已失效] 本题自愈次数已用尽：不要再打旧端点，直接 report/done 收口。"
+        challenge.tool_counts["instance_recover"] = used + 1
+        challenge.instance_id = ""
+        challenge.instance = {}
+        self.store.save()
+        start_name = self.platform.try_resolve("start_instance")
+        info = self._start_with_backoff(challenge_id, start_name) if start_name else None
+        if not isinstance(info, dict):
+            return text + "\n[实例已失效] 平台未能重建实例：如再失败请直接收口，不要反复重试旧端点。"
+        self._register_instance(challenge_id, info)
+        return (
+            text
+            + "\n[实例已自愈] 旧实例已失效，平台已重建新实例（旧 host:port 和经验全部作废）："
+            + json.dumps(info, ensure_ascii=False)[:500]
+        )
+
     def _recover_instance_slot(self, challenge_id: str, start_name: str) -> dict | None:
         """start 失败后的自愈：先清掉「不属于本题」的残留实例，再重试一次。
 
@@ -1236,6 +1280,7 @@ class Solver:
                         text, accepted = f"[平台工具错误] {exc}", False
                     except Exception as exc:  # 任何异常都要回灌给模型，别让循环挂掉
                         text, accepted = f"[执行异常] {type(exc).__name__}: {exc}", False
+                    text = self._maybe_recover_instance(challenge_id, str(text))
                     tail_action = name  # 集群-B 归因：最后一步动作（verify/submit 接近目标 → near_miss）
                     if name in (submit_name, "verify_answer") and not accepted:
                         _ans = str(args.get("answer") or args.get("flag") or args.get("value") or "").strip()
@@ -1555,6 +1600,7 @@ class Solver:
                         text = f"[平台工具错误] {exc}"
                     except Exception as exc:
                         text = f"[执行异常] {type(exc).__name__}: {exc}"
+                    text = self._maybe_recover_instance(challenge_id, str(text))
 
                 actions.append(f"{name}: {' '.join(str(text).split())[:100]}")
 

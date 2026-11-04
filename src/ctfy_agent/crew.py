@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from json import JSONDecodeError
 
 from .budget import Budget, BudgetExceeded, apply_deadline, stop_reason_of
@@ -389,6 +390,27 @@ def _convergence_stalled(stats: dict, last_open: int, last_refuted: int,
     else:
         stalls = 0
     return stalls, opn, ref
+
+
+def _chat_with_recovery(agent, messages: list, tools: list | None, *, attempts: int = 2,
+                        delay: float = 20.0):
+    """协调者 LLM 调用兜底恢复。
+
+    [v6.4] 实测 SAMPLE-009：平台换节点后 agent 重启，首轮调用撞上持续限速窗口，
+    llm 客户端 3 次退避（合计 14s）不够 → LLMError 视作致命 → 整题 halted，149 次调用的
+    工作全废。客户端已改为 5 次退避 + Retry-After；这里再给一层「整轮重试」，
+    因为协调者一挂整题就结束，代价远大于多等 20 秒。
+    """
+    last = None
+    for i in range(max(1, attempts)):
+        try:
+            return agent.chat(messages, tools=tools)
+        except LLMError as exc:
+            last = exc
+            if not getattr(exc, "retryable", False) or i >= attempts - 1:
+                raise
+            time.sleep(delay)
+    raise last  # pragma: no cover
 
 
 def _delegate_task(objective: str, done_when: str) -> str:
@@ -940,7 +962,7 @@ class Crew:
                     )
                 try:
                     messages = _compact_history(messages, self.config.max_context_tokens)
-                    response = coordinator.chat(messages, tools=self._coordinator_tools())
+                    response = _chat_with_recovery(coordinator, messages, self._coordinator_tools())
                 except BudgetExceeded as exc:
                     # 集群-B：attempt_cap（切片用尽、题级还有配额）≠ budget_exhausted（题级真耗尽）
                     # P0-3：wall_clock（时间到）单独成一类，便于赛后区分「没钱」与「没时间」

@@ -1,6 +1,28 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
-## ✅ v6.2 已构建、匿名可拉取（2026-11-03）——**提交用这个**
+## ✅ v6.3 已构建、匿名可拉取、平台 admission=admitted（2026-11-04）——**提交用这个**
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v6.3` |
+| digest | `sha256:c64388d2227444f0b817fab53c9b5c41955ad8b4dccddc07806570e3c08da50b` |
+| 构建 | GitHub Actions run `41742653277`（branch `v3`、sha `87fb0e7`）→ 全步 success |
+| 平台校验 | harness `d0ef391d-…/ctfy-agent-pub-v6.3`：conformance `passed`、probe `passed` + `hardened=true`、`admission.state=admitted`，digest 与上表一致 |
+| 本次变更（v6.2 SAMPLE 实测 10/15 后逐题归因） | ① **多问题答案逐题留档**：`Challenge.answers_by_qid` + `mark_submitted(question_id=…)`，`result.json.answers/solved` 覆盖全部已通过题号（旧实现只写一个 `default_question_id`，SAMPLE-001 把 slug 当 flag 交）；② **submit 工具补 `question_id` 参数** + **提交节流**：同题号 ≥2 次拦截、通过一问后必须先 delegate 拿新答案、已通过的值禁止投给别的题号（实测 001 提交 70 次 / 009 提交 44 次）；③ **预算折价口径**：开 `budget_cache_discount`（缓存命中按 1/10 计，800k ≈ 3.5M 原始 token），`max_llm_calls` 160→200，`result.json` 仍报真实 token（另记 `prompt_tokens_billed`），`cut_off` 不再写死 usage/tokens=0；④ **pwn 黑盒纪律**：先穷尽 attachments/实例附件/hints，真黑盒只准 2 步结构探测，禁止千词级命令名爆破（003/012 实测 4000+ 词零命中且连接约 80 条即断） |
+| 单测 | `tests/smoke.py` **170 passed / 0 failed**（新增 `v63_multi_answers` / `v63_submit_guards` / `v63_budget_and_pwn`）；全部 34 个 `tests/smoke_*.py` 全绿 |
+| 体积/层数 | 17 层，匿名传输 **62.7 MB** |
+| 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app` / `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` |
+| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v6.3`）|
+| SAMPLE 复跑 | campaign `b38c86c0d8e24643adcf9291ba75179c`（15 题，harness v6.3 × DeepSeek V4 Flash）|
+
+### v6.2 实测基线（对照用，2026-11-03）
+
+15 题 → **panel 口径 10/15**（平台 summary 计 9/15 已解 + 007 在补跑批次解出）：
+解出 002/004/005/006/007/008/010/011/013/014；未解 001(slug✓/flag✗)、003(pwn 黑盒)、009(flag✓/root✗ checker)、012(pwn 黑盒)、015(平台 503 无可用端口段)。
+
+---
+
+## 历史：v6.2 已构建（2026-11-03）——已被 v6.3 取代
 
 | 项 | 值 |
 |---|---|
@@ -13,20 +35,6 @@
 | 体积/层数 | 17 层，匿名传输 **62.7 MB** |
 | 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app` / `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` |
 | 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v6.2`）|
-
-### 下一步：跑 SAMPLE（浏览器，人工）
-
-1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v6.2`（**显式 tag，别填 latest**）→ 点「重新检查」
-2. 模型/provider/密钥沿用上次（DeepSeek V4 Flash + OpenAI + 自有 key）
-3. 提交审核 → 通过后「测评我的 Agent」→ 选 SAMPLE（questions/suite）跑，**留足 3 小时**且不要中途取消
-4. 结果观察点：
-   - `turns` 应明显高于 v6.1（14 轮 → 24 轮可跑），`stop_reason=max_turns` 不再出现在 20-25 turns 处
-   - token 用量上限 800k；预计单题 60–120k，`cut_off` 才说明真的花光预算
-   - 与 v6.1 对照的三题：SAMPLE-011（v6.1 `max_turns`）、SAMPLE-003（v6.1 35 轮未解）、SAMPLE-005（qa，应维持解出）
-
----
-
-## 历史：v6.1 已构建（2026-11-03）——已被 v6.2 取代
 
 | 项 | 值 |
 |---|---|

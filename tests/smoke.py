@@ -4718,6 +4718,75 @@ def case_v63_budget_and_pwn(tmp: Path) -> None:
     ok("v6.3 预算：缓存折价只用于刹车，result.json 仍报真实 token；pwn 黑盒纪律已内置")
 
 
+def case_v64_llm_and_instance(tmp: Path) -> None:
+    """v6.4：LLM 限速恢复 + 失效实例自愈。
+
+    实测 SAMPLE-009：平台 node_unreachable 换节点后 agent 重启，首轮调用撞限速窗口 →
+    LLMError 被当致命 → 整题 halted（前面 149 次调用全废）；同时旧实例 UUID 一直
+    instance_not_found，agent 在反代 404 上又烧了 130+ 次调用。
+    """
+    from ctfy_agent.crew import _chat_with_recovery  # noqa: PLC0415
+    from ctfy_agent.llm import DeepSeekLLM, LLMError  # noqa: PLC0415
+
+    # 1) 客户端退避加固：重试次数 3 → 5（429 窗口可能超过 14s）
+    assert DeepSeekLLM._post.__defaults__[0] >= 5, DeepSeekLLM._post.__defaults__
+
+    # 2) 协调者整轮恢复：可重试错误等一轮后重试成功
+    calls = {"n": 0}
+
+    class _Flaky:
+        def chat(self, messages, tools=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise LLMError("HTTP 429 限速", status=429, retryable=True)
+            return {"content": "ok", "tool_calls": []}
+
+    out = _chat_with_recovery(_Flaky(), [{"role": "user", "content": "x"}], None, attempts=2, delay=0)
+    assert out["content"] == "ok" and calls["n"] == 2, (out, calls)
+
+    class _Fatal:
+        def chat(self, messages, tools=None):
+            raise LLMError("HTTP 401 Key 无效", status=401, retryable=False)
+
+    try:
+        _chat_with_recovery(_Fatal(), [], None, attempts=3, delay=0)
+        raise AssertionError("不可重试的 LLM 错误不应被吞掉")
+    except LLMError:
+        pass
+
+    # 3) 失效实例自愈
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp / "v64")
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store = Store(tmp / "v64").load()
+        store.challenges.clear()
+        seed_challenge(store)
+        solver = Solver(config, platform, fake_llm.ScriptedLLM([]), store)
+        store.require("web-01").instance_id = "dead-uuid-1"
+        store.save()
+
+        plain = solver._maybe_recover_instance("web-01", '{"status":200,"body":"hello"}')
+        assert "实例已自愈" not in plain, plain
+
+        healed = solver._maybe_recover_instance("web-01", '{"error":"instance_not_found"}')
+        assert "[实例已自愈]" in healed and "10.0.0.9" in healed, healed
+        assert store.require("web-01").instance_id == "", store.require("web-01").instance_id
+        assert store.require("web-01").tool_counts.get("instance_recover") == 1
+
+        # 自愈次数上限：打到上限后必须给「收口」指令，别无限重建
+        for uuid in ("dead-uuid-2", "dead-uuid-3"):
+            store.require("web-01").instance_id = uuid
+            store.save()
+            last = solver._maybe_recover_instance("web-01", "instance_not_found")
+        assert "用尽" in last, last
+        ok("v6.4 LLM 限速整轮恢复 + 失效实例自愈（含自愈次数上限）")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def main() -> int:
     # 必须绝对路径：Linux/CI 没有 TEMP 环境变量，退回 "." 会让 tmp 变相对路径，
     # sandbox 里执行假 ffuf/sqlmap 时会拼成 <repo>/<sandbox>/ctfy_agent_smoke/fake_ffuf.py
@@ -4838,6 +4907,7 @@ def main() -> int:
         ("v63_multi_answers", case_v63_multi_answers),
         ("v63_submit_guards", case_v63_submit_guards),
         ("v63_budget_and_pwn", case_v63_budget_and_pwn),
+        ("v64_llm_and_instance", case_v64_llm_and_instance),
     ]
     for name, case in cases:
         try:

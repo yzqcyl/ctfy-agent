@@ -55,7 +55,7 @@ class DeepSeekLLM:
 
     # ---------- 传输 ----------
 
-    def _post(self, path: str, payload: dict, retries: int = 3, timeout_retries: int = 1):
+    def _post(self, path: str, payload: dict, retries: int = 5, timeout_retries: int = 1):
         url = f"{self.base_url}{path}"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -67,6 +67,7 @@ class DeepSeekLLM:
         timeouts = 0
         while True:
             request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            retry_after = 0.0
             try:
                 with self._opener.open(request, timeout=self.timeout) as response:
                     return json.loads(read_limited(response).decode("utf-8"))
@@ -83,10 +84,16 @@ class DeepSeekLLM:
                     hint = "（余额不足）"
                 elif exc.code == 429:
                     hint = "（限速或额度用尽）"
+                # 服务端给了 Retry-After 就按它等（429 在高并发评测里很常见，
+                # 固定 2/4/8s 加起来才 14s，撑不过一次限速窗口 → 整题 halted，实测 SAMPLE-009）。
+                try:
+                    retry_after = float((exc.headers or {}).get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    retry_after = 0.0
                 error = LLMError(
                     f"HTTP {exc.code} {exc.reason}{hint}: {detail[:200]}",
                     status=exc.code,
-                    retryable=exc.code in (429, 500, 502, 503, 504),
+                    retryable=exc.code in (408, 409, 425, 429, 500, 502, 503, 504),
                 )
                 if not (error.retryable and attempt < retries):
                     raise error from None
@@ -113,7 +120,9 @@ class DeepSeekLLM:
                 raise LLMError(f"响应不是合法 JSON: {exc}") from None
 
             attempt += 1
-            delay = min(2 ** attempt, 20)
+            delay = min(2 ** attempt, 30)
+            if retry_after:
+                delay = max(delay, min(retry_after, 60))
             time.sleep(delay)
 
     # ---------- 接口 ----------
