@@ -1799,7 +1799,17 @@ def case_submit_question_id(tmp: Path) -> None:
         platform._question_meta["UPLOADLABS-021"] = {"outage": {"mode": "flag"}}
         assert platform.preferred_question_id() == "outage"
         assert platform._repair_runtime_args("submit_answer", {})["question_id"] == "outage"
-        ok("多问题题默认题号：verify 通过后沿用该题号，单问题题不回落到 flag")
+
+        # [v6.4] 显式给的题号一律信任，不改写成「已知唯一题号」：门控题（SAMPLE-001）的 flag 题
+        # 不在 get_challenge 的 questions 里，旧逻辑会把 question_id="flag" 改写成 "slug"，
+        # 把正确答案错投到 slug 题判错（001 实测 flag wrong_attempts=0）。
+        platform._active_challenge_id = "SAMPLE-001"
+        platform._question_meta["SAMPLE-001"] = {"slug": {"mode": "dynamic", "prompt": "32-hex slug"}}
+        repaired = platform._repair_runtime_args(
+            "submit_answer", {"answer": "FLAG{x}", "question_id": "flag"}
+        )
+        assert repaired.get("question_id") == "flag", repaired
+        ok("多问题题默认题号：verify 通过后沿用该题号，单问题题不回落到 flag；显式题号不再被改写")
     finally:
         server.shutdown()
         server.server_close()
@@ -4879,7 +4889,7 @@ def case_v66_answer_status(tmp: Path) -> None:
         vals = [str(a.get("answer") or a.get("flag") or "") for a in submits2]
         assert vals == ["GUESS-1", "GUESS-2"], vals
         txt = store.transcript_path("web-01").read_text(encoding="utf-8")
-        assert "幂等保护" in txt, txt[-2000:]  # GUESS-1 的第二次被 solver 幂等拦截，而非 crew 去重
+        assert "平台判错" in txt, txt[-2000:]  # GUESS-1 的第二次被幂等拦下，且文案点明「已判错、去重新取源」
 
         # 5) [v6.4] 环境故障收敛：连续 3 次专家结论指向实例/网关不可达 → 收口 environment_error
         from ctfy_agent import crew as crew_mod  # noqa: PLC0415

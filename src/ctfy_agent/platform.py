@@ -364,15 +364,15 @@ class CtfyPlatform:
         if "question_id" in props and name in _QUESTION_TOOLS:
             qid = args.get("question_id")
             current = self._question_meta.get(self._active_challenge_id) or {}
-            if isinstance(qid, str) and qid and current and qid not in current:
+            if not qid and current:
+                # 没给题号时才自动补：别让平台落到默认 "flag"（本题真实题号可能是 user/outage/…）。
                 better = self._pick_question_id(name)
                 if better:
                     args["question_id"] = better
-            elif not qid and current:
-                # 没给题号时别让平台落到默认 "flag"：本题真实题号可能是 user/outage/…
-                better = self._pick_question_id(name)
-                if better:
-                    args["question_id"] = better
+            # [v6.4] 显式给的题号一律信任，不再改写成「已知唯一题号」：门控题（SAMPLE-001）的 flag 题
+            # 不在 get_challenge 的 questions 里，旧逻辑会把 question_id="flag" 改写成 "slug"，
+            # 导致正确答案被当成 slug 判错、flag 题从未真正提交（001 实测 wrong_attempts=0）。
+            # 真写错题号时平台会回明确的 422 unknown_question_id，模型自己会纠，比静默错投更安全。
         return args
 
     # ---------- 调用 ----------

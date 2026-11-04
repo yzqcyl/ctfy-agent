@@ -829,7 +829,13 @@ class Solver:
 
         reservation = self.store.reserve_submit(challenge_id, answer, self.config.submit_limit)
         if reservation == "duplicate":
-            return "[提交被拦截] 这个答案之前已经提交过（幂等保护），不要重复提交。", False
+            # [v6.4] 到这里说明这个值之前交过且平台判错（已答对的值早被上面的 accepted_map 分支拦下）。
+            # 旧文案「已经提交过」太含糊，模型误以为还没成功，实测 001 把同一个错值重交 ~37 次。
+            return (
+                "[提交被拦截] 这个答案之前已经提交过、平台判错（wrong），再交同一个值结果不会变。\n"
+                "别在原地重试：delegate 专家重新取源（fresh=1 重新抓取），或换一个候选值再交。",
+                False,
+            )
         if reservation == "limit":
             return f"[提交被拦截] 本题已达到提交上限 {self.config.submit_limit} 次。", False
 
