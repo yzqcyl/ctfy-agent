@@ -23,6 +23,7 @@ import os
 import re
 import signal
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -415,6 +416,27 @@ def _enrich_facets(store: Store, platform, cid: str) -> None:
 # ---------- 最终 rollup ----------
 
 
+def _state_answers(config: Config, challenge_id: str) -> tuple[dict, list, str]:
+    """[v6.8] 从已落盘的 state.json 恢复「已通过题号 → 答案」。
+
+    实测 SAMPLE-001 v6.7：平台重启后进程重连 MCP 失败（DNS 短暂异常），旧实现直接写
+    `answers={}` 的 result.json，把已经拿到的 slug 分从结果里抹掉了。连不上平台时也必须
+    把 state 里的事实写回去。
+    """
+    try:
+        store = Store(config.run_dir(challenge_id or "run")).load()
+        challenge = store.get(challenge_id)
+    except Exception:  # noqa: BLE001 - 恢复失败不该毁掉 result.json
+        return {}, [], ""
+    if challenge is None:
+        return {}, [], ""
+    per_qid = dict(getattr(challenge, "answers_by_qid", {}) or {})
+    answers = {str(k): str(v) for k, v in per_qid.items() if v}
+    if not answers and challenge.flag_value:
+        answers[str(config.extra.get("default_question_id") or "flag")] = str(challenge.flag_value)
+    return answers, sorted(answers), str(getattr(challenge, "instance_id", "") or "")
+
+
 def _final_rollup(store: Store, challenge_id: str, summary: dict, config: Config) -> dict:
     challenge = store.get(challenge_id)
     qid = str(config.extra.get("default_question_id") or "flag")
@@ -559,13 +581,31 @@ def run_agent(
     # 6) 平台连接（或复用注入）
     if platform is None:
         platform = CtfyPlatform(mcp_url, token, timeout=config.timeout)
-        try:
-            platform.connect()
-        except Exception as exc:  # noqa: BLE001
+        connect_err = None
+        for attempt in range(4):
+            if attempt:
+                # [v6.8] 平台整机重启期间 DNS/建连会短暂失败（实测 v6.7 SAMPLE-001
+                # "Temporary failure in name resolution"）：退避重试，别一次失败就收工。
+                time.sleep(min(5 * (2 ** (attempt - 1)), 40))
+            try:
+                platform.connect()
+                connect_err = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                connect_err = exc
+        if connect_err is not None:
+            answers, solved, inst = _state_answers(config, challenge_id)
             _write_rollup(
                 result_path,
-                _rollup(challenge_id=challenge_id, stop_reason="halted",
-                        writeup=f"MCP connect failed: {exc}"),
+                _rollup(
+                    challenge_id=challenge_id,
+                    instance_id=inst,
+                    answers=answers,
+                    solved=solved,
+                    fully_solved=False,
+                    stop_reason="halted",
+                    writeup=f"MCP connect failed: {connect_err}（已从 state 保留 {len(answers)} 个已通过题号）",
+                ),
                 announce=True,
             )
             return 0

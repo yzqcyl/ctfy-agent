@@ -4881,7 +4881,63 @@ def case_v66_answer_status(tmp: Path) -> None:
         assert vals == ["GUESS-1", "GUESS-2"], vals
         txt = store.transcript_path("web-01").read_text(encoding="utf-8")
         assert "这个答案在题号 `flag` 上已经交过了" in txt, txt[-2000:]
-        ok("v6.6/v6.7 逐题状态每轮回灌 + 只拦重复值（新候选放行）+ 协调者 40 轮")
+
+        # 5) [v6.8] oracle 预检 false（门控未解锁，不算提交）不能进「已交过的值」：
+        #    解锁后同一个值必须能真正提交（v6.7 实测自伤：同值被自己拦死 30+ 轮）
+        from ctfy_agent import solver as solver_mod  # noqa: PLC0415
+
+        store.transcript_path("web-01").unlink(missing_ok=True)
+        submit_calls: list = []
+        orig_solver_submit = solver_mod.Solver._submit
+
+        def fake_submit(self, args, cid):
+            submit_calls.append(dict(args))
+            if len(submit_calls) == 1:
+                return "[判定] oracle 预检未通过（未消耗提交次数，可继续试）。", False
+            return json.dumps({"accepted": True}), True
+
+        solver_mod.Solver._submit = fake_submit
+        try:
+            script4 = [
+                {"content": "门控态", "tool_calls": [tool_call("submit", {"answer": "FLAG-REAL", "question_id": "flag"})]},
+                {"content": "解锁后重交", "tool_calls": [tool_call("submit", {"answer": "FLAG-REAL", "question_id": "flag"})]},
+                {"content": "收工", "tool_calls": [tool_call("done", {})]},
+            ]
+            crew5 = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script4))
+            crew5._question_info = {"flag_solves": {"slug": True, "flag": False}}
+            crew5.solve("web-01")
+        finally:
+            solver_mod.Solver._submit = orig_solver_submit
+        assert len(submit_calls) == 2, submit_calls
+
+        # 6) [v6.8] MCP 连不上时 result.json 必须保留 state 里已通过的题号（不能写空 answers 覆盖）
+        from ctfy_agent import agent_main as agent_mod  # noqa: PLC0415
+
+        st2 = Store(config.run_dir("web-01")).load()
+        st2.challenges.clear()
+        seed_challenge(st2)
+        it2 = st2.require("web-01")
+        it2.answers_by_qid = {"slug": "slug-abc"}
+        it2.instance_id = "inst-1"
+        st2.save()
+        answers, solved, inst = agent_mod._state_answers(config, "web-01")
+        assert answers == {"slug": "slug-abc"}, answers
+        assert solved == ["slug"], solved
+        assert inst == "inst-1", inst
+
+        # 7) [v6.8] checker 题（无 flag 串，平台靠 verify_exploit 判分）没判分前不许 done：
+        #    实测 v6.7 SAMPLE-006 deface 直接 done，白丢一题。
+        store.transcript_path("web-01").unlink(missing_ok=True)
+        script5 = [{"content": "done", "tool_calls": [tool_call("done", {})]} for _ in range(4)]
+        crew6 = Crew(config, platform, store, lambda model=None: fake_llm.ScriptedLLM(script5))
+        crew6._question_info = {"questions": [{"id": "deface", "mode": "checker"}]}
+        crew6._fetch_challenge = lambda cid, solver: {
+            "questions": [{"id": "deface", "mode": "checker", "prompt": "Change the banner."}]
+        }
+        crew6.solve("web-01")
+        t2 = store.transcript_path("web-01").read_text(encoding="utf-8")
+        assert "done 被 checker 闸门拦下" in t2, t2[-1500:]
+        ok("v6.6/v6.7/v6.8 逐题状态回灌 + 只拦真实重复提交 + 连不上平台也保住已得分 + checker 闸门")
     finally:
         server.shutdown()
         server.server_close()

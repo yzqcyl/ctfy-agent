@@ -870,6 +870,7 @@ class Crew:
 
         # 候选闸门 / 假设收敛 状态（v3 P0）
         done_blocks = 0
+        checker_blocks = 0
         last_open = -1
         last_refuted = -1
         convergence_stalls = 0
@@ -1118,9 +1119,20 @@ class Crew:
                             )
                         else:
                             text, accepted = solver._submit(args, challenge_id)
+                            # [v6.8] 只有**真的送达平台**的提交才记进「已交过的值」。
+                            # SAMPLE-001 实测 v6.7 自伤：门控未解锁时 oracle 预检判 false（不算提交），
+                            # 却也记进了去重表，于是 slug 通过、门控解锁后同一个 flag 值的重试被自己拦死 30+ 轮。
+                            real_submit = "oracle 预检未通过" not in str(text) and "未消耗提交次数" not in str(text)
                             submit_counts[qid_hint] = tries + 1
-                            if answer_val:
+                            if answer_val and real_submit:
                                 submit_seen.setdefault(qid_hint, set()).add(answer_val)
+                            if not accepted and real_submit and "提交被拦截" not in str(text):
+                                # [v6.8] 该值被平台判错：门控题的题面可能随前置题通过而变化，提示重新取源。
+                                text = (
+                                    f"{text}\n\n[重新取源] 题号 `{qid_hint}` 的这个值平台判错。若这是门控题，"
+                                    "前置题通过后题面/页面内容已经变了：重新 get_challenge，再让专家 fresh=1 "
+                                    "重新抓一次源（不要复用旧字节），拿到新值再交。"
+                                )
                             if accepted:
                                 submitted = True
                                 reason = "flag_accepted"
@@ -1168,7 +1180,33 @@ class Crew:
                         self.store.add_note(challenge_id, str(args.get("text") or ""))
                         text = "已记录。"
                     elif name == "done":
-                        if self.config.extra.get("candidate_gate", True):
+                        # [v6.8] checker 题（没有 flag 串，靠 verify_exploit 让平台判分）不许空口 done：
+                        # 实测 v6.7 SAMPLE-006（deface checker）finish 时直接 done，白丢一题。
+                        checker_left: list[str] = []
+                        try:
+                            info_now = self._fetch_challenge(challenge_id, solver) or {}
+                        except Exception:  # noqa: BLE001 - 拿不到题面就按原逻辑走
+                            info_now = {}
+                        accepted_now = dict(getattr(challenge, "answers_by_qid", {}) or {})
+                        for q in info_now.get("questions") or []:
+                            if isinstance(q, dict) and str(q.get("mode") or "") == "checker":
+                                qid = str(q.get("id") or "")
+                                if qid and qid not in accepted_now:
+                                    checker_left.append(qid)
+                        if checker_left and checker_blocks < 2:
+                            checker_blocks += 1
+                            stop = False
+                            text = (
+                                f"[done 被拦] 题号 {', '.join('`' + q + '`' for q in checker_left)} 是 checker 题"
+                                "（没有 flag 串，平台靠判分 sidecar 认结果），还没通过。\n"
+                                "下一步只能 delegate：让专家把利用动作做完（改页面/触发效果），再调 `verify_exploit` "
+                                "让平台判分；通过后再 done。"
+                            )
+                            self.store.append_transcript(
+                                challenge_id,
+                                {"role": "gate", "step": rnd, "note": f"done 被 checker 闸门拦下（第 {checker_blocks} 次）"},
+                            )
+                        elif self.config.extra.get("candidate_gate", True):
                             text, stop, no_cand = _done_gate(
                                 submitted, challenge.attempts, ledger.observations, done_blocks
                             )
@@ -1786,3 +1824,4 @@ class Crew:
             )
         parts.append("可用专家角色：" + ", ".join(sorted(name for name in self.roles if name != "coordinator")))
         return "\n\n".join(parts)
+
