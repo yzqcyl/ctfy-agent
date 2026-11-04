@@ -213,6 +213,20 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
         if value:
             extra[extra_key] = value
 
+    # [fix 2026-11-05] 测试/重跑用的预算档允许走环境变量（不污染 config/agent.json 的
+    # 平台契约默认值 800k/160；tests/smoke.py 有守卫断言默认值必须保持）。
+    for env_key, field_name, caster in (
+        ("AGENT_MAX_TOKENS_PER_CHALLENGE", "max_tokens_per_challenge", int),
+        ("AGENT_MAX_LLM_CALLS", "max_llm_calls", int),
+        ("AGENT_MAX_STEPS", "max_steps", int),
+    ):
+        value = os.environ.get(env_key, "").strip()
+        if value:
+            try:
+                raw[field_name] = caster(float(value))
+            except ValueError:
+                pass  # 写错格式当没设，绝不炸配置加载
+
     return Config(
         mcp_url=raw["mcp_url"],
         timeout=float(raw["timeout"]),

@@ -484,6 +484,19 @@ def cmd_crew(args) -> int:
         print(problem, file=sys.stderr)
         return EXIT["solve"]
 
+    # [fix 2026-11-05 CTFARENA-005/008/010] 重跑专用：清空本题累计用量。
+    # 预算是跨 run 累计的（challenge.tokens 落盘），旧轮次烧穿的题在调低预算档后会
+    # 立刻被「预算不足」拒绝开跑，修复后根本无法重测。旧账写 notes 留痕，不丢审计。
+    if getattr(args, "fresh_budget", False):
+        _ch = store.require(args.challenge_id)
+        _prev = dict(_ch.tokens or {})
+        if _prev:
+            _ch.notes.append(
+                f"[fresh-budget {now()}] 清空累计用量（旧账留痕）：{json.dumps(_prev, ensure_ascii=False)[:300]}"
+            )
+            _ch.tokens = {}
+            store.save()
+            print(f"[fresh-budget] 已清空 {args.challenge_id} 累计用量，旧账写入 notes")
     def on_event(kind, payload=None):
         if kind == "delegate":
             print(f"[协调] 派活 -> {payload['role']}：{payload['task'][:120]}")
@@ -718,6 +731,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_crew.add_argument("--reap", action="store_true",
                         help="开跑前清掉不属于本题的残留实例（配额只有 1，泄漏会堵死后续题）")
     p_crew.add_argument("--no-reap", action="store_true", help="即使配置里开了也跳过清扫")
+    p_crew.add_argument("--fresh-budget", action="store_true",
+                        help="重跑专用：清空本题累计 token/调用计数（旧账写 notes 留痕）")
 
     p_auto = sub.add_parser("auto", help="无人值守批量解本地题单（单题失败不中断）")
     p_auto.add_argument("--no-reap", action="store_true",
