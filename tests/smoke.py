@@ -40,6 +40,7 @@ from smoke_webmap import (  # noqa: E402
 )
 from smoke_brake import case_no_progress_brake  # noqa: E402
 from smoke_gate import case_done_gate, case_convergence_stalled  # noqa: E402
+from smoke_p6c_autosubmit import case_p6c_autosubmit  # noqa: E402
 from smoke_ai_agent import case_ai_agent_e2e  # noqa: E402
 from smoke_ai_fixtures import case_ai_fixtures  # noqa: E402
 from smoke_ai_infra import case_ai_infra  # noqa: E402
@@ -5164,6 +5165,7 @@ def main() -> int:
         ("ai_direction_dod", case_ai_direction_dod),
         ("misc_ext", case_misc_ext),
         ("done_gate", case_done_gate),
+        ("p6c_autosubmit", case_p6c_autosubmit),
         ("convergence_stalled", case_convergence_stalled),
         ("clusterb_crew", case_clusterb_crew),
         ("clusterb_facts_reflow", case_clusterb_facts_reflow),
