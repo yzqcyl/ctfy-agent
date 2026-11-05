@@ -209,3 +209,16 @@ bb77838 fix(crew/solver): verify_answer/verify_exploit 通过均落库逐题状�
   “模型能力/预算上限”（多为 hard 题墙钟/预算触顶，无框架性浪费证据）。
 - 恢复 LLM 访问后建议执行：
   `RUNNER_MAX_TOKENS=600000 RUNNER_MAX_CALLS=120 python runs/_ctfarena_runner.py --ids-file runs/ctfarena/run4_ids.txt --workers 1 --timeout 900 --run-id ctfarena-20261105-run4b --out runs/ctfarena/20261105-run4b --resume`
+
+## 十、最终状态（2026-11-05 17:45）
+
+- **外部阻塞确认（连续 3 轮）**：Paratera key 自 17:16 起对所有 DeepSeek 模型返回 403 `team_model_access_denied`；`/models` 仅剩 7 个 GLM flash 模型（GLM-4-Flash/Z1 可调用但语义不符原测试；GLM-4.5-Flash 429 限流）。
+- 替代模型尝试（GLM-4-Flash 跑 084）因实例启动缺少 competition 上下文即中止，未能构成有效验证；且用非目标模型验证会污染结论，故不纳入主结论。
+- **可交付结论**：
+  1. Run1（修复前样本 28 题）与 Run2（修复后全量 115 题）数据完整，真实解出率从 ≈9% 提升到 ≈38%（31/81）；
+  2. 14 个通用修复全部有实证证据、smoke 174/174、可独立回滚；
+  3. P6c（verify 自动补交必须在实例释放前）有代码级回归测试保证；真实链路实测需 LLM 恢复后跑 Run4b；
+  4. 剩余 45 道未解题归类为“模型能力/预算上限”（hard 题墙钟/预算触顶，无框架性浪费证据）。
+- **恢复后一键续跑**：
+  `RUNNER_MAX_TOKENS=600000 RUNNER_MAX_CALLS=120 python runs/_ctfarena_runner.py --ids-file runs/ctfarena/run4_ids.txt --workers 1 --timeout 900 --run-id ctfarena-20261105-run4b --out runs/ctfarena/20261105-run4b --resume`
+  然后重新生成报告：`python runs/_ctfarena_report.py --run2 runs/ctfarena/20261105-run2 --run3 runs/ctfarena/20261105-run4b`
