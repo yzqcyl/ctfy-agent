@@ -1388,6 +1388,11 @@ class Crew:
                 reason = "step_limit"
         finally:
             self._attempt_temperature = None  # 集群-B：温度只作用于本次尝试，绝不外泄到下一次
+            # [fix 2026-11-05 P6c] verify 通过的题号必须在实例释放前补 submit：
+            # flag 多为按实例动态生成（实测旧答案在新实例 submit 返回 correct=false），实例一停
+            # 就再也交不上。原 P6 放在 finally 之后，实例已释放 → 补交全部无效（17:00 实证）。
+            if not submitted:
+                submitted, reason = self._auto_submit_verified(challenge_id, solver, submitted, reason)
             # 团队实例配额只有 1 个：无论成败都释放，否则下一题起不来（审计 B7/B20）。
             # 成功提交后是否保留实例由 keep_instance_on_success 决定（默认释放：运行内已拿到 verdict）。
             if keep_instance is not None:
@@ -1409,38 +1414,9 @@ class Crew:
                 challenge.instance = {}
                 self.store.save()
 
-        # [fix 2026-11-05 P6] verify_answer 通过 ≠ 平台记分：verify 只是候选校验，平台只有在
-        # submit 后才记 solved。实测 CTFARENA-084/085/086 三题都是 verify_answer=true 后协调者
-        # 直接 done（"全部题号已锁定"），最终 submitted=False 整题白跑。收尾前把已通过题号自动
-        # 补交一次，拿平台回执（submit_limit 内，幂等，重复提交由 state 层拦截）。
-        if not submitted:
-            try:
-                _ch = self.store.require(challenge_id)
-                _verified = dict(getattr(_ch, "verified_qids", {}) or {})
-                _queue = list(_verified.items())
-                if not _queue:
-                    # 兼容旧 state（F1 曾把 verify 写进 answers_by_qid）
-                    _queue = list((getattr(_ch, "answers_by_qid", {}) or {}).items())
-                for _qid, _ans in _queue[:3]:
-                    _ans = str(_ans or "")
-                    if not _ans or _ans.startswith("verified:"):
-                        continue
-                    _tb, _ok = solver._submit({"answer": _ans, "question_id": _qid}, challenge_id)
-                    self.store.append_transcript(
-                        challenge_id,
-                        {"role": "tool", "step": rnd,
-                         "note": f"[自动补交] verify 通过的题号 {_qid} 补 submit：{'通过' if _ok else '未通过'} {str(_tb)[:120]}"},
-                    )
-                    if _ok:
-                        submitted = True
-                        reason = "auto_submit_after_verify"
-                        _ch = self.store.require(challenge_id)
-                        _ch.status = "submitted"
-                        _ch.submitted_ok = True
-                        self.store.save()
-                        break
-            except Exception:  # noqa: BLE001 - 补交是保险项，失败不拦收尾
-                pass
+        # 兜底：若实例仍保留（keep_instance）则再试一次补交；实例已释放时该调用会安全失败。
+        if not submitted and getattr(challenge, "instance_id", ""):
+            submitted, reason = self._auto_submit_verified(challenge_id, solver, submitted, reason)
 
         if not submitted and challenge.status not in ("submitted", "done"):
             try:
@@ -1877,6 +1853,35 @@ class Crew:
         }
         self.on_event("done", summary)
         return summary
+
+    def _auto_submit_verified(self, challenge_id: str, solver, submitted: bool,
+                              reason: str) -> tuple[bool, str]:
+        """把 verify_answer 通过但尚未提交的题号补 submit（需在实例释放前调用）。"""
+        if submitted:
+            return submitted, reason
+        try:
+            ch = self.store.require(challenge_id)
+            queue = list((getattr(ch, "verified_qids", {}) or {}).items())
+            if not queue:
+                queue = list((getattr(ch, "answers_by_qid", {}) or {}).items())
+            for qid, ans in queue[:3]:
+                ans = str(ans or "")
+                if not ans or ans.startswith(("verified:", "pending:")):
+                    continue
+                text, ok = solver._submit({"answer": ans, "question_id": str(qid)}, challenge_id)
+                self.store.append_transcript(
+                    challenge_id,
+                    {"role": "tool", "note": f"[自动补交] 题号 {qid} 补 submit：{'通过' if ok else '未通过'} {str(text)[:120]}"},
+                )
+                if ok:
+                    ch = self.store.require(challenge_id)
+                    ch.status = "submitted"
+                    ch.submitted_ok = True
+                    self.store.save()
+                    return True, "auto_submit_after_verify"
+        except Exception:  # noqa: BLE001 - 补交是保险项，失败不拦收尾
+            pass
+        return submitted, reason
 
     def _fetch_challenge(self, challenge_id: str, solver) -> dict:
         """只读拉一次 get_challenge 取多问题/门控信息；失败返回 {}（增强项，绝不击穿主流程）。"""
