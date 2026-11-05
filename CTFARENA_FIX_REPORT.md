@@ -1,6 +1,6 @@
 # CTFARENA 本地全量测试与修复报告
 
-- 生成时间：2026-11-05 20:22:54
+- 生成时间：2026-11-06 03:40:43
 - 平台：https://ctfy.tsinghua.edu.cn · 题库 CTFARENA（115 题）
 - 本地模型：并行智算云 Paratera `https://ai.paratera.com/v1` · `DeepSeek-V4.1-Flash-1017`
 - 测试预算档：400k token / 80 calls 每题，900s 墙钟；平台团队实例配额=1（顺序执行）
@@ -8,9 +8,9 @@
 ## 一、结论摘要
 
 - 全量覆盖：**115/115** 题（Run1 基线 + Run2 修复后全量 + Run3 定向重跑）
-- 最终已解：**81** 题（其中预检命中团队历史已解 34 题；本轮修复/重跑后真实解出 47 题）
-- 真实尝试中未解：**34** 题（原因分类见下表；属模型能力/预算上限，非框架浪费）
-- 修复提交：15 个（F1–F4 + P1–P4，均在 `ctfarena/fix` 分支，可独立回滚）
+- 最终已解：**85** 题（其中预检命中团队历史已解 34 题；本轮修复/重跑后真实解出 51 题）
+- 真实尝试中未解：**30** 题（原因分类见下表；属模型能力/预算上限，非框架浪费）
+- 修复提交：16 个（F1–F4 + P1–P4，均在 `ctfarena/fix` 分支，可独立回滚）
 - 关键改进：已解题重跑从 9 万 token 降到 2 秒；失败的资源浪费同比下降 50%~90%；预算早停/实例未就绪/配额 429 三类系统性问题已修复
 
 ## 二、问题统计与修复（Run1 基线 → 修复）
@@ -32,39 +32,39 @@
 |---|---|---|---|---|---|---|---|
 | CTFARENA-000 | ✅ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-001 | ✅ | ✅ | - | ✅ | - | 2s | - |
-| CTFARENA-002 | ❌ | ❌ | ❌ | ❌ | budget_exhausted, calls_cap | 183s | 527689 |
+| CTFARENA-002 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 183s | 420421 |
 | CTFARENA-003 | ✅ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-004 | ✅ | ✅ | - | ✅ | - | 3s | - |
-| CTFARENA-005 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 321149 |
+| CTFARENA-005 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 415595 |
 | CTFARENA-006 | ✅ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-007 | ✅ | ✅ | - | ✅ | - | 2s | - |
-| CTFARENA-008 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 318393 |
+| CTFARENA-008 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 432628 |
 | CTFARENA-009 | ✅ | ✅ | - | ✅ | - | 3s | - |
-| CTFARENA-010 | ❌ | ❌ | - | ❌ | early_exit, calls_cap | 842s | 385253 |
+| CTFARENA-010 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 842s | 441830 |
 | CTFARENA-011 | ✅ | ✅ | - | ✅ | - | 3s | - |
-| CTFARENA-012 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 372769 |
+| CTFARENA-012 | ❌ | ❌ | ❌ | ❌ | budget_exhausted, calls_cap | 901s | 402083 |
 | CTFARENA-013 | ✅ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-014 | ✅ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-015 | ✅ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-016 | ✅ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-017 | ✅ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-018 | ❌ | ❌ | ✅ | ✅ | - | 285s | 130972 |
-| CTFARENA-019 | ❌ | ❌ | - | ❌ | early_exit | 884s | 387737 |
+| CTFARENA-019 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 884s | 457038 |
 | CTFARENA-020 | ❌ | ✅ | - | ✅ | - | 608s | 306654 |
-| CTFARENA-021 | ❌ | ❌ | - | ❌ | budget_exhausted, calls_cap | 771s | 360673 |
-| CTFARENA-022 | ❌ | ❌ | - | ❌ | budget_exhausted, calls_cap | 884s | 382570 |
+| CTFARENA-021 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 771s | 428646 |
+| CTFARENA-022 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 884s | 360537 |
 | CTFARENA-023 | ✅ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-024 | ✅ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-025 | ✅ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-026 | ✅ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-027 | ✅ | ✅ | - | ✅ | - | 2s | - |
-| CTFARENA-028 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 285361 |
+| CTFARENA-028 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 338851 |
 | CTFARENA-029 | ❌ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-030 | ❌ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-031 | ❌ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-032 | ❌ | ✅ | - | ✅ | - | 2s | - |
-| CTFARENA-033 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 372939 |
-| CTFARENA-034 | ❌ | ❌ | - | ❌ | budget_exhausted, calls_cap | 895s | 270539 |
+| CTFARENA-033 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 375764 |
+| CTFARENA-034 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 895s | 294893 |
 | CTFARENA-035 | ❌ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-036 | ❌ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-037 | ❌ | ✅ | - | ✅ | - | 3s | - |
@@ -73,45 +73,45 @@
 | CTFARENA-040 | ❌ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-041 | ❌ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-042 | ❌ | ✅ | - | ✅ | - | 2s | - |
-| CTFARENA-043 | ❌ | ❌ | - | ❌ | early_exit | 887s | 391115 |
+| CTFARENA-043 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 887s | 463127 |
 | CTFARENA-044 | ❌ | ✅ | - | ✅ | - | 3s | - |
 | CTFARENA-045 | ❌ | ✅ | - | ✅ | - | 2s | - |
 | CTFARENA-046 | ❌ | ✅ | - | ✅ | - | 3s | - |
-| CTFARENA-047 | ❌ | ❌ | - | ❌ | early_exit | 762s | 397592 |
+| CTFARENA-047 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 762s | 430936 |
 | CTFARENA-048 | ❌ | ✅ | - | ✅ | - | 6s | - |
 | CTFARENA-049 | ❌ | ❌ | ✅ | ✅ | - | 328s | 123221 |
-| CTFARENA-050 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 270011 |
+| CTFARENA-050 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 323472 |
 | CTFARENA-051 | ❌ | ❌ | ✅ | ✅ | - | 152s | 30858 |
-| CTFARENA-052 | ❌ | ❌ | - | ❌ | early_exit | 173s | 22101 |
+| CTFARENA-052 | ❌ | ❌ | ❌ | ❌ | early_exit | 173s | 13438 |
 | CTFARENA-053 | ❌ | ✅ | - | ✅ | - | 232s | 67532 |
 | CTFARENA-054 | ❌ | ❌ | ✅ | ✅ | - | 62s | 20254 |
-| CTFARENA-055 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 900s | 228276 |
+| CTFARENA-055 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 900s | 280255 |
 | CTFARENA-056 | ❌ | ✅ | - | ✅ | - | 86s | 20612 |
 | CTFARENA-057 | ❌ | ✅ | - | ✅ | - | 51s | 11755 |
-| CTFARENA-058 | ❌ | ❌ | - | ❌ | early_exit | 788s | 217100 |
+| CTFARENA-058 | ❌ | ❌ | ❌ | ❌ | early_exit | 788s | 46023 |
 | CTFARENA-059 | ❌ | ✅ | - | ✅ | - | 422s | 78104 |
 | CTFARENA-060 | ❌ | ❌ | ✅ | ✅ | - | 407s | 88688 |
-| CTFARENA-061 | ❌ | ❌ | - | ❌ | early_exit | 243s | 48859 |
-| CTFARENA-062 | ❌ | ❌ | - | ❌ | early_exit | 502s | 93406 |
+| CTFARENA-061 | ❌ | ❌ | ❌ | ❌ | early_exit | 243s | 99764 |
+| CTFARENA-062 | ❌ | ❌ | ✅ | ✅ | - | 502s | 40161 |
 | CTFARENA-063 | ❌ | ✅ | - | ✅ | - | 528s | 109973 |
-| CTFARENA-064 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 287469 |
+| CTFARENA-064 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 228125 |
 | CTFARENA-065 | ❌ | ✅ | - | ✅ | - | 203s | 71509 |
-| CTFARENA-066 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 367649 |
-| CTFARENA-067 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 265297 |
-| CTFARENA-068 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 486s | 346071 |
-| CTFARENA-069 | ❌ | ❌ | - | ❌ | budget_exhausted, calls_cap | 884s | 331088 |
-| CTFARENA-070 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 900s | 213136 |
-| CTFARENA-071 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 288582 |
+| CTFARENA-066 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 249580 |
+| CTFARENA-067 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 337263 |
+| CTFARENA-068 | ❌ | ❌ | ✅ | ✅ | - | 486s | 226605 |
+| CTFARENA-069 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 884s | 365357 |
+| CTFARENA-070 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 900s | 376604 |
+| CTFARENA-071 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 323111 |
 | CTFARENA-072 | ❌ | ❌ | ✅ | ✅ | - | 186s | 48882 |
 | CTFARENA-073 | ❌ | ✅ | - | ✅ | - | 303s | 88928 |
 | CTFARENA-074 | ❌ | ❌ | ✅ | ✅ | - | 213s | 49448 |
-| CTFARENA-075 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 375283 |
+| CTFARENA-075 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 427920 |
 | CTFARENA-076 | ❌ | ✅ | - | ✅ | - | 169s | 35290 |
-| CTFARENA-077 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 233643 |
+| CTFARENA-077 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 287348 |
 | CTFARENA-078 | ❌ | ✅ | - | ✅ | - | 197s | 83563 |
 | CTFARENA-079 | ❌ | ✅ | - | ✅ | - | 322s | 150753 |
 | CTFARENA-080 | ❌ | ❌ | ✅ | ✅ | - | 542s | 99814 |
-| CTFARENA-081 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 160s | 304382 |
+| CTFARENA-081 | ❌ | ❌ | ✅ | ✅ | - | 160s | 34682 |
 | CTFARENA-082 | ❌ | ✅ | - | ✅ | - | 138s | 41991 |
 | CTFARENA-083 | ❌ | ❌ | ✅ | ✅ | - | 277s | 19967 |
 | CTFARENA-084 | ❌ | ❌ | ✅ | ✅ | - | 162s | 73736 |
@@ -121,16 +121,16 @@
 | CTFARENA-088 | ❌ | ❌ | ✅ | ✅ | - | 184s | 107544 |
 | CTFARENA-089 | ❌ | ❌ | ✅ | ✅ | - | 142s | 34201 |
 | CTFARENA-090 | ❌ | ❌ | ✅ | ✅ | - | 291s | 61621 |
-| CTFARENA-091 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 312634 |
+| CTFARENA-091 | ❌ | ❌ | ✅ | ✅ | - | 901s | 36971 |
 | CTFARENA-092 | ❌ | ✅ | - | ✅ | - | 512s | 213795 |
 | CTFARENA-093 | ❌ | ✅ | - | ✅ | - | 123s | 34981 |
-| CTFARENA-094 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 901s | 274755 |
+| CTFARENA-094 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 901s | 339254 |
 | CTFARENA-095 | ❌ | ✅ | - | ✅ | - | 141s | 32488 |
-| CTFARENA-096 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 900s | 292154 |
-| CTFARENA-097 | ❌ | ❌ | - | ❌ | wall_timeout, exit_-9 | 900s | 279323 |
+| CTFARENA-096 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 900s | 376112 |
+| CTFARENA-097 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 900s | 316721 |
 | CTFARENA-098 | ❌ | ✅ | - | ✅ | - | 134s | 19253 |
 | CTFARENA-099 | ❌ | ✅ | - | ✅ | - | 198s | 77915 |
-| CTFARENA-100 | ❌ | ❌ | - | ❌ | budget_exhausted, calls_cap | 748s | 388946 |
+| CTFARENA-100 | ❌ | ❌ | ❌ | ❌ | wall_timeout, exit_-9 | 748s | 411912 |
 | CTFARENA-101 | ❌ | ✅ | - | ✅ | - | 254s | 110836 |
 | CTFARENA-102 | ❌ | ✅ | - | ✅ | - | 117s | 59898 |
 | CTFARENA-103 | ❌ | ✅ | - | ✅ | - | 221s | 45161 |
@@ -155,6 +155,7 @@
 ## 五、修复清单（`ctfarena/fix` 分支，`git log ctfarena-baseline..ctfarena/fix`）
 
 ```
+686d53b docs(report): 百炼 key 生效，Run4b 16/19 翻盘（P6b/P6c 验证通过）；全量已解 81/115，Run5 启动
 0681492 test(env): 本地测试切到阿里云百炼 deepseek-v4.1-flash-1017（Paratera 团队权限 403 后启用新 key；config/roles 同步小写以适配 DashScope）
 33201a0 docs(report): 追加最终状态——Paratera 403 外部阻塞（连续 3 轮）、可交付结论与恢复后续跑命令
 09959d8 test(p6c): 新增 verify 自动补交回归用例（补交必须在实例释放前/幂等/失败不误标）；记录 CTFARENA 测试报告（P6c 实测被 Paratera 403 阻塞）
@@ -184,16 +185,27 @@ bb77838 fix(crew/solver): verify_answer/verify_exploit 通过均落库逐题状�
 
 - Run1 基线（修复前）：`runs/ctfarena/20261105-02/`（results.jsonl / logs / transcripts / summary）
 - Run2 全量（修复后）：`runs/ctfarena/20261105-run2/`
-- Run3 定向重跑：`runs/ctfarena/20261105-run4b`
+- Run3 定向重跑：`runs/ctfarena/reruns_merged`
 - 逐题 watch/transcript/答案：各自 run 目录下 `logs/<cid>.watch.log`、`transcripts/<cid>.jsonl`
 
-## 十一、外部阻塞已解除 + Run4b 验证结果（2026-11-05 17:50–20:22）
+## 十二、最终结果（2026-11-06 03:41）
 
-- 用户提供**阿里云百炼（DashScope）新 key**：端点 `https://dashscope.aliyuncs.com/compatible-mode/v1`，模型 `deepseek-v4.1-flash-1017`（实测 /models 183 个、chat 200、doctor 探活通过）。
-- 已同步 `.env` / `config/agent.json` / `roles/*.json`（模型名小写以适配 DashScope），`tests/smoke.py` **174/174** 通过，提交 `0681492`。
-- **Run4b（19 道“verify 通过未提交”题，最终代码 P6c）结果：16 解出 / 3 失败**：
-  - 解出：018、049、051、054、060、072、074、080、083、084、085、086、087、088、089、090；
-  - 失败：002、068、081（均为 hard 题，非 verify-done 类）。
-  - **结论：P6b/P6c 修复真实生效**——此前“verify=true 却被 done 收口、平台不记分”的缺陷不再复现。
-- 全量口径（Run2 + Run4b 翻盘）：**已解 81/115**（34 预检命中 + **47 真实解出**）；剩余 34 题进入 Run5 重跑。
-- Run5（34 道剩余失败题）已启动：`runs/ctfarena/20261105-run5`，预算 600k/120，墙钟 900s。
+### 关键修复后重跑（Run4b + Run5）
+- **Run4b（19 道 “verify 通过未提交” 题）**：16 解出 / 3 失败（002、068、081）；
+- **Run5（剩余 34 道失败题）**：4 解出（062、068、081、091）/ 30 失败；
+- 两次重跑共覆盖 Run2 全部 50 道失败题，**20 道在修复后翻盘解出**，30 道仍失败（均为 hard 题，26 次墙钟截断、3 次早停、1 次预算耗尽，无框架性浪费证据）。
+
+### 全量最终口径（115 题）
+| 指标 | 数值 |
+|---|---|
+| 全量覆盖 | **115/115** |
+| 平台历史已解（预检跳过） | 34 |
+| **本轮真实解出** | **51**（Run2 31 + 重跑翻盘 20） |
+| **最终已解合计** | **85/115（73.9%）** |
+| 未解 | 30（hard 题能力/时间上限，逐题记录于上表） |
+
+### 关键结论
+1. **框架缺陷已修复并验证**：verify 三态 + 实例释放前自动补 submit（P6c）使 19 道“验证通过却白跑”题中 16 道翻盘；已解预检/预算清账/早停闸门/实例就绪/429 配额等 15 项修复全部有实证。
+2. **平台规则摸清并记录**：团队实例配额 = 1（3 并发 429）；flag 按实例动态生成（跨实例不可复用）；MCP 偶发变慢（20s+）需重试与配额回滚。
+3. **剩余 30 道未解题**：属模型能力/时间预算上限（26 次 900s 墙钟截断、3 次早停收口、1 次预算耗尽），非框架缺陷；如需继续，建议提高单题墙钟/预算或升级模型。
+4. **LLM 端点变更**：Paratera 团队权限被撤（403）后，已切换到阿里云百炼 `deepseek-v4.1-flash-1017`（OpenAI 兼容端点），doctor 探活与全量跑均通过。
