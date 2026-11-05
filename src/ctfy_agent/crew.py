@@ -309,6 +309,14 @@ def _usage_delta(start: dict | None, end: dict | None) -> dict:
 # [fix 2026-11-05 P4] 预算闸门：协调者 done 时若预算充足且账本仍有大量未验证假设，拦下并逼它继续。
 # 实证：CTFARENA-002 Run2 只 2 轮、75k/80calls 就 coordinator_done（23 条 open 假设未验证）；
 # CTFARENA-010 Run2 5 轮、385k 就收口，plan 自己写「收敛期只剩 ~24 次调用」却选择收口。
+# [fix 2026-11-05 P5] 候选闸门：账本里已有候选 flag 却直接 done 的，拦下并强制先验证/提交。
+# 实证：CTFARENA-051 Run2 已收出 FLAG{73ef...} 候选，协调者却 coordinator_done 收口 → 白白错失。
+_CANDIDATE_SUBMIT_GATE = (
+    "[done 被候选闸门拦下] 你已经拿到候选 flag：{cands}。直接 done 等于把候选白扔。下一步必须二选一：\n"
+    "1) 先 verify_answer 自校验（不消耗提交次数），通过立即 submit；\n"
+    "2) 若该候选已被证伪，delegate 补一条能产出新证据的增量目标，拿到后同样先 verify 再 submit。"
+)
+
 _BUDGET_DONE_GATE = (
     "[done 被预算闸门拦下] 本题未解，但预算仍充足（剩余调用/预算见上一条 system 状态），"
     "账本里还有未验证的假设。现在收口等于白扔预算。下一步必须二选一：\n"
@@ -335,7 +343,8 @@ _FLAG_CANDIDATE_HINT = (
 
 def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: int,
                max_blocks: int = MAX_DONE_BLOCKS, calls_left: int | None = None,
-               tokens_left: int | None = None, open_count: int = 0) -> tuple[str, bool, bool]:
+               tokens_left: int | None = None, open_count: int = 0,
+               candidates: list[str] | None = None) -> tuple[str, bool, bool]:
     """候选/预算闸门：拦 done 至多 max_blocks 次。
 
     返回 (text, stop, no_candidate)。stop=False 表示拦下（本轮不结束，把闸门文案回灌给协调者），
@@ -349,6 +358,10 @@ def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: 
         if done_blocks < max_blocks:
             return _NO_CANDIDATE_GATE, False, False
         return "协调结束（无候选，候选闸门放行并记为 no_candidate）。", True, True
+    # [fix 2026-11-05 P5] 有候选却 done：优先拦下逼它先 verify/submit（比预算闸门更具体）
+    if not submitted and candidates and done_blocks < max_blocks:
+        shown = "、".join(f"`{c}`" for c in candidates[:3])
+        return _CANDIDATE_SUBMIT_GATE.format(cands=shown), False, False
     budget_left = calls_left is not None or tokens_left is not None
     if (
         not submitted
@@ -1280,6 +1293,7 @@ class Crew:
                                 submitted, challenge.attempts, ledger.observations, done_blocks,
                                 calls_left=_left_calls, tokens_left=_left_tok,
                                 open_count=int(_lstat.get("open") or 0),
+                                candidates=_ledger_candidates(ledger),
                             )
                             if not stop:
                                 done_blocks += 1
