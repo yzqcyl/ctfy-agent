@@ -767,6 +767,14 @@ class Solver:
                             "且当前没有可清理的残留实例；确认无其它题占用后再试。"
                         )
                 elif self._is_transient(text):
+                    # [fix 2026-11-05 P7] 瞬时失败（SSE 读超时/MCP 响应超时/上游限流）时平台并未
+                    # 真正开实例，不能占用本地 instance_ops_limit。实测 Run3b CTFARENA-084 在平台
+                    # 变慢期间连续 5 次 start 超时，额度烧光后连正常 start 也被本地拦死。
+                    if name in self._instance_op_names():
+                        try:
+                            self.store.refund_call(challenge_id, name)
+                        except Exception:  # noqa: BLE001
+                            pass
                     # 实测：团队实例配额=1，泄漏/另开的实例会让 start_instance 长期报「Rate limited」。
                     # 这不是时间限流，等再久也没用——把排查动作直接写给模型。
                     text += (
