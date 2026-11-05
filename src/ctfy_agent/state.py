@@ -192,6 +192,8 @@ class Challenge:
     # 单值 flag_value 在第二问通过时会被覆盖，导致 result.json 的 answers 张冠李戴
     # （实测 SAMPLE-001：slug 通过后 flag_value=slug，最终 answers 把 slug 当 flag 交上去）。
     answers_by_qid: dict = field(default_factory=dict)
+    # [fix 2026-11-05 P6b] verify_answer 通过但尚未 submit 的题号（verify 只是校验，平台不记分）
+    verified_qids: dict = field(default_factory=dict)
     next_question_id: str = ""    # 多问题题：下一道待提交的 question_id（per-challenge 隔离，不写 config.extra）
     notes: list[str] = field(default_factory=list)
     tool_counts: dict = field(default_factory=dict)  # 写操作频控计数（start/stop 实例等）

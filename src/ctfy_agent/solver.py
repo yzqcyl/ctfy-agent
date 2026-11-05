@@ -817,7 +817,10 @@ class Solver:
                 try:
                     item = self.store.require(challenge_id)
                     if qid:
-                        item.answers_by_qid[qid] = answer or f"verified:{qid}"
+                        # [P6b] verify 通过只记「待提交」；平台只有 submit 后才记分。写
+                        # answers_by_qid 会被 _submit 的「已答对别再交」守卫拦住、还会让协调者
+                        # 误以为已锁定（CTFARENA-084~090 实证 7 题）。
+                        item.verified_qids[qid] = answer or f"pending:{qid}"
                         if qid == "flag" and answer and not item.flag_value:
                             item.flag_value = answer
                     self.store.save()

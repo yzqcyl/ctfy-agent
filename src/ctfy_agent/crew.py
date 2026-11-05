@@ -1416,8 +1416,12 @@ class Crew:
         if not submitted:
             try:
                 _ch = self.store.require(challenge_id)
-                _accepted = dict(getattr(_ch, "answers_by_qid", {}) or {})
-                for _qid, _ans in list(_accepted.items())[:2]:
+                _verified = dict(getattr(_ch, "verified_qids", {}) or {})
+                _queue = list(_verified.items())
+                if not _queue:
+                    # 兼容旧 state（F1 曾把 verify 写进 answers_by_qid）
+                    _queue = list((getattr(_ch, "answers_by_qid", {}) or {}).items())
+                for _qid, _ans in _queue[:3]:
                     _ans = str(_ans or "")
                     if not _ans or _ans.startswith("verified:"):
                         continue
@@ -1917,21 +1921,31 @@ class Crew:
         任何压缩/重置都丢不掉。
         """
         info = getattr(self, "_question_info", None) or {}
-        accepted = set(getattr(challenge, "answers_by_qid", {}) or {})
-        solved = accepted | self._solved_qids(info)
-        if not solved:
+        # [P6b] 三态区分：平台已记分（submit 回执） / verify 已通过但未记分 / 尚未验证。
+        # 旧版把 verify 通过也当「已锁定、绝不要再 submit」，导致 CTFARENA-084~090 共 7 题
+        # verify=true 后协调者直接 done、平台没记分 → 整题白跑（平台 my_solves 实证未记）。
+        accepted = set(getattr(challenge, "answers_by_qid", {}) or {}) | self._solved_qids(info)
+        verified = set(getattr(challenge, "verified_qids", {}) or {})
+        if not accepted and not verified:
             return ""
-        all_qids = self._question_ids(info) or sorted(solved)
-        rest = [qid for qid in all_qids if qid not in solved]
+        all_qids = self._question_ids(info) or sorted(accepted | verified)
+        pending = sorted(verified - accepted)
+        rest = [qid for qid in all_qids if qid not in accepted and qid not in verified]
         lines = ["## 逐题状态（平台回执，硬事实，每轮刷新）"]
-        lines.append("已通过（已锁定，**绝不要再 submit**）：" + "、".join(f"`{q}`" for q in sorted(solved)))
+        if accepted:
+            lines.append("已通过（平台已记分，**绝不要再 submit 同一值**）：" + "、".join(f"`{q}`" for q in sorted(accepted)))
+        if pending:
+            lines.append(
+                "已通过 verify 但**平台未记分**（verify 只是校验，未记 solved）：" + "、".join(f"`{q}`" for q in pending)
+                + " —— 必须立即 submit 这些题号拿平台回执；拿到通过回执前不要 done。"
+            )
         if rest:
             lines.append(
-                "未通过：" + "、".join(f"`{q}`" for q in rest)
-                + " —— 下一步必须 delegate 针对这些题号取证；全部通过前不要 done。"
+                "未通过（尚未验证）：" + "、".join(f"`{q}`" for q in rest)
+                + " —— 下一步必须 delegate 针对这些题号取证；拿到候选先 verify_answer 再 submit。"
             )
-        else:
-            lines.append("全部题号已通过（verify 通过≠平台记分）→ **必须 submit 一次拿平台回执**，拿到通过回执后再 done 收口。")
+        if not pending and not rest:
+            lines.append("全部题号已由平台记分 → 可以 done 收口。")
         return "\n".join(lines)
 
     def _brief(self, challenge) -> str:
