@@ -1409,6 +1409,35 @@ class Crew:
                 challenge.instance = {}
                 self.store.save()
 
+        # [fix 2026-11-05 P6] verify_answer 通过 ≠ 平台记分：verify 只是候选校验，平台只有在
+        # submit 后才记 solved。实测 CTFARENA-084/085/086 三题都是 verify_answer=true 后协调者
+        # 直接 done（"全部题号已锁定"），最终 submitted=False 整题白跑。收尾前把已通过题号自动
+        # 补交一次，拿平台回执（submit_limit 内，幂等，重复提交由 state 层拦截）。
+        if not submitted:
+            try:
+                _ch = self.store.require(challenge_id)
+                _accepted = dict(getattr(_ch, "answers_by_qid", {}) or {})
+                for _qid, _ans in list(_accepted.items())[:2]:
+                    _ans = str(_ans or "")
+                    if not _ans or _ans.startswith("verified:"):
+                        continue
+                    _tb, _ok = solver._submit({"answer": _ans, "question_id": _qid}, challenge_id)
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "tool", "step": rnd,
+                         "note": f"[自动补交] verify 通过的题号 {_qid} 补 submit：{'通过' if _ok else '未通过'} {str(_tb)[:120]}"},
+                    )
+                    if _ok:
+                        submitted = True
+                        reason = "auto_submit_after_verify"
+                        _ch = self.store.require(challenge_id)
+                        _ch.status = "submitted"
+                        _ch.submitted_ok = True
+                        self.store.save()
+                        break
+            except Exception:  # noqa: BLE001 - 补交是保险项，失败不拦收尾
+                pass
+
         if not submitted and challenge.status not in ("submitted", "done"):
             try:
                 self.store.set_status(challenge_id, "stalled")
@@ -1902,7 +1931,7 @@ class Crew:
                 + " —— 下一步必须 delegate 针对这些题号取证；全部通过前不要 done。"
             )
         else:
-            lines.append("全部题号已通过 → 直接 done 收口。")
+            lines.append("全部题号已通过（verify 通过≠平台记分）→ **必须 submit 一次拿平台回执**，拿到通过回执后再 done 收口。")
         return "\n".join(lines)
 
     def _brief(self, challenge) -> str:
