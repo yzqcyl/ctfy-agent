@@ -209,3 +209,11 @@ bb77838 fix(crew/solver): verify_answer/verify_exploit 通过均落库逐题状�
 2. **平台规则摸清并记录**：团队实例配额 = 1（3 并发 429）；flag 按实例动态生成（跨实例不可复用）；MCP 偶发变慢（20s+）需重试与配额回滚。
 3. **剩余 30 道未解题**：属模型能力/时间预算上限（26 次 900s 墙钟截断、3 次早停收口、1 次预算耗尽），非框架缺陷；如需继续，建议提高单题墙钟/预算或升级模型。
 4. **LLM 端点变更**：Paratera 团队权限被撤（403）后，已切换到阿里云百炼 `deepseek-v4.1-flash-1017`（OpenAI 兼容端点），doctor 探活与全量跑均通过。
+
+## 十三、补充：剩余 30 题的优化再分析（2026-11-07）
+
+详见 `runs/ctfarena/OPTIMIZATION_ANALYSIS.md`（含 ExpB/ExpC 两组对照实验）：
+- 30 题并非全是时间上限：052 本地内网不可达、012 是 calls 上限、058/061 是 reasoning 烧穿、064 是 competition 未解析（已修，ExpC 解出）；
+- 新增修复：P8 自适应 max_tokens（烧穿时 4096→8192→16384）、AGENT_COMPETITION_ID 固定比赛上下文（commit 6dbe0a6）；
+- 实测 thinking off 可把吞吐提到 10–12 calls/min（2.6–5×），但抽样的 5 道 hard 题仍未在 900s 内解出 → 剩余主要瓶颈是模型能力/预算，而不是单纯的墙钟。
+- 建议：本地默认 thinking off + 1800s + 800k/250 calls 做回归；052 需平台 VPN 或平台内跑。
