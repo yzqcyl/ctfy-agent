@@ -1379,6 +1379,19 @@ class Solver:
                 if burns >= 2:
                     reason = "completion_burned"
                     break
+                # [fix 2026-11-06 P8] 自适应放大 max_tokens：reasoning 占满补全时，
+                # 4096 上限会把整步烧掉（CTFARENA-058/061 实证）。放大后重试一次即可出内容。
+                try:
+                    cur = int(getattr(self.llm, "max_tokens", 0) or 0)
+                    if cur and cur < 16384:
+                        self.llm.max_tokens = min(16384, cur * 2)
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"step": step, "role": "note",
+                             "content": f"[思考烧穿] max_tokens {cur} -> {self.llm.max_tokens}（容纳 reasoning）"},
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
             burns = 0
             if len(calls) > self.config.max_calls_per_step:
@@ -1683,6 +1696,18 @@ class Solver:
                     report = f"[思考烧穿终止] 连续 {burns} 次补全打满且无输出（reasoning 占满 max_tokens）"
                     reason = "completion_burned"
                     break
+                try:
+                    cur = int(getattr(self.llm, "max_tokens", 0) or 0)
+                    if cur and cur < 16384:
+                        self.llm.max_tokens = min(16384, cur * 2)
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"step": step, "role": "note",
+                             "content": f"[思考烧穿] max_tokens {cur} -> {self.llm.max_tokens}（容纳 reasoning）"},
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
                 continue
             burns = 0
             if len(calls) > self.config.max_calls_per_step:

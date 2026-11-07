@@ -1066,6 +1066,24 @@ class Crew:
                     self.store.set_tokens(challenge_id, spending.snapshot())
                     self.store.save()
 
+                # [fix 2026-11-06 P8] 协调者补全被 reasoning 占满（finish=length、content 空、无
+                # tool_calls）时，不算“空动作”消耗守卫，而是放大 max_tokens 后重试。
+                if (not (response.get("tool_calls") or [])
+                        and not str(response.get("content") or "").strip()
+                        and response.get("finish_reason") == "length"):
+                    try:
+                        cur = int(getattr(coordinator, "max_tokens", 0) or 0)
+                        if cur and cur < 16384:
+                            coordinator.max_tokens = min(16384, cur * 2)
+                            self.store.append_transcript(
+                                challenge_id,
+                                {"role": "coordinator", "step": rnd,
+                                 "note": f"[思考烧穿] 协调者 max_tokens {cur} -> {coordinator.max_tokens}（容纳 reasoning）"},
+                            )
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 calls = response.get("tool_calls") or []
                 content = response.get("content") or ""
                 # P2-2：web 批处理档位放宽单步工具数（一次抓多个端点），其余沿用配置

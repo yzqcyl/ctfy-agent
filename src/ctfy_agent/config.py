@@ -213,6 +213,13 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
         if value:
             extra[extra_key] = value
 
+    # [fix 2026-11-06] 本地测试/容器场景可用环境变量固定比赛上下文：多队参赛时平台
+    # start_instance 不带 competition_id 会报 competition_required（expA 实测），
+    # 反查在平台慢时也可能失败，因此提供显式注入口。
+    _comp = os.environ.get("AGENT_COMPETITION_ID", "").strip()
+    if _comp:
+        extra["competition_id"] = _comp
+
     # [fix 2026-11-05] 测试/重跑用的预算档允许走环境变量（不污染 config/agent.json 的
     # 平台契约默认值 800k/160；tests/smoke.py 有守卫断言默认值必须保持）。
     for env_key, field_name, caster in (
