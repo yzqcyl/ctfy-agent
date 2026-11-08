@@ -11,7 +11,7 @@
 
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
-| docs/plan-p2v-validation-and-alignment.md | Y（镜像/验证线） | 10-30 19:00 | 方案已批；按门推进时更新，门 C 后释放 |
+| （当前无活动锁） | | | |
 
 ## 已释放
 
@@ -62,3 +62,4 @@
 | docs/ai-oracle-2026-11-01.md | 新建后已释放 | 11-01 17:40–18:00 | AI 方向补齐记录 |
 | src/ctfy_agent/crew.py + src/ctfy_agent/solver.py + tests/smoke_ctxopt.py | **并行对话（非本线）** | 11-01 起 | S1b 轮间会话重置等；本线未触碰、不提交 |
 | HANDOFF.md + docs/OPENING.txt | Z（交接线） | 11-03 21:00–21:30 | 对外交接版重写（A–H+附录结构；关键数字全部标注实测口径；新增缺口 #11：总入口依赖未入库的 runs/bench_stats.py，干净 clone 151/1；B.4 列全未提交 WIP 处置清单）；OPENING.txt 同步浓缩；随本轮提交 |
+| docs/plan-p2v-validation-and-alignment.md | Y（镜像/验证线） | 10-30 19:00 起 | 悬置超 24h 过期，按约定第 3 条交用户裁决；2026-11-08 用户裁决释放。文档状态停在「方案待批」，WIP 横幅已删；真机验证线由 ctfarena/fix 分支后续实测报告取代（见 docs/CTFARENA_FIX_REPORT.md） |

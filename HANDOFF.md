@@ -17,13 +17,13 @@
   （web / pwn / rev / crypto / misc / ai），通过平台 MCP 工具解题并当场提交。
 - 入口：`python -m ctfy_agent agent`；读 `/ctfy/work/task.json` → 写 `/ctfy/work/result.json` → `exit 0`；
   **stdout 不被平台读**，日志全走 stderr。
-- 仓库：`E:\ctfy_project` → GitHub `https://github.com/yzqcyl/ctfy-agent.git`（branch `v3` 为当前线，`master` 为旧线）。
+- 仓库：`E:\ctfy_project` → GitHub `https://github.com/yzqcyl/ctfy-agent.git`（branch `ctfarena/fix` 为当前线【2026-11-08 起】，`v3` 为 v5 镜像基线线，`master` 为旧线）。
 
 ### A.2 现状速览（2026-11-03）
 
 | 项 | 状态 |
 |---|---|
-| **git 基线** | HEAD `4fae989`（v3 线，2026-11-05：v4 之后 8 个提交 + CI 五修）；本地与 `origin/v3` 同步；`ctfy_agent` 包 33 模块；docs 70+ 篇；smoke 套件 34 个文件 |
+| **git 基线** | 当前线 **`ctfarena/fix`** HEAD `f6437e0`（2026-11-07：领先 v3 22 个提交，含 CTFARENA 16 项修复 F1–F4+P1–P9 + 全量测试/分析报告；已推送 origin【11-08】）；v3 HEAD `260c037` = v5 镜像基线；本地与远程同步；`ctfy_agent` 包 31 模块；docs 80+ 篇；总入口单测 174/0 |
 | **交付镜像** | ✅ **v5** 已构建推送：`ghcr.io/yzqcyl/ctfy-agent-pub:v5`，digest `sha256:037edd2d607a…`（详见 §B.2 / 附录 D）|
 | **平台审核/提交** | ⬜ **未开始**，只能人工走浏览器（`docs/submit-image-runbook.md` + `platform-submit-opsheet.md`）——交接后第一优先级之一 |
 | **总入口单测（干净 clone）** | ✅ **163 passed / 0 failed**【实测 11-05，干净 clone 口径】：`bench_stats` 已入库到 `tools/bench_stats.py`，缺口 #11 关闭|
@@ -48,7 +48,7 @@
 
 ## B. 你拿到什么（四层清单）
 
-### B.1 git 基线（HEAD `89739a5`，branch `v3`）
+### B.1 git 基线（当前线 `ctfarena/fix` HEAD `f6437e0`；下表为 v3 线口径，ctfarena/fix 在其上叠加 CTFARENA 16 修复，明细见 `docs/CTFARENA_FIX_REPORT.md`）
 
 | 内容 | 说明 |
 |---|---|
@@ -353,7 +353,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 | 1 | 只支持 `run_mode=instance`；qa/defence/engagement/awd 会静默 0 分 | 部分：QA 已修并提交（§B.4）；defence/engagement/awd 未动 |
 | 2 | CI 不跑任何单测 | **已修并提交**：workflow 加 总入口单测 / 25 个免凭据套件 / 密钥扫描 / 镜像姿态探针 |
 | 3 | 33 个测试套件不在总入口 | 部分：25 个免凭据套件接进 CI（同上，已提交）|
-| 4 | README 6 处失真（自称 18 项/12 步/30 万 token/方向未做…）| 未修；**以本文件为准** |
+| 4 | README 6 处失真（自称 18 项/12 步/30 万 token/方向未做…）| **已修（2026-11-08）**：README 全文重写对齐真值（174 项断言、800k/160 calls 预算、7 角色 23 工具、CTFARENA 85/115、镜像 v5 现状）|
 | 5 | 本地跑题污染仓库根（`js/`、`work/capture.pcap`、`x/`、`%TEMP%/`）| 未修；本地跑题请显式锚定 run 目录/沙箱 |
 | 6 | XBOW 50 题 + 部分 CYBENCH 实例 `*.internal` 需 VPN，本机不可达 | 环境限制；这些库的 0% 不是能力结论 |
 | 7 | 网关忽略 `enable_thinking:false`（思考 token 照计费）| 网关侧，代码不可修；预算按含思考估算 |
@@ -367,8 +367,8 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 
 1. **吊销此前暴露过的 GitHub PAT**（遗留未处理）。
 2. **轮换凭据**：`CTFY_TOKEN`（平台令牌 30 天有效可吊销）与模型 Key；`.env` 不进 git 但在本地——**打包转移时剔除**。
-3. 密钥扫描：HEAD 全树无 `sk-/ghp_/gho_/AKIA/xoxb-` 命中【实测 11-03】；`.env.example` 全占位符。
-4. **无 LICENSE 文件**：接手方需自定代码许可；镜像分发的第三方义务——ffuf Apache-2.0 / SecLists MIT / sqlmap **GPLv2+**（GPL 传播需提供对应源码，上游 pin 见 Dockerfile）；`tools_local.http_map` 的 AI 组件指纹来源为 MIT 技能卡（ctfy-ai-infra）。
+3. 密钥扫描：HEAD 全树无 `sk-/ghp_/gho_/AKIA/xoxb-` 命中【实测 11-03；**11-08 复扫仍干净**：`tools/secret_scan.py --all` 实扫 159 个跟踪文件】；`.env.example` 全占位符；`.env` 未被 git 跟踪【核验 11-08】。
+4. LICENSE：**已有**（MIT，2026-11-02 P1-2 补入）；第三方义务见 `THIRD_PARTY_NOTICES.md`——ffuf Apache-2.0 / SecLists MIT / sqlmap **GPLv2+**（GPL 传播需提供对应源码，上游 pin 见 Dockerfile）/ capstone BSD-3-Clause；`tools_local.http_map` 的 AI 组件指纹来源为 MIT 技能卡（ctfy-ai-infra）。
 5. GHCR 包随仓库转移时注意：镜像在 `ghcr.io/yzqcyl/` 名下，换主需重推并重过平台审核（digest 会变）。
 
 ### F.3 仓库卫生（可清理清单）
@@ -388,7 +388,7 @@ python tools/publish_image.py --tag v5       # 发新版（需 GH_TOKEN；见下
 5. ☐ **吊销旧 GitHub PAT、轮换 CTFY_TOKEN/模型 Key**（§F.2）。
 6. ☐ 拿走本地数据：`runs/`（transcripts+报告+脚本）、`misc-bank/`、`inbox/`、`.tools/ctfy-src/`、`dist/` 两个交付包。
 7. ☐ 决定 LICENSE 与第三方合规口径（§F.2.4）。
-8. ☐ （可选）清理根目录杂物（§F.3），重写 README（缺口 #4）。
+8. ✅ 清理根目录杂物（§F.3 的 `%TEMP%/`、`x/` 与 dist 调试残留已于 2026-11-08 删除，交付包保留）、重写 README（缺口 #4 已修，2026-11-08）。
 9. ✅ 平台提交镜像：**v5 已构建推送**（2026-11-05，`ghcr.io/yzqcyl/ctfy-agent-pub:v5`），按 `docs/submit-image-runbook.md` 走浏览器 4 步（显式 `:v5`）。
 10. ☐ 通读 §H 禁忌与附录 A/B（工具箱与补短板记录），再动提示词——**改提示词要单独走审批**（原团队规矩）。
 
