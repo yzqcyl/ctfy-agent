@@ -1468,6 +1468,10 @@ def case_bounded_run(tmp: Path) -> None:
 
     # --- 3) 超时：杀掉的是整棵树，孙进程不能在超时后继续写盘 ---
     marker = tmp / "leaked_by_orphan.txt"
+    # [接手 2026-11-10] 幂等：共享 tmp 从不清理，一旦某次真实泄漏（高负载时 taskkill /T
+    # 偶发没杀干净孙进程）留下 marker，之后每次运行这条断言都会误红（实测 11-10 19:59 一次
+    # 泄漏 → 连续 4 次 174/1；删除残留后 175/0）。先清残留，让断言只检验"本次"的进程树。
+    marker.unlink(missing_ok=True)
     if os.name == "nt":
         command = f'ping -n 4 127.0.0.1 >nul && echo late>{marker}'
     else:

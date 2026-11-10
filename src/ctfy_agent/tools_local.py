@@ -2843,9 +2843,10 @@ class LocalTools:
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("CTFY_PYTHON", sys.executable)
         # [接手 2026-11-10] 本地扩展依赖库（tools/pylibs，由 tools/fetch_pylibs.py 装）：
-        # 镜像只装了 capstone，没有 pycryptodome/gmpy2/sympy/pwntools/z3，于是本地跑
-        # crypto/pwn 时模型写的脚本 import 全挂（runs/plat 实测 CRYPTO 0/5、PWN 0/4 都卡在这）。
-        # 只对 shell 子进程生效：不动本进程、不改镜像；容器里没有该目录时行为与旧版一致。
+        # 这是**本机（Windows）外挂**：容器镜像 v7 起已内置 pwntools/Crypto/gmpy2/sympy/capstone，
+        # 本机没有 site-packages 里的这些库，于是把 tools/pylibs 挂进 shell 子进程的 PYTHONPATH，
+        # 让 crypto/pwn 时模型写的脚本 import 不挂（runs/plat 实测 CRYPTO 0/5、PWN 0/4 都卡在这）。
+        # 只对 shell 子进程生效：不动本进程；容器里没有该目录时走 site-packages，行为一致。
         _pylibs = _PYLIBS_DIR
         if _pylibs.is_dir():
             _existing = env.get("PYTHONPATH") or ""
@@ -2876,21 +2877,44 @@ class LocalTools:
         }
         if result.get("bytes_total", 0) > MAX_BODY + 2000:
             output["note"] = f"输出共 {result['bytes_total']} 字节，这里只保留首尾；需要全量请重定向到文件再分段读。"
-        # [接手 2026-11-10] 缺依赖时给出确定性事实，别让模型反复试 import：
-        # 镜像里没有 pycryptodome/gmpy2/sympy/pwntools，本地可以把它们外挂在 tools/pylibs。
+        # [接手 2026-11-10] 缺依赖时给出确定性事实，别让模型反复试 import。
+        # 运行时探测（find_spec）而非断言「镜像里有什么」：跑在旧镜像（无库）还是 v7+（有库）
+        # 都只报真话——免得模型被「镜像已内置」误导去重试必然失败的 import。
         _err = output.get("stderr") or ""
         if "ModuleNotFoundError" in _err or "No module named" in _err:
+            import importlib.util  # noqa: PLC0415 - 仅缺依赖提示需要
+
+            def _spec_ok(mod: str) -> bool:
+                try:
+                    return importlib.util.find_spec(mod) is not None
+                except Exception:  # noqa: BLE001 - 探测失败按「没有」处理
+                    return False
+
+            _probes = ("pwn", "Crypto", "gmpy2", "sympy", "capstone")
             if _PYLIBS_DIR.is_dir():
+                # 只列真正可 import 的顶层模块目录：wheel 解包产物（bin/share/*.libs/*.dist-info）不是模块；
+                # site-packages 里也有的（如本机 pip 装过 capstone）一并如实列出，不漏报可用能力
                 _tops = sorted(p.name for p in _PYLIBS_DIR.iterdir()
-                               if p.is_dir() and not p.name.endswith((".dist-info", ".data", "__pycache__")))
+                               if p.is_dir()
+                               and not p.name.endswith((".dist-info", ".data", "__pycache__", ".libs"))
+                               and p.name not in ("bin", "share", "etc", "common"))
+                _have = sorted(set(_tops) | {m for m in _probes if _spec_ok(m)})
                 output["note"] = (
                     "本机已外挂扩展库目录（PYTHONPATH 已包含 tools/pylibs）："
-                    + ("、".join(_tops[:14]) if _tops else "（空）")
+                    + ("、".join(_have[:14]) if _have else "（空）")
                     + "。缺的模块若不在其中，就别再试 import——用纯 stdlib 重写那一小段。"
                 )
             else:
-                output["note"] = (
-                    "本机没有扩展库目录（容器镜像同样只有 stdlib）：缺的第三方库不要再试，"
-                    "用纯 stdlib 实现；本地想装可跑 `python tools/fetch_pylibs.py`（需联网）。"
-                )
+                _have = [m for m in _probes if _spec_ok(m)]
+                if _have:
+                    output["note"] = (
+                        "当前 Python 环境已有：" + "、".join(_have)
+                        + "。缺的模块若不在这个清单里，就别再试 import——用纯 stdlib 重写那一小段。"
+                    )
+                else:
+                    output["note"] = (
+                        "当前 Python 环境没有任何扩展库（pwn/Crypto/gmpy2/sympy 都没有）："
+                        "缺的第三方库不要再试，用纯 stdlib 实现；本地想装可跑 "
+                        "`python tools/fetch_pylibs.py`（需联网）。"
+                    )
         return json.dumps(output, ensure_ascii=False)

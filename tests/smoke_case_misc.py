@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -42,6 +43,10 @@ def case_misc_ext(tmp: Path) -> None:
     from ctfy_agent.tools_local import LocalTools, ToolError
 
     work = tmp / "misc_ext"
+    # 幂等性修复（2026-11-10）：tmp 是跨次运行共享的固定路径，残留的 unzipped/ 会让
+    # unpack_archive 的 out_dir 避让成 unzipped-N（_unique_dir 只要目录存在就避让），
+    # 于是断言查 unzipped/ok.txt 必失败——同机第二次跑 smoke.py 必红。先清再建。
+    shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     tools = LocalTools(work, "misc-01", allow_shell=True)  # noqa: F841  构造即校验不抛
 

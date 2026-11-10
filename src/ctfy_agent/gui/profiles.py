@@ -21,7 +21,7 @@ from .settings import _update_env
 PROFILES_PATH = CONFIG_DIR / "platforms.json"
 TRASH_PATH = CONFIG_DIR / "platforms.deleted.json"
 DEFAULT_NAME = "CTFY"
-DEFAULT_TOKEN_ENV = "CTFY_TOKEN"
+DEFAULT_TOKEN_ENV = "CTFY_TOKEN"  # secret-scan: allow —— 这是环境变量「名字」，不是凭据值
 
 
 def _read_agent_json() -> dict:

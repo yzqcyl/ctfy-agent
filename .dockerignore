@@ -11,3 +11,12 @@ docs/
 .tools/
 misc-bank/
 .venv/
+# 本机外挂第三方库（tools/fetch_pylibs.py 装，Windows wheel ~91MB）：镜像构建走 pip 装
+# manylinux wheel，绝不需要这些本地二进制进 build context
+tools/pylibs/
+tools/__pycache__/
+# [v7] 正赛镜像只跑 `python -m ctfy_agent agent`（CTFY 单平台），不带：
+#   1) 可视化界面（gui/app.py、worker.py、settings.py、limits.py、onboard.py）
+#   2) 切平台用的档案与适配器（gui/platform_adapter.py、platform_worker.py、profiles.py、toolmap.py）
+# 两者都在 gui/ 包里，整包排除；Dockerfile 里有构建期断言兜底（误加回来会直接构建失败）。
+src/ctfy_agent/gui/

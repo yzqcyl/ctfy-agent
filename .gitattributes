@@ -9,3 +9,9 @@ roles/*.system.txt text eol=lf
 # ModuleNotFoundError / 命令不存在（HANDOFF-2026-11-10 §9 已记）。显式钉死，不依赖本机 core.autocrlf。
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+
+# [接手 2026-11-10] Dockerfile 必须固定 LF。
+# 原因：core.autocrlf=true 下若按默认策略把 Dockerfile 提交成 CRLF，`RUN set -eux; \`
+# 续行符后会多出 \r，Docker 构建在 Linux runner 上直接失败（shell 解析错误）。
+# 与 roles/*.system.txt 同口径：显式钉死，不依赖本机 autocrlf。
+Dockerfile text eol=lf

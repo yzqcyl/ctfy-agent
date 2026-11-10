@@ -1,5 +1,5 @@
 {
-  "mcp_url": "https://ctf2.dasctf.com/api/ai/v1/mcp",
+  "mcp_url": "https://ctfy.tsinghua.edu.cn/api/v1/mcp/",
   "timeout": 120.0,
   "connect_timeout": 40.0,
   "connect_deadline": 5400.0,
@@ -23,17 +23,7 @@
   "price_input_per_mtok": 0.0,
   "price_output_per_mtok": 0.0,
   "runs_dir": "runs",
-  "tool_map": {
-    "list_competitions": "ctf2_list_practice_grounds",
-    "list_challenges": "ctf2_list_practice_challenges",
-    "submit_flag": "ctf2_submit_flag",
-    "get_challenge": "ctf2_get_practice_challenge",
-    "stop_instance": "ctf2_user_delete_practice_id_challenges_challengeid_environment",
-    "whoami": "ctf2_agent_whoami",
-    "start_instance": "ctf2_start_challenge_environment",
-    "renew_instance": "ctf2_extend_environment",
-    "get_instance": "ctf2_get_environment"
-  },
+  "tool_map": {},
   "roles": {
     "coordinator": {
       "model": "deepseek-v4.1-flash-1017",

@@ -184,6 +184,37 @@ RUN set -eux; \
     rm -f /tmp/capstone-req.txt; \
     python -c "import capstone; assert capstone.__version__=='5.0.3', capstone.__version__; cs=capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64); ins=list(cs.disasm(bytes([0x55,0x48,0x89,0xe5]), 0x1000)); assert len(ins)==2 and ins[0].mnemonic=='push', ins; print('capstone selftest ok:', capstone.__version__, len(ins), 'insns')"
 
+# ---------- crypto/pwn 扩展库：pwntools + pycryptodome + gmpy2 + sympy（v7 新增） ----------
+# 为什么现在才装：上一轮（HANDOFF-2026-11-10-r2 §8）实测 runs/plat 26 题 CRYPTO 0/5、PWN 0/4，
+# 收尾结论反复是「镜像里没有第三方库，只能纯 stdlib」；unipickle 19 次手工拼 opcode 全被拒。
+# 模型是通过 shell() 子进程写脚本、脚本里 `import pwn/Crypto/...`，代码本体零 import——
+# 所以只要把库装进 site-packages（子进程继承环境），crypto/pwn 角色就能直接用。
+#
+# 体积口径：基线 126.5MB，门禁 400MB（tools/container_check.py 默认），可用约 270MB。
+# 本段合计约 +55~65MB（pwntools 12.3 + unicorn 15.7 + zstandard 5.3 + cryptography 4.5 +
+# pycryptodome 3.0 + gmpy2 1.8 + sympy 6.0 + 纯 Python 小依赖 ~8），仍远低于门禁。
+#
+# 为什么是「C 扩展锁 sha256 + 纯 Python 锁版本」而非全量 --require-hashes：
+# pwntools 有 24 个传递依赖，--require-hashes 要求每个都有 hash，手工维护极易漏、
+# 且任意一个依赖发新版就会让构建炸掉；这里对「带二进制 wheel、被换包体危害最大」的两个
+# C 扩展包（pycryptodome/gmpy2）单独 --require-hashes 锁 sha256，pwntools/sympy 及
+# 纯 Python 依赖链交给 pip 解析器按顶层版本约束解决（与 capstone 的「版本+sha256 双钉死」同口径地保守）。
+#
+# ⚠️ 必须放在下面「删 pip」那段之前（装完才删 pip）；wheel 都选 manylinux x86_64（CI 只建 amd64）。
+ARG PYCRYPTODOME_VERSION=4.4.0
+ARG PYCRYPTODOME_SHA256=32c1a3d98c93d92c2f2a45d6cc9c79fb8d7552aca1bd9a764209a3309bf6a7b1
+ARG GMPY2_VERSION=2.3.2
+ARG GMPY2_SHA256=c3021ec352e1b26baf4752f99d88adc9e930f115a053162c127d1c1b2f5783c2
+ARG PWNYTOOLS_VERSION=4.15.0
+ARG SYMPY_VERSION=1.14.0
+RUN set -eux; \
+    printf 'pycryptodome==%s --hash=sha256:%s\n' "${PYCRYPTODOME_VERSION}" "${PYCRYPTODOME_SHA256}" > /tmp/ext-req.txt; \
+    printf 'gmpy2==%s --hash=sha256:%s\n' "${GMPY2_VERSION}" "${GMPY2_SHA256}" >> /tmp/ext-req.txt; \
+    python -m pip install --no-cache-dir --require-hashes -r /tmp/ext-req.txt; \
+    python -m pip install --no-cache-dir "pwntools==${PWNYTOOLS_VERSION}" "sympy==${SYMPY_VERSION}"; \
+    rm -f /tmp/ext-req.txt; \
+    python -c "import Crypto, gmpy2, sympy, pwnlib; from pwn import remote, process, cyclic, p64, p32, context, ELF, asm, cyclic_find; assert len(cyclic(128))==128, 'cyclic 异常'; assert cyclic_find(p32(0x61616162))==4, 'cyclic_find 异常'; assert p64(0x41424344)==b'DCBA\x00\x00\x00\x00', 'p64 异常'; assert asm('nop')==b'\x90', 'asm 异常'; print('ext-libs selftest ok: Crypto', Crypto.__version__, '| gmpy2', gmpy2.version(), '| sympy', sympy.__version__, '| pwntools', pwnlib.__version__)"
+
 # 瘦身（主办方：镜像太大传不上去）。运行时只用 stdlib，下列都是死重量（约 20MB）：
 #   pip/setuptools/wheel/ensurepip（不安装依赖）、test 模块、idlelib/lib2to3/pydoc_data/turtledemo。
 # 另：.dockerignore 已排除 tests/docs/runs/__pycache__，ENV 里禁了运行时写 .pyc。
@@ -206,6 +237,16 @@ WORKDIR /ctfy
 # stdlib-only：只拷源码 + 角色 profile（web allow_shell / 各角色 system 提示词等；无凭据）
 COPY src/ /ctfy/src/
 COPY config/agent.json /ctfy/config/agent.json
+
+# ---------- [v7] 镜像不带 GUI / 多平台档案适配器：构建期硬校验 ----------
+# 正赛容器只跑 `python -m ctfy_agent agent`（CTFY 单平台）。src/ctfy_agent/gui/ 里是
+#   * 可视化界面：app.py / worker.py / settings.py / limits.py / onboard.py
+#   * 连接其他平台的档案与适配器：platform_adapter.py / platform_worker.py / profiles.py / toolmap.py
+# 二者对比赛毫无用处，且会把「切平台的开关」带进一个只该连 CTFY 的镜像里。.dockerignore 已把
+# 该目录排除出构建上下文；这里再断言一次（任何人把它加回来，构建当场失败而不是静默混入）。
+# 同时证明剔除后入口链路完好：attachments 对 gui 只有 main() 里一处懒加载（且捕获 ImportError
+# 按单平台继续跑），agent 主链路（agent_main→crew→solver→platform→tools_*）零 gui 依赖。
+RUN python -c "import importlib.util as u; assert u.find_spec('ctfy_agent.gui') is None, 'src/ctfy_agent/gui 不该进镜像（GUI + 多平台档案适配器）'; import ctfy_agent, ctfy_agent.agent_main, ctfy_agent.attachments, ctfy_agent.crew, ctfy_agent.solver, ctfy_agent.instance_guard, ctfy_agent.tools_local, ctfy_agent.tools_misc_ext, ctfy_agent.tools_webscan, ctfy_agent.tools_websec, ctfy_agent.tools_websql, ctfy_agent.tools_domain_ext; print('v7 image selftest ok: no gui, entrypoint imports clean')"
 
 # 平台协议检查硬性要求：用户镜像必须以 uid != 0 的非 root 用户运行
 # （root 直接被判「协议检查：发现问题 / 试运行：失败」）。
