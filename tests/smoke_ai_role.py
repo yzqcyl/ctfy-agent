@@ -218,6 +218,16 @@ def case_ai_contract(tmp: Path) -> None:
         # 12) 路由澄清：提示词写明「静态陷阱页可派 web、防御卡照样注入」（37 题最大池的走法）
         assert "agent_defense" in COORDINATOR_PROMPT, "协调者提示词没写 agent_defense 的走法"
 
+        # 12b) [规则 v2.5 审计 #8/#12] 两条纪律必须在协调者提示词里：
+        #      verify 不是穷举器（禁止批量猜值逐个试） + 平台漏洞不利用转申报
+        assert "verify_answer 不是穷举器" in COORDINATOR_PROMPT, "缺 verify 反穷举纪律"
+        assert "爆破" in COORDINATOR_PROMPT, "缺「禁止爆破提交接口」的纪律措辞"
+        assert "不得借此获利" in COORDINATOR_PROMPT, "缺平台漏洞处置纪律（规则：报告、不利用）"
+        # 12c) ai 角色 verify 纪律同步进了三源（config → roles/ai.*）
+        ai_system = (json.loads((ROOT / "config" / "agent.json").read_text(encoding="utf-8-sig"))
+                     .get("roles", {}).get("ai", {}).get("system", ""))
+        assert "有推理依据" in ai_system and "穷举" in ai_system, "ai 角色 system 缺 verify 纪律"
+
         # 13) _method_hint 门控兜底：非 web 分类但带 ASI tag 也要出卡（平台改标时不静默失效）；
         #     非 web 且无 ASI tag 仍然不出卡（不过度注入）
         from ctfy_agent.solver import Solver  # noqa: PLC0415

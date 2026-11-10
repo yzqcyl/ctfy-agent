@@ -94,3 +94,84 @@ SAMPLE / practice 机制下发若干模拟题。我们 11-09 已经用 v6.9 在 
 11-14/11-15 这两场**不考出题、只考解题**，我们现在的短板不在能力而在「别被平台形态变化坑掉」：
 配额 1→3 的互杀 bug、未知 run_mode 的弃权、智谱字段兼容——这三个都已在本轮修掉并过回归。
 剩下的关键路径是**把 v7 提审并在真实平台上跑一次**，这一步只能你来操作浏览器。
+
+---
+
+## 7. 现场监控 runbook（11-14 入围测试 / 11-15 初选赛）
+
+> ⚠️ **先记住一件事**：11-10 深夜追加的三件小改（§7.5）**还没进 v7 镜像**——commit 之后要跑
+> `build-agent-image.yml` 出 **v7.1** 并提审，否则 11-14 跑的还是没这些护栏的版本。
+> 11-14 → 11-15 之间是规则允许的更新窗口（**须登记**），那是调默认值的唯一机会。
+
+### 7.1 盯什么：每题一份 `result.json`
+
+| 字段 | 正常 | 异常 → 动作 |
+|---|---|---|
+| `stop_reason` | `done` | 见下表逐值诊断 |
+| `llm_endpoint_alert` | `""`（空） | **非空 = LLM 注入/回落问题**（平台没注入 `LLM_*`，用了镜像内本地配置）。入围/初选下应为空；非空立即查平台注入 |
+| `writeup` | `reason=… steps=… tokens=… ledger=…` | grep `degraded_run_mode` → 平台下发了我们不认识的 run_mode（已按 instance 降级跑，没弃权）；`refused` 的原因也在这里 |
+| `fully_solved`/`answers` | | 交了几个、判对几个 |
+
+`stop_reason` 逐值诊断：
+
+| 值 | 含义 | 动作 |
+|---|---|---|
+| `refused` | 注入/配置类拒绝 | 看 writeup：`unsupported run_mode=`（只剩 defence/awd/engagement）、`missing CTFY_TOKEN or LLM_API_KEY`、`unsupported LLM_FLAVOR` —— 全是**平台侧注入问题**，立即申报，别自己改 |
+| `halted` | 起不来/跑崩 | writeup：`no MCP endpoint` / `MCP connect failed`（平台侧或凭据）/ `crew failed: …`（**代码异常，立刻捞 `runs/<cid>/transcripts`**）/ `task.json missing` |
+| `cut_off` | 预算/时间烧完 | `budget_exhausted` / `wall_clock` → 当晚调 agent.json 旋钮（§7.2）重建镜像 |
+| `max_turns` | 步数烧完（含 action_loop 重复被拦动作） | transcript 里看在重复什么工具 → 提示词/断路器问题 |
+| `done` 但 `fully_solved=false` | 交了判错或没交 | `ledger=` 字段看提交记录与判错回执 |
+
+批量统计（PowerShell，对拉回来的记录目录）：
+
+```powershell
+Get-ChildItem -Recurse -Filter result.json | ForEach-Object {
+  $j = Get-Content $_.FullName -Raw | ConvertFrom-Json
+  "{0,-14} {1,-9} solved={2,-5} alert={3}" -f $_.Directory.Name, $j.stop_reason, $j.fully_solved, ($j.llm_endpoint_alert -ne '')
+} | Sort-Object
+```
+
+### 7.2 旋钮分级（诚实版：赛中途几乎改不了）
+
+| 层级 | 旋钮 | 改法 |
+|---|---|---|
+| **镜像内（赛中途不可改）** | `max_llm_calls` / `max_tokens_per_challenge` / `max_steps` / `oracle_limit` / 角色提示词 | 改 `config/agent.json` → 重建镜像。平台不注入任意 env，这些只有「允许窗口」能换 |
+| 平台下发 | `task.json.max_turns`（优先于本地一切） | 平台控制 |
+| 无旋钮 | 跑题顺序/并行度 | 平台编排，只能靠镜像内默认值间接影响 |
+
+**11-14 的真正用途 = 校准默认值**：统计 `stop_reason` 分布 + 单题 tokens/steps 中位数 →
+决定 11-15 的档位（候选：`max_steps` 12→N、单题 800k→400k）。当晚改完 → 重建 v7.2 → 提审 →
+11-15 10:00 前完成（按规则**登记**更新）。
+
+### 7.3 配额 3 的并行行为（11-14 观察点）
+
+- 3 实例并行；429 时给模型的提示写「平台团队实例配额是 N 个」（从回执文案解析）；
+  配额 ≥2 走年龄判定，**不会盲停并行兄弟任务的实例**。
+- 若「三题并行全 429」→ 看提示里的 N 是不是还是 1（平台文案/实际配额不一致），按 1 配额的旧逻辑它自己会清。
+
+### 7.4 当天 checklist
+
+开赛前：
+- [ ] 镜像审核通过，**digest 记下来**（别覆盖 v6.9；v7.1 含 §7.5 三件小改）
+- [ ] 平台状态页扫一眼
+
+跑动中（每 30 分钟）：
+- [ ] 跑一遍 §7.1 的统计命令
+- [ ] `refused`/`halted` 的题立刻捞 transcript（`runs/<cid>/transcripts/*.jsonl` 尾部 3 条）
+- [ ] `llm_endpoint_alert` 非空的题 = 注入问题，申报
+
+赛后当晚（允许窗口，须登记）：
+- [ ] 统计回填 `PROGRESS.md`；定 11-15 档位
+- [ ] 需要改就出 v7.2 提审
+- [ ] 给平台提工单问三件事（出题下发形态 / 运行记录归档 / 本队题标记）——11-15 之后就要用答案了
+
+### 7.5 本轮（11-10 深夜）追加的三件小改（规则审计终版 #6/#8/#12/#1 监控面）
+
+| 文件 | 改动 | 为什么 |
+|---|---|---|
+| `agent_main.py` | `LLM_ENDPOINT_ALLOWLIST`（手册 12 家）+ `_llm_endpoint_note()` → `result.json` 新增恒在字段 `llm_endpoint_alert` + stderr 告警（**只告警不拦截**，本地联调非白名单属正常） | 审计 #6：平台不注入 `LLM_*` 时回落本地配置 = 正式赛整场挂在 LLM 调用上；入围/初选下该字段应恒为空，非空即注入问题 |
+| `agent_main.py` | `_final_rollup` 的 writeup 追加 `degraded_run_mode='…'`（常规 instance/qa 零噪音） | 审计 #1 监控面：11-14 盯 `result.json` 就能发现「平台下发了不认识的 run_mode」 |
+| `crew.py` + `config/agent.json`(ai) + `roles/ai.*` | 两条纪律：**verify_answer 反穷举**（只验证有推理依据的候选，规则禁爆破提交接口）、**平台漏洞不利用转申报**（规则「应及时报告，不得借此获利」） | 审计 #8 残余 + #12 |
+
+回归：`smoke_agent_qa` 6/6（新增 2 用例：白名单判定 + 降级写回）、`smoke_ai_role` 新增 3 断言、
+`smoke.py` 175/0、action_loop / instance_recovery / local_tools / gate / llm_retry 全绿；`sync_roles --check` 三源一致。

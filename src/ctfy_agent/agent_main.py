@@ -50,6 +50,43 @@ DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
 # max_turns 与本地预算兜底——宁可跑不准，也不要整题弃权。
 UNSUPPORTED_RUN_MODES = ("defence", "defense", "awd", "engagement")
 
+# [规则 v2.5 §二(五)] 入围/初选可用的 12 家白名单端点 + 正式赛智谱独家端点。
+# 只用于**告警**（rollup + stderr），不用于拦截：本地联调（llm.example / Paratera 等）
+# 不在名单内属于正常，但正式赛若平台没注入 LLM_* 而回落到本地配置，这条告警就是
+# 「整场会挂在 LLM 调用上」的第一个可见信号（正式赛无公网，非白名单域名直接不可达）。
+LLM_ENDPOINT_ALLOWLIST = (
+    "api.hunyuan.cloud.tencent.com",   # 腾讯混元
+    "api.deepseek.com",                # DeepSeek 官方
+    "dashscope.aliyuncs.com",          # 阿里云百炼（compatible-mode）
+    "qianfan.baidubce.com",            # 百度千帆
+    "open.bigmodel.cn",                # 智谱（正式赛唯一）
+    "ark.cn-beijing.volces.com",       # 字节火山方舟（Coding Plan 地址除外）
+    "api.moonshot.cn",                 # Kimi
+    "spark-api-open.xf-yun.com",       # 讯飞星火
+    "api.minimax.cn",                  # MiniMax
+    "api.stepfun.com",                 # 阶跃星辰
+    "api.baichuan-ai.com",             # 百川
+    "api.xiaomimimo.com",              # 小米 MiMo
+)
+
+
+def _llm_endpoint_note(base_url: str) -> str:
+    """LLM 端点不在规则白名单内时返回告警文本（在名单内返回空串）。"""
+    try:
+        host = (urlparse(str(base_url or "")).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if not host:
+        return "LLM 端点为空：无法核对规则白名单（检查 LLM_BASE_URL 注入）"
+    for allow in LLM_ENDPOINT_ALLOWLIST:
+        if host == allow or host.endswith("." + allow):
+            return ""
+    return (
+        f"LLM 端点 {host} 不在赛事规则 v2.5 白名单内（12 家 + 正式赛智谱）。"
+        "本地联调属正常；正式赛出现此告警 = 平台未注入 LLM_* 且回落到了本地配置，"
+        "无公网环境下所有 LLM 调用都会失败——立即人工核查注入。"
+    )
+
 _RESULT_PATH: Path | None = None
 _CHALLENGE_ID = ""
 
@@ -126,7 +163,8 @@ def _split_host_port(value: str) -> tuple[str, int | None]:
 
 def _rollup(*, challenge_id="", instance_id="", answers=None, solved=None,
             fully_solved=False, turns=0, tool_calls_made=0, input_tokens=0,
-            output_tokens=0, stop_reason="done", writeup="") -> dict:
+            output_tokens=0, stop_reason="done", writeup="",
+            llm_endpoint_alert="") -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
         "challenge_id": challenge_id,
@@ -140,6 +178,9 @@ def _rollup(*, challenge_id="", instance_id="", answers=None, solved=None,
         "output_tokens": output_tokens,
         "stop_reason": stop_reason,
         "writeup": writeup,
+        # 空串 = 端点在白名单内（或没走到构建 config）。非空 = 规则审计 #6 的告警，
+        # 11-14/15 盯 result.json 时顺手看这个字段即可。
+        "llm_endpoint_alert": llm_endpoint_alert,
     }
 
 
@@ -491,6 +532,11 @@ def _final_rollup(store: Store, challenge_id: str, summary: dict, config: Config
         f"tokens={summary.get('tokens_spent', 0)} "
         f"ledger={json.dumps(ledger, ensure_ascii=False)}"
     )
+    # [规则 v2.5 审计 #1 监控面] 降级跑的题要把「按什么模式跑的」写进 result.json，
+    # 11-14 入围测试盯盘时 grep degraded_run_mode 就能定位平台下发了我们不认识的 run_mode。
+    _degraded = str(config.extra.get("degraded_run_mode") or "")
+    if _degraded and _degraded != "(empty)":
+        writeup += f" degraded_run_mode={_degraded!r}(按 instance 通用链路降级跑)"
 
     return _rollup(
         challenge_id=challenge_id,
@@ -504,6 +550,7 @@ def _final_rollup(store: Store, challenge_id: str, summary: dict, config: Config
         output_tokens=int(usage.get("completion_tokens") or 0),
         stop_reason=_map_stop_reason(reason),
         writeup=writeup[:2000],
+        llm_endpoint_alert=str(config.extra.get("llm_endpoint_alert") or ""),
     )
 
 
@@ -612,6 +659,13 @@ def run_agent(
             return 0
 
     config = _build_config(task, work_dir, mcp_url, env)
+
+    # [规则 v2.5 审计 #6] 端点白名单告警：只记录不拦截（本地联调非白名单属正常）。
+    # 正式赛若平台未注入 LLM_* 回落本地配置，这条是「整场挂在 LLM 调用上」的第一可见信号。
+    _endpoint_note = _llm_endpoint_note(config.llm_base_url)
+    if _endpoint_note:
+        config.extra["llm_endpoint_alert"] = _endpoint_note
+        _log(f"[warn] {_endpoint_note}")
 
     # 6) 平台连接（或复用注入）
     if platform is None:
