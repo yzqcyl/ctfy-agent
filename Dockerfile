@@ -9,12 +9,16 @@ FROM python:3.12-slim
 # grep 不在 coreutils 里、是独立 Debian 包；curl + ca-certificates 供 https 探测；
 # bash 供 web 角色的 shell 工具（模型会用它跑探测，缺了 shell 16/16 全灭）；
 # passwd 提供 useradd（下面要建非 root 用户；debian slim 不保证自带，显式装上最稳）。
-# binutils（v7）：pwntools 的 asm()/disasm()/ROP 依赖 binutils 的 as/objdump/readelf——
-# 没有它 `asm('nop')` 直接抛 PwnlibException（实测 v7 首次构建 run 31 就死在这），
-# 而 pwn 题写 shellcode 绕不开 asm。装它约 +25~35MB，基线 126.5MB + 扩展库 ~60MB 后仍远低于 400MB 门禁。
+#
+# gcc + libc6-dev + binutils（v7）：pwntools 的 asm() 是「cpp 预处理 → as 汇编」两步，
+# 少任何一个都抛 PwnlibException——实测 v7 构建 run 31 缺 as、run 32 缺 cpp 连续挂两次。
+# 顺带 gcc/libc6-dev 让模型能在容器里本地编译 C 漏洞利用（pwn 常见打法：写 poc.c 编译跑通
+# 再打远程）。disasm()/ROP 还要 binutils 的 objdump/readelf。
+# 体积：合计约 +85MB，基线 126.5 + 扩展库 ~60 后约 280MB，仍在 400MB 门禁内（tools/container_check.py）。
+# 注意 libc6-dev 必须显式列出：gcc 只 Recommend 它，本行是 --no-install-recommends，不写就没有 stdio.h。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl grep coreutils ca-certificates bash passwd binutils \
+        curl grep coreutils ca-certificates bash passwd binutils gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- P2：web 工具链（构建期安装；运行期无网络，所以必须烤进镜像） ----------
@@ -216,6 +220,9 @@ RUN set -eux; \
     python -m pip install --no-cache-dir --require-hashes -r /tmp/ext-req.txt; \
     python -m pip install --no-cache-dir "pwntools==${PWNYTOOLS_VERSION}" "sympy==${SYMPY_VERSION}"; \
     rm -f /tmp/ext-req.txt; \
+    for b in as cpp gcc objdump readelf; do \
+        command -v "$b" >/dev/null || { echo "缺工具链 $b（pwntools asm = cpp 预处理 + as 汇编，ROP/disasm 要 objdump/readelf）" >&2; exit 1; }; \
+    done; \
     python -c "import Crypto, gmpy2, sympy, pwnlib; from pwn import remote, process, cyclic, p64, p32, context, ELF, asm, cyclic_find; assert len(cyclic(128))==128, 'cyclic 异常'; assert cyclic_find(p32(0x61616162))==4, 'cyclic_find 异常'; assert p64(0x41424344)==b'DCBA\x00\x00\x00\x00', 'p64 异常'; assert asm('nop')==b'\x90', 'asm 异常'; print('ext-libs selftest ok: Crypto', Crypto.__version__, '| gmpy2', gmpy2.version(), '| sympy', sympy.__version__, '| pwntools', pwnlib.__version__)"
 
 # 瘦身（主办方：镜像太大传不上去）。运行时只用 stdlib，下列都是死重量（约 20MB）：
