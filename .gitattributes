@@ -3,3 +3,9 @@
 # tests/smoke_ai_role.py（config roles.ai.system == roles/ai.system.txt）与
 # tests/smoke.py misc 防漂移用例（按 "\n" 逐字比对）会在 Windows 上假红。
 roles/*.system.txt text eol=lf
+
+# [接手 2026-11-10] Windows 启动器必须固定 CRLF。
+# 原因：tools/shims/*.cmd 与 run_gui.cmd 若被 checkout 成 LF，cmd.exe 解析失败会表现为
+# ModuleNotFoundError / 命令不存在（HANDOFF-2026-11-10 §9 已记）。显式钉死，不依赖本机 core.autocrlf。
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

@@ -45,6 +45,7 @@ def make_platform(config: Config, *, verbose: bool = False) -> CtfyPlatform:
         config.mcp_url,
         config.token,
         timeout=config.timeout,
+        connect_timeout=config.connect_timeout,
         tool_map=config.extra.get("tool_map") or {},
         verbose=verbose,
     )
@@ -332,11 +333,38 @@ def cmd_challenges(args) -> int:
         print("没有可用的比赛。先跑 `run.cmd competitions` 看列表，再用 --competition <id> 指定。", file=sys.stderr)
         return EXIT["config"]
 
+    # P2a 修复：平台 list_competition_challenges 的 limit 默认 50，题库超 50 题会漏页
+    # （SQLILABS 实际 69 题只拉到 50）。这里按页翻取全量；--limit 0 表示全量。
+    page_size = 200
+    start_offset = int(getattr(args, "offset", 0) or 0)
+    limit = int(getattr(args, "limit", 0) or 0)
+    all_items: list = []
+    raw_err = ""
+    offset = start_offset
     try:
-        raw = platform.list_challenges(competition_id)
+        while True:
+            page = platform.list_challenges(competition_id, limit=page_size, offset=offset)
+            if isinstance(page, str):
+                raw_err = page  # 平台返回非 JSON/错误文本
+                break
+            items = [x for x in (page or []) if isinstance(x, dict)]
+            all_items.extend(items)
+            if limit and len(all_items) >= limit:
+                all_items = all_items[:limit]
+                break
+            if len(items) < page_size:
+                break
+            offset += page_size
+            if offset > 20000:  # 护栏：异常分页防死循环
+                break
     except Exception as exc:
         print(f"FAIL {exc}", file=sys.stderr)
         return EXIT["network"]
+
+    if raw_err and not all_items:
+        raw = raw_err
+    else:
+        raw = all_items
 
     if isinstance(raw, str):
         print(raw)
@@ -718,6 +746,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_chal = sub.add_parser("challenges", help="拉取题单并同步到 state")
     p_chal.add_argument("--competition", help="比赛 ID；不填则自动选用你已报名的比赛")
+    p_chal.add_argument("--limit", type=int, default=0, help="最多拉取题数（0=全量，默认）；平台实现 limit 默认 50 会漏页")
+    p_chal.add_argument("--offset", type=int, default=0, help="起始偏移（0=从头）")
 
     sub.add_parser("state", help="查看本地 state")
 

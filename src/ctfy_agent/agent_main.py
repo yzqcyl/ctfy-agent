@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import signal
 import sys
@@ -256,6 +257,11 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     # 读超时：长上下文+长输出的单次生成实测能挂满 300s（120s 默认太紧）。容器侧抬到 240s；
     # 配合 llm._post 把 TimeoutError 归一成可重试 LLMError，单次超时不再击穿整题。
     config.timeout = _as_float(env.get("AGENT_TIMEOUT"), 240.0)
+    # P1 修复：握手超时与 tools/call、LLM 分离。握手（initialize/tools/list）在容器连 ctfy.io
+    # 时会 TLS/SSE 挂死，用 40s 短超时让「平台恢复后 1 分钟内重连」；connect_deadline 保留
+    # 60–90 分钟总窗口，避免平台整机故障时快速失败丢掉 SAMPLE-001/002 这类熬过去的题。
+    config.connect_timeout = _as_float(env.get("AGENT_CONNECT_TIMEOUT"), 40.0)
+    config.connect_deadline = _as_float(env.get("AGENT_CONNECT_DEADLINE"), 5400.0)
 
     # 归一化角色 profile：网关会按 LLM_MODEL 改写 model（多模型名是误导），
     # 且 agent.json 里 web 的 max_tokens=4096 会截断思考块——统一到容器默认值。
@@ -581,19 +587,28 @@ def run_agent(
 
     # 6) 平台连接（或复用注入）
     if platform is None:
-        platform = CtfyPlatform(mcp_url, token, timeout=config.timeout)
+        platform = CtfyPlatform(mcp_url, token, timeout=config.timeout,
+                                 connect_timeout=config.connect_timeout)
         connect_err = None
-        for attempt in range(4):
-            if attempt:
-                # [v6.8] 平台整机重启期间 DNS/建连会短暂失败（实测 v6.7 SAMPLE-001
-                # "Temporary failure in name resolution"）：退避重试，别一次失败就收工。
-                time.sleep(min(5 * (2 ** (attempt - 1)), 40))
+        # P1 修复：改 deadline 窗口（默认 90 分钟）+ 短握手超时 + 封顶退避/抖动。
+        # 旧版 `range(4)` × 240s 握手最坏 ~112 分钟，且平台恢复后最长 ~240s+backoff 才重连；
+        # 现在握手失败快速返回，平台一恢复就在 ~40s 内重连，总窗口仍兜住 60–90 分钟故障。
+        deadline = max(float(config.connect_deadline or 5400.0), 1.0)
+        started = time.monotonic()
+        attempt = 0
+        while True:
             try:
                 platform.connect()
                 connect_err = None
                 break
             except Exception as exc:  # noqa: BLE001
                 connect_err = exc
+                attempt += 1
+                if time.monotonic() - started >= deadline:
+                    break
+                # 退避封顶 40s + 0~1.5s 抖动（多容器同时建连时错峰，避免叠加洪峰）
+                delay = min(5.0 * (2 ** min(attempt - 1, 6)), 40.0) + random.uniform(0.0, 1.5)
+                time.sleep(delay)
         if connect_err is not None:
             answers, solved, inst = _state_answers(config, challenge_id)
             _write_rollup(

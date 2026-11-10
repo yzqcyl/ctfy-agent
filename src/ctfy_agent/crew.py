@@ -146,23 +146,27 @@ def profile_calls_cap(profile: dict | None, default_cap: int) -> int:
     return max(1, int(default_cap) + int((profile or {}).get("calls_per_step_add") or 0))
 
 
+# 各角色步数上限统一为一档（取历史最高值）：原来 misc=16 / 其余=20 / coordinator=40，
+# 实测 pwn 在容器实例还没就绪时就把 20 步烧完了，角色之间能力不对等。
+ROLE_MAX_STEPS = 40
+
 # 默认角色。config/agent.json 的 roles 键可覆盖（会进 extra）。
 DEFAULT_ROLES: dict[str, dict] = {
-    "coordinator": {"max_steps": 24, "platform": ["read", "instance", "oracle", "submit"], "local": []},
-    "web": {"max_steps": 20, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request"], "keep_tail": 5, "facts_max": 12, "facts_chars": 780},
-    "rev": {"max_steps": 20, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell"], "keep_tail": 4},
-    "crypto": {"max_steps": 20, "allow_shell": True, "platform": ["read", "instance", "oracle"], "local": ["shell"]},
-    "misc": {"max_steps": 16, "allow_shell": False, "platform": ["read", "instance"], "local": ["http_request"]},
+    "coordinator": {"max_steps": ROLE_MAX_STEPS, "platform": ["read", "instance", "oracle", "submit"], "local": []},
+    "web": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request"], "keep_tail": 5, "facts_max": 12, "facts_chars": 780},
+    "rev": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell"], "keep_tail": 4},
+    "crypto": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance", "oracle"], "local": ["shell"]},
+    "misc": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["read", "instance"], "local": ["http_request"]},
     # pwn/ai 与 config/agent.json 的 roles 键对齐：DEFAULT_ROLES 是「角色丢失时的兜底」，
     # 缺了这两条，agent.json 一旦裁剪/丢失 pwn/ai，这两类题会无人可派（审计发现：
     # agent.json 之外没有任何兜底来源）。工具面按 agent.json 的同名角色抄全，避免兜底退化。
-    "pwn": {"max_steps": 20, "allow_shell": True,
+    "pwn": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True,
             "platform": ["read", "instance"],
             "local": ["shell", "elfpeek", "tcp", "tcp_batch", "netcheck"]},
-    # [web-ai-gap 2026-10-30] ai 兜底按 agent.json 抄全（20 步、开 shell、
-    # local 补 shell/decode_blob），避免 config 丢失时退化成「无载荷构造」的旧面。
+    # [web-ai-gap 2026-10-30] ai 兜底按 agent.json 抄全（开 shell、local 补 shell/decode_blob），
+    # 避免 config 丢失时退化成「无载荷构造」的旧面。
     # platform 用组名：oracle 组 = verify_answer + verify_exploit，校验通道无需单列。
-    "ai": {"max_steps": 20, "allow_shell": True,
+    "ai": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True,
            "platform": ["read", "instance", "oracle"],
            "local": ["http_request", "http_map", "chat", "shell", "decode_blob"]},
 }

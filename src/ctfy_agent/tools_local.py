@@ -246,6 +246,16 @@ MAP_PROBE_TIMEOUT = 6.0     # probe 单请求超时
 MAP_TIMEOUT = 15            # crawl 抓页面超时
 # 探测路径：AI 栈身份路径在前（决定性特征，来自 ctf-ai-infra 技能卡：按特征定型，不猜端口），
 # 通用文档/工具面在后。摸到组件就该转打法，不是继续枚举端点。
+# Windows 兼容层：把 head/tail/grep/wc/xxd 用 Python shim 补上。
+# 模型天然写 Linux 风格命令，而本地 shell 是 cmd —— 实测「工具被拒绝」占全部调用的
+# 8~12%，约一半是这类命令不存在。装上 shim 后这些命令直接可用，不再浪费一整轮。
+_SHIM_DIR = Path(__file__).resolve().parents[2] / "tools" / "shims"
+
+
+def _shims_available() -> bool:
+    return (_SHIM_DIR / "shim.py").is_file() and (_SHIM_DIR / "head.cmd").is_file()
+
+
 PROBE_PATHS = (
     "/api/version", "/system_stats", "/api/tags", "/api/config", "/config",
     "/v1/models", "/console/api/setup", "/metrics",
@@ -827,7 +837,7 @@ class LocalTools:
                 port_int = int(port) if str(port if port is not None else "").isdigit() else None
                 self.allow_instance(host, port_int)
             for inner in value.values():
-                if isinstance(inner, (dict, list)):
+                if isinstance(inner, (dict, list, str)):
                     self._walk(inner, depth + 1)
         elif isinstance(value, list):
             for inner in value:
@@ -835,13 +845,63 @@ class LocalTools:
         elif isinstance(value, str):
             self._allow_url(value)
 
+    BARE_ENDPOINT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*):(\d{1,5})$")
+    BARE_HOST = re.compile(
+        r"^(?:\d{1,3}(?:\.\d{1,3}){3}|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})$")
+
     def _allow_url(self, text: str) -> None:
-        try:
-            parsed = urlparse(text)
-            if parsed.hostname:
-                self.allow_instance(parsed.hostname, parsed.port)
-        except Exception:
-            pass
+        """从字符串里提取可访问端点：URL、裸 host:port、裸主机名都要认。
+
+        平台常见形状（DASCTF）：access_url = "xxx.tcp-ctf2.dasctf.com:9999"，
+        没有 scheme，urlparse 会当成路径而拿不到 hostname，必须单独识别。
+        注意只认「像端点」的字符串，否则题面描述里的普通单词会被误登记成主机。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return
+        match = self.BARE_ENDPOINT.match(text)
+        if match:
+            self.allow_instance(match.group(1), int(match.group(2)))
+            return
+        if "://" in text:
+            try:
+                parsed = urlparse(text)
+                if parsed.hostname:
+                    self.allow_instance(parsed.hostname, parsed.port)
+            except Exception:
+                pass
+            return
+        if self.BARE_HOST.match(text):
+            self.allow_instance(text, None)
+
+    @staticmethod
+    def _host_root(host: str) -> str:
+        """去掉最左边一段，得到「根域」：a.node4.ctfy.run → node4.ctfy.run。"""
+        parts = (host or "").split(".")
+        return ".".join(parts[1:]) if len(parts) > 2 else (host or "")
+
+    def _same_platform_host(self, host: str) -> bool:
+        """同一平台下发的主机（换节点/换子域名）放行。
+
+        平台会把实例从一个子域名换到同域的另一个（实测 sa5bkcyyu6xqmg6kt.node4.ctfy.run
+        被当成「非本题实例」拒了 17 次）。判据：
+          * 目标是 IP 时**只允许精确匹配**（下面会先做精确检查，走到这里说明不等）
+          * 目标必须是 ≥3 段域名（否则 root 等于自身，没有意义，也防误放行）
+          * 目标的根域 = 某个已登记主机/端点的根域
+        这样只放行「同一平台节点下的兄弟实例」，第三方域名仍会被拒。
+        """
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host or ""):
+            # 关键：IP 不能走「去首段」逻辑 —— 10.0.0.5 的 root 会变成 0.0.5，
+            # 从而把 99.0.0.5 这类完全不同的 IP 也放行（白名单绕过）。
+            return False
+        root = self._host_root(host)
+        if not root or root == host or "." not in root:
+            return False
+        roots = {self._host_root(h) for h in self.allowed_hosts}
+        for ep in self.allowed_endpoints:
+            roots.add(self._host_root(ep.rsplit(":", 1)[0]))
+        roots.discard("")
+        return root in roots
 
     def _check_target(self, url: str) -> None:
         parsed = urlparse(url)
@@ -865,6 +925,8 @@ class LocalTools:
             # 否则访问 https://host/ 会被「只登记了 host:443」误拦（CTFARENA-035 实测）。
             port = 443 if parsed.scheme == "https" else 80
         if f"{host}:{port}" in self.allowed_endpoints:
+            return
+        if self._same_platform_host(host):
             return
         raise ToolError(
             f"合规拦截：{host} 不是平台为本题下发的实例地址。"
@@ -891,6 +953,8 @@ class LocalTools:
         if host in self.allowed_hosts:
             return
         if port is not None and f"{host}:{int(port)}" in self.allowed_endpoints:
+            return
+        if self._same_platform_host(host):
             return
         raise ToolError(
             f"合规拦截：{host}{':' + str(port) if port else ''} 不是平台为本题下发的实例端点。"
@@ -939,6 +1003,30 @@ class LocalTools:
 
     # ---------- 执行 ----------
 
+    # write_file 的参数别名（模型常用这些叫法）
+    _ARG_ALIASES = {
+        "path": ("file", "filename", "filepath", "file_path", "fname"),
+        "content": ("text", "data", "body", "value", "code"),
+    }
+
+    @classmethod
+    def _apply_arg_aliases(cls, name: str, arguments: dict, sig) -> dict:
+        """把模型常用的别名参数映射成工具真实参数名（目前只对 write_file）。
+
+        实测 CTFY 历史里有 27 次「write_file() missing 2 required positional arguments」，
+        都是模型把 path/content 写成了 file/text/data —— 映射一下即省掉一整轮重试。
+        """
+        if name != "write_file":
+            return arguments
+        for param, aliases in cls._ARG_ALIASES.items():
+            if param in arguments or param not in sig.parameters:
+                continue
+            for alias in aliases:
+                if alias in arguments:
+                    arguments[param] = arguments.pop(alias)
+                    break
+        return arguments
+
     def call(self, name: str, arguments: dict | None = None) -> str:
         """按签名分发，只接受工具真实声明的参数。
 
@@ -956,6 +1044,7 @@ class LocalTools:
             return self._call_domain_tool(name, arguments)
         fn = getattr(self, name)
         sig = inspect.signature(fn)
+        arguments = self._apply_arg_aliases(name, arguments, sig)
         accepted: dict = {}
         dropped: list[str] = []
         for key, value in arguments.items():
@@ -1705,12 +1794,14 @@ class LocalTools:
     def fuzz(self, mode: str = "dir", base: str = "", url: str = "", wordlist: str = "common",
              words: list | None = None, ext: str = "",
              match_codes: str = FUZZ_MATCH_CODES_DEFAULT,
-             filter_size: int = 0, max_results: int = 40, timeout_s: int = 45) -> str:
+             filter_size: int = 0, filter_codes: str = "", filter_regex: str = "",
+             max_results: int = 40, timeout_s: int = 45) -> str:
         """用内置字典做路径/参数发现（见 tools_webscan.FUZZ_SPEC）。"""
         return _webscan_fuzz(
             mode=mode, base=base, url=url, wordlist=wordlist, words=words, ext=ext,
-            match_codes=match_codes, filter_size=filter_size, max_results=max_results,
-            timeout_s=timeout_s,
+            match_codes=match_codes, filter_size=filter_size,
+            filter_codes=filter_codes, filter_regex=filter_regex,
+            max_results=max_results, timeout_s=timeout_s,
             check_target=self._check_target,
             record=self._fuzz_record,
             work_dir=self._sandbox_dir(),
@@ -2515,21 +2606,66 @@ class LocalTools:
         return words
 
     @classmethod
+    def _rewrite_quotes(cls, command: str) -> str:
+        """单引号 → 双引号（仅在不产生歧义时）。
+
+        cmd 不认单引号，但盲目替换会破坏含 % ! ^ 的内容（cmd 会做变量展开/转义），
+        所以只在「整体没有双引号、单引号成对、内容不含这些特殊字符」时才改写，
+        其余情况保持原样交给守卫拒绝（并提示改用 write_file + python 脚本）。
+        """
+        if '"' in command or command.count("'") % 2 != 0:
+            return command
+        chunks = re.findall(r"'([^']*)'", command)
+        if not chunks:
+            return command
+        if any(("!" in c) or ("%" in c) or ("^" in c) for c in chunks):
+            return command
+        return re.sub(r"'([^']*)'", r'"\1"', command)
+
+    @staticmethod
+    def _outside_dquotes(command: str) -> str:
+        """返回「双引号之外」的字符串（双引号内的内容抹成空格）。
+
+        cmd 里双引号内的单引号/<< 都是字面量：
+          python -c "print('x')"   完全合法
+          python -c "print(1 << 2)" 完全合法
+        原实现直接 `"'" in command` / `"<<" in command` 判断，把这两种常见写法误拒了。
+        双引号数量为奇数时无法可靠判断，保守起见整串返回（维持原来的严格行为）。
+        """
+        if command.count('"') % 2 != 0:
+            return command
+        out: list[str] = []
+        inside = False
+        for ch in command:
+            if ch == '"':
+                inside = not inside
+                out.append(" ")
+                continue
+            out.append(" " if inside else ch)
+        return "".join(out)
+
+    @classmethod
     def _windows_shell_guard(cls, command: str) -> str | None:
         # 已被 _windows_rewrite 换成等价物的命令不再列入（ls/cat/pwd/which/cp/mv），
         # 只保留「有叫法差异但无语义等价物」或「改写不安全」的命令。
         unix_only = ("grep", "head", "tail", "wc", "sed", "awk", "xxd", "sh", "bash")
+        if _shims_available():
+            # 前五个由 tools/shims 提供 Windows 实现，不再拦截；sed/awk 太复杂不做 shim
+            unix_only = ("sed", "awk", "sh", "bash")
         cmds = cls._windows_command_words(command)
+        outside = cls._outside_dquotes(command)
         notes: list[str] = []
         missing = sorted({c for c in cmds if c in unix_only})
         if missing:
             notes.append(f"Windows shell 无 {'/'.join(missing)}；文本处理改用 http_request 的 grep/offset")
         if "python3" in cmds:
             notes.append("Windows 上解释器叫 `python`（不是 python3）")
-        if "<<" in command:
+        if "<<" in outside:
             notes.append("Windows cmd 不支持 heredoc(<<)，改 write_file 写脚本再跑，或 python -c")
-        if "'" in command:
-            notes.append("Windows cmd 不认单引号，用双引号")
+        if "'" in outside:
+            notes.append(
+                "Windows cmd 不认单引号：把外层单引号换成双引号即可；"
+                "若代码里本来就要用双引号（无法安全自动改写），改用 write_file 写 .py 再 `python x.py` 最稳")
         return "；".join(notes) if notes else None
 
     # B2：Windows cmd 里「叫法不同」但不是「能力缺失」的命令 → 安全等价物。
@@ -2583,6 +2719,7 @@ class LocalTools:
         # 与其让 cmd 吐一句没用的英文报错，不如提前把模型指回 http_request 的 grep/offset。
         if os.name == "nt":
             rewritten = self._windows_rewrite(command)   # B2：先做安全别名改写（python3→python、ls→dir…）
+            rewritten = self._rewrite_quotes(rewritten)  # 单引号 → 双引号（安全时）
             if rewritten != command:
                 command = rewritten
             hint = self._windows_shell_guard(command)
@@ -2596,9 +2733,13 @@ class LocalTools:
         # 应用商店占位符（实测会报 "Python was not found"），模型写脚本时就会踩空。
         env = dict(os.environ)
         interpreter_dir = str(Path(sys.executable).parent)
-        env["PATH"] = interpreter_dir + os.pathsep + env.get("PATH", "")
+        search = interpreter_dir
+        if _shims_available():
+            search = str(_SHIM_DIR) + os.pathsep + search
+        env["PATH"] = search + os.pathsep + env.get("PATH", "")
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("CTFY_PYTHON", sys.executable)
 
         try:
             # P0-2：有界收割 + 超时杀整棵进程树（旧写法是 capture_output 全量进内存后切片）

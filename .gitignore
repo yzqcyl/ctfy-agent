@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# 平台档案（含各平台 MCP 地址/工具映射，属本机状态）
+config/platforms.json
+config/platforms.deleted.json
+
 # 运行产物
 runs/
 logs/

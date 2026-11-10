@@ -130,9 +130,10 @@ class PlatformError(RuntimeError):
 
 
 class CtfyPlatform:
-    def __init__(self, mcp_url: str, token: str, *, timeout: float = 30.0, tool_map: dict | None = None,
-                 verbose: bool = False):
-        self.client = McpHttpClient(mcp_url, token, timeout=timeout, verbose=verbose)
+    def __init__(self, mcp_url: str, token: str, *, timeout: float = 30.0, connect_timeout: float | None = None,
+                 tool_map: dict | None = None, verbose: bool = False):
+        self.client = McpHttpClient(mcp_url, token, timeout=timeout, connect_timeout=connect_timeout,
+                                    verbose=verbose)
         self.tool_map = dict(tool_map or {})
         self.tools: list[dict] = []
         self._by_name: dict[str, dict] = {}

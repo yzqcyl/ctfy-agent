@@ -473,25 +473,32 @@ class Solver:
         return names
 
     def _find_live_instance(self, challenge_id: str) -> dict | None:
-        """查平台已有实例，只复用明确属于本题的那条（防攻击到别题/别队的实例）。"""
+        """查平台已有实例，只复用明确属于本题的那条（防攻击到别题/别队的实例）。
+
+        P2b 修复：优先用 schema 里的 `challenge_id` 精确过滤（比 `q` 模糊匹配更稳），
+        命中字段改用 instance_guard.instance_challenge_id（兼容 challenge 是 dict 的情况）。
+        """
+        from .instance_guard import instance_challenge_id  # noqa: PLC0415 - 与 reap 同款延迟导入
+
         list_name = self.platform.try_resolve("list_instances")
         if not list_name:
             return None
-        try:
-            text = self.platform.call_text(list_name, {"q": challenge_id})
-        except Exception:
-            return None
-        data = self.platform._as_json(text)
-        items: list = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = data.get("instances") or data.get("items") or data.get("data") or []
-        if not isinstance(items, list):
-            return None
-        for it in items:
-            if isinstance(it, dict) and str(it.get("challenge_id") or it.get("challenge") or "") == challenge_id:
-                return it
+        for filter_args in ({"challenge_id": challenge_id}, {"q": challenge_id}):
+            try:
+                text = self.platform.call_text(list_name, filter_args)
+            except Exception:  # noqa: BLE001 - 读列表失败绝不能毁掉本流程
+                continue
+            data = self.platform._as_json(text)
+            items: list = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("instances") or data.get("items") or data.get("data") or []
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if isinstance(it, dict) and instance_challenge_id(it) == challenge_id:
+                    return it
         return None
 
     @staticmethod
@@ -651,6 +658,14 @@ class Solver:
         )
         self.on_event("instance_guard", {"note": summarize(guard), "detail": guard})
         if not guard.get("stopped"):
+            # P2b 修复：槽位可能被「同题」实例占着（reap 会 keep 本题实例 → stopped 为空）。
+            # 这正是我们要用的实例：直接认领复用，而不是让 start_instance 反复撞上游限流。
+            # 实测 SQLILABS-051：平台已有本题 ready 实例时 start_instance 报 "Rate limited by
+            # upstream API"（其实是被占槽位），旧逻辑走到这里返回 None → 模型空转重试烧 token。
+            live = self._find_live_instance(challenge_id)
+            if isinstance(live, dict):
+                self.on_event("instance_guard", {"note": f"槽位被同题实例占着，直接复用（id={live.get('id')}）"})
+                return live
             return None  # 槽位不是被残留实例占着，重试没有意义
         # [fix 2026-11-03] 记账下沉到 _start_with_backoff，此处不再前置 record_call（审计 B-2）。
         return self._start_with_backoff(challenge_id, start_name)

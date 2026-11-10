@@ -153,20 +153,36 @@ def tcp(host: str, port: int, payload: str = "", hex_mode: bool = False,
 
     t0 = time.time()
     sock = _connect(host, int(port), min(10.0, total_timeout), tls=bool(tls), sni=sni)
+    closed_early = False
+    send_failed = ""
     try:
-        # 先尝试读 banner（很多 pwn/crypto 服务先给提示再等输入），无 banner 也不失败
+        # 先尝试读 banner（很多 pwn/crypto 服务先给提示再等输入），无 banner 也不失败。
+        # 读到 max_recv 或 0.4s 空闲为止：大 banner 不再被硬截成 4KB。
+        banner = b""
         try:
             sock.settimeout(0.4)
-            banner = sock.recv(4096)
-        except (socket.timeout, OSError):
-            banner = b""
-        if raw:
+            while len(banner) < int(max_recv):
+                chunk = sock.recv(min(4096, int(max_recv) - len(banner)))
+                if not chunk:
+                    closed_early = True
+                    break
+                banner += chunk
+                if expect and expect.encode("utf-8", "surrogateescape") in banner:
+                    break
+        except socket.timeout:
+            pass
+        except OSError:
+            # 连上就被 RST：典型的「明文打 TLS 端口」，先记下来，等下给提示
+            if not banner:
+                closed_early = True
+        if raw and not closed_early:
             try:
                 sock.sendall(raw)
             except OSError as exc:
-                raise DomainToolError("发送失败：%s" % exc) from None
+                # 发送失败也要把已经读到的 banner 带回去，不能整条丢掉
+                send_failed = "发送失败（%s）" % exc
         body = _recv_until(sock, expect.encode("utf-8", "surrogateescape") if expect else None,
-                           float(read_timeout), int(max_recv))
+                           float(read_timeout), int(max_recv)) if not closed_early else b""
     finally:
         try:
             sock.close()
@@ -176,10 +192,20 @@ def tcp(host: str, port: int, payload: str = "", hex_mode: bool = False,
     parts = ["连接 %s:%s 成功（往返 %.0f ms，发送 %d 字节）" % (host, port, ms, len(raw))]
     if banner:
         parts.append(_fmt_stream(banner, "banner"))
+    if send_failed:
+        parts.append(send_failed)
     if body:
         parts.append(_fmt_stream(body, "回显"))
-    elif not banner:
-        parts.append("未收到任何数据（连接建立但服务端未回包；可能要先发协议头/换端口）")
+    if banner[:2] == b"\x15\x03":
+        parts.append("检测到 TLS alert（0x15 03）：这个端口是 TLS 端点，请用 tls=true 重试。")
+    elif not banner and not body and not send_failed:
+        if closed_early:
+            parts.append(
+                "服务端在交换任何数据前就关闭了连接。最常见原因是**明文连了 TLS 端口**"
+                "（平台 access_url 常在详情里标 tls）：请用 tls=true 重试；"
+                "也可能是实例后端还没就绪，可先用 netcheck（tls=True）判定链路。")
+        else:
+            parts.append("未收到任何数据（连接建立但服务端未回包；可能要先发协议头/换端口）")
     if expect and body and expect.encode() in body:
         parts.append("已命中 expect=%r" % expect)
     return _clip("\n".join(parts))

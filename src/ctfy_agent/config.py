@@ -22,6 +22,12 @@ DEFAULTS = {
     # 平台侧
     "mcp_url": "https://ctfy.tsinghua.edu.cn/api/v1/mcp/",
     "timeout": 120.0,
+    # 握手（initialize / tools/list / notify）专用超时：容器连 ctfy.io 会 TLS/SSE 挂死，
+    # 用短超时让「平台恢复后被 1 分钟内重连」；tools/call 与 LLM 仍走 timeout（长）。实测 submit 单次 242s，
+    # 故 timeout 在容器侧抬到 240s。参见 docs/pending-fixes-2026-11-09.md P1。
+    "connect_timeout": 40.0,
+    # MCP 建连总等待窗口（秒）：平台整机故障时能兜 60–90 分钟（SAMPLE-001/002 靠熬过去才解出）。
+    "connect_deadline": 5400.0,
     # 模型侧（DeepSeek V4.1 Flash，OpenAI 兼容接口）
     "model": "deepseek-v4.1-flash",
     "llm_base_url": "https://api.deepseek.com/v1",
@@ -49,6 +55,8 @@ DEFAULTS = {
 ENV_MAP = {
     "CTFY_MCP_URL": "mcp_url",
     "AGENT_TIMEOUT": "timeout",
+    "AGENT_CONNECT_TIMEOUT": "connect_timeout",
+    "AGENT_CONNECT_DEADLINE": "connect_deadline",
     "DEEPSEEK_MODEL": "model",
     "DEEPSEEK_BASE_URL": "llm_base_url",
     "DEEPSEEK_TEMPERATURE": "temperature",
@@ -101,6 +109,8 @@ def _coerce(value, default):
 class Config:
     mcp_url: str = DEFAULTS["mcp_url"]
     timeout: float = DEFAULTS["timeout"]
+    connect_timeout: float = DEFAULTS["connect_timeout"]
+    connect_deadline: float = DEFAULTS["connect_deadline"]
 
     model: str = DEFAULTS["model"]
     llm_base_url: str = DEFAULTS["llm_base_url"]
@@ -237,6 +247,8 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
     return Config(
         mcp_url=raw["mcp_url"],
         timeout=float(raw["timeout"]),
+        connect_timeout=float(raw["connect_timeout"]),
+        connect_deadline=float(raw["connect_deadline"]),
         model=raw["model"],
         llm_base_url=raw["llm_base_url"],
         temperature=float(raw["temperature"]),

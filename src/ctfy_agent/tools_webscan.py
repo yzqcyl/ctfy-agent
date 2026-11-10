@@ -42,6 +42,9 @@ FUZZ_ADDED_LEN = 40           # 截断时给尾部提示留的空间
 FUZZ_MATCH_CODES_DEFAULT = "200-299,301,302,307,401,403,405,500"
 
 WORDLIST_DIR = Path(os.environ.get("CTFY_WORDLIST_DIR") or "/opt/wordlists")
+# 容器镜像把字典放在 /opt/wordlists；本地开发机没有这个目录，
+# 所以再兜一层仓库内置字典 tools/wordlists（同一套 basename，同样只做白名单拼接）。
+_BUNDLED_WORDLIST_DIR = Path(__file__).resolve().parents[2] / "tools" / "wordlists"
 # 名字 -> 文件名。只认这三个 basename，且只从 WORDLIST_DIR 拼，
 # 模型给的字符串永远不进路径（杜绝 ../../etc/passwd 这类穿越）。
 WORDLIST_FILES = {
@@ -83,6 +86,12 @@ FUZZ_SPEC = {
                                 "description": "算作命中的状态码，逗号分隔，支持范围如 200-299"},
                 "filter_size": {"type": "integer", "default": 0,
                                 "description": "额外过滤该响应长度（软 404）；0=只靠自动校准"},
+                "filter_codes": {"type": "string", "default": "",
+                                 "description": "不算命中的状态码，逗号分隔，支持范围如 \"404,500\" 或 \"400-499\"；"
+                                                "软 404 返回 200 时用它剔掉"},
+                "filter_regex": {"type": "string", "default": "",
+                                 "description": "响应体匹配该正则就不算命中（ffuf -fr）；"
+                                                "压掉「所有路径都返回同一段兜底文案」的 SPA 噪声"},
                 "max_results": {"type": "integer", "default": 40,
                                 "description": f"最多返回多少条命中（上限 {FUZZ_MAX_RESULTS}）"},
                 "timeout_s": {"type": "integer", "default": FUZZ_TIMEOUT_DEFAULT,
@@ -113,8 +122,8 @@ def _clip(text: str, limit: int = TOOL_TEXT_MAX) -> str:
     return text[: limit - FUZZ_ADDED_LEN] + f"\n...[已截断，原长 {len(text)} 字符]"
 
 
-def _normalize_codes(codes: str) -> str:
-    """校验并归一化 match_codes（逗号分隔，元素可为 NNN 或 NNN-MMM 范围）。"""
+def _normalize_codes(codes: str, label: str = "match_codes") -> str:
+    """校验并归一化状态码列表（逗号分隔，元素可为 NNN 或 NNN-MMM 范围）。"""
     out: list[str] = []
     for tok in codes.split(","):
         tok = tok.strip()
@@ -123,17 +132,17 @@ def _normalize_codes(codes: str) -> str:
         if "-" in tok:
             lo_s, _, hi_s = tok.partition("-")
             if not (lo_s.isdigit() and hi_s.isdigit()):
-                _fail(f"match_codes 非法：{codes!r}（形如 \"200-299,302\"）")
+                _fail(f"{label} 非法：{codes!r}（形如 \"200-299,302\"）")
             lo, hi = int(lo_s), int(hi_s)
             if not (100 <= lo <= hi <= 599):
-                _fail(f"match_codes 区间非法：{tok!r}（需 100-599 且左端≤右端）")
+                _fail(f"{label} 区间非法：{tok!r}（需 100-599 且左端≤右端）")
             out.append(f"{lo}-{hi}")
         else:
             if not tok.isdigit() or not 100 <= int(tok) <= 599:
-                _fail(f"match_codes 非法：{tok!r}（形如 \"200-299,302\"）")
+                _fail(f"{label} 非法：{tok!r}（形如 \"200-299,302\"）")
             out.append(str(int(tok)))
     if not out:
-        _fail("match_codes 不能为空")
+        _fail(f"{label} 不能为空")
     return ",".join(out)
 
 
@@ -172,7 +181,12 @@ def _resolve_wordlist(wordlist: str, words, work: Path) -> tuple[Path, int, str]
         _fail(f"未知 wordlist={wordlist!r}，可选：{', '.join(sorted(WORDLIST_FILES))}")
     path = WORDLIST_DIR / WORDLIST_FILES[key]
     if not path.is_file():
-        _fail(f"字典缺失：{path}（镜像应内置；本地开发机可忽略此工具）")
+        bundled = _BUNDLED_WORDLIST_DIR / WORDLIST_FILES[key]
+        if bundled.is_file():
+            path = bundled
+        else:
+            _fail(f"字典缺失：{path}（也不在 {_BUNDLED_WORDLIST_DIR}）；"
+                  "可用 words=[...] 传自定义词表")
     try:
         lines = sum(1 for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip())
     except Exception as exc:  # noqa: BLE001
@@ -184,7 +198,8 @@ def _resolve_wordlist(wordlist: str, words, work: Path) -> tuple[Path, int, str]
 
 def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str = "common",
              words=None, ext: str = "", match_codes: str = FUZZ_MATCH_CODES_DEFAULT,
-             filter_size: int = 0, max_results: int = 40, timeout_s: int = FUZZ_TIMEOUT_DEFAULT,
+             filter_size: int = 0, filter_codes: str = "", filter_regex: str = "",
+             max_results: int = 40, timeout_s: int = FUZZ_TIMEOUT_DEFAULT,
              check_target, record, work_dir, ffuf_bin=None) -> str:
     """执行一次 ffuf 扫描并返回裁剪后的 JSON 字符串。
 
@@ -219,6 +234,18 @@ def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str 
 
     # ---- 参数校验 ----
     codes = _normalize_codes((match_codes or FUZZ_MATCH_CODES_DEFAULT).strip())
+    # ffuf -fc：命中了也不算（软 404 常返回 200，光靠 -mc 剔不掉）
+    filter_codes_norm = ""
+    if (filter_codes or "").strip():
+        filter_codes_norm = _normalize_codes(filter_codes.strip(), "filter_codes")
+    # ffuf -fr：响应体命中该正则就不算（压掉 SPA 兜底文案噪声）
+    filter_regex_norm = ""
+    if (filter_regex or "").strip():
+        filter_regex_norm = filter_regex.strip()
+        try:
+            re.compile(filter_regex_norm)
+        except re.error as exc:
+            _fail(f"filter_regex 不是合法正则：{exc}")
     # ext 仅 dir 模式生效（param 拼的是 ?FUZZ=1，扩展名无意义）：只在 dir 下解析/校验，
     # 避免 param 模式被一个用不上的 ext 误拦（审计修复）。
     # ffuf 把每个元素原样拼到词尾（text+ext），不带点的元素会拼出 wordbak 这种垃圾请求，
@@ -243,10 +270,19 @@ def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str 
     max_results = max(1, min(max_results, FUZZ_MAX_RESULTS))
 
     # ---- 二进制 ----
+    fallback_shim = ""
     if ffuf_bin is None:
         found = shutil.which("ffuf")
         if not found:
-            _fail("ffuf 未安装（本镜像应内置；本地开发机没有属正常）")
+            # 本地开发机通常没有 ffuf 二进制；用内置的等价扫描器兜底，
+            # 这样 web 目录/参数发现能力不会因为「本机没装」而整体消失（实测 CTFY 历史里被拒 90 次）。
+            shim = Path(__file__).resolve().parents[2] / "tools" / "shims" / "ffuf.cmd"
+            if not shim.is_file():
+                _fail("ffuf 未安装，且内置等价扫描器缺失（tools/shims/ffuf.cmd）")
+            found = str(shim)
+            fallback_shim = ("本机无 ffuf 二进制，已用内置**降级**扫描器完成：支持 "
+                             "GET + URL 处的 FUZZ，以及 -mc/-fs/-fc/-fr/-e/-ac；不含递归、"
+                             "POST/头部 fuzz、多关键字/多字典，吞吐也远低于 ffuf（大字典请分批）")
         prefix: list[str] = [found]
     elif isinstance(ffuf_bin, (list, tuple)):
         prefix = [str(x) for x in ffuf_bin]
@@ -268,8 +304,9 @@ def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str 
         "-s", "-noninteractive",
         "-ac",                      # 自动软 404 校准：CTF 的 SPA 兜底全靠它
         "-of", "json",
-        "-o", str(out_path),
-        "-w", str(wordlist_path),
+        # 传绝对路径：子进程 cwd 是 work，相对路径会解析到错误层级（本地兜底扫描器实测踩到）
+        "-o", str(out_path.resolve()),
+        "-w", str(Path(wordlist_path).resolve()),
         "-u", target,
         "-t", "15",
         "-timeout", "10",
@@ -280,10 +317,22 @@ def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str 
         argv += ["-e", ",".join(exts)]
     if filter_size > 0:
         argv += ["-fs", str(filter_size)]
+    if filter_codes_norm:
+        argv += ["-fc", filter_codes_norm]
+    if filter_regex_norm:
+        argv += ["-fr", filter_regex_norm]
 
     env = {k: v for k, v in os.environ.items()
            if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
     env["NO_COLOR"] = "1"
+    # 内置兜底扫描器是 Python 脚本，必须显式告诉 shim 用哪个解释器：
+    # cmd 里的 `python` 在本地会落到应用商店占位符（实测 rc=9009）。
+    try:
+        import sys as _sys
+        env["CTFY_PYTHON"] = _sys.executable
+        env["PATH"] = str(Path(_sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    except Exception:  # noqa: BLE001
+        pass
 
     t0 = time.perf_counter()
     proc_out = ""
@@ -359,6 +408,10 @@ def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str 
     }
     if filter_size > 0:
         out["filter_size"] = filter_size
+    if filter_codes_norm:
+        out["filter_codes"] = filter_codes_norm
+    if filter_regex_norm:
+        out["filter_regex"] = filter_regex_norm
     # 达到 -maxtime 上限 → 大概率没扫完（审计 D1：别让模型把部分当全集）
     if elapsed_ms >= timeout_s * 1000 - 1000:
         out["stopped_early"] = True
@@ -383,6 +436,8 @@ def run_fuzz(*, mode: str = "dir", base: str = "", url: str = "", wordlist: str 
         out["more_hits"] = more
 
     notes: list[str] = []
+    if fallback_shim:
+        notes.append(fallback_shim)
     if subprocess_failed:
         notes.append(f"ffuf 退出码 {rc}")
     if out.get("stopped_early"):
