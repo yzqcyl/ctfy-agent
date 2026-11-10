@@ -58,12 +58,21 @@
 
 ## 2. 赛道事实（此前已确认，勿再猜）
 
-- 赛道类别仅 **在线交互式：Web、Pwn、AI 安全**。Crypto/Reverse/Misc 是「离线附件类」，不在 agent 赛道。
-- 报名 2026-10-15 起；**入围测试 11-14~15，初选赛 11-15 10:00–20:00**；正式 11-21~22。agent 赛道上限 150 队。
+- **解题**范围是常规 CTF 全类别（Crypto / Reverse / Misc / Web / Pwn / AI 安全，见赛事简介与 v2.5 手册）；
+  仅**出题**被限制为在线交互类（Web / Pwn / AI 安全）。两件事别混：以前这里写成「赛道仅 Web/Pwn/AI」，
+  那只对出题成立。
+- 报名 2026-10-15 起，**报名截止 11-13 20:00 CST**；**11-14 平台调试 + 入围测试**（不是比赛日）；
+  **11-15 初选赛 10:00–20:00**；11-21 出题三轮（10–12 / 14–16 / 18–20）；11-22 解题 10:00–20:00。
+  晋级线：入围 **150** 队（= 有资格进初选赛，不是晋级线）→ 正式赛 **前 30 队**。
+  ⚠️ 人机协同赛道才是前 100，两条赛道数字不同，别串。
+- 赛事 id `c0d8b4e3dd3b42c095d63d7dfa66431f`（`TPCTF 2026 · 智能体团队赛道`），`sessions` 三段各 10h，
+  每段结束 `session_end_mode=delete` + 900s 宽限；`internet_policy=deny`、`flag_prefix=FLAG`、
+  `expects_report=false`（智能体赛道不交 WP）；2026-11-10 实测已报名 **423 队**。
 - 提交物 = **容器镜像**；三道门：①镜像注册（push 平台仓库或引用已发布镜像）②组织审核（异步）③provider 密钥（方言必须匹配，平台网关路由模型请求）。
 - 真实 MCP：`https://ctfy.tsinghua.edu.cn/api/v1/mcp/`，server `ctfy 3.4.6`，97 tools，allowlist 26（A0 起含 `list_hints/view_hint`）。
-- 练习套：`CTFARENA` id `4394a10aa5d24f97a1ec3301ca718a45`（115 题全 web，easy 7/medium 48/hard 60，仅 50 可见）。
-- 团队实例配额 `max_instances_per_team_effective = 1`（单实例槽位，卡实例会堵下一题）。
+- 练习套：`CTFARENA` id `4394a10aa5d24f97a1ec3301ca718a45`（117 题全 web，easy/medium/hard，部分不可见）。
+- 团队实例配额：`CTFARENA` 练习套 = **1**；`TPCTF 智能体赛道` = **3**（2026-11-10 实测）。
+  走宽配额时**不能盲停别的题的实例**（可能是并行跑的兄弟任务），代码见 `solver._evict_stale_instances` 的配额分支。
 
 ---
 

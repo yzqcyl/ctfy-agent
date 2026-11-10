@@ -14,6 +14,7 @@ import os
 
 import hashlib
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +25,7 @@ from .budget import Budget, BudgetExceeded, apply_deadline, stop_reason_of
 from .companion import PlanTrack, parse_companion
 from .config import Config
 from .ctxcompress import FactsBoard, shrink_message_text, with_facts
+from .instance_guard import reap
 from .ledger import NO_DEDUPE, Ledger, claims_discovery
 from .llm import DeepSeekLLM, LLMError
 from .mcp_client import render_call_result
@@ -826,30 +828,34 @@ class Solver:
                     time.sleep(wait)
                     text = self.platform.call_text(name, args)
                 if self._is_capacity_error(text):
-                    # [fix 2026-11-05 P3] 团队实例配额=1（实测 429 team_capacity_exceeded /
-                    # "Max 1 concurrent instances per team"）。旧逻辑把失败调用也计入
-                    # instance_ops_limit=5，两三次失败就把额度烧光。这里：回滚计数 -> 清掉
-                    # 不属于本题的残留实例 -> 重试一次，仍失败才把排查动作写给模型。
+                    # [fix 2026-11-05 P3] 团队实例配额有限（arena 实测 1，TPCTF 智能体赛道 3）。
+                    # 旧逻辑把失败调用也计入 instance_ops_limit=5，两三次失败就把额度烧光。
+                    # 这里：回滚计数 -> 清掉残留实例（按配额选策略）-> 重试一次，
+                    # 仍失败才把排查动作写给模型。
                     try:
                         self.store.refund_call(challenge_id, name)
                     except Exception:  # noqa: BLE001 - 计数回滚是增强项
                         pass
-                    cleaned = self._evict_stale_instances(challenge_id)
+                    quota = self._capacity_quota(text)
+                    cleaned = self._evict_stale_instances(challenge_id, quota)
+                    slots = f"平台团队实例配额是 {quota} 个" if quota else "平台团队实例配额很小"
                     if cleaned:
                         self.store.append_transcript(
                             challenge_id,
-                            {"role": "tool", "note": f"[实例守卫] 清掉 {cleaned} 个不属于本题的残留实例后重试 {name}"},
+                            {"role": "tool", "note": f"[实例守卫] 清掉 {cleaned} 个残留实例后重试 {name}"},
                         )
                         text = self.platform.call_text(name, args)
                         if self._is_capacity_error(text):
                             text += (
-                                f"\n[实例守卫] 已清理 {cleaned} 个残留实例仍被拒：平台团队配额只有 1 个实例，"
-                                "确认没有其它题在用实例后再试；不要连续重试（本地已回滚本次计数）。"
+                                f"\n[实例守卫] 已清理 {cleaned} 个残留实例仍被拒：{slots}，"
+                                "且可能被并行跑的其它题占用。先 list_instances 看清是谁在占，"
+                                "不要连续重试（本地已回滚本次计数）。"
                             )
                     else:
                         text += (
-                            "\n[实例守卫] 平台团队实例配额只有 1 个（429 team_capacity_exceeded），"
-                            "且当前没有可清理的残留实例；确认无其它题占用后再试。"
+                            f"\n[实例守卫] {slots}（429 team_capacity_exceeded），"
+                            "且当前没有可清理的残留实例——可能是本队其它题正在并行使用，"
+                            "先 list_instances 确认占用者，不要盲停别人的实例，也不要连续重试。"
                         )
                 elif self._is_transient(text):
                     # [fix 2026-11-05 P7] 瞬时失败（SSE 读超时/MCP 响应超时/上游限流）时平台并未
@@ -860,11 +866,13 @@ class Solver:
                             self.store.refund_call(challenge_id, name)
                         except Exception:  # noqa: BLE001
                             pass
-                    # 实测：团队实例配额=1，泄漏/另开的实例会让 start_instance 长期报「Rate limited」。
-                    # 这不是时间限流，等再久也没用——把排查动作直接写给模型。
+                    # 实测：团队实例配额有限（arena 1 / TPCTF 智能体赛道 3），泄漏或另开的实例会让
+                    # start_instance 长期报「Rate limited」。这不是时间限流，等再久也没用——
+                    # 把排查动作直接写给模型。
                     text += (
-                        "\n[提示] 团队实例配额通常只有 1 个：若别的题目实例还在跑，start_instance 会一直被拒。"
-                        "先 list_instances 查看，确认是废弃实例后 stop_instance，再重试。"
+                        "\n[提示] 团队并发实例配额有限：若别的题目实例还在跑，start_instance 会一直被拒。"
+                        "先 list_instances 查看占用者，确认是**已废弃**的实例再 stop_instance，"
+                        "不要盲停正在并行的兄弟任务。"
                     )
                 parsed = self.platform._as_json(text)
                 local.allow_many(parsed if parsed is not None else text)
@@ -933,14 +941,40 @@ class Solver:
     def _is_capacity_error(text: str) -> bool:
         """平台团队实例配额拒绝（429）判定。"""
         low = str(text or "").lower()
-        return (
-            "team_capacity_exceeded" in low
-            or "max 1 concurrent instances" in low
-            or "concurrent instances per team" in low
-        )
+        return "team_capacity_exceeded" in low or "concurrent instances" in low
 
-    def _evict_stale_instances(self, challenge_id: str) -> int:
-        """清掉不属于本题的实例（团队配额=1，残留实例会堵死 start_instance）。返回停掉数量。"""
+    @staticmethod
+    def _capacity_quota(text: str) -> int | None:
+        """从 429 文案里读出团队并发实例配额（如 "Max 3 concurrent instances per team"）。
+
+        读不到就返回 None——调用方按「已知只有 1 格」的老行为处理，
+        绝不在「不知道配额是几」的情况下把别的题的实例当残留杀掉。
+        """
+        match = re.search(r"(\d+)\s+concurrent\s+instances?", str(text or ""), re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            value = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 1 else None
+
+    def _evict_stale_instances(self, challenge_id: str, quota: int | None = None) -> int:
+        """清掉堵住 start_instance 的残留实例，返回停掉数量。
+
+        两种配额语义不能混（2026-11-10 平台实测：CTFARENA 是 1，TPCTF 智能体赛道是 3）：
+          - 配额 1：团队只有一格，列表里**别的题**的实例必然是残留 → 全清（旧行为，arena 靠它脱困）；
+          - 配额 ≥2：另外的实例可能是**并行跑的兄弟任务**，盲清等于互相残杀（三个 run 一起崩）。
+            这种情况改走 instance_guard.reap 的年龄判定：只停「存活超过宽限期」的，
+            拿不到创建时间的一律不动（宁可漏杀，不可误杀）。
+        """
+        if quota is not None and quota >= 2:
+            try:
+                result = reap(self.platform, keep=challenge_id, grace_seconds=180.0)
+            except Exception:  # noqa: BLE001 - 守卫失败不拦主流程
+                return 0
+            return len(result.get("stopped") or [])
+
         list_name = self.platform.try_resolve("list_instances")
         stop_name = self.platform.try_resolve("stop_instance")
         if not list_name or not stop_name:

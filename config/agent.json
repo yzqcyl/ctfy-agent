@@ -11,7 +11,7 @@
   "submit_limit": 3,
   "max_calls_per_step": 8,
   "instance_ops_limit": 5,
-  "oracle_limit": 300,
+  "oracle_limit": 100,
   "auto_start_instance": true,
   "allow_shell": false,
   "debug": false,

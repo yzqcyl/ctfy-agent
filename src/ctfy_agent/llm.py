@@ -14,8 +14,24 @@ import time
 import urllib.error
 import urllib.request
 from json import JSONDecodeError
+from urllib.parse import urlparse
 
 from .httputil import SameOriginRedirect, build_opener, read_limited
+
+# 哪些端点认得 `enable_thinking` 这个请求字段。
+#   百炼 / DashScope（含 compatible-mode）认，是原生扩展字段；
+#   智谱 open.bigmodel.cn、DeepSeek 官方、以及各家中转网关不认——它们要么忽略、
+#   要么直接 400（严格网关）。发过去 400 的话整题报废，代价远大于「思考模式没关掉」，
+#   所以只在已知支持的 host 上发。
+_THINKING_HOSTS = ("dashscope.aliyuncs.com", "aliyuncs.com")
+
+
+def _accepts_enable_thinking(base_url: str) -> bool:
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == item or host.endswith("." + item) for item in _THINKING_HOSTS)
 
 
 class LLMError(RuntimeError):
@@ -141,9 +157,12 @@ class DeepSeekLLM:
         }
         # 思考模式开关：百炼（DashScope）默认开启，重推理步骤会把 max_tokens 全烧在
         # reasoning_content 上，导致 content 为空、finish=length，白丢一步。
-        # .env 置 LLM_ENABLE_THINKING=0 显式关闭；不设置则完全保持端点默认行为
-        # （回滚到 Paratera 等不认识该字段的网关时，删掉 .env 里那行即可）。
-        if os.environ.get("LLM_ENABLE_THINKING", "").strip().lower() in ("0", "false", "no", "off"):
+        # .env 置 LLM_ENABLE_THINKING=0 显式关闭；不设置则完全保持端点默认行为。
+        # 只在**认得该字段**的端点发（见 _accepts_enable_thinking）：正赛换智谱
+        # open.bigmodel.cn 时这条会被自动跳过，不会因为多传一个字段吃 400。
+        if _accepts_enable_thinking(self.base_url) and os.environ.get(
+            "LLM_ENABLE_THINKING", ""
+        ).strip().lower() in ("0", "false", "no", "off"):
             payload["enable_thinking"] = False
         if tools:
             payload["tools"] = tools

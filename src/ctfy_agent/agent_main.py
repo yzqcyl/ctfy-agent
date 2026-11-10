@@ -41,6 +41,15 @@ DEFAULT_MAX_TOKENS = 8192       # 4096 会在 thinking 块截断、一步即「�
 DEFAULT_MAX_CONTEXT = 32000  # 对齐 agent.json 与各角色提示词的「上下文 32k」承诺（原 16000 导致 16k 就丢旧步骤，模型按 32k 规划却提前失忆）
 DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
 
+# 协议（CTFY-0001）定义的 5 种 run_mode 里，我们只真正实现了 instance / qa。
+# 下面三个语义完全不同，照 instance 跑只会白烧预算，仍然直接拒绝：
+#   defence     —— AWD+ 守靶场，交付物是补丁（POST /patches）；
+#   awd         —— 按轮攻防，进程退出即比赛结束；
+#   engagement  —— 企业靶场（GAUNTLET），交付物是报告（PUT .../report）。
+# 不在这张表里的（含空值、平台将来新增的）一律降级按 instance 跑，靠平台下发的
+# max_turns 与本地预算兜底——宁可跑不准，也不要整题弃权。
+UNSUPPORTED_RUN_MODES = ("defence", "defense", "awd", "engagement")
+
 _RESULT_PATH: Path | None = None
 _CHALLENGE_ID = ""
 
@@ -304,6 +313,10 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     if str((task or {}).get("run_mode") or "") == "qa":
         config.extra["qa_mode"] = True
         config.extra["auto_start_instance"] = False
+    # 未知 run_mode 降级说明：写进 extra 便于赛后复盘「这题是按什么模式跑的」。
+    _mode = str((task or {}).get("run_mode") or "")
+    if _mode not in ("instance", "qa"):
+        config.extra["degraded_run_mode"] = _mode or "(empty)"
     return config
 
 
@@ -550,9 +563,12 @@ def run_agent(
         )
         return 0
 
-    # 3) 只支持 instance / qa 模式（defence/engagement/awd 显式拒绝，不烧钱）
+    # 3) 已知做不了的 run_mode 直接拒绝（不烧钱）；**未知/新增**的降级按 instance 跑。
+    #    为什么放宽（2026-11-10 规则 v2.5 审计）：旧实现把所有没见过的模式一律 refused，
+    #    等于平台换个词我们就整题弃权——0 分且不可恢复。而 defence/awd/engagement 的语义
+    #    完全不同（守靶场 / 按轮攻防 / 企业靶场报告），照 instance 跑只会白烧预算，仍拒绝。
     run_mode = str(task.get("run_mode") or "")
-    if run_mode not in ("instance", "qa"):
+    if run_mode in UNSUPPORTED_RUN_MODES:
         _write_rollup(
             result_path,
             _rollup(challenge_id=challenge_id, stop_reason="refused",
