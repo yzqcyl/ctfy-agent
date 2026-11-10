@@ -9,9 +9,12 @@ FROM python:3.12-slim
 # grep 不在 coreutils 里、是独立 Debian 包；curl + ca-certificates 供 https 探测；
 # bash 供 web 角色的 shell 工具（模型会用它跑探测，缺了 shell 16/16 全灭）；
 # passwd 提供 useradd（下面要建非 root 用户；debian slim 不保证自带，显式装上最稳）。
+# binutils（v7）：pwntools 的 asm()/disasm()/ROP 依赖 binutils 的 as/objdump/readelf——
+# 没有它 `asm('nop')` 直接抛 PwnlibException（实测 v7 首次构建 run 31 就死在这），
+# 而 pwn 题写 shellcode 绕不开 asm。装它约 +25~35MB，基线 126.5MB + 扩展库 ~60MB 后仍远低于 400MB 门禁。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl grep coreutils ca-certificates bash passwd \
+        curl grep coreutils ca-certificates bash passwd binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- P2：web 工具链（构建期安装；运行期无网络，所以必须烤进镜像） ----------
