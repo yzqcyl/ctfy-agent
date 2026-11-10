@@ -42,6 +42,9 @@ from ctfy_agent.state import Store  # noqa: E402
 
 FAILS: list[str] = []
 
+# 「槽位/配额」类 start 失败（值得回收重试）——真实回执里的 agent_environment_limit 语义
+LIMIT_FAIL = "agent_environment_limit: practice and competition environments share one quota"
+
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     if cond:
@@ -53,12 +56,22 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 # ---------------------------------------------------------------- 假平台
 class FakePlatform:
-    """按 DASCTF ctf2 的能力面建模：没有 list_instances，只有按题查/删 + start。"""
+    """按 DASCTF ctf2 的能力面建模：没有 list_instances，只有按题查/删 + start。
 
-    def __init__(self, *, env=None, start_results=(), delete_ok=True):
+    重要细节（2026-11-11 真实回执）：ctf2 的工具 schema 是 `additionalProperties: false`，
+    只认 `practice_ground_id` / `challenge_id` / `limit`。硬塞 `competition_id` 会被平台拒绝，
+    查询恒失败 → 自愈静默失效（这是第一版实现踩到的真 bug，本假平台会主动断言参数集合）。
+    """
+
+    ALLOWED = {"challenge_id", "practice_ground_id", "limit"}
+
+    def __init__(self, *, env=None, start_results=(), delete_ok=True, allow_competition_id=False,
+                 delete_soft_error=False):
         self._env = env                        # dict | None；None 表示查询失败
         self._starts = list(start_results)     # 每次 start 的结果（str=失败文本 / dict=成功）
         self._delete_ok = delete_ok
+        self._allow_comp = allow_competition_id
+        self._delete_soft = delete_soft_error   # 模拟「回执里 isError=true 但不抛异常」
         self.calls: list[tuple[str, dict]] = []
         self.tool_map = {
             "get_instance": "ctf2_get_environment",
@@ -76,15 +89,35 @@ class FakePlatform:
         return tool
 
     def schema_of(self, name):
-        return {}
+        if self._allow_comp:  # CTFY 风格：按 instance_id/challenge_id + competition_id
+            props = {"challenge_id": {"type": "string"}, "competition_id": {"type": "string"}}
+            required = ["challenge_id", "competition_id"]
+        else:                 # DASCTF ctf2 风格：practice_ground_id 必填
+            props = {k: {"type": "string"} for k in self.ALLOWED}
+            required = ["challenge_id", "practice_ground_id"]
+        return {"type": "object", "properties": props,
+                "required": required, "additionalProperties": False}
 
     def call_text(self, name, arguments=None, *, retries=0):
-        self.calls.append((name, dict(arguments or {})))
+        args = dict(arguments or {})
+        schema = self.schema_of(name)
+        unknown = set(args) - set(schema["properties"])
+        if unknown:
+            raise AssertionError(f"{name} 收到 schema 之外的参数 {sorted(unknown)}（平台会拒绝）")
+        missing = [k for k in schema["required"] if k not in args]
+        if missing:
+            raise AssertionError(f"{name} 缺少必填参数 {missing}（服务端会报缺少必填参数）")
+        self.calls.append((name, args))
         if name == "ctf2_get_environment":
             if self._env is None:
                 raise RuntimeError("upstream 查询失败")
             return "----- 工具返回 -----\n" + __import__("json").dumps({"environment": self._env})
         if name.startswith("ctf2_user_delete"):
+            if self._delete_soft:
+                # 真实平台行为：工具级错误包在正常回执文本里，call_text 不抛异常
+                return ('----- 工具返回 (isError=true) -----\n'
+                        '{"code":"NOT_FOUND","message":"The requested resource was not found.",'
+                        '"retryable":false}')
             if not self._delete_ok:
                 raise RuntimeError("delete 失败")
             return "----- 工具返回 -----\n" + __import__("json").dumps({"deleted": True})
@@ -163,7 +196,7 @@ def main() -> int:
     plat = FakePlatform(env={"status": "running", "access_ready": True, "id": "env-1"})
     store = _store(tmp / "r1", cid)
     solver, events = _solver(store, plat, _config())
-    info = solver._recover_instance_slot(cid, "start_instance")
+    info = solver._recover_instance_slot(cid, "start_instance", LIMIT_FAIL)
     names = [n for n, _ in plat.calls]
     check("环境可用时直接复用", isinstance(info, dict) and info.get("status") == "running", str(info))
     check("复用时没有调 start", "start_instance" not in names, str(names))
@@ -176,7 +209,7 @@ def main() -> int:
                                         "access_ready": True}])
     store = _store(tmp / "r2", cid)
     solver, events = _solver(store, plat, _config())
-    info = solver._recover_instance_slot(cid, "start_instance")
+    info = solver._recover_instance_slot(cid, "start_instance", LIMIT_FAIL)
     names = [n for n, _ in plat.calls]
     order = [n for n in names if n in ("ctf2_get_environment", "start_instance")
              or n.startswith("ctf2_user_delete")]
@@ -191,7 +224,7 @@ def main() -> int:
     plat = FakePlatform(env=None)
     store = _store(tmp / "r3", cid)
     solver, _ = _solver(store, plat, _config())
-    info = solver._recover_instance_slot(cid, "start_instance")
+    info = solver._recover_instance_slot(cid, "start_instance", LIMIT_FAIL)
     names = [n for n, _ in plat.calls]
     check("查询失败时不乱删", not any(n.startswith("ctf2_user_delete") for n in names), str(names))
     check("查询失败时不重试 start", "start_instance" not in names, str(names))
@@ -204,7 +237,7 @@ def main() -> int:
     for _ in range(4):
         store.record_call(cid, "start_instance", 5)
     solver, events = _solver(store, plat, _config())
-    info = solver._recover_instance_slot(cid, "start_instance")
+    info = solver._recover_instance_slot(cid, "start_instance", LIMIT_FAIL)
     check("配额仅剩 1 次时放弃重试", info is None, str(info))
     check("配额不足时一个平台调用都不发", plat.calls == [], str(plat.calls))
 
@@ -212,9 +245,31 @@ def main() -> int:
     plat = FakePlatform(env={"status": "none"}, delete_ok=False)
     store = _store(tmp / "r5", cid)
     solver, _ = _solver(store, plat, _config())
-    info = solver._recover_instance_slot(cid, "start_instance")
+    info = solver._recover_instance_slot(challenge_id=cid, start_name="start_instance",
+                                         failure="agent_environment_limit: share one quota")
     check("回收失败时不盲目重试 start", info is None and "start_instance" not in [n for n, _ in plat.calls],
           str(plat.calls))
+
+    # ---- 5b) 真实平台那种「软失败」回执（isError=true 文本、不抛异常）也算失败 ----
+    from ctfy_agent.instance_guard import delete_environment as _del  # noqa: PLC0415
+
+    soft = FakePlatform(env={"status": "none"}, delete_soft_error=True)
+    got = _del(soft, cid, "ground-1")
+    check("软失败回执不被当成删除成功", got.get("ok") is False, str(got))
+
+    # ---- 5c) start 失败原因不是槽位问题（NOT_FOUND）→ 不删环境、不重试 ----
+    not_found = ('[工具报错] ----- 工具返回 (isError=true) -----\n'
+                 '{"code":"NOT_FOUND","message":"The requested resource was not found."}')
+    plat = FakePlatform(env={"status": "none"}, start_results=[not_found])
+    store = _store(tmp / "r5c", cid)
+    solver, events = _solver(store, plat, _config())
+    info = solver._recover_instance_slot(cid, "start_instance", not_found)
+    names = [n for n, _ in plat.calls]
+    check("NOT_FOUND 失败不按 challenge_id 删环境",
+          not any(n.startswith("ctf2_user_delete") for n in names), str(names))
+    check("NOT_FOUND 失败不重试 start", "start_instance" not in names, str(names))
+    check("NOT_FOUND 失败有确定性说明",
+          any("不是槽位问题" in str(p.get("note")) for _, p in events), str(events)[-300:])
 
     # ---- 6) 原语直测：delete 参数带 competition_id ----
     plat = FakePlatform(env={"status": "none"})
@@ -222,8 +277,16 @@ def main() -> int:
     check("delete_environment 成功", got.get("ok") is True, str(got))
     check("delete_environment 带 challenge_id",
           plat.calls and plat.calls[-1][1].get("challenge_id") == cid, str(plat.calls[-1:]))
+    check("严格 schema 平台不塞 competition_id（塞了平台会拒）",
+          "competition_id" not in plat.calls[-1][1], str(plat.calls[-1:]))
     check("query_environment 解出 environment",
           query_environment(FakePlatform(env={"status": "none"}), cid, "g") == {"status": "none"})
+    # schema 里真有 competition_id 的平台（CTFY 风格）才传
+    plat_comp = FakePlatform(env={"status": "none"}, allow_competition_id=True)
+    query_environment(plat_comp, cid, "comp-9")
+    check("schema 允许时 query 带 competition_id",
+          plat_comp.calls and plat_comp.calls[-1][1].get("competition_id") == "comp-9",
+          str(plat_comp.calls[-1:]))
 
     # ---- 7) GUI 开跑前清扫：无 list_instances 平台给确定性提示 ----
     from ctfy_agent.gui.platform_worker import _preflight_instances  # noqa: PLC0415

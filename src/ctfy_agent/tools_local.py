@@ -2764,6 +2764,40 @@ class LocalTools:
                 out.append(part)
         return "".join(out) if changed else command
 
+    def _cross_run_guard(self, command: str) -> str:
+        """拦住「读到别的 run 的残留沙盒」——实测污染，不是假想。
+
+        2026-11-11 真实批量：`satisfied` 这题的 misc 专家在
+        `runs/plat/sandbox/<旧 cid>/src/flag.txt` 找到 11-10 那次运行留下的 44 字节
+        `dice{...}`（其实是**官方仓库自带的 flag**），当成平台下发的 flag 提交 → 又被判错，
+        白烧一次提交（平台 attempt 直接变成 2，它按用户+题全局计数）。
+        每个 run 的沙盒是隔离的临时目录，跨 run 读到的只可能是历史残留，一律拒绝。
+        """
+        low = str(command or "").replace("/", "\\").lower()
+        if "sandbox" not in low:
+            return ""
+        try:
+            sandbox = self._sandbox_dir().resolve()
+            runs_dir = sandbox.parents[2]                      # runs/<run>/sandbox/<cid>
+            current = sandbox.parents[1].name.lower()
+        except (OSError, IndexError):
+            return ""
+        try:
+            siblings = [p.name for p in runs_dir.iterdir() if p.is_dir()]
+        except OSError:
+            return ""
+        for name in siblings:
+            low_name = name.lower()
+            if low_name == current or len(low_name) < 3:
+                continue
+            if re.search(r"(?<![a-z0-9_-])" + re.escape(low_name) + r"(?![a-z0-9_-])", low):
+                return (
+                    f"[拒绝] 命令引用了其它运行目录 runs\\{name}\\sandbox。每个 run 的沙盒互相隔离，"
+                    "那里只会有历史运行残留（例如旧 run 从官方仓库下载的占位 flag.txt，提交必然判错）。"
+                    "只用本题沙盒根目录下的附件与你自己写的文件。"
+                )
+        return ""
+
     def shell(self, command: str, timeout: int = 60) -> str:
         if not self._warned_shell:
             self._warned_shell = True
@@ -2792,6 +2826,10 @@ class LocalTools:
 
         cwd = self._sandbox_dir()
         cwd.mkdir(parents=True, exist_ok=True)
+
+        _cross_run = self._cross_run_guard(command)
+        if _cross_run:
+            raise ToolError(_cross_run)
 
         # 让 shell 里的 `python` 指向当前解释器：宿主 PATH 上的 python 可能只是
         # 应用商店占位符（实测会报 "Python was not found"），模型写脚本时就会踩空。

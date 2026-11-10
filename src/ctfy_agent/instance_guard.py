@@ -117,6 +117,36 @@ def supports_reap(platform) -> bool:
         return False
 
 
+def _schema_props(platform, tool: str) -> set[str]:
+    """目标工具 inputSchema 里允许的参数名（取不到时返回空集，调用方按「只传最保险的字段」处理）。"""
+    try:
+        schema = platform.schema_of(tool) or {}
+    except Exception:  # noqa: BLE001 - 假平台/老接口没有 schema
+        return set()
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    return set(props) if isinstance(props, dict) else set()
+
+
+def _challenge_args(platform, tool: str, challenge_id: str, competition_id: str) -> dict:
+    """拼「按题」调用参数：只传 schema 认的字段，并把已知的比赛/练习场 id 映射到对应名字。
+
+    [修正 2026-11-11 实测两连坑]
+    1. DASCTF 的 `ctf2_get_environment` 是 `additionalProperties:false`，只认
+       practice_ground_id / challenge_id / limit；硬塞 competition_id 会被拒绝。
+    2. 但 `practice_ground_id` 又是**服务端必填**：只传 challenge_id 会报
+       「缺少必填参数 practice_ground_id」。参数桥接层有时能靠「失败一次再补」学到它，
+       但那要看调用顺序，不能依赖——这里直接把已知的练习场/比赛 id 映射过去。
+    """
+    props = _schema_props(platform, tool)
+    args: dict = {"challenge_id": challenge_id}
+    if competition_id:
+        if not props or "practice_ground_id" in props:
+            args["practice_ground_id"] = competition_id
+        elif "competition_id" in props:
+            args["competition_id"] = competition_id
+    return args
+
+
 def query_environment(platform, challenge_id: str, competition_id: str = "") -> dict:
     """按 challenge_id 查本题环境状态（无需实例 id，DASCTF 唯一可用的「有没有环境」原语）。
 
@@ -129,9 +159,7 @@ def query_environment(platform, challenge_id: str, competition_id: str = "") -> 
         tool = None
     if not tool:
         return {}
-    args: dict = {"challenge_id": challenge_id}
-    if competition_id:
-        args["competition_id"] = competition_id
+    args = _challenge_args(platform, tool, challenge_id, competition_id)
     try:
         text = platform.call_text(tool, args)
         data = platform._as_json(text) if hasattr(platform, "_as_json") else None
@@ -164,6 +192,19 @@ def environment_absent(env: dict) -> bool:
     return str(env.get("status") or "").strip().lower() in {"none", "absent", "deleted", ""}
 
 
+# 工具回执是「软失败」的标记：MCP 层把工具级错误也当正常结果返回（`isError=true` 文本），
+# call_text 不会抛异常。删除/查询这类写操作必须自己认错，否则会把「删失败」当成功。
+_TOOL_ERROR_MARKS = (
+    "iserror=true", "[工具报错]", '"code":', "not_found", "not visible",
+    "缺少必填参数", "permission denied", "forbidden", "unauthorized",
+)
+
+
+def _tool_failed(text) -> bool:
+    low = str(text or "").lower()
+    return any(mark in low for mark in _TOOL_ERROR_MARKS)
+
+
 def delete_environment(platform, challenge_id: str, competition_id: str = "") -> dict:
     """按 challenge_id 删本题环境（平台唯一的回收原语；不需要实例 id）。
 
@@ -176,11 +217,13 @@ def delete_environment(platform, challenge_id: str, competition_id: str = "") ->
         tool = None
     if not tool:
         return {"ok": False, "error": "平台没有按 challenge_id 回收环境的工具"}
-    args: dict = {"challenge_id": challenge_id}
-    if competition_id:
-        args["competition_id"] = competition_id
+    args = _challenge_args(platform, tool, challenge_id, competition_id)
     try:
         text = platform.call_text(tool, args)
+        if _tool_failed(text):
+            # [实测 2026-11-11 踩坑] 平台回执是 `[工具报错] … isError=true … NOT_FOUND` 文本，
+            # call_text 不抛异常；旧实现当成「删除成功」→ 白重试一次 start。
+            return {"ok": False, "error": f"工具回执报错：{str(text)[-200:]}"}
         return {"ok": True, "note": str(text)[:300]}
     except Exception as exc:  # noqa: BLE001 - 回收失败不抛，交给上层决定是否继续重试
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}

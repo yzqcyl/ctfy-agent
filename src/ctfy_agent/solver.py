@@ -295,6 +295,9 @@ class Solver:
         self.llm = llm
         self.store = store
         self.on_event = on_event or (lambda kind, payload=None: None)
+        # [接手 2026-11-11] 最近一次 start_instance 失败原因；_recover_instance_slot 据此判断
+        # 「值不值得删环境重试」（NOT_FOUND = 本题没有环境，回收无意义）。
+        self._last_start_error = ""
         # 本轮 body 缓存：跨 delegate 共享（crew 复用同一个 Solver 实例），
         # LocalTools 构造时把它传进去即可，一轮内同一 URL 只抓一次网络。
         self._http_cache: dict = {}
@@ -533,8 +536,10 @@ class Solver:
         避免「重试 5 次但配额只记 1 次」打穿平台每题 5 次硬上限（审计 B-2）。
         """
         waits = (5, 15, 30)
+        self._last_start_error = ""  # [接手 2026-11-11] 供 _recover_instance_slot 判「值不值得回收重试」
         for attempt in range(len(waits) + 2):
             if start_name and not self.store.record_call(challenge_id, start_name, self.config.instance_ops_limit):
+                self._last_start_error = "实例启动配额用尽"
                 self.on_event("instance_start_failed", {"error": "实例启动配额用尽"})
                 return None
             try:
@@ -567,6 +572,7 @@ class Solver:
                 except Exception:  # noqa: BLE001
                     pass
             self.on_event("instance_start_failed", {"error": str(info)})
+            self._last_start_error = str(info)
             return None
         return None
 
@@ -633,7 +639,30 @@ class Solver:
             + json.dumps(info, ensure_ascii=False)[:500]
         )
 
-    def _recover_instance_slot(self, challenge_id: str, start_name: str) -> dict | None:
+    # [接手 2026-11-11] 只有「槽位/配额」类失败才值得回收重试。实测 DASCTF 上给 crypto/misc
+    # 这类没有环境的题调 start_instance 会回 `NOT_FOUND / is not visible`（不是槽位问题），
+    # 这时删环境再 start 纯属白烧一次每题 5 次的硬配额。
+    _RECYCLE_WORTHY = (
+        "agent_environment_limit", "environment_limit", "rate limit", "rate-limited",
+        "429", "already have", "already exists", "too many", "quota", "conflict",
+        "409", "槽位", "配额",
+    )
+
+    @classmethod
+    def _start_failure_worth_recycle(cls, text: str) -> bool:
+        low = str(text or "").lower()
+        if not low:
+            return True  # 拿不到失败原因时维持旧行为（清扫是安全的）
+        if "not_found" in low or "not visible" in low or "not found" in low:
+            return False
+        from .instance_guard import looks_rate_limited  # noqa: PLC0415 - 与自愈同款延迟导入
+
+        if looks_rate_limited(low):
+            return True
+        return any(mark in low for mark in cls._RECYCLE_WORTHY)
+
+    def _recover_instance_slot(self, challenge_id: str, start_name: str,
+                               failure: str = "") -> dict | None:
         """start 失败后的自愈：先清掉「不属于本题」的残留实例，再重试一次。
 
         为什么不是原地重试：11-03 的失败链是「上一次进程被 kill → 残留实例占住唯一槽位 →
@@ -695,6 +724,13 @@ class Solver:
                 )
                 return info
             if environment_absent(env):
+                if not self._start_failure_worth_recycle(failure):
+                    self.on_event(
+                        "instance_guard",
+                        {"note": f"start 失败不是槽位问题（{str(failure)[:80]}），不做删环境重试",
+                         "detail": {"failure": str(failure)[:300]}},
+                    )
+                    return None
                 removed = delete_environment(self.platform, challenge_id, comp or "")
                 self.on_event("instance_guard", {"note": f"按 challenge_id 回收残留环境：{removed}", "detail": removed})
                 if removed.get("ok"):
@@ -721,7 +757,8 @@ class Solver:
             # 避免此处只记 1 次而重试 5 次打穿平台硬上限（审计 B-2）。
             info = self._start_with_backoff(challenge_id, start_name)
             if not info:
-                info = self._recover_instance_slot(challenge_id, start_name)
+                info = self._recover_instance_slot(
+                    challenge_id, start_name, getattr(self, "_last_start_error", ""))
         if not info:
             return None
         return self._register_instance(challenge_id, info)

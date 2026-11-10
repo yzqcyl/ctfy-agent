@@ -128,6 +128,27 @@ def _run(tmp: pathlib.Path) -> int:
     except ToolError as exc:
         check("host 位模板被拒并发指引", "模板" in str(exc) and "{v}" in str(exc), str(exc))
 
+    # ---- 跨 run 沙盒污染护栏（2026-11-11 真实踩坑）----
+    # 每个 run 的沙盒互相隔离：读到别的 run 只可能是历史残留（旧 run 从官方仓库抓的占位 flag.txt）。
+    runs_root = tmp  # store 在 tmp/store，沙盒在 tmp/store/sandbox/<cid>
+    sibling = tmp / "plat" / "sandbox" / "old-cid" / "src"
+    sibling.mkdir(parents=True, exist_ok=True)
+    (sibling / "flag.txt").write_text("flag{stale_repo_placeholder}\n", encoding="utf-8")
+    own = local._sandbox_dir()
+    own.mkdir(parents=True, exist_ok=True)
+    guard = local._cross_run_guard
+    check("跨 run 读取被拒（命中兄弟 run 名）",
+          "其它运行目录" in guard("type ..\\..\\plat\\sandbox\\old-cid\\src\\flag.txt"), guard("type ..\\..\\plat\\sandbox\\x"))
+    check("跨 run 读取被拒（正斜杠也算）",
+          "其它运行目录" in guard("cat ../plat/sandbox/old-cid/src/flag.txt"))
+    check("本 run 内正常命令放行", guard("type work\\exp.py") == "" and guard("python s1.py") == "")
+    check("不含 sandbox 的命令不受影响", guard("cd .. && dir") == "")
+    try:
+        local.shell("type ..\\..\\plat\\sandbox\\old-cid\\src\\flag.txt")
+        check("shell() 真的拒绝跨 run 读取", False)
+    except ToolError as exc:
+        check("shell() 真的拒绝跨 run 读取", "其它运行目录" in str(exc), str(exc)[:120])
+
     # ---- 规格面：write_file 可见、decode_blob 必填、burst 上限文案 ----
     names = {s["function"]["name"] for s in MISC_EXT_SPECS}
     check("write_file 已注册为工具", "write_file" in names and "write_file" in NAMES)
