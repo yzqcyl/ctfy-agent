@@ -94,11 +94,11 @@ def case_ai_contract(tmp: Path) -> None:
     # 3) 关键行为条款漂移守卫（对照 roles/ai.system.txt 逐条钉住）
     for needle in (
         "阶梯", "引用靶子上一句", "session", "reset", "技法", "反劫持",
-        "原样摘录", "FLAG{...}", "上限 20 步",
+        "原样摘录", "FLAG{...}", "上限 40 步",
     ):
         assert needle in raw_prompt, f"ai 提示词缺关键条款: {needle}"
-    # 步数预算与配置一致（提示词写死了 14，config 也必须是 14，否则两处漂移）
-    assert int(spec["max_steps"]) == 20, spec["max_steps"]
+    # 步数预算与配置一致（提示词写死的步数必须等于 config 的 max_steps，否则两处漂移）
+    assert int(spec["max_steps"]) == 40, spec["max_steps"]
 
     server, url = fake_llm.start_fake_mcp()
     try:

@@ -74,7 +74,33 @@ def capability(platform, kind: str, tool: str) -> list[str]:
 
 
 def probe(config, log=None) -> dict:
-    """连平台读契约 → 自动生成映射 → 只读实测 → 返回体检报告。"""
+    """连平台读契约 → 自动生成映射 → 只读实测 → 返回体检报告。
+
+    [接手 2026-11-10] 探测完必须关掉 MCP 会话：一键接入每次都会 initialize 一条新会话，
+    没有关闭出口就会在平台侧越堆越多（P2 待办）。关闭失败不影响报告。
+    """
+    platform = _platform_for(config)
+    try:
+        return _probe_with(platform, log)
+    finally:
+        _close_quietly(platform)
+
+
+def _close_quietly(platform) -> None:
+    """尽力关闭底层 MCP 会话（客户端没有 close 时静默跳过）。"""
+    for holder in (getattr(platform, "client", None), platform):
+        if holder is None:
+            continue
+        close = getattr(holder, "close", None)
+        if callable(close):
+            try:
+                close()
+                return
+            except Exception:  # noqa: BLE001 - 关闭失败绝不能影响调用方
+                continue
+
+
+def _probe_with(platform, log=None) -> dict:
     report: dict = {
         "ok": False,
         "tools": [],
@@ -96,7 +122,6 @@ def probe(config, log=None) -> dict:
             except Exception:  # noqa: BLE001 - 日志失败不能影响探测
                 pass
 
-    platform = _platform_for(config)
     platform.connect()
     names = [str(n) for n in platform.tool_names()]
     report["tools"] = names

@@ -250,6 +250,8 @@ MAP_TIMEOUT = 15            # crawl 抓页面超时
 # 模型天然写 Linux 风格命令，而本地 shell 是 cmd —— 实测「工具被拒绝」占全部调用的
 # 8~12%，约一半是这类命令不存在。装上 shim 后这些命令直接可用，不再浪费一整轮。
 _SHIM_DIR = Path(__file__).resolve().parents[2] / "tools" / "shims"
+# 本地扩展依赖库目录（tools/fetch_pylibs.py 装；镜像里不存在，存在时只挂进 shell 子进程）
+_PYLIBS_DIR = Path(__file__).resolve().parents[2] / "tools" / "pylibs"
 
 
 def _shims_available() -> bool:
@@ -886,7 +888,8 @@ class LocalTools:
         平台会把实例从一个子域名换到同域的另一个（实测 sa5bkcyyu6xqmg6kt.node4.ctfy.run
         被当成「非本题实例」拒了 17 次）。判据：
           * 目标是 IP 时**只允许精确匹配**（下面会先做精确检查，走到这里说明不等）
-          * 目标必须是 ≥3 段域名（否则 root 等于自身，没有意义，也防误放行）
+          * 同主机不减免（端口必须精确登记）
+          * 根域必须 ≥3 段（node4.ctfy.run 可以，example.com 不行）
           * 目标的根域 = 某个已登记主机/端点的根域
         这样只放行「同一平台节点下的兄弟实例」，第三方域名仍会被拒。
         """
@@ -894,8 +897,21 @@ class LocalTools:
             # 关键：IP 不能走「去首段」逻辑 —— 10.0.0.5 的 root 会变成 0.0.5，
             # 从而把 99.0.0.5 这类完全不同的 IP 也放行（白名单绕过）。
             return False
+        # [接手 2026-11-10] 同主机不享受「兄弟域名」减免：否则 tls.example.com 登记 :443 后，
+        # http://tls.example.com（默认 80）也会被放行 —— 端口白名单形同虚设（smoke case_hardening 实测）。
+        # 减免只应作用于**不同**子域名（平台换节点那类），同一主机的端口必须精确登记。
+        if host in self.allowed_hosts:
+            return False
+        for ep in self.allowed_endpoints:
+            if ep.rsplit(":", 1)[0] == host:
+                return False
         root = self._host_root(host)
         if not root or root == host or "." not in root:
+            return False
+        # [接手 2026-11-10] 根域必须 ≥3 段：否则登记 tls.example.com 就等于把整个 example.com
+        # 放行（evil.example.com 也会过），仍是白名单绕过。平台节点是 xxx.node4.ctfy.run 这种形状，
+        # 根域 node4.ctfy.run 有 3 段，减免照常生效。
+        if root.count(".") < 2:
             return False
         roots = {self._host_root(h) for h in self.allowed_hosts}
         for ep in self.allowed_endpoints:
@@ -2674,8 +2690,47 @@ class LocalTools:
     _WINDOWS_ALIASES = {
         "python3": "python", "python3.11": "python", "python3.12": "python", "python3.13": "python",
         "ls": "dir", "cat": "type", "pwd": "cd", "which": "where",
-        "cp": "copy", "mv": "move", "rm": "del", "clear": "cls",
+        "cp": "copy", "mv": "move", "clear": "cls",
     }
+
+    @staticmethod
+    def _rewrite_rm(rest: str) -> str:
+        """把 rm 的常用写法改写成 cmd 等价物。
+
+        [接手 2026-11-10] 原来 `rm` 被一律改成 `del`，于是 `rm -rf out/` → `del -rf out/`：
+        cmd 的 del 不认 `-rf`，命令必然失败，模型还得再花一轮。按语义分流：
+          rm -rf/-r 目录 → rmdir /s /q；rm -f 文件 → del /f /q；其余 → del /q。
+        目标为空时不猜，交回守卫/报错。
+        """
+        args = (rest or "").strip()
+        targets = args
+        flags = ""
+        m = re.match(r"((?:-[A-Za-z]+|--[a-z-]+)(?:\s+(?:-[A-Za-z]+|--[a-z-]+))*)\s*(.*)$", args)
+        if m:
+            flags, targets = m.group(1), m.group(2)
+        targets = targets.strip()
+        if not targets:
+            return "rm"  # 没有目标：别瞎猜，让守卫去提示
+        recursive = bool(re.search(r"(?:^|\s)(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\s|$)", flags))
+        force = bool(re.search(r"(?:^|\s)(?:-{1,2}[A-Za-z]*f[A-Za-z]*|--force)(?:\s|$)", flags))
+        if recursive:
+            return f"rmdir /s /q {targets}"
+        return ("del /f /q " if force else "del /q ") + targets
+
+    @staticmethod
+    def _rewrite_ls(rest: str) -> str:
+        """ls → dir，并把 -l/-a/-R 这类 Unix 开关换成 dir 的开关（`dir -la` 是无效开关）。"""
+        args = (rest or "").strip()
+        m = re.match(r"((?:-[A-Za-z]+)(?:\s+-[A-Za-z]+)*)\s*(.*)$", args)
+        flags, target = (m.group(1), m.group(2)) if m else ("", args)
+        target = target.strip()
+        if re.search(r"[rR]", flags):
+            cmd = "dir /s /b"
+        elif flags:
+            cmd = "dir /a"
+        else:
+            cmd = "dir"
+        return f"{cmd} {target}".strip()
 
     @classmethod
     def _windows_rewrite(cls, command: str) -> str:
@@ -2692,7 +2747,16 @@ class LocalTools:
                 out.append(part)
                 continue
             lead, word, rest = match.group(1), match.group(2), match.group(3)
-            alias = cls._WINDOWS_ALIASES.get(word.strip("\"'").lower())
+            name = word.strip("\"'").lower()
+            if name == "rm":  # 递归/强制语义不同，单独走 _rewrite_rm
+                out.append(f"{lead}{cls._rewrite_rm(rest)}")
+                changed = True
+                continue
+            if name == "ls":  # -l/-a/-R 在 dir 上写法不同
+                out.append(f"{lead}{cls._rewrite_ls(rest)}")
+                changed = True
+                continue
+            alias = cls._WINDOWS_ALIASES.get(name)
             if alias:
                 out.append(f"{lead}{alias}{rest}")
                 changed = True
@@ -2740,6 +2804,21 @@ class LocalTools:
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("CTFY_PYTHON", sys.executable)
+        # [接手 2026-11-10] 本地扩展依赖库（tools/pylibs，由 tools/fetch_pylibs.py 装）：
+        # 镜像只装了 capstone，没有 pycryptodome/gmpy2/sympy/pwntools/z3，于是本地跑
+        # crypto/pwn 时模型写的脚本 import 全挂（runs/plat 实测 CRYPTO 0/5、PWN 0/4 都卡在这）。
+        # 只对 shell 子进程生效：不动本进程、不改镜像；容器里没有该目录时行为与旧版一致。
+        _pylibs = _PYLIBS_DIR
+        if _pylibs.is_dir():
+            _existing = env.get("PYTHONPATH") or ""
+            env["PYTHONPATH"] = str(_pylibs) + (os.pathsep + _existing if _existing else "")
+            env.setdefault("CTFY_PYLIBS", str(_pylibs))
+            # win_amd64 的轮子把依赖 DLL 放在 <pkg>.libs/ 里（gmpy2 依赖 libgmp/libmpfr…）。
+            # Windows 的 DLL 搜索路径包含 PATH，所以这些目录要挂进去，否则 import gmpy2 会
+            # 报 "DLL load failed while importing gmpy2"（实测）。纯 Python 包不受影响。
+            _dll_dirs = [str(p) for p in _pylibs.glob("*.libs") if p.is_dir()]
+            if _dll_dirs:
+                env["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + env.get("PATH", "")
 
         try:
             # P0-2：有界收割 + 超时杀整棵进程树（旧写法是 capture_output 全量进内存后切片）
@@ -2759,4 +2838,21 @@ class LocalTools:
         }
         if result.get("bytes_total", 0) > MAX_BODY + 2000:
             output["note"] = f"输出共 {result['bytes_total']} 字节，这里只保留首尾；需要全量请重定向到文件再分段读。"
+        # [接手 2026-11-10] 缺依赖时给出确定性事实，别让模型反复试 import：
+        # 镜像里没有 pycryptodome/gmpy2/sympy/pwntools，本地可以把它们外挂在 tools/pylibs。
+        _err = output.get("stderr") or ""
+        if "ModuleNotFoundError" in _err or "No module named" in _err:
+            if _PYLIBS_DIR.is_dir():
+                _tops = sorted(p.name for p in _PYLIBS_DIR.iterdir()
+                               if p.is_dir() and not p.name.endswith((".dist-info", ".data", "__pycache__")))
+                output["note"] = (
+                    "本机已外挂扩展库目录（PYTHONPATH 已包含 tools/pylibs）："
+                    + ("、".join(_tops[:14]) if _tops else "（空）")
+                    + "。缺的模块若不在其中，就别再试 import——用纯 stdlib 重写那一小段。"
+                )
+            else:
+                output["note"] = (
+                    "本机没有扩展库目录（容器镜像同样只有 stdlib）：缺的第三方库不要再试，"
+                    "用纯 stdlib 实现；本地想装可跑 `python tools/fetch_pylibs.py`（需联网）。"
+                )
         return json.dumps(output, ensure_ascii=False)

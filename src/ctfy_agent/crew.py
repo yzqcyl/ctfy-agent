@@ -344,6 +344,52 @@ _FLAG_CANDIDATE_HINT = (
     "不要继续侦察了：立即用 verify_answer 校验（不消耗提交次数），通过就 submit。"
 )
 
+# ---------------- 重复被拦动作断路器（2026-11-10 接手新增） ----------------
+# 实测（runs/plat 2026-11-10 02:28 收尾，26 题 13 解；转录逐条核对）：
+#   satisfied 96 次调用里 35 次、t9 51 次里 38 次、winxy-pistol 86 次里 37 次、
+#   spn 88 次里 35 次、Not My Mod Files 105 次里 35 次、TranscendentRenovation 88 次里 37 次、
+#   vorpal-sword 160 次里 14 次，全是**把同一个已被守卫拦下的答案再交一遍**。
+# 提交闸门本身工作正常（首次真提交、之后每次都回「[提交被拦截] …再交同一个值结果不会变」），
+# 但模型看到拦截文案后仍然重复同一动作 —— 单题 40%~75% 的调用预算烧在零信息量的循环上。
+# 所以补一层与模型无关的确定性护栏：同一动作连续被拦 → 升级文案 → 移出工具面 → 连续超限收口。
+_REPEAT_BLOCK_MARKS = (
+    "[提交被拦截]",
+    "[拒绝]",
+    "[done 被候选闸门拦下]",
+    "[done 被预算闸门拦下]",
+    "[候选闸门]",
+    "[未知动作]",
+    "[ledger] 本轮派活与第",
+)
+REPEAT_BLOCK_STREAK = 2   # 连续被拦 2 次 → 该动作移出下一轮工具面
+REPEAT_BLOCK_LIMIT = 4    # 连续被拦 4 次仍不改 → 判卡死收口（reason=action_loop）
+
+_REPEAT_BLOCK_HINT = (
+    "[重复动作断路器] `{name}` 已经是第 {n} 次用**完全相同的参数**调用，而且每次都被拦下。\n"
+    "这条动作已经**从你的工具面移除**（本轮不会再出现）。重复它不会有任何新信息，只会烧预算。\n"
+    "下一步只能二选一：① 用 delegate 派一个**与之前不同的增量目标**去拿新证据；"
+    "② 改用其它候选值/其它题号再提交。禁止原样重试。"
+)
+_REPEAT_LOOP_STOP = (
+    "连续 {n} 次重复同一被拦动作，判定为卡死循环，本题收口（reason=action_loop）。"
+    "已省下的预算留给其它题；复现稿里按「需要新证据/换思路」记录。"
+)
+
+
+def _looks_blocked(text: str) -> bool:
+    """工具返回是否属于「被守卫拦下、重试无意义」的那一类。"""
+    head = str(text or "").lstrip()[:120]
+    return any(head.startswith(mark) or mark in head for mark in _REPEAT_BLOCK_MARKS)
+
+
+def _action_signature(name: str, args: dict) -> tuple[str, str]:
+    """动作指纹：工具名 + 规范化参数（排序键，保证同参数同指纹）。"""
+    try:
+        canon = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        canon = str(args)
+    return (str(name or ""), canon)
+
 
 def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: int,
                max_blocks: int = MAX_DONE_BLOCKS, calls_left: int | None = None,
@@ -696,8 +742,12 @@ class Crew:
         specs.append(REPORT_SPEC)
         return specs
 
-    def _coordinator_tools(self) -> list[dict]:
-        """协调者的工具面：delegate 的候选角色从 roles 派生，新角色无需改代码。"""
+    def _coordinator_tools(self, suppressed: set[str] | None = None) -> list[dict]:
+        """协调者的工具面：delegate 的候选角色从 roles 派生，新角色无需改代码。
+
+        suppressed：被「重复动作断路器」摘掉的工具名（见 solve() 里的护栏）。
+        传空/None 时与旧行为逐字等价。
+        """
         names = sorted(name for name in self.roles if name != "coordinator")
         tools = json.loads(json.dumps(COORDINATOR_TOOLS))  # 深拷贝，不改模块常量
         for tool in tools:
@@ -705,6 +755,8 @@ class Crew:
             if function.get("name") == "delegate":
                 props = function.setdefault("parameters", {}).setdefault("properties", {})
                 props.setdefault("role", {})["enum"] = names
+        if suppressed:
+            tools = [t for t in tools if ((t.get("function") or {}).get("name") not in suppressed)]
         return tools
 
     # ---------- 专家 ----------
@@ -960,6 +1012,12 @@ class Crew:
         # 循环诱因（001 v6.5 s4→s24 重交 slug）。提交闸门只保留一条硬事实拦截（见 submit 分支）。
         env_fail_streak = 0
 
+        # [接手 2026-11-10] 重复被拦动作断路器状态（见 _REPEAT_BLOCK_* 常量）：
+        # 同一动作连续被拦 → 摘出工具面 → 连续超限收口。零重复时对旧行为完全透明。
+        blocked_sig: tuple[str, str] | None = None
+        blocked_streak = 0
+        suppressed_tools: set[str] = set()
+
         # 断点续跑（P0-1）：协调者上下文是本 run 最贵的状态，崩溃即清零（003 实测烧掉 135k token）。
         # 每轮开跑前把 messages/reports/ledger/plan 快照到 run_dir/checkpoints/；正常收尾删除，
         # 进程被 kill 则残留 → 下次跑题时续跑。extra.resume 设为 false/off/no/0 可强制从零重跑。
@@ -1055,7 +1113,8 @@ class Crew:
                     )
                 try:
                     messages = _compact_history(messages, self.config.max_context_tokens)
-                    response = _chat_with_recovery(coordinator, messages, self._coordinator_tools())
+                    response = _chat_with_recovery(
+                        coordinator, messages, self._coordinator_tools(suppressed_tools))
                 except BudgetExceeded as exc:
                     # 集群-B：attempt_cap（切片用尽、题级还有配额）≠ budget_exhausted（题级真耗尽）
                     # P0-3：wall_clock（时间到）单独成一类，便于赛后区分「没钱」与「没时间」
@@ -1335,6 +1394,40 @@ class Crew:
                     self.store.append_transcript(challenge_id, {"role": "coordinator", "step": rnd, "tool": name, "args": args, "result": text[:2000]})
                     messages.append({"role": "tool", "tool_call_id": tool_id, "content": _untrusted(text[:MAX_TOOL_TEXT])})
                     self.on_event("tool", {"name": name, "args": args, "result": text})
+
+                    # [接手 2026-11-10] 重复被拦动作断路器（实测同一错 flag 被连交 34~39 次）。
+                    # 只对「被守卫拦下的动作」计数：正常动作即使重复也不在这里拦（账本另有去重）。
+                    sig = _action_signature(name, args)
+                    if _looks_blocked(text):
+                        if sig == blocked_sig:
+                            blocked_streak += 1
+                        else:
+                            blocked_sig, blocked_streak = sig, 1
+                        if blocked_streak >= REPEAT_BLOCK_STREAK and name not in suppressed_tools:
+                            suppressed_tools.add(name)
+                            messages.append({
+                                "role": "user",
+                                "content": _REPEAT_BLOCK_HINT.format(name=name, n=blocked_streak),
+                            })
+                            self.store.append_transcript(
+                                challenge_id,
+                                {"role": "gate", "step": rnd,
+                                 "note": f"重复动作断路器：{name} 连续 {blocked_streak} 次被拦，已移出工具面"},
+                            )
+                        if blocked_streak >= REPEAT_BLOCK_LIMIT:
+                            stop = True
+                            reason = "action_loop"
+                            messages.append({
+                                "role": "user",
+                                "content": _REPEAT_LOOP_STOP.format(n=blocked_streak),
+                            })
+                            self.store.append_transcript(
+                                challenge_id,
+                                {"role": "gate", "step": rnd,
+                                 "note": f"重复动作断路器：{name} 连续 {blocked_streak} 次重复，收口 action_loop"},
+                            )
+                    else:
+                        blocked_sig, blocked_streak = None, 0
 
                     if name == "delegate" and ledger.drain_new_refutations():
                         rotate = ledger.rotate()

@@ -151,6 +151,9 @@ _STOP_MAP = {
     "coordinator_done": "done",
     "no_more_actions": "done",
     "step_limit": "max_turns",
+    # [接手 2026-11-10] 重复被拦动作断路器收口：本质是「轮次被同一个无用动作烧光」，
+    # 对平台口径与 step_limit 同类（max_turns）。不加这条会落到默认 "done" 被误报成解出。
+    "action_loop": "max_turns",
     "budget_exhausted": "cut_off",
     "wall_clock": "cut_off",   # P0-3：时间到与预算耗尽对平台是同一类（都是"没做完"）
     "llm_error": "halted",

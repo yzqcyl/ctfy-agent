@@ -83,7 +83,9 @@ def _run(tmp: pathlib.Path) -> int:
     # ---- B2: Windows 命令别名自动改写 ----
     rw = LocalTools._windows_rewrite
     check("改写 python3 → python", rw("python3 exp.py") == "python exp.py")
-    check("改写 ls → dir", rw("ls -la work") == "dir -la work")
+    # [接手 2026-11-10] `dir -la` 是无效开关（dir 不认 Unix 短选项），必须换成 dir 自己的写法
+    check("改写 ls → dir", rw("ls -la work") == "dir /a work")
+    check("改写 ls -R → dir /s /b", rw("ls -R src") == "dir /s /b src")
     check("改写 cat → type", rw("cat a.txt | grep flag") == "type a.txt | grep flag")
     check("改写链式命令", rw("pwd && python3 -V") == "cd && python -V")
     check("无别名时原样返回", rw("curl -s http://a/b") == "curl -s http://a/b")

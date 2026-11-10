@@ -50,10 +50,17 @@ def _iter_lines(text: str) -> list[str]:
     return lines
 
 
-def _parse_count(args: list[str], default: int) -> tuple[int, list[str]]:
-    """解析 head/tail 的 -n N / -N / --lines=N。"""
+def _parse_count(args: list[str], default: int) -> tuple[int, list[str], str]:
+    """解析 head/tail 的行/字节选项。
+
+    返回 (count, 文件列表, 模式)；模式 "lines" 或 "bytes"。
+    支持：-n N / -N / --lines=N / -c N / -cN / --bytes=N。
+    [接手 2026-11-10] 补上 -c（字节）：模型最常用的 `tail -c 8000` 之前被当成「文件 -c」
+    直接报 No such file，等于 shim 在这条最热路径上是坏的（smoke case_windows_shell_guard 实测）。
+    """
     count = default
     rest: list[str] = []
+    mode = "lines"
     i = 0
     while i < len(args):
         a = args[i]
@@ -62,31 +69,59 @@ def _parse_count(args: list[str], default: int) -> tuple[int, list[str]]:
             if i >= len(args):
                 raise SystemExit(f"{a} 缺少数字")
             count = int(args[i].replace("k", "000"))
+            mode = "lines"
+        elif a in ("-c", "--bytes"):
+            i += 1
+            if i >= len(args):
+                raise SystemExit(f"{a} 缺少数字")
+            count = int(str(args[i]).replace("k", "000"))
+            mode = "bytes"
+        elif a.startswith("-c") and a[2:].isdigit():
+            count = int(a[2:].replace("k", "000"))
+            mode = "bytes"
+        elif a.startswith("--bytes="):
+            count = int(a.split("=", 1)[1].replace("k", "000"))
+            mode = "bytes"
         elif a.startswith("-n") and a[2:].isdigit():
             count = int(a[2:])
         elif a.startswith("--lines="):
             count = int(a.split("=", 1)[1])
         elif a.startswith("-") and a[1:].isdigit():
             count = int(a[1:])
+        elif a in ("-f", "--follow"):  # 不支持跟随：读完即退出，别报错
+            pass
         else:
             rest.append(a)
         i += 1
-    return count, rest
+    return count, rest, mode
+
+
+def _head_text(text: str, count: int, mode: str) -> str:
+    if mode == "bytes":
+        return text.encode("utf-8")[: max(0, count)].decode("utf-8", "replace")
+    return "".join(_iter_lines(text)[: max(0, count)])
+
+
+def _tail_text(text: str, count: int, mode: str) -> str:
+    if mode == "bytes":
+        if count <= 0:
+            return ""
+        return text.encode("utf-8")[-count:].decode("utf-8", "replace")
+    lines = _iter_lines(text)
+    return "".join(lines[-count:] if count else [])
 
 
 def cmd_head(args: list[str]) -> int:
-    count, files = _parse_count(args, 10)
+    count, files, mode = _parse_count(args, 10)
     _, text = _read_inputs(files)
-    lines = _iter_lines(text)
-    sys.stdout.write("".join(lines[:count]))
+    sys.stdout.write(_head_text(text, count, mode))
     return 0
 
 
 def cmd_tail(args: list[str]) -> int:
-    count, files = _parse_count(args, 10)
+    count, files, mode = _parse_count(args, 10)
     _, text = _read_inputs(files)
-    lines = _iter_lines(text)
-    sys.stdout.write("".join(lines[-count:] if count else []))
+    sys.stdout.write(_tail_text(text, count, mode))
     return 0
 
 

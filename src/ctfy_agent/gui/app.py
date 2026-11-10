@@ -92,7 +92,7 @@ class App:
             pass
         self._build_ui()
         self._refresh_history()
-        self._refresh_solved()
+        self._refresh_solved(background=True)  # 不卡启动：扫 runs/* 放后台线程
         self._poll()
 
     # ---------------- UI ----------------
@@ -333,33 +333,62 @@ class App:
         self._config_writeup_tags()
         self.txt_writeup.insert("1.0", "左侧是已解出的题目；选中一题点「生成/查看复现」才会生成正文。\n")
 
-    def _refresh_solved(self) -> None:
-        """扫描 runs/* 收集「已解出」的题（只读 state.json，不生成复现、不花 token）。"""
+    def _refresh_solved(self, background: bool = False) -> None:
+        """扫描 runs/* 收集「已解出」的题（只读 state.json，不生成复现、不花 token）。
+
+        [接手 2026-11-10] 两处修正：
+        1) 启动时放后台线程扫（实测 600+ run 目录约 1s，直接在 __init__ 里扫会卡住窗口）；
+        2) runs/ 下有历史遗留的不可读目录（早期 pip/临时目录用 0o700 建、创建者都读不了），
+           原来只 try 住 read_text，`is_file()` 上抛 PermissionError 会让整个刷新崩掉。
+        """
+        if background:
+            def _bg() -> None:
+                rows = self._scan_solved()
+                try:
+                    self.after(0, self._apply_solved, rows)
+                except (tk.TclError, RuntimeError, AttributeError):  # 窗口已关 / selftest 桩对象
+                    pass
+
+            threading.Thread(target=_bg, name="scan-solved", daemon=True).start()
+            return
+        self._apply_solved(self._scan_solved())
+
+    def _scan_solved(self) -> list[dict]:
+        """纯扫描：读 runs/*/state.json 收集已解出条目（不碰界面，可放线程里跑）。"""
         rows: list[dict] = []
         base = PROJECT_ROOT / "runs"
-        if base.is_dir():
-            for d in base.iterdir():
+        try:
+            entries = list(base.iterdir()) if base.is_dir() else []
+        except OSError:
+            return rows
+        for d in entries:
+            try:
+                if not d.is_dir():
+                    continue
                 st = d / "state.json"
-                if not d.is_dir() or not st.is_file():
+                if not st.is_file():
                     continue
-                try:
-                    data = json.loads(st.read_text(encoding="utf-8-sig"))
-                except Exception:  # noqa: BLE001
+                data = json.loads(st.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):  # 不可读/半截文件：跳过，不拖垮刷新
+                continue
+            for cid, ch in (data.get("challenges") or {}).items():
+                if not isinstance(ch, dict):
                     continue
-                for cid, ch in (data.get("challenges") or {}).items():
-                    if not isinstance(ch, dict):
-                        continue
-                    flag = str(ch.get("flag_value") or "")
-                    if not (ch.get("submitted_ok") or flag):
-                        continue
-                    rows.append({
-                        "run": d.name, "cid": cid,
-                        "name": str(ch.get("name") or cid),
-                        "cat": str(ch.get("category") or "-"),
-                        "flag": flag,
-                        "at": str(ch.get("updated_at") or ""),
-                    })
+                flag = str(ch.get("flag_value") or "")
+                if not (ch.get("submitted_ok") or flag):
+                    continue
+                rows.append({
+                    "run": d.name, "cid": cid,
+                    "name": str(ch.get("name") or cid),
+                    "cat": str(ch.get("category") or "-"),
+                    "flag": flag,
+                    "at": str(ch.get("updated_at") or ""),
+                })
         rows.sort(key=lambda r: r["at"], reverse=True)
+        return rows
+
+    def _apply_solved(self, rows: list[dict]) -> None:
+        """把扫描结果填进表格（必须在主线程调用）。"""
         self._solved = rows
         self.tv_solved.delete(*self.tv_solved.get_children())
         self._solved_rows = {}
@@ -1364,6 +1393,17 @@ class App:
             self._tool_line(f"{tag}• [{self.active_role or '?'}] {p.get('name')} {self._short(p.get('args'))} → {self._short(p.get('result'))}")
         elif kind == "instance_guard":
             self._log(f"{tag}[{_NOW()}] {str(p.get('note') or '')[:160]}")
+        elif kind == "attachments":
+            self._log(f"{tag}[{_NOW()}] 附件：{str(p.get('note') or '')[:400]}")
+            self._tool_line(f"{tag}───── 附件已落盘 ─────")
+        elif kind == "attachment":
+            name = p.get("name") or p.get("file_id") or "?"
+            if p.get("ok"):
+                self._tool_line(f"{tag}  附件 {name} → 沙盒 {p.get('bytes', '?')} 字节")
+            else:
+                self._log(f"{tag}[!] 附件 {name} 下载失败：{str(p.get('error') or '')[:160]}")
+        elif kind == "attachments_error":
+            self._log(f"{tag}[!] 附件拉取失败（不影响解题）：{str(p.get('error') or '')[:160]}")
 
     def _tool_line(self, line: str) -> None:
         self.txt_tools.insert("end", line + "\n")

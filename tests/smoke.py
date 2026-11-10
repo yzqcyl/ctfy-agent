@@ -632,6 +632,22 @@ def case_hardening(tmp: Path) -> None:
         pass
     ok("https 443：不写端口按协议默认端口对齐，异协议仍被拦")
 
+    # M3b2：同平台的「兄弟子域名」放行（平台会把实例换到同域另一子域名，实测拒了 17 次）；
+    # 但同一主机的其它端口必须仍然精确登记 —— 两条一起钉，防止放宽过头。
+    local.allow_instance("a1.node4.ctfy.run", 31001)
+    local._check_target("http://b2.node4.ctfy.run:9999/")   # 兄弟节点：放行
+    try:
+        local._check_target("http://a1.node4.ctfy.run:9999/")  # 同主机换端口：拦
+        raise AssertionError("兄弟域名减免把同一主机的其它端口也放行了")
+    except ToolError:
+        pass
+    try:
+        local._check_target("http://evil.thirdparty.net:31001/")  # 第三方根域：拦
+        raise AssertionError("第三方根域被放行")
+    except ToolError:
+        pass
+    ok("兄弟子域名放行 + 同主机端口/第三方根域仍拦")
+
     # M3c：http_request 的 grep 只回匹配片段，不整段回（大响应搜 flag 用，防上下文爆炸）
     out = LocalTools._render_http(200, {}, "a" * 500 + "flag{abc}" + "b" * 500, r"flag\{[^}]+\}")
     assert "flag{abc}" in out and '"matched": 1' in out
@@ -1635,7 +1651,12 @@ def case_handoff_and_rejected(tmp: Path) -> None:
 
 
 def case_windows_shell_guard(tmp: Path) -> None:
-    """Fix 4b：Windows 上 Unix-only 内建命令/heredoc/单引号被明确拦截并指回正路。"""
+    """Windows shell 护栏：能安全改写的自动放行，真跑不了的才拒收并指回正路。
+
+    [接手 2026-11-10 修正] 上一轮加了 tools/shims（grep/head/tail/wc/xxd 的 Windows 实现）
+    与 _rewrite_quotes（安全的单引号自动换双引号），但本用例还停在「一律拒收」的旧契约上，
+    于是恒定假红。现在按三层断言，正好钉住新契约与「拒收必须给替代方案」这两件事。
+    """
     if os.name != "nt":
         return  # 容器是 Linux，这些命令都在；只有本地 Windows 开发需要此护栏
     store = Store(tmp / "winshell").load()
@@ -1643,13 +1664,39 @@ def case_windows_shell_guard(tmp: Path) -> None:
     seed_challenge(store)
     local = LocalTools(store, "web-01", allow_shell=True)
 
+    # 1) 第 1 层：叫法差异 + 安全单引号 → 自动改写（B2：拒收会让模型白花整顿重写命令）
+    assert LocalTools._windows_rewrite("python3 a.py") == "python a.py"
+    assert LocalTools._rewrite_quotes("curl -sL 'http://x'") == 'curl -sL "http://x"'
+    # rm 的开关语义和 del 不同：rm -rf 必须变 rmdir /s /q（旧实现给出 `del -rf`，必然失败）
+    assert LocalTools._windows_rewrite("rm -rf out/") == "rmdir /s /q out/"
+    assert LocalTools._windows_rewrite("rm -f x.txt") == "del /f /q x.txt"
+    assert LocalTools._windows_rewrite("rm x.txt") == "del /q x.txt"
+    assert LocalTools._windows_rewrite("rm -rf") == "rm"  # 没目标不猜，交guard
+    # ls 的 -l/-a/-R 也要换写法（`dir -la` 是无效开关）
+    assert LocalTools._windows_rewrite("ls -la") == "dir /a"
+    assert LocalTools._windows_rewrite("ls -R src") == "dir /s /b src"
+    out = local.call("shell", {"command": "echo hi | tail -c 8"})
+    assert "hi" in out, out  # tail 有 shim，且 -c（字节）这条最热路径要真的能跑
+
+    # 2) 第 2 层：没有等价物/改写不安全的 → 明确拒收，并指回 http_request / write_file
     try:
-        local.call("shell", {"command": "curl -sL 'http://x' | tail -c 8000"})
-        raise AssertionError("Unix-only 命令在 Windows 上没被拦")
+        local.call("shell", {"command": "sed -n '1,3p' a.txt"})
+        raise AssertionError("sed 在 Windows 上没被拦")
     except ToolError as exc:
-        assert "tail" in str(exc) and "http_request" in str(exc), exc
-        assert "单引号" in str(exc), exc  # 单引号提示也在
-        ok("Windows shell 护栏：Unix 内建命令 + 单引号被明确拦截并指回 http_request")
+        assert "sed" in str(exc) and "http_request" in str(exc), exc
+
+    try:
+        local.call("shell", {"command": "python - <<'EOF'\nprint(1)\nEOF"})
+        raise AssertionError("heredoc 在 Windows 上没被拦")
+    except ToolError as exc:
+        assert "heredoc" in str(exc), exc
+
+    try:
+        local.call("shell", {"command": "echo '100%'"})  # 含 % 不能安全改写
+        raise AssertionError("不安全的单引号没被拦")
+    except ToolError as exc:
+        assert "单引号" in str(exc), exc
+    ok("Windows shell 护栏：别名/安全引号自动改写放行，sed/heredoc/不安全单引号拒收并指回正路")
 
 
 def case_prompt_hints(tmp: Path) -> None:
@@ -4827,7 +4874,11 @@ def case_v63_budget_and_pwn(tmp: Path) -> None:
 
     cfg = load_config(pathlib.Path(__file__).resolve().parents[1] / "config" / "agent.json")
     assert cfg.extra.get("budget_cache_discount") is True, "budget_cache_discount 未开启"
-    assert int(cfg.max_llm_calls) == 160, cfg.max_llm_calls
+    # [接手 2026-11-10] 调用数上限 160 → 240：40 步 × 最多 6 次调用/步。依据见 HANDOFF §8 P1：
+    # 历史 transcript 里 6 道题出现 11~38 次连续重复被拦动作（合计可省调用 ≥176），有近半
+    # 调用是循环浪费；去掉浪费后 160 对 IRS/diligent-auditor 这类「真干活」的题偏紧。
+    # DEFAULTS 仍是 20（见 config.py 注释），这里断言的只是本仓 config/agent.json 的运行档。
+    assert int(cfg.max_llm_calls) == 240, cfg.max_llm_calls
     pwn = str((cfg.extra.get("roles") or {}).get("pwn", {}).get("system") or "")
     assert "黑盒服务题" not in pwn, "pwn 提示词应回滚到 v6.2（无黑盒纪律段）"
 
@@ -4845,7 +4896,7 @@ def case_v63_budget_and_pwn(tmp: Path) -> None:
     assert delta["prompt_tokens"] == 10000, delta     # 报表口径 = 真实 token
     assert delta["completion_tokens"] == 100, delta
     assert delta.get("prompt_tokens_billed") == 1900, delta
-    ok("v6.4 回滚：预算折价保留，max_llm_calls=160，pwn 提示词回到 v6.2")
+    ok("v6.4 回滚：预算折价保留，max_llm_calls=240（可省调用≥176 的证据见 HANDOFF §8 P1），pwn 提示词回到 v6.2")
 
 
 def case_v64_llm_and_instance(tmp: Path) -> None:

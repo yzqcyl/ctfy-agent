@@ -37,6 +37,55 @@ def _seed_bridge(platform, competition_id: str | None) -> None:
         bridge.seed(competition_id=competition_id)
 
 
+def _hydrate_attachments(platform, store, challenge_id: str, competition_id: str,
+                         emit) -> str:
+    """把题目附件下载进本题沙盒，并把清单写进 store 笔记（会进协调者 brief）。
+
+    2026-11-10 实测：13 道未解题里 7 道卡在「沙盒目录为空」，而平台本来下发附件。
+    这一步必须在 Crew 开跑前做完；任何失败都只提示，不拦解题。
+    """
+    try:
+        from ..attachments import hydrate  # noqa: PLC0415
+
+        note = hydrate(platform, store, challenge_id, competition_id=competition_id,
+                       on_event=lambda kind, payload=None: emit(kind, payload or {}))
+        if note:
+            emit("attachments", {"challenge_id": challenge_id, "note": note[:600]})
+        return note
+    except Exception as exc:  # noqa: BLE001 - 附件是加分项，绝不拦解题
+        emit("attachments_error", {"challenge_id": challenge_id,
+                                   "error": f"{type(exc).__name__}: {exc}"})
+        return ""
+
+
+def _preflight_instances(platform, challenge_id: str, protect: tuple[str, ...], emit,
+                         enabled: bool = True) -> None:
+    """开跑前清一次残留实例（P0 配额治理）。
+
+    平台每队的运行实例配额只有 1：上一题异常退出没释放，本题 start_instance 直接报
+    `agent_environment_limit`，而模型往往把它当成「靶场坏了」白耗几轮。
+    instance_guard.reap 的安全边界（见模块注释）：本题永不碰、protect 里的兄弟题不碰、
+    拿不到创建时间或存活不到 grace(120s) 的一律不动。任何失败都只提示，绝不拦解题。
+    """
+    if not enabled:
+        return
+    try:
+        from ..instance_guard import reap, summarize  # noqa: PLC0415
+
+        result = reap(platform, keep=challenge_id, protect=protect, grace_seconds=120.0)
+    except Exception as exc:  # noqa: BLE001 - 清扫是加分项
+        emit("instance_guard", {"challenge_id": challenge_id,
+                                "note": f"开跑前清扫失败（忽略）：{type(exc).__name__}: {exc}"})
+        return
+    note = summarize(result)
+    stopped = len(result.get("stopped") or []) if isinstance(result, dict) else 0
+    emit("instance_guard", {
+        "challenge_id": challenge_id,
+        "note": (f"开跑前清掉 {stopped} 个残留实例：" if stopped else "开跑前实例检查：") + note,
+        "detail": result if isinstance(result, dict) else {},
+    })
+
+
 def _teams_of(me) -> list[dict]:
     """从 whoami 结果里取参赛队伍列表。"""
     if not isinstance(me, dict):
@@ -206,6 +255,14 @@ def solve(config, challenge_id: str, run_id: str, competition_id: str,
         def on_event(kind, payload=None):
             q.put(("event", kind, payload or {}))
 
+        # 实例配额只有 1：开跑前先清残留（上一题崩了没释放 → 这题报 agent_environment_limit）
+        _preflight_instances(platform, challenge_id, (), on_event,
+                             enabled=bool(config.extra.get("instance_reap_preflight", True)))
+
+        # 附件先落沙盒：题面 files[] 不进模型工具面时，模型只能对着空目录猜
+        _hydrate_attachments(platform, store, challenge_id, competition_id or "",
+                             lambda k, p=None: on_event(k, p or {}))
+
         crew = Crew(config, platform, store,
                     lambda model=None: make_llm(config, model=model), on_event=on_event)
         summary = crew.solve(challenge_id, cancel_event=cancel)
@@ -275,6 +332,17 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                     data = dict(payload or {})
                     data["_cid"] = cid  # 并发时让界面能标出属于哪一题
                     q.put(("event", kind, data))
+
+                # 附件先落沙盒（同 solve()）：批量跑时每题各自拉自己的附件
+                # 开跑前清残留实例；并发时把同批其它题全列进保护名单，绝不互相误杀
+                _preflight_instances(
+                    platform, cid,
+                    tuple(str(x.get("id")) for x in challenges
+                          if x.get("id") and str(x.get("id")) != cid),
+                    on_event,
+                    enabled=bool(config.extra.get("instance_reap_preflight", True)),
+                )
+                _hydrate_attachments(platform, store, cid, competition_id or "", on_event)
 
                 crew = Crew(config, platform, store,
                             lambda model=None: make_llm(config, model=model), on_event=on_event)

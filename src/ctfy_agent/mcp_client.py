@@ -302,6 +302,31 @@ class McpHttpClient:
         self.notify("notifications/initialized")
         return result
 
+    def close(self) -> None:
+        """结束本次 MCP 会话（Streamable HTTP：带 session 头发 DELETE）。
+
+        [接手 2026-11-10] 「一键接入」每次探测都会 initialize 一个新会话；原来没有关闭出口，
+        点几次就在平台侧堆几个会话（进程退出才回收）。这里按 MCP 规范尽力关：
+        服务端不支持 DELETE / 已过期都静默忽略——关会话失败绝不能影响调用方。
+        """
+        session = self.session_id
+        if not session:
+            return
+        self.session_id = None  # 先清空：即使 DELETE 失败也不再复用这条会话
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "MCP-Protocol-Version": self.protocol_version,
+            "Mcp-Session-Id": session,
+            "User-Agent": "ctfy-probe/0.1 (stdlib-urllib)",
+        }
+        try:
+            request = urllib.request.Request(self.url, headers=headers, method="DELETE")
+            with self._opener.open(request, timeout=self.connect_timeout) as response:
+                response.read(256)
+            self._debug(f"会话已关闭 session={session}")
+        except Exception as exc:  # noqa: BLE001 - 关闭是尽力而为
+            self._debug(f"关闭会话失败（忽略）session={session}: {exc}")
+
     def list_tools(self):
         tools: list[dict] = []
         cursor = None

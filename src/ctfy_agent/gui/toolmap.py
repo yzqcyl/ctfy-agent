@@ -245,17 +245,8 @@ def ocr_image(path: str, scale: int = 3) -> str:
 
     work = _new_workdir()
     try:
-        img = src
-        if scale and scale > 1:
-            try:
-                from PIL import Image  # noqa: PLC0415
-
-                im = Image.open(src).convert("RGB")
-                im = im.resize((im.width * scale, im.height * scale), Image.LANCZOS)
-                img = work / "scaled.png"
-                im.save(img)
-            except Exception:  # noqa: BLE001 - 无 Pillow 就直接原图识别
-                img = src
+        # 放大交给 PowerShell 脚本里的 System.Drawing（原实现 import PIL：容器与纯净运行时
+        # 都没有 Pillow，且违反「src 纯 stdlib」契约，见 smoke.py case_stdlib_only）。
         out = work / "out.txt"
         err = work / "err.txt"
         sout = work / "stdout.txt"
@@ -263,9 +254,10 @@ def ocr_image(path: str, scale: int = 3) -> str:
         cmd = [
             "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", str(_OCR_SCRIPT.resolve()),
-            "-ImagePath", str(Path(img).resolve()),
+            "-ImagePath", str(src.resolve()),
             "-OutPath", str(out.resolve()), "-ErrPath", str(err.resolve()),
             "-Gap", "18",
+            "-Scale", str(float(scale or 1)),
         ]
         with open(sout, "w", encoding="utf-8") as fo, open(serr, "w", encoding="utf-8") as fe:
             subprocess.run(cmd, stdout=fo, stderr=fe, timeout=120, check=False)

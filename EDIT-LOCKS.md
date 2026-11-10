@@ -11,12 +11,18 @@
 
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
-| （当前无活动锁） | | | |
+| （无活动锁） | — | — | 接手轮（W）已收尾，见下方「已释放」最后 5 行 |
 
 ## 已释放
 
 | 文件 | 会话 | 区间 | 结果 |
 |---|---|---|---|
+| src/ctfy_agent/crew.py + src/ctfy_agent/agent_main.py | W（接盘 2026-11-10） | 11-10 接手轮 | 重复被拦动作断路器（`reason=action_loop`，`_STOP_MAP` 映射到 `max_turns`）。`smoke_action_loop.py` 23 条绿；`smoke.py` 175/0；对非重复动作字节透明 |
+| src/ctfy_agent/tools_local.py + tools/shims/shim.py | W（接盘 2026-11-10） | 11-10 接手轮 | ① 修同主机换端口绕过 / 兄弟域名过度放宽（`smoke.py::case_hardening` 断言）；② shell 子进程挂 `tools/pylibs`（PYTHONPATH + `*.libs` DLL）与缺库提示；③ `rm -rf`→`rmdir /s /q`、`ls -la`→`dir /a`；④ shim `head/tail -c`。`smoke_local_tools.py` 全绿（ls 断言按新语义更新） |
+| src/ctfy_agent/attachments.py（新建）+ src/ctfy_agent/gui/{platform_worker,app}.py | W（接盘 2026-11-10） | 11-10 接手轮 | 附件自动下载（真实 DASCTF 验证：unipickle.py 90B/sha256 `96309f79…`）+ 开跑前实例清扫 + 扫盘后台化。`smoke_attachments.py` 26 条绿 |
+| src/ctfy_agent/mcp_client.py + gui/onboard.py + gui/toolmap.py + gui/ocr_tools.ps1 | W（接盘 2026-11-10） | 11-10 接手轮 | ① `McpHttpClient.close()`（只新增）；② `probe()` finally 关会话；③ OCR 去掉 PIL 依赖、`.ps1` 重写为 UTF-8 BOM+CRLF。`smoke_ps1.py` 绿、GUI selftest OK |
+| config/agent.json + src/ctfy_agent/config.py + roles/{ai,misc}.* + tools/{fetch_pylibs,sync_roles,analyze_loop_waste}.py | W（接盘 2026-11-10） | 11-10 接手轮 | `max_llm_calls` 160→240（证据：`tools/analyze_loop_waste.py` 量化可省 ≥176 次）；角色三源重新同步；本地依赖库装上并 gitignore `tools/pylibs`；`.gitignore` 补该行 |
+| docs/HANDOFF-2026-11-10.md + tests/{smoke,smoke_local_tools,smoke_ai_role,smoke_webai_gap}.py + run.cmd + .gitignore | W（接盘 2026-11-10） | 11-10 接手轮 | 文档回填本轮真值（§7.1/§8.1/§9/§10）；既有断言按新语义更新（175/0）；`run.cmd` 归一 CRLF |
 | runs/_stats.py | Y（镜像/验证线） | 10-30 19:00–19:20 | 验收通过：bank-500k-v1 全指标复现（35/10、22/2/1、15,331,789 tok、23.5/39.0 calls）；门 A 后迁 tools/ 前重新上锁 |
 | docs/contest-harvest-checklist.md | Y（镜像/验证线） | 10-30 19:00–19:25 | M4 交付完成，单轮写完即释放 |
 | runs/_p2v_batch.py | Y（镜像/验证线） | 10-30 19:40–19:55 | M2 两臂启动器完成，离线消融验证通过（A 臂 profile={}）；只写未跑，开跑需 --confirm-gate-a |

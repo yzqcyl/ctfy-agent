@@ -25,5 +25,9 @@ dist/
 .ref/
 .workbuddy/
 
+# 本地扩展依赖库（tools/fetch_pylibs.py 装进来的 wheel 解包，约 80MB，不进 git）
+# 只有本地 GUI/CLI 用得上；容器镜像不带它，shell 里会自动退回纯 stdlib。
+tools/pylibs/
+
 # 收进来的第三方模块（可能内嵌凭据，且不属于镜像源码）
 inbox/

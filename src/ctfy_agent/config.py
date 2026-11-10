@@ -231,7 +231,10 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
         extra["competition_id"] = _comp
 
     # [fix 2026-11-05] 测试/重跑用的预算档允许走环境变量（不污染 config/agent.json 的
-    # 平台契约默认值 800k/160；tests/smoke.py 有守卫断言默认值必须保持）。
+    # 平台契约默认值 800k；tests/smoke.py 有守卫断言 DEFAULTS 必须保持）。
+    # [接手 2026-11-10] 调用数默认值仍是 20（DEFAULTS 不动），但 config/agent.json 把它放到
+    # 240：40 步 × 最多 6 次调用/步；实测 160 次 × ~3.2k tok/次 ≈ 500k，240 次 ≈ 800k，
+    # 也就是「先撞 token 上限」——那才是设计中的真墙（见 HANDOFF §5.2 与 §8 P1）。
     for env_key, field_name, caster in (
         ("AGENT_MAX_TOKENS_PER_CHALLENGE", "max_tokens_per_challenge", int),
         ("AGENT_MAX_LLM_CALLS", "max_llm_calls", int),
