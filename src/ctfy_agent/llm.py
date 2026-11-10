@@ -17,6 +17,7 @@ from json import JSONDecodeError
 from urllib.parse import urlparse
 
 from .httputil import SameOriginRedirect, build_opener, read_limited
+from .keypool import KeyPool, classify_key_failure
 
 # 哪些端点认得 `enable_thinking` 这个请求字段。
 #   百炼 / DashScope（含 compatible-mode）认，是原生扩展字段；
@@ -54,8 +55,12 @@ class DeepSeekLLM:
         timeout: float = 120.0,
         debug: bool = False,
         budget=None,
+        key_pool: KeyPool | None = None,
     ):
-        self.api_key = api_key
+        # [2026-11-10 加固-需求1] key_pool 存在时以 pool.current() 为准（api_key 参数仅兜底）；
+        # pool 为单 key 时行为与现状逐字节一致。
+        self._key_pool = key_pool
+        self.api_key = (key_pool.current() if key_pool is not None and len(key_pool) else api_key)
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.temperature = temperature
@@ -111,6 +116,23 @@ class DeepSeekLLM:
                     status=exc.code,
                     retryable=exc.code in (408, 409, 425, 429, 500, 502, 503, 504),
                 )
+                # [2026-11-10 加固-需求1] KeyPool 轮换：只对「注定失败」的 key 语义
+                # （401/403 失效、402 欠费、配额类 429、400 无模型权限）切下一个 key 并立即重发，
+                # 不消耗 retries 配额；纯限速走退避、5xx/网络错误绝不切（判定见 keypool.py）。
+                # 无 pool（或单 key pool）时下面整块不执行，行为与现状一致。
+                if self._key_pool is not None and len(self._key_pool) > 1:
+                    kind = classify_key_failure(exc.code, detail)
+                    if kind in ("dead", "quota"):
+                        if self._key_pool.rotate(f"http_{exc.code}:{kind}"):
+                            self.api_key = self._key_pool.current()
+                            headers["Authorization"] = f"Bearer {self.api_key}"
+                            continue
+                        raise LLMError(
+                            f"HTTP {exc.code} {exc.reason}{hint}: {detail[:200]}"
+                            f"（{len(self._key_pool)} 个 key 全部不可用）",
+                            status=exc.code,
+                            retryable=False,
+                        ) from None
                 if not (error.retryable and attempt < retries):
                     raise error from None
             except urllib.error.URLError as exc:

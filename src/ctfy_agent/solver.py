@@ -1013,9 +1013,20 @@ class Solver:
         port = svc.get("port") or (443 if str(svc.get("service_type")) == "https" else 80)
         scheme = "https" if str(port) not in ("80", "8080") else "http"
         url = f"{scheme}://{host}/"
-        deadline = time.time() + 45
+        # [2026-11-10 加固-需求4] 上限可配：重 Docker 靶场（Java/Node + 初始化数据）常见
+        # 60–120s 才可用，45s 就停等会让后续每个请求都被拒、进而被误判成「实例卡住」。
+        # 默认仍 45s（= 旧行为）；比赛 .env 设 AGENT_INSTANCE_READY_TIMEOUT=180。
+        # 超时后照旧不 abort（只写 note），决定权留给模型——我们不当裁判。
+        try:
+            wait_cap = float(os.environ.get("AGENT_INSTANCE_READY_TIMEOUT") or 45)
+        except (TypeError, ValueError):
+            wait_cap = 45.0
+        wait_cap = max(5.0, min(wait_cap, 600.0))  # 下限防 0 秒死循环，上限防把 10h session 等没
+        deadline = time.time() + wait_cap
         attempt = 0
         last = "（未探测）"
+        # 退避间隔：重靶场前半段注定失败，固定 3s 连打大半是无效请求
+        backoff = [3, 5, 8, 10]
         while time.time() < deadline:
             attempt += 1
             code = 0
@@ -1042,10 +1053,10 @@ class Solver:
                         {"role": "instance", "note": f"[就绪等待] {host} 第 {attempt} 次探测 {last}，视为就绪"},
                     )
                     return
-            time.sleep(3)
+            time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
         self.store.append_transcript(
             challenge_id,
-            {"role": "instance", "note": f"[就绪等待] {host} 45s 内未见应用就绪（最后 {last}），继续按平台状态推进"},
+            {"role": "instance", "note": f"[就绪等待] {host} {wait_cap:.0f}s 内未见应用就绪（最后 {last}），继续按平台状态推进"},
         )
 
     def _submit(self, args: dict, challenge_id: str) -> tuple[str, bool]:

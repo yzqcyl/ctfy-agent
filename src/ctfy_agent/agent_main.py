@@ -532,6 +532,19 @@ def _final_rollup(store: Store, challenge_id: str, summary: dict, config: Config
         f"tokens={summary.get('tokens_spent', 0)} "
         f"ledger={json.dumps(ledger, ensure_ascii=False)}"
     )
+    # [2026-11-10 加固-需求3a] 未解题归档标注：写在 writeup 最前面（协议明确超长是截断不是拒收，
+    # 截断只砍尾部；writeup 不参与评分）。只写已发生的事实（用量/原因/轮换次数），
+    # 绝不写未验证的答案——answers 走 per-question wrong-attempt cap，蒙错会烧掉题号额度。
+    if _map_stop_reason(reason) != "done":
+        _tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+        _ann = (
+            f"[未解归档] reason={reason} tokens={_tokens}"
+            f" calls={budget.get('calls', '?')} steps={summary.get('steps', '?')}"
+        )
+        if summary.get("keypool_rotations"):
+            _ann += f" keypool_rotations={summary['keypool_rotations']}"
+        _ann += "（本题未解出，用量与收口原因供重跑参考）"
+        writeup = f"{_ann} | {writeup}"
     # [规则 v2.5 审计 #1 监控面] 降级跑的题要把「按什么模式跑的」写进 result.json，
     # 11-14 入围测试盯盘时 grep degraded_run_mode 就能定位平台下发了我们不认识的 run_mode。
     _degraded = str(config.extra.get("degraded_run_mode") or "")
@@ -724,7 +737,20 @@ def run_agent(
     _enrich_facets(store, platform, challenge_id)
 
     # 8) LLM 工厂（或复用注入）；强制所有角色用 LLM_MODEL（网关会改 model，多模型名是误导）
+    key_pool = None
     if llm_factory is None:
+        # [2026-11-10 加固-需求1] KeyPool：只有配了 LLM_API_KEYS（≥2 个有效 key）才启用；
+        # 未配置时 key_pool=None，DeepSeekLLM 行为与现状逐字节一致。
+        # 合规闸：pool_from_env 在平台网关 base_url 下强制单 key（正式赛额度按平台 handle 计）。
+        from .keypool import pool_from_env
+
+        # 注意：不往 key/凭证解析链里回落 config.llm_api_key（DEEPSEEK_API_KEY）——
+        # 「缺凭证 → refused」是保分契约（smoke.py case_agent_degraded 钉死），不能松。
+        _pool = pool_from_env(env, config.llm_base_url)
+        if len(_pool) > 1:
+            key_pool = _pool
+            _log(f"[keypool] 启用 {len(_pool)} 个 key（首 {key_pool.label()}），401/402/配额类429 自动切换")
+
         def llm_factory(model=None):
             return DeepSeekLLM(
                 api_key=config.llm_api_key,
@@ -736,6 +762,7 @@ def run_agent(
                 # 读超时用题级 timeout（默认 120s）：长上下文+长输出的单次生成可能超过 120s，
                 # 不传就会退回 llm 默认值，偶发 raw TimeoutError 直接击穿整题（实测 3.3min 崩两次）。
                 timeout=config.timeout,
+                key_pool=key_pool,
             )
 
     # 9) 跑 Crew
@@ -743,6 +770,15 @@ def run_agent(
         crew = Crew(config, platform, store, llm_factory)
         # 集群-B 编排入口：config 不加 clusterb_k 时 k=1，与 crew.solve 逐字等价（零回归）
         summary = crew.solve_clusterb(challenge_id)
+        # [2026-11-10 加固-需求1 铁律3] 自动动作留痕：key 轮换事件落 transcript（只记指纹，无明文）
+        if key_pool is not None and key_pool.events:
+            for _ev in key_pool.events:
+                store.append_transcript(
+                    challenge_id,
+                    {"role": "keypool",
+                     "note": f"[KeyPool] 切换到 key#{_ev['idx'] + 1}({_ev['fp8']})，原因={_ev['reason']}"},
+                )
+            summary.setdefault("keypool_rotations", len(key_pool.events))
     except Exception as exc:  # noqa: BLE001 - 任何解题异常都不许毁掉 result.json
         _write_rollup(
             result_path,

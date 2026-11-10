@@ -61,12 +61,15 @@ classify(text, status) -> "dead" | "quota" | "ratelimit" | "transient" | None
 | 5xx / URLError / Timeout | 服务端抖动 | **不切**（切了更糟） |
 | HTTP 400 且 body 含 `model` / `permission` | 新 key 无该模型权限 | 当 `dead` 处理，继续切 |
 
-**硬门禁（合规，不可绕过）**
-> 只要检测到**平台注入**的 `LLM_API_KEY`（同时存在 `LLM_BASE_URL`），KeyPool **只装这一个 key，`rotate()` 恒 False**。
-> 正式赛的 1B 额度是按平台下发的 per-run handle 计的，用自备 key 绕过去等于违反「不得绕过资源限制」。这条写成断言，不是注释。
+**硬门禁（合规，不可绕过）——复审后简化为两道闸**
+> 闸一（结构性，已核实）：`load_dotenv(override=False)` 是**环境变量优先于 .env**，且 Dockerfile
+> 只 COPY `src/` + `config/agent.json`——镜像里**没有 .env**。正式赛容器里 `LLM_API_KEYS` 天然不存在，
+> pool 自动退化为单 key。KeyPool 只有配了 `LLM_API_KEYS` 才可能有 ≥2 个 key。
+> 闸二（代码断言）：`LLM_API_KEYS` 与平台网关 base_url（`*.tsinghua.edu.cn`）共存时，强制只用
+> 平台注入的 `LLM_API_KEY` 单 key。正式赛 1B 额度按平台下发的 handle 计，用自备 key 绕过 = 违规。
 
-**接入点**：`agent_main.py:673` 的 `llm_factory` 把 `KeyPool` 传给每个 `DeepSeekLLM`；
-对象各自独立但共享同一个 pool 引用 → 任一角色切换，全局生效。
+**接入点**：`agent_main.py` 的 `llm_factory`（当前 727 行附近）把 `KeyPool` 传给每个 `DeepSeekLLM`；
+对象各自独立但共享同一个 pool 引用（`threading.Lock` 保证并发 run 下轮转安全，R7）→ 任一角色切换，全局生效。
 日志只打 `key#2(ab12cd34)`，**绝不打明文**。
 
 ### 危险
@@ -76,7 +79,7 @@ classify(text, status) -> "dead" | "quota" | "ratelimit" | "transient" | None
 | 1.1 | 把 429 限速当额度耗尽，多 key 轮询 | 可能被判「绕限速」，也可能加剧封禁 | 只在 body 明确配额类时切；纯限速走退避 |
 | 1.2 | 所有 key 都死 | 整题报废（与现在一样），但**更晚**才失败 → 浪费预算 | 全耗尽立即抛 `LLMError(kind=all_keys_dead)`，写 `llm_error` + writeup 注明，不再重试 |
 | 1.3 | 新 key 没开通该模型 | 400，被误当服务端错误反复重试 | 400+`model/permission` 归到 `dead`，继续切；切满一圈仍失败则收口 |
-| 1.4 | usage 统计被重置 | `max_tokens_per_challenge` 失效 → 烧穿 | usage 挂在 pool 上，切换不重置 |
+| 1.4 | ~~usage 统计被重置~~ | 复审证伪：`budget.record()` 按每次响应的 usage 记账、与 key 无关，切 key 天然不重置账本 | 无需处理；pool 只管 key 不管 usage |
 | 1.5 | 平台注入场景被误切 | **违规** | §硬门禁，代码里 `assert platform_injected: len(pool)==1` |
 | 1.6 | key 明文进日志/transcript | 密钥外泄（文档会被提交） | 只存 `fp8 = sha256(key)[:8]`；`tools/secret_scan.py` 已有兜底 |
 
@@ -172,17 +175,17 @@ CTFY-0001 §2：**一个容器 = 一道题**，跑完写 `result.json` 退出，
 
 ### 现状
 
-`solver.py:968 _wait_instance_ready`：deadline **45s** 固定，每次 8s 超时，无退避。
-重 Docker 靶场（Java/Node + 初始化数据）常见 60–120s 才可用 → 现在会提前判「未就绪」继续，
+`solver.py:1002 _wait_instance_ready`：deadline **45s 写死**（`time.time() + 45`），每次探测
+`urlopen timeout=8` + 固定 `sleep(3)`，无退避；超时后**本来就不 abort**（写一行 note 继续，已核实）。
+重 Docker 靶场（Java/Node + 初始化数据）常见 60–120s 才可用 → 45s 就停止等待，
 后面每个请求都拒绝 → 触发需求 2 的收口。**这两件事是同一条因果链**。
 
 ### 设计
 
 - 上限改为 `AGENT_INSTANCE_READY_TIMEOUT`，**默认仍 45s（= 当前行为）**，比赛 `.env` 设 `180`。
-- 探测间隔退避：3 → 5 → 8 → 10 → 10…（旧实现固定 8s 连打，15 次里大半是无效请求）。
+- 探测间隔退避：3 → 5 → 8 → 10 → 10…（旧实现固定 sleep(3) 连打 15 次；重靶场前半段注定失败，退避少打无效请求）。
 - 就绪判据不变（非「网关 404」的任意响应即就绪），只 `GET /`，**无副作用**。
-- 超时后**不 abort**：写一行 note「实例 X 在 180s 内未就绪，按未就绪继续」，把决定权留给模型
-  （它可能选择继续试、换端口、或换路线）。**我们不当裁判**。
+- 超时后**不 abort**（与现状一致）：note 文案带上配置的秒数，把决定权留给模型。**我们不当裁判**。
 - 与需求 2 联动：**就绪等待期间不计入 stalled 计数**，避免「等得久 → 被判卡死」。
 
 ### 危险
