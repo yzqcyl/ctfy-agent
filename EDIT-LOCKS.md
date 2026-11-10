@@ -17,6 +17,7 @@
 
 | 文件 | 会话 | 区间 | 结果 |
 |---|---|---|---|
+| docs/audit-rules-v2.5-2026-11-10.md（第二遍全量细读扩写）+ runs/_rules/*（PDF 提取件，gitignored） | W（规则审计 2026-11-10 第二遍） | 11-10 22:00–22:40 | 逐页读完 v2.5 手册 7 页，把第一遍 7 处扩成 **15 处**（新增：LLM 注入回落链路、本队题得分规避、出题约束清单〔镜像白名单/六禁止/每轮配额/倒扣分〕、公开仓库保密边界、平台漏洞处置义务、10h 吞吐、隔离纪律、白名单 12 家口径），更新 `241c845` 已修状态 + 比赛事实卡。PDF 提取：pypdf 7.0.1（wheel 手工解包，pip 临时目录 ACL 坑绕开），全文存 `runs/_rules/rules_text.txt` |
 | src/ctfy_agent/instance_guard.py + src/ctfy_agent/solver.py + src/ctfy_agent/gui/platform_worker.py | W（接盘 2026-11-11 二次轮） | 11-11 只读 + 离线 | 补「无 `list_instances` 平台」的按题原语（`supports_reap/query_environment/environment_live/delete_environment`），并把 `_recover_instance_slot` 的失败恢复扩成「查→复用 / 明确不存在才删一次→重试」。只读实测 DASCTF ctf2 无列表能力（`ctf2_get_environment` 回 `{"environment":{"status":"none"}}`）。`tests/smoke_instance_recovery.py` 24 条绿；`smoke.py` 175/0、p1/p2/gate/evidence/brake/clustera/clusterb 全绿 |
 | src/ctfy_agent/crew.py + src/ctfy_agent/agent_main.py | W（接盘 2026-11-11 二次轮） | 11-11 离线 | ① 每题写「生效预算+来源」note + `budget_plan` 事件；② `COORDINATOR_PROMPT` 加「flag 必须来自靶标真实产物（仓库/样例 `flag.txt` 不算答案）」纪律。`smoke_action_loop.py` 25 条绿 |
 | tools/analyze_rejections.py（新建）+ tests/smoke_instance_recovery.py（新建）+ docs/HANDOFF-2026-11-10.md | W（接盘 2026-11-11 二次轮） | 11-11 | 被拒答案溯源工具（证据：8 条被拒答案前缀全对、来源为公开仓库/样例占位 flag）+ 文档回填 §7.2/§8.1b/§8.2/§9/§10 |
