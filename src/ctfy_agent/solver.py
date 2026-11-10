@@ -641,7 +641,15 @@ class Solver:
         清扫是这条链上唯一有效的动作，原地重试只会加速烧额度。
         只在**剩余配额 ≥2** 时执行（留一次给正常流程），且不设保护名单之外的例外。
         """
-        from .instance_guard import reap, start_remaining, summarize  # noqa: PLC0415 - 只在失败路径需要
+        from .instance_guard import (  # noqa: PLC0415 - 只在失败路径需要
+            delete_environment,
+            environment_absent,
+            environment_live,
+            query_environment,
+            reap,
+            start_remaining,
+            summarize,
+        )
 
         remaining = start_remaining(self.store, challenge_id, self.config.instance_ops_limit)
         if remaining < 2:
@@ -666,7 +674,32 @@ class Solver:
             if isinstance(live, dict):
                 self.on_event("instance_guard", {"note": f"槽位被同题实例占着，直接复用（id={live.get('id')}）"})
                 return live
-            return None  # 槽位不是被残留实例占着，重试没有意义
+            # [fix 2026-11-11] 没有 list_instances 的平台（DASCTF ctf2 实测）上面两步都是空转。
+            # 该平台只有「按 challenge_id 查/删环境」两个原语，且全队共享 1 个环境配额：
+            # 旧环境占位时 start 只会一直报 agent_environment_limit，旧逻辑在这里 return None，
+            # 模型就会反复 start 把每题 5 次硬上限烧光。改为按题判定：
+            #   环境在   → 直接复用作答（不删，删了等于白扔一次 start 配额）；
+            #   明确不存在 → 先按题删一次（幂等，平台唯一回收原语）再重试 start；
+            #   查不到   → 维持旧行为（不乱删）。
+            comp = self._competition_id(challenge_id)
+            env = query_environment(self.platform, challenge_id, comp or "")
+            if environment_live(env):
+                info: dict = dict(env)
+                info.setdefault("id", str(env.get("instance_id") or ""))
+                if not info.get("id"):
+                    info.pop("id", None)
+                self.on_event(
+                    "instance_guard",
+                    {"note": "按 challenge_id 查到本题环境仍可用，直接复用（不重新 start）",
+                     "detail": env},
+                )
+                return info
+            if environment_absent(env):
+                removed = delete_environment(self.platform, challenge_id, comp or "")
+                self.on_event("instance_guard", {"note": f"按 challenge_id 回收残留环境：{removed}", "detail": removed})
+                if removed.get("ok"):
+                    return self._start_with_backoff(challenge_id, start_name)
+            return None  # 平台没有可用的按题原语 / 状态不明：不猜，交给上层
         # [fix 2026-11-03] 记账下沉到 _start_with_backoff，此处不再前置 record_call（审计 B-2）。
         return self._start_with_backoff(challenge_id, start_name)
 

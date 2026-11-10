@@ -11,12 +11,15 @@
 
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
-| （无活动锁） | — | — | 接手轮（W）已收尾，见下方「已释放」最后 5 行 |
+| （无活动锁） | — | — | 二次接手轮（2026-11-11）已收尾，见下方「已释放」最前 3 行 |
 
 ## 已释放
 
 | 文件 | 会话 | 区间 | 结果 |
 |---|---|---|---|
+| src/ctfy_agent/instance_guard.py + src/ctfy_agent/solver.py + src/ctfy_agent/gui/platform_worker.py | W（接盘 2026-11-11 二次轮） | 11-11 只读 + 离线 | 补「无 `list_instances` 平台」的按题原语（`supports_reap/query_environment/environment_live/delete_environment`），并把 `_recover_instance_slot` 的失败恢复扩成「查→复用 / 明确不存在才删一次→重试」。只读实测 DASCTF ctf2 无列表能力（`ctf2_get_environment` 回 `{"environment":{"status":"none"}}`）。`tests/smoke_instance_recovery.py` 24 条绿；`smoke.py` 175/0、p1/p2/gate/evidence/brake/clustera/clusterb 全绿 |
+| src/ctfy_agent/crew.py + src/ctfy_agent/agent_main.py | W（接盘 2026-11-11 二次轮） | 11-11 离线 | ① 每题写「生效预算+来源」note + `budget_plan` 事件；② `COORDINATOR_PROMPT` 加「flag 必须来自靶标真实产物（仓库/样例 `flag.txt` 不算答案）」纪律。`smoke_action_loop.py` 25 条绿 |
+| tools/analyze_rejections.py（新建）+ tests/smoke_instance_recovery.py（新建）+ docs/HANDOFF-2026-11-10.md | W（接盘 2026-11-11 二次轮） | 11-11 | 被拒答案溯源工具（证据：8 条被拒答案前缀全对、来源为公开仓库/样例占位 flag）+ 文档回填 §7.2/§8.1b/§8.2/§9/§10 |
 | src/ctfy_agent/crew.py + src/ctfy_agent/agent_main.py | W（接盘 2026-11-10） | 11-10 接手轮 | 重复被拦动作断路器（`reason=action_loop`，`_STOP_MAP` 映射到 `max_turns`）。`smoke_action_loop.py` 23 条绿；`smoke.py` 175/0；对非重复动作字节透明 |
 | src/ctfy_agent/tools_local.py + tools/shims/shim.py | W（接盘 2026-11-10） | 11-10 接手轮 | ① 修同主机换端口绕过 / 兄弟域名过度放宽（`smoke.py::case_hardening` 断言）；② shell 子进程挂 `tools/pylibs`（PYTHONPATH + `*.libs` DLL）与缺库提示；③ `rm -rf`→`rmdir /s /q`、`ls -la`→`dir /a`；④ shim `head/tail -c`。`smoke_local_tools.py` 全绿（ls 断言按新语义更新） |
 | src/ctfy_agent/attachments.py（新建）+ src/ctfy_agent/gui/{platform_worker,app}.py | W（接盘 2026-11-10） | 11-10 接手轮 | 附件自动下载（真实 DASCTF 验证：unipickle.py 90B/sha256 `96309f79…`）+ 开跑前实例清扫 + 扫盘后台化。`smoke_attachments.py` 26 条绿 |

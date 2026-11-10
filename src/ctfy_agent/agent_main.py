@@ -245,6 +245,15 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     # 调用数预算：task.max_turns（平台下发）> env AGENT_MAX_TURNS > agent.json > 160。
     # [fix 2026-11-03] 此前 agent.json 的 max_llm_calls 同样被忽略，与实际生效值不一致。
     _calls_cap = config.max_llm_calls or DEFAULT_MAX_TURNS
+    # [接手 2026-11-11] 记录生效来源：交接文档里多次把「改了 agent.json 还是 160」当 bug，
+    # 实际是平台下发的 task.max_turns 优先。来源只写进 config.extra（新键，不改变任何分支）。
+    if max_turns:
+        _calls_source = "平台下发 task.max_turns"
+    elif env.get("AGENT_MAX_TURNS"):
+        _calls_source = "环境变量 AGENT_MAX_TURNS"
+    else:
+        _calls_source = "config/agent.json max_llm_calls"
+    config.extra["max_llm_calls_source"] = _calls_source
     config.max_llm_calls = max_turns or _as_int(env.get("AGENT_MAX_TURNS"), _calls_cap)
     config.max_context_tokens = _as_int(env.get("AGENT_MAX_CONTEXT_TOKENS"), DEFAULT_MAX_CONTEXT)
     # [fix 2026-11-03] 单题 token 上限统一：以 config/agent.json 为唯一权威值（800k），

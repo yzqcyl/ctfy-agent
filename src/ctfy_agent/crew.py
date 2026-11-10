@@ -572,6 +572,11 @@ COORDINATOR_PROMPT = """你是 CTF 解题**协调者**。你不亲自探测，�
   `verify_exploit` 校验，别用 submit 蒙；通过一问后禁止连发 submit，下一动作只能是 delegate 或 done。
 - **先提交再补链路**：专家结论里只要出现「疑似成功值」（FLAG{...}、题面指定格式的串、响应回显里的 secret/token），下一动作**必须是 submit**——不要先 note、不要为「再确认一轮」再派活。链路没走完不影响提交；晚提交不加分，只多烧预算（历史失败题里 35/37 从未交过任何候选值）。
 - submit 被判错时：把该值记进 note 并标注「已提交-错误」，然后继续派活换路线；同一值最多提交 1 次，不同候选值可以再提交。
+- **flag 必须来自本题靶标的真实产物**：从公开仓库、题面附件、仓库里自带的示例/占位 `flag.txt`、网上 writeup 里抄来的串**不算答案**——
+  本平台练习场是重新签发的 flag，公开值基本都判错（实测 11-10 有 7 题就是交了仓库/样例里的 flag，每题白烧 1 次提交；
+  其中两道仓库文件自己写着 "repo placeholder"）。可直接交的来源只有三种：① 打运行中实例/服务拿到的回显；
+  ② 你本地脚本对**本题附件**解密/解包算出的结果（且能重跑出同一串）；③ 平台只读工具回执里的原文。
+  候选来自仓库/样例时先在 note 标「来源=仓库/样例」，判错后不要靠改拼写重交。
 - 不要臆造事实，不要重复派相同的活，不要连发 submit。
 - **接入层不可达 = 本题到此为止（硬性）**：专家结论里出现「DNS 解析失败 / 内网隧道 / `*.internal` 无法解析 / VPN 不可达」
   说明这台机器根本没有平台内网隧道，本机永远打不通这道题。下一动作**必须直接 done 收口**，
@@ -918,6 +923,18 @@ class Crew:
             # 集群-B：本次尝试切片（空/None = 不切片，行为同旧）。必须在首个 spending.check() 之前设。
             spending.set_attempt_caps(attempt_caps)
         start_usage = spending.snapshot()
+
+        # [接手 2026-11-11] 把「这次真正生效的预算 + 来源」落成确定性事实：
+        # 平台托管跑法里 `task.max_turns` 会覆盖 agent.json 的 max_llm_calls，历史交接里
+        # 多次把「改了配置为什么还是 160」当成 bug。一行 note 比事后翻代码可靠。
+        _caps_note = (
+            f"生效预算：调用上限 {int(getattr(spending, 'max_calls', 0) or 0)}"
+            f"（来源 {self.config.extra.get('max_llm_calls_source') or 'config/agent.json'}）"
+            f"，token 上限 {int(getattr(spending, 'max_tokens', 0) or 0)}"
+            f"（来源 config/agent.json）"
+        )
+        self.store.append_transcript(challenge_id, {"role": "budget", "note": _caps_note})
+        self.on_event("budget_plan", {"challenge_id": challenge_id, "note": _caps_note})
 
         # 一开始就超了：直接拒绝，不起实例、不发请求（与 Solver.solve 对齐，审计 B8）
         try:

@@ -70,8 +70,17 @@ def _preflight_instances(platform, challenge_id: str, protect: tuple[str, ...], 
     if not enabled:
         return
     try:
-        from ..instance_guard import reap, summarize  # noqa: PLC0415
+        from ..instance_guard import reap, summarize, supports_reap  # noqa: PLC0415
 
+        if not supports_reap(platform):
+            # [接手 2026-11-11 实测] DASCTF ctf2 没有 list_instances：reap 在这条平台上是空转，
+            # 别给用户「清掉了 0 个残留」的假象；它靠按 challenge_id 查/删环境（solver 自愈路径）。
+            emit("instance_guard", {
+                "challenge_id": challenge_id,
+                "note": "平台未暴露 list_instances，跳过开跑前全量清扫"
+                        "（同题残留由 solver 的「按题查环境 → 复用/回收」自愈处理）",
+            })
+            return
         result = reap(platform, keep=challenge_id, protect=protect, grace_seconds=120.0)
     except Exception as exc:  # noqa: BLE001 - 清扫是加分项
         emit("instance_guard", {"challenge_id": challenge_id,

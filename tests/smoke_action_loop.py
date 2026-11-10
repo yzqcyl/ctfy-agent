@@ -143,12 +143,14 @@ class ScriptedLLM:
         }
 
 
-def _fresh(cfg, plat, llm, run_id: str) -> tuple[Store, Crew]:
+def _fresh(cfg, plat, llm, run_id: str, events: list | None = None) -> tuple[Store, Crew]:
     store = open_store(cfg, run_id)
     store.upsert({"id": CID, "name": "loop-demo", "category": "MISC",
                   "description": "断路器回归", "points": 1})
     store.save()
-    crew = Crew(cfg, plat, store, lambda model=None: llm)
+    sink = events if events is not None else []
+    crew = Crew(cfg, plat, store, lambda model=None: llm,
+                on_event=lambda kind, payload=None: sink.append((kind, payload or {})))
     return store, crew
 
 
@@ -188,7 +190,8 @@ def main() -> int:
     # ---------- 2) 端到端：同一答案连交 → 断路器收口 ----------
     plat = StubPlatform()
     llm = ScriptedLLM([{"name": "submit", "args": {"answer": "L3AK{same_guess}"}}] * 20)
-    store, crew = _fresh(cfg, plat, llm, "loop1")
+    events: list = []
+    store, crew = _fresh(cfg, plat, llm, "loop1", events)
     summary = crew.solve(CID)
 
     check("收口原因是 action_loop", summary.get("reason") == "action_loop", str(summary.get("reason")))
@@ -201,6 +204,10 @@ def main() -> int:
     check("转录记了移出工具面", "已移出工具面" in tr)
     check("转录记了 action_loop 收口", "action_loop" in tr)
     check("状态记为 stalled", store.require(CID).status == "stalled", store.require(CID).status)
+    # [接手 2026-11-11] 生效预算必须落成确定性一行（来源可辨，避免"改了配置没用"的误判）
+    check("转录记了生效预算与来源", "生效预算：调用上限" in tr and "来源" in tr, tr[-300:])
+    check("预算事件已发出",
+          any(k == "budget_plan" for k, _ in events), str([k for k, _ in events])[:200])
 
     # ---------- 3) 工具面真的少了 submit ----------
     names_after = crew._coordinator_tools({"submit"})

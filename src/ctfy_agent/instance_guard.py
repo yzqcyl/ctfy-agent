@@ -18,6 +18,14 @@
   - `keep`：本题 challenge_id，永不触碰；
   - `protect`：调用方显式声明的保护名单（并发批跑时把兄弟题塞进来）；
   - `grace_seconds`：**拿不到创建时间的实例一律不动**（宁可漏杀，不可误杀）。
+
+平台能力差异（2026-11-11 只读实测，别想当然）：
+  - 有 `list_instances` 的平台：走 `reap()` 全量清扫（上面三道防线）。
+  - **DASCTF ctf2 没有 `list_instances`**：`reap()`/`_find_live_instance()` 在这条平台上是空转。
+    它只有两个按题原语，由本模块包装：
+      `query_environment()`（`ctf2_get_environment` → `{"environment":{"status":"none"}}`，
+      无需实例 id）与 `delete_environment()`（`ctf2_user_delete_…_environment`，按 challenge_id 删）。
+    `solver._recover_instance_slot` 在 start 失败时用这两个原语做「查 → 复用 / 明确不存在才删一次 → 重试」。
 """
 
 from __future__ import annotations
@@ -96,6 +104,88 @@ def list_all(platform) -> list[dict] | None:
         return None
 
 
+def supports_reap(platform) -> bool:
+    """平台是否有「列出全部实例」的能力（决定 reap/复用列表这条路是否为空转）。
+
+    [接手 2026-11-11 实测] DASCTF ctf2 **没有** list_instances：reap()/`_find_live_instance()`
+    在这个平台上永远拿不到列表（`reap` 返回 ok=False），开跑前清扫是空转。它只有
+    「按 challenge_id 查环境 / 按 challenge_id 删环境」两个原语，见下面三个函数。
+    """
+    try:
+        return bool(platform.try_resolve("list_instances"))
+    except Exception:  # noqa: BLE001 - 假平台/老接口
+        return False
+
+
+def query_environment(platform, challenge_id: str, competition_id: str = "") -> dict:
+    """按 challenge_id 查本题环境状态（无需实例 id，DASCTF 唯一可用的「有没有环境」原语）。
+
+    实测回执：`{"environment": {"access_ready": false, "status": "none"}}`。
+    返回 `{}` 表示平台不支持/查询失败——调用方必须按「未知」处理，**不得**据此删东西。
+    """
+    try:
+        tool = platform.try_resolve("get_instance")
+    except Exception:  # noqa: BLE001
+        tool = None
+    if not tool:
+        return {}
+    args: dict = {"challenge_id": challenge_id}
+    if competition_id:
+        args["competition_id"] = competition_id
+    try:
+        text = platform.call_text(tool, args)
+        data = platform._as_json(text) if hasattr(platform, "_as_json") else None
+    except Exception:  # noqa: BLE001 - 查询失败按未知处理
+        return {}
+    if isinstance(data, dict):
+        env = data.get("environment")
+        if isinstance(env, dict):
+            return env
+        return data
+    return {}
+
+
+def environment_live(env: dict) -> bool:
+    """环境是否「已存在且可用」：明确的 none/stopped 不算，未知状态也按不可用（宁可漏判）。"""
+    if not isinstance(env, dict) or not env:
+        return False
+    status = str(env.get("status") or "").strip().lower()
+    if status in {"none", "stopped", "deleted", "expired", "absent"}:
+        return False
+    if env.get("access_ready") is True:
+        return True
+    return status in {"running", "ready", "active", "started"}
+
+
+def environment_absent(env: dict) -> bool:
+    """环境是否**明确**不存在（只有这种情形才允许「删一次再起」）。"""
+    if not isinstance(env, dict) or not env:
+        return False
+    return str(env.get("status") or "").strip().lower() in {"none", "absent", "deleted", ""}
+
+
+def delete_environment(platform, challenge_id: str, competition_id: str = "") -> dict:
+    """按 challenge_id 删本题环境（平台唯一的回收原语；不需要实例 id）。
+
+    ⚠️ 这是写操作。只在「start 失败且环境明确不存在/残留」的恢复路径里调用，调用方负责
+    保证本题当前没有可用环境（否则等于白扔一次 start 配额）。
+    """
+    try:
+        tool = platform.try_resolve("stop_instance")
+    except Exception:  # noqa: BLE001
+        tool = None
+    if not tool:
+        return {"ok": False, "error": "平台没有按 challenge_id 回收环境的工具"}
+    args: dict = {"challenge_id": challenge_id}
+    if competition_id:
+        args["competition_id"] = competition_id
+    try:
+        text = platform.call_text(tool, args)
+        return {"ok": True, "note": str(text)[:300]}
+    except Exception as exc:  # noqa: BLE001 - 回收失败不抛，交给上层决定是否继续重试
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
 def reap(
     platform,
     *,
@@ -115,7 +205,7 @@ def reap(
     }
     name = platform.try_resolve("list_instances") if hasattr(platform, "try_resolve") else None
     if not name:
-        result["error"] = "平台没有 list_instances，跳过清扫"
+        result["error"] = "平台没有 list_instances（改用 query_environment/delete_environment 按 challenge_id 回收）"
         return result
     try:
         items = _items(platform.list_instances())
