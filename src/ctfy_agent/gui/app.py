@@ -14,11 +14,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 from ..config import PROJECT_ROOT, load
 from ..writeup import build_writeup, build_writeup_blocks, write_writeup_file
-from . import limits, platform_worker, profiles, settings, toolmap, worker
+from . import limits, platform_worker, profiles, settings, theme, toolmap, worker
 
 CATEGORIES = ["web", "pwn", "rev", "crypto", "misc", "ai"]
 DIFFICULTIES = ["easy", "medium", "hard"]
@@ -85,7 +85,12 @@ class App:
 
         self.root = root or tk.Tk()
         self.root.title("CTF 自动解题（离线 / 平台）")
-        self.root.geometry("1200x780")
+        # 自适应窗口：保证左栏「开始/停止」不用滚动就能看见（1280×900 下正好放下整张表单）
+        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _w = min(1320, max(1060, _sw - 140))
+        _h = min(900, max(680, _sh - 140))
+        self.root.geometry(f"{_w}x{_h}")
+        self.root.minsize(1040, 660)
         try:
             self.root.tk.call("tk", "scaling", 1.2)
         except Exception:  # noqa: BLE001
@@ -97,176 +102,272 @@ class App:
 
     # ---------------- UI ----------------
 
-    def _build_ui(self) -> None:
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:  # noqa: BLE001
-            pass
+    # ---------------- 界面骨架 ----------------
 
-        # 顶部状态栏
-        top = ttk.Frame(self.root, padding=(10, 6))
-        top.pack(fill="x")
+    def _build_ui(self) -> None:
+        """毛玻璃 + GitHub 配色骨架（视觉全走 gui/theme.py，业务逻辑不在这里）。"""
+        theme.apply(self.root)
+
+        page = tk.Frame(self.root, bg=theme.PAGE)
+        page.pack(fill="both", expand=True)
+
+        # ---------- 顶部：毛玻璃标题条（Inter Bold + -0.02em 字距） ----------
+        head = theme.Card(page, padding=(22, 12), radius=theme.RADIUS_CARD, glass=True)
+        head.pack(fill="x", padx=14, pady=(14, 10))
+        hl = tk.Frame(head.body, bg=theme.GLASS)
+        hl.pack(side="left", anchor="w")
+        brand = tk.Canvas(hl, bg=theme.GLASS, height=34, highlightthickness=0, bd=0)
+        brand.pack(anchor="w")
+        self._draw_brand(brand)
+        tk.Label(hl, text="离线靶场 / 平台接口 · 解题 · 复现 · 任务面板", bg=theme.GLASS,
+                 fg=theme.TEXT_MUTED, font=theme.body_font(9)).pack(anchor="w")
+
+        hr = tk.Frame(head.body, bg=theme.GLASS)
+        hr.pack(side="right")
         self.lbl_status = tk.StringVar(value="就绪")
         self.lbl_budget = tk.StringVar(value="预算：—")
         self.lbl_elapsed = tk.StringVar(value="耗时：—")
-        ttk.Label(top, text="CTF 自动解题", font=("", 14, "bold")).pack(side="left")
-        ttk.Label(top, textvariable=self.lbl_status, foreground="#0a5").pack(side="left", padx=(24, 0))
-        ttk.Button(top, text="⚙ 设置", command=self._open_settings).pack(side="right")
-        ttk.Label(top, textvariable=self.lbl_elapsed).pack(side="right", padx=(0, 16))
-        ttk.Label(top, textvariable=self.lbl_budget).pack(side="right")
+        self.pill_status = theme.Pill(hr, "就绪", color=theme.TEXT_MUTED, bg=theme.HOVER)
+        self.pill_status.pack(side="right", padx=(10, 0))
+        theme.RoundedButton(hr, text="设置", icon="gear", variant="secondary",
+                            command=self._open_settings, pad_y=8, pad_x=16).pack(side="right")
+        for _var in (self.lbl_elapsed, self.lbl_budget):
+            tk.Label(hr, textvariable=_var, bg=theme.GLASS, fg=theme.TEXT_MUTED,
+                     font=theme.body_font(9)).pack(side="right", padx=(0, 14))
+        self.lbl_status.trace_add("write", lambda *a: self._sync_status_pill())
 
-        # 预算进度条（token / 调用 / 费用）
-        bud = ttk.Frame(self.root, padding=(10, 0))
-        bud.pack(fill="x", pady=(0, 4))
+        # ---------- 预算进度：卡片里两条细进度条 ----------
+        budc = theme.Card(page, padding=(20, 10), radius=16)
+        budc.pack(fill="x", padx=14, pady=(0, 10))
+        bud = budc.body
+        bud.columnconfigure(1, weight=1)
+        bud.columnconfigure(3, weight=1)
         self.lbl_tokens = tk.StringVar(value="token 预算：—")
         self.lbl_calls = tk.StringVar(value="调用：—")
         self.lbl_cost = tk.StringVar(value="费用：—")
-        ttk.Label(bud, textvariable=self.lbl_tokens).grid(row=0, column=0, sticky="w")
-        self.bar_tokens = ttk.Progressbar(bud, maximum=1000, length=260)
-        self.bar_tokens.grid(row=0, column=1, padx=6)
-        ttk.Label(bud, textvariable=self.lbl_calls).grid(row=0, column=2, sticky="w", padx=(14, 0))
-        self.bar_calls = ttk.Progressbar(bud, maximum=1000, length=180)
-        self.bar_calls.grid(row=0, column=3, padx=6)
-        ttk.Label(bud, textvariable=self.lbl_cost).grid(row=0, column=4, padx=(14, 0))
+        tk.Label(bud, textvariable=self.lbl_tokens, bg=theme.CANVAS, fg=theme.TEXT,
+                 font=theme.body_font(9)).grid(row=0, column=0, sticky="w")
+        self.bar_tokens = ttk.Progressbar(bud, maximum=1000)
+        self.bar_tokens.grid(row=0, column=1, sticky="ew", padx=(10, 20))
+        tk.Label(bud, textvariable=self.lbl_calls, bg=theme.CANVAS, fg=theme.TEXT,
+                 font=theme.body_font(9)).grid(row=0, column=2, sticky="w")
+        self.bar_calls = ttk.Progressbar(bud, maximum=1000)
+        self.bar_calls.grid(row=0, column=3, sticky="ew", padx=(10, 20))
+        tk.Label(bud, textvariable=self.lbl_cost, bg=theme.CANVAS, fg=theme.TEXT_MUTED,
+                 font=theme.body_font(9)).grid(row=0, column=4, sticky="w")
 
-        body = ttk.PanedWindow(self.root, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        # ---------- 主体：左栏（整栏可滚动） + 右栏页签 ----------
+        body = ttk.PanedWindow(page, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
 
-        # 左栏
-        left = ttk.Frame(body, width=340)
-        body.add(left, weight=0)
+        # 左栏 = 可滚动内容 + 固定页脚（开始/停止永远可见，不用滚动找按钮）
+        left_holder = tk.Frame(body, bg=theme.PAGE)
+        body.add(left_holder, weight=0)
+        left_foot = tk.Frame(left_holder, bg=theme.PAGE)
+        left_foot.pack(side="bottom", fill="x", padx=10, pady=(6, 8))
+        left_sf = theme.ScrollFrame(left_holder, bg=theme.PAGE)
+        left_sf.canvas.configure(width=372)
+        left_sf.pack(side="top", fill="both", expand=True)
+        left = left_sf.inner
+        side = {"padx": 10}
 
-        # 模式切换
-        msf = ttk.Frame(left)
-        msf.pack(fill="x", padx=(0, 8), pady=(0, 6))
-        ttk.Label(msf, text="模式：").pack(side="left")
+        # 模式卡
+        mcard = theme.Card(left, padding=(16, 12), radius=16)
+        mcard.pack(fill="x", pady=(0, 10), **side)
+        mb = mcard.body
+        tk.Label(mb, text="模式", bg=theme.CANVAS, fg=theme.TEXT,
+                 font=theme.heading_font(10)).pack(anchor="w")
+        mrow = tk.Frame(mb, bg=theme.CANVAS)
+        mrow.pack(fill="x", pady=(6, 0))
         self.var_mode = tk.StringVar(value="offline")
-        ttk.Radiobutton(msf, text="离线靶场", variable=self.var_mode, value="offline",
-                        command=self._on_mode).pack(side="left")
-        ttk.Radiobutton(msf, text="平台接口", variable=self.var_mode, value="platform",
-                        command=self._on_mode).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(mrow, text="离线靶场", variable=self.var_mode, value="offline",
+                        command=self._on_mode, style="Card.TRadiobutton").pack(side="left")
+        ttk.Radiobutton(mrow, text="平台接口", variable=self.var_mode, value="platform",
+                        command=self._on_mode,
+                        style="Card.TRadiobutton").pack(side="left", padx=(16, 0))
 
-        # 表单容器：固定位置，内部在「离线 / 平台」两套表单间切换
-        self.frm_form = ttk.Frame(left)
-        self.frm_form.pack(fill="x", padx=(0, 8), pady=(0, 8))
-        self.frm_off = ttk.LabelFrame(self.frm_form, text="离线靶场（人工起靶）", padding=8)
+        # 表单卡（离线 / 平台两套表单切换）
+        fcard = theme.Card(left, padding=(16, 12), radius=16)
+        fcard.pack(fill="x", pady=(0, 10), **side)
+        self.frm_form = tk.Frame(fcard.body, bg=theme.CANVAS)
+        self.frm_form.pack(fill="x")
+
+        # ---- 离线表单 ----
+        self.frm_off = tk.Frame(self.frm_form, bg=theme.CANVAS)
         self.frm_off.pack(fill="x")
         frm_new = self.frm_off
-
-        ttk.Label(frm_new, text="目标地址（每行一个）").pack(anchor="w")
-        self.txt_urls = tk.Text(frm_new, height=2, font=("Consolas", 10))
+        theme.card_title(frm_new, "离线靶场", subtitle="人工起靶，地址每行一个").pack(anchor="w")
+        theme.label(frm_new, "目标地址（每行一个）", muted=True,
+                    size=9).pack(anchor="w", pady=(10, 0))
+        c_urls = theme.Card(frm_new, radius=theme.RADIUS_INPUT, padding=(1, 1))
+        c_urls.pack(fill="x", pady=(4, 0))
+        self.txt_urls = theme.textbox(c_urls.body, height=2, mono=True, size=9)
         self.txt_urls.pack(fill="x")
-
-        row1 = ttk.Frame(frm_new)
-        row1.pack(fill="x", pady=4)
-        ttk.Label(row1, text="题型").pack(side="left")
-        self.cb_cat = ttk.Combobox(row1, values=CATEGORIES, width=9, state="readonly")
+        row1 = tk.Frame(frm_new, bg=theme.CANVAS)
+        row1.pack(fill="x", pady=(10, 0))
+        theme.label(row1, "题型", muted=True, size=9).pack(side="left")
+        self.cb_cat = ttk.Combobox(row1, values=CATEGORIES, width=8, state="readonly")
         self.cb_cat.set("web")
-        self.cb_cat.pack(side="left", padx=4)
-        ttk.Label(row1, text="难度").pack(side="left", padx=(12, 0))
-        self.cb_diff = ttk.Combobox(row1, values=DIFFICULTIES, width=9, state="readonly")
+        self.cb_cat.pack(side="left", padx=(6, 0))
+        theme.label(row1, "难度", muted=True, size=9).pack(side="left", padx=(16, 0))
+        self.cb_diff = ttk.Combobox(row1, values=DIFFICULTIES, width=8, state="readonly")
         self.cb_diff.set("medium")
-        self.cb_diff.pack(side="left", padx=4)
-
-        ttk.Label(frm_new, text="题名（可选）").pack(anchor="w", pady=(6, 0))
+        self.cb_diff.pack(side="left", padx=(6, 0))
+        theme.label(frm_new, "题名（可选）", muted=True, size=9).pack(anchor="w", pady=(10, 0))
         self.var_name = tk.StringVar()
-        ttk.Entry(frm_new, textvariable=self.var_name).pack(fill="x")
-
-        ttk.Label(frm_new, text="题面（可选，文本框或选文件）").pack(anchor="w", pady=(6, 0))
-        self.txt_brief = tk.Text(frm_new, height=5, font=("", 10))
+        theme.RoundedEntry(frm_new, textvariable=self.var_name,
+                           placeholder="例如 ez_web").pack(fill="x", pady=(4, 0))
+        theme.label(frm_new, "题面（可选，文本框或选文件）", muted=True,
+                    size=9).pack(anchor="w", pady=(10, 0))
+        c_brief = theme.Card(frm_new, radius=theme.RADIUS_INPUT, padding=(1, 1))
+        c_brief.pack(fill="x", pady=(4, 0))
+        self.txt_brief = theme.textbox(c_brief.body, height=4, size=9)
         self.txt_brief.pack(fill="x")
-        ttk.Button(frm_new, text="从文件载入题面…", command=self._load_brief).pack(anchor="w", pady=2)
-
-        ttk.Label(frm_new, text="运行名（run-id）").pack(anchor="w", pady=(6, 0))
+        theme.RoundedButton(frm_new, text="从文件载入题面", icon="folder", variant="ghost",
+                            pad_x=12, pad_y=7, command=self._load_brief).pack(
+            anchor="w", pady=(6, 0))
+        theme.label(frm_new, "运行名（run-id）", muted=True,
+                    size=9).pack(anchor="w", pady=(8, 0))
         self.var_run = tk.StringVar(value="hunt")
-        ttk.Entry(frm_new, textvariable=self.var_run).pack(fill="x")
-
+        theme.RoundedEntry(frm_new, textvariable=self.var_run).pack(fill="x", pady=(4, 0))
         self.var_started = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frm_new, text="我已人工启动靶场", variable=self.var_started).pack(anchor="w", pady=6)
+        ttk.Checkbutton(frm_new, text="我已人工启动靶场", variable=self.var_started,
+                        style="Card.TCheckbutton").pack(anchor="w", pady=(10, 0))
+        # 开始/停止按钮统一放在左栏固定页脚（见下方 left_foot），表单里不再重复放
 
-        btns = ttk.Frame(frm_new)
-        btns.pack(fill="x")
-        self.btn_start = ttk.Button(btns, text="▶ 开始", command=self._start)
-        self.btn_start.pack(side="left", fill="x", expand=True)
-        self.btn_stop = ttk.Button(btns, text="■ 停止", command=self._stop, state="disabled")
-        self.btn_stop.pack(side="left", fill="x", expand=True, padx=(6, 0))
-
-        # 平台接口表单（默认隐藏）
-        self.frm_plat = ttk.LabelFrame(self.frm_form, text="平台接口（自动起靶 + 提交）", padding=8)
+        # ---- 平台表单（默认隐藏） ----
+        self.frm_plat = tk.Frame(self.frm_form, bg=theme.CANVAS)
+        theme.card_title(self.frm_plat, "平台接口",
+                         subtitle="自动起靶 + 自动提交").pack(anchor="w")
         self.lbl_conn = tk.StringVar(value="未连接")
-        ttk.Label(self.frm_plat, text="平台").pack(anchor="w")
+        theme.label(self.frm_plat, "平台档案", muted=True,
+                    size=9).pack(anchor="w", pady=(10, 0))
         self.cb_prof = ttk.Combobox(self.frm_plat, state="readonly")
-        self.cb_prof.pack(fill="x")
+        self.cb_prof.pack(fill="x", pady=(4, 0))
         self.cb_prof.bind("<<ComboboxSelected>>", self._on_profile_change)
         self._refresh_profiles()
-        rc = ttk.Frame(self.frm_plat)
-        rc.pack(fill="x")
-        ttk.Button(rc, text="连接平台", command=self._connect_platform).pack(side="left")
-        ttk.Label(rc, textvariable=self.lbl_conn, foreground="#777").pack(side="left", padx=(8, 0))
+        rc = tk.Frame(self.frm_plat, bg=theme.CANVAS)
+        rc.pack(fill="x", pady=(8, 0))
+        theme.RoundedButton(rc, text="连接平台", icon="bolt", variant="secondary",
+                            pad_y=8, pad_x=16, command=self._connect_platform).pack(side="left")
+        self.spin_conn = theme.Spinner(rc)
+        theme.label(rc, textvariable=self.lbl_conn, muted=True,
+                    size=9).pack(side="left", padx=(8, 0))
 
-        ttk.Label(self.frm_plat, text="比赛").pack(anchor="w", pady=(6, 0))
+        theme.label(self.frm_plat, "比赛", muted=True, size=9).pack(anchor="w", pady=(10, 0))
         self.cb_comp = ttk.Combobox(self.frm_plat, state="readonly")
-        self.cb_comp.pack(fill="x")
+        self.cb_comp.pack(fill="x", pady=(4, 0))
 
-        ttk.Button(self.frm_plat, text="刷新题单", command=self._fetch_challenges).pack(fill="x", pady=(6, 0))
-        ttk.Label(self.frm_plat, text="题目（勾选要跑的，可全选）").pack(anchor="w", pady=(6, 0))
-        tvf = ttk.Frame(self.frm_plat)
-        tvf.pack(fill="x")
-        self.tv = ttk.Treeview(tvf, columns=("sel", "id", "cat", "name"), show="headings", height=10)
-        for col, width, text in (("sel", 34, "选"), ("id", 118, "ID"), ("cat", 54, "分类"), ("name", 180, "名称")):
+        theme.RoundedButton(self.frm_plat, text="刷新题单", icon="refresh",
+                            variant="secondary", pad_y=8, pad_x=16,
+                            command=self._fetch_challenges).pack(fill="x", pady=(8, 0))
+        theme.label(self.frm_plat, "题库（勾选要跑的题，可全选）", muted=True,
+                    size=9).pack(anchor="w", pady=(10, 0))
+        chal_panel = theme.panel(self.frm_plat, height=236)
+        chal_panel.pack(fill="x", pady=(4, 0))
+        self.tv = ttk.Treeview(chal_panel, columns=("sel", "id", "cat", "name"),
+                               show="headings", height=8)
+        for col, width, text in (("sel", 34, "选"), ("id", 118, "ID"),
+                                 ("cat", 54, "分类"), ("name", 168, "名称")):
             self.tv.heading(col, text=text)
             self.tv.column(col, width=width, anchor="center" if col == "sel" else "w",
                            stretch=(col == "name"))
-        vsb = ttk.Scrollbar(tvf, orient="vertical", command=self.tv.yview)
+        vsb = ttk.Scrollbar(chal_panel, orient="vertical", command=self.tv.yview)
         self.tv.configure(yscrollcommand=vsb.set)
-        self.tv.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        self.tv.pack(side="left", fill="both", expand=True)
         self.tv.bind("<Button-1>", self._toggle_row)
+        self.skel_chal = theme.Skeleton(chal_panel, rows=5, row_height=20, gap=8)
+
+        sb = tk.Frame(self.frm_plat, bg=theme.CANVAS)
+        sb.pack(fill="x", pady=(6, 0))
+        theme.RoundedButton(sb, text="全选", variant="ghost", pad_x=12, pad_y=6,
+                            command=lambda: self._select_all(True)).pack(side="left")
+        theme.RoundedButton(sb, text="全不选", variant="ghost", pad_x=12, pad_y=6,
+                            command=lambda: self._select_all(False)).pack(
+            side="left", padx=(6, 0))
         self.lbl_sel_chal = tk.StringVar(value="已勾选 0 道")
-        sb = ttk.Frame(self.frm_plat)
-        sb.pack(fill="x", pady=(2, 0))
-        ttk.Button(sb, text="全选", command=lambda: self._select_all(True)).pack(side="left")
-        ttk.Button(sb, text="全不选", command=lambda: self._select_all(False)).pack(side="left", padx=(6, 0))
-        ttk.Label(sb, textvariable=self.lbl_sel_chal, foreground="#666").pack(side="left", padx=(10, 0))
+        tk.Label(sb, textvariable=self.lbl_sel_chal, bg=theme.CANVAS, fg=theme.TEXT_MUTED,
+                 font=theme.body_font(9)).pack(side="left", padx=(10, 0))
 
-        ttk.Label(self.frm_plat, text="运行名（run-id）").pack(anchor="w", pady=(6, 0))
+        # 跑题库选项：跳过已解出 / 重跑已解出
+        opt = tk.Frame(self.frm_plat, bg=theme.CANVAS)
+        opt.pack(fill="x", pady=(8, 0))
+        tk.Label(opt, text="跑题库", bg=theme.CANVAS, fg=theme.TEXT_MUTED,
+                 font=theme.body_font(9)).pack(side="left")
+        self.var_skip_solved = tk.BooleanVar(value=True)
+        ttk.Radiobutton(opt, text="跳过已解出", variable=self.var_skip_solved, value=True,
+                        style="Card.TRadiobutton",
+                        command=self._update_sel_label).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(opt, text="重跑已解出", variable=self.var_skip_solved, value=False,
+                        style="Card.TRadiobutton",
+                        command=self._update_sel_label).pack(side="left", padx=(10, 0))
+
+        theme.label(self.frm_plat, "运行名（run-id）", muted=True,
+                    size=9).pack(anchor="w", pady=(10, 0))
         self.var_run_p = tk.StringVar(value="plat")
-        ttk.Entry(self.frm_plat, textvariable=self.var_run_p).pack(fill="x")
+        theme.RoundedEntry(self.frm_plat,
+                           textvariable=self.var_run_p).pack(fill="x", pady=(4, 0))
 
-        ttk.Label(self.frm_plat, text="并发度（勾选多题时并行求解）").pack(anchor="w", pady=(6, 0))
-        cf = ttk.Frame(self.frm_plat)
-        cf.pack(fill="x")
+        theme.label(self.frm_plat, "并发度（勾选多题时并行求解）", muted=True,
+                    size=9).pack(anchor="w", pady=(10, 0))
+        cf = tk.Frame(self.frm_plat, bg=theme.CANVAS)
+        cf.pack(fill="x", pady=(4, 0))
         self.var_conc = tk.IntVar(value=1)
         self.sp_conc = ttk.Spinbox(cf, from_=1, to=3, width=5, textvariable=self.var_conc)
         self.sp_conc.pack(side="left")
         self.lbl_conc = tk.StringVar(value="")
-        ttk.Label(cf, textvariable=self.lbl_conc, foreground="#888").pack(side="left", padx=(8, 0))
+        tk.Label(cf, textvariable=self.lbl_conc, bg=theme.CANVAS, fg=theme.TEXT_SUBTLE,
+                 font=theme.body_font(9)).pack(side="left", padx=(8, 0))
         self._refresh_conc_limit()
 
-        pb = ttk.Frame(self.frm_plat)
-        pb.pack(fill="x", pady=(8, 0))
-        self.btn_start_p = ttk.Button(pb, text="▶ 开始", command=self._start)
+        # 左栏固定页脚：离线/平台两套「开始/停止」按钮，按模式切换显示
+        theme.separator(left_foot).pack(fill="x", pady=(0, 8))
+        self.foot_off = tk.Frame(left_foot, bg=theme.PAGE)
+        self.btn_start = theme.RoundedButton(self.foot_off, text="开始", icon="play",
+                                             variant="primary", command=self._start)
+        self.btn_start.pack(side="left", fill="x", expand=True)
+        self.btn_stop = theme.RoundedButton(self.foot_off, text="停止", icon="stop",
+                                            variant="secondary", command=self._stop)
+        self.btn_stop.config(state="disabled")
+        self.btn_stop.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.foot_off.pack(fill="x")
+
+        self.foot_plat = tk.Frame(left_foot, bg=theme.PAGE)
+        self.btn_start_p = theme.RoundedButton(self.foot_plat, text="开始", icon="play",
+                                               variant="primary", command=self._start)
         self.btn_start_p.pack(side="left", fill="x", expand=True)
-        self.btn_stop_p = ttk.Button(pb, text="■ 停止", command=self._stop, state="disabled")
-        self.btn_stop_p.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.btn_stop_p = theme.RoundedButton(self.foot_plat, text="停止", icon="stop",
+                                              variant="secondary", command=self._stop)
+        self.btn_stop_p.config(state="disabled")
+        self.btn_stop_p.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
-        # 历史
-        frm_hist = ttk.LabelFrame(left, text="任务历史", padding=8)
-        frm_hist.pack(fill="both", expand=True, padx=(0, 8))
-        self.lb_hist = tk.Listbox(frm_hist)
-        self.lb_hist.pack(fill="both", expand=True)
+        # ---------- 任务历史卡 ----------
+        hcard = theme.Card(left, padding=(16, 12), radius=16)
+        hcard.pack(fill="both", expand=True, **side)
+        hb2 = hcard.body
+        theme.card_title(hb2, "任务历史").pack(anchor="w")
+        theme.label(hb2, "双击查看；续跑沿用原 run-id", muted=True,
+                    size=9).pack(anchor="w", pady=(2, 6))
+        lh = tk.Frame(hb2, bg=theme.CANVAS)
+        lh.pack(fill="both", expand=True)
+        self.lb_hist = tk.Listbox(lh, height=8)
+        theme.style_listbox(self.lb_hist)
+        hsb = ttk.Scrollbar(lh, orient="vertical", command=self.lb_hist.yview)
+        self.lb_hist.configure(yscrollcommand=hsb.set)
+        hsb.pack(side="right", fill="y")
+        self.lb_hist.pack(side="left", fill="both", expand=True)
         self.lb_hist.bind("<Double-Button-1>", lambda e: self._view_history())
-        hb = ttk.Frame(frm_hist)
-        hb.pack(fill="x", pady=(6, 0))
-        ttk.Button(hb, text="刷新", command=self._refresh_history).pack(side="left", fill="x", expand=True)
-        ttk.Button(hb, text="查看", command=self._view_history).pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Button(hb, text="续跑", command=self._resume_history).pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Button(hb, text="删除", command=self._del_history).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        hb3 = tk.Frame(hb2, bg=theme.CANVAS)
+        hb3.pack(fill="x", pady=(8, 0))
+        for text, cmd in (("刷新", self._refresh_history), ("查看", self._view_history),
+                          ("续跑", self._resume_history), ("删除", self._del_history)):
+            theme.RoundedButton(hb3, text=text, variant="secondary", pad_x=10, pad_y=6,
+                                command=cmd).pack(side="left", fill="x", expand=True,
+                                                  padx=(0, 6))
 
-        # 右栏：3 个页签（复现 / 任务面板 / 日志）
-        # 原来的「进展 / 工具流 / 过程 / Flag 候选」合并精简：日志一份、Flag 进复现。
-        right = ttk.Frame(body)
+        # ---------- 右栏：复现 / 任务面板 / 日志 ----------
+        right = tk.Frame(body, bg=theme.PAGE)
         body.add(right, weight=1)
         nb = ttk.Notebook(right)
         nb.pack(fill="both", expand=True)
@@ -279,59 +380,106 @@ class App:
         self.txt_tools = self.txt_events
         self.txt_process = self.txt_events
 
-        fsub = ttk.Frame(right)
-        fsub.pack(fill="x", pady=(4, 0))
-        ttk.Button(fsub, text="复制选中 flag", command=self._copy_flag).pack(side="left")
-        ttk.Button(fsub, text="复制复现稿", command=self._copy_writeup).pack(side="left", padx=(6, 0))
-        ttk.Button(fsub, text="导出报告", command=self._export_report).pack(side="left", padx=(6, 0))
+        theme.separator(right).pack(fill="x", pady=(0, 8))
+        fsub = tk.Frame(right, bg=theme.PAGE)
+        fsub.pack(fill="x", pady=(0, 0))
+        theme.RoundedButton(fsub, text="复制选中 flag", icon="copy", variant="secondary",
+                            pad_x=14, pad_y=7, command=self._copy_flag).pack(side="left")
+        theme.RoundedButton(fsub, text="复制复现稿", icon="copy", variant="secondary",
+                            pad_x=14, pad_y=7, command=self._copy_writeup).pack(
+            side="left", padx=(8, 0))
+        theme.RoundedButton(fsub, text="导出报告", icon="export", variant="primary",
+                            pad_x=14, pad_y=7, command=self._export_report).pack(
+            side="left", padx=(8, 0))
+
+    def _draw_brand(self, canvas: tk.Canvas) -> None:
+        """标题逐字绘制：实现 -0.02em 字距（Tk 字体没有 letter-spacing API）。"""
+        text = "CTF 自动解题"
+        size = 19
+        f = tkfont.Font(root=canvas, font=theme.heading_font(size))
+        tracking = theme.LETTER_SPACING_EM * size  # em → px 近似（1em≈字号 pt）
+        x = 2.0
+        for ch in text:
+            canvas.create_text(x, 17, text=ch, anchor="w", fill=theme.TEXT, font=f)
+            x += f.measure(ch) + tracking
+        canvas.configure(width=max(80, int(x) + 4))
+
+    def _sync_status_pill(self) -> None:
+        text = (self.lbl_status.get() or "就绪").strip()
+        if any(k in text for k in ("出错", "错误", "失败")):
+            color, bg = theme.DANGER, theme.DANGER_SOFT
+        elif any(k in text for k in ("运行", "解题中", "连接中", "拉取", "生成")):
+            color, bg = theme.PRIMARY, theme.PRIMARY_SOFT
+        elif any(k in text for k in ("完成", "已解出", "拿到")):
+            color, bg = theme.SUCCESS, theme.SUCCESS_SOFT
+        else:
+            color, bg = theme.TEXT_MUTED, theme.HOVER
+        self.pill_status.set(text[:18], color=color, bg=bg)
 
     def _add_text_tab(self, nb, title: str) -> tk.Text:
-        f = ttk.Frame(nb)
+        f = tk.Frame(nb, bg=theme.PAGE)
         nb.add(f, text=title)
-        txt = tk.Text(f, wrap="word", font=("Consolas", 10))
-        sb = ttk.Scrollbar(f, orient="vertical", command=txt.yview)
+        card = theme.Card(f, padding=(2, 2), radius=16, hug=False)
+        card.pack(fill="both", expand=True, padx=10, pady=10)
+        txt = theme.textbox(card.body, height=10, mono=True, size=10)
+        sb = ttk.Scrollbar(card.body, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True)
+        txt.pack(side="left", fill="both", expand=True)
         return txt
 
     # ---------------- 复现：已解出列表 + 按需生成 ----------------
 
     def _build_writeup_tab(self, nb) -> None:
-        f = ttk.Frame(nb)
+        f = tk.Frame(nb, bg=theme.PAGE)
         nb.add(f, text="复现")
-        bar = ttk.Frame(f)
-        bar.pack(fill="x")
-        ttk.Button(bar, text="刷新已解出", command=self._refresh_solved).pack(side="left")
-        ttk.Button(bar, text="生成/查看复现", command=self._gen_writeup_selected).pack(side="left", padx=(6, 0))
-        self.lbl_solved = tk.StringVar(value="已解出 0 题（选中后点「生成/查看复现」，不点不生成）")
-        ttk.Label(bar, textvariable=self.lbl_solved, foreground="#666").pack(side="left", padx=(10, 0))
+        bar = tk.Frame(f, bg=theme.PAGE)
+        bar.pack(fill="x", padx=10, pady=(10, 6))
+        theme.RoundedButton(bar, text="刷新已解出", icon="refresh", variant="secondary",
+                            pad_y=8, pad_x=16,
+                            command=self._refresh_solved).pack(side="left")
+        theme.RoundedButton(bar, text="生成/查看复现", icon="bolt", variant="primary",
+                            pad_y=8, pad_x=16,
+                            command=self._gen_writeup_selected).pack(side="left", padx=(8, 0))
+        self.lbl_solved = tk.StringVar(
+            value="已解出 0 题（选中后点「生成/查看复现」，不点不生成）")
+        tk.Label(bar, textvariable=self.lbl_solved, bg=theme.PAGE, fg=theme.TEXT_MUTED,
+                 font=theme.body_font(9)).pack(side="left", padx=(12, 0))
+        self.spin_solved = theme.Spinner(bar)
+        self.spin_solved.pack(side="left", padx=(6, 0))
 
+        theme.separator(f).pack(fill="x", padx=10, pady=(0, 8))
         pane = ttk.PanedWindow(f, orient="horizontal")
-        pane.pack(fill="both", expand=True, pady=(4, 0))
-        lf = ttk.Frame(pane)
-        pane.add(lf, weight=1)
-        cols = ("name", "cat", "flag", "run")
-        self.tv_solved = ttk.Treeview(lf, columns=cols, show="headings", height=12)
-        for col, width, text in (("name", 150, "题目"), ("cat", 58, "分类"),
-                                 ("flag", 170, "flag"), ("run", 80, "运行")):
+        pane.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        lcard = theme.Card(pane, padding=(2, 2), radius=16, hug=False)
+        pane.add(lcard, weight=2)
+        # tree 列放「日期分组标题」，题目作为子节点 → 按日期分层
+        self.tv_solved = ttk.Treeview(lcard.body, columns=("cat", "flag", "run"),
+                                      show="tree headings", height=12, selectmode="browse")
+        self.tv_solved.heading("#0", text="日期 / 题目")
+        self.tv_solved.column("#0", width=190, stretch=True, anchor="w")
+        for col, width, text in (("cat", 54, "分类"), ("flag", 168, "flag"),
+                                 ("run", 74, "运行")):
             self.tv_solved.heading(col, text=text)
-            self.tv_solved.column(col, width=width, anchor="w", stretch=col in ("name", "flag"))
-        sbv = ttk.Scrollbar(lf, orient="vertical", command=self.tv_solved.yview)
+            self.tv_solved.column(col, width=width, anchor="w", stretch=col in ("flag",))
+        sbv = ttk.Scrollbar(lcard.body, orient="vertical", command=self.tv_solved.yview)
         self.tv_solved.configure(yscrollcommand=sbv.set)
         sbv.pack(side="right", fill="y")
         self.tv_solved.pack(side="left", fill="both", expand=True)
         self.tv_solved.bind("<Double-Button-1>", lambda e: self._gen_writeup_selected())
+        self.skel_solved = theme.Skeleton(lcard.body, rows=7, row_height=22, gap=9)
 
-        rf = ttk.Frame(pane)
-        pane.add(rf, weight=3)
-        self.txt_writeup = tk.Text(rf, wrap="word", font=("Consolas", 10))
-        sbr = ttk.Scrollbar(rf, orient="vertical", command=self.txt_writeup.yview)
+        rcard = theme.Card(pane, padding=(2, 2), radius=16, hug=False)
+        pane.add(rcard, weight=3)
+        self.txt_writeup = theme.textbox(rcard.body, height=10, mono=True, size=10)
+        sbr = ttk.Scrollbar(rcard.body, orient="vertical", command=self.txt_writeup.yview)
         self.txt_writeup.configure(yscrollcommand=sbr.set)
         sbr.pack(side="right", fill="y")
-        self.txt_writeup.pack(fill="both", expand=True)
+        self.txt_writeup.pack(side="left", fill="both", expand=True)
         self._config_writeup_tags()
-        self.txt_writeup.insert("1.0", "左侧是已解出的题目；选中一题点「生成/查看复现」才会生成正文。\n")
+        self.txt_writeup.insert(
+            "1.0",
+            "左侧按日期分层列出已解出的题目；选中一题点「生成/查看复现」才会生成正文。\n")
 
     def _refresh_solved(self, background: bool = False) -> None:
         """扫描 runs/* 收集「已解出」的题（只读 state.json，不生成复现、不花 token）。
@@ -341,6 +489,7 @@ class App:
         2) runs/ 下有历史遗留的不可读目录（早期 pip/临时目录用 0o700 建、创建者都读不了），
            原来只 try 住 read_text，`is_file()` 上抛 PermissionError 会让整个刷新崩掉。
         """
+        self._solved_loading(True)
         if background:
             def _bg() -> None:
                 rows = self._scan_solved()
@@ -352,6 +501,22 @@ class App:
             threading.Thread(target=_bg, name="scan-solved", daemon=True).start()
             return
         self._apply_solved(self._scan_solved())
+
+    def _solved_loading(self, on: bool) -> None:
+        """骨架屏：扫描期间盖住列表（脉冲动画），扫完收起。"""
+        try:
+            if on:
+                self.skel_solved.place(relx=0, rely=0, relwidth=1, relheight=1)
+                self.skel_solved.lift()
+                self.skel_solved.start()
+                self.spin_solved.start()
+                self.lbl_solved.set("扫描 runs/ 中…")
+            else:
+                self.skel_solved.stop()
+                self.skel_solved.place_forget()
+                self.spin_solved.stop()
+        except (tk.TclError, AttributeError):
+            pass
 
     def _scan_solved(self) -> list[dict]:
         """纯扫描：读 runs/*/state.json 收集已解出条目（不碰界面，可放线程里跑）。"""
@@ -382,22 +547,35 @@ class App:
                     "name": str(ch.get("name") or cid),
                     "cat": str(ch.get("category") or "-"),
                     "flag": flag,
-                    "at": str(ch.get("updated_at") or ""),
+                    "at": str(ch.get("updated_at") or d.stat().st_mtime),
                 })
-        rows.sort(key=lambda r: r["at"], reverse=True)
+        rows.sort(key=lambda r: str(r["at"]), reverse=True)
         return rows
 
     def _apply_solved(self, rows: list[dict]) -> None:
-        """把扫描结果填进表格（必须在主线程调用）。"""
+        """把扫描结果按日期分层填进列表（必须在主线程调用）。"""
         self._solved = rows
-        self.tv_solved.delete(*self.tv_solved.get_children())
+        tv = self.tv_solved
+        tv.delete(*tv.get_children())
         self._solved_rows = {}
-        for r in rows:
-            iid = self.tv_solved.insert(
-                "", "end",
-                values=(r["name"], r["cat"], r["flag"] or "（未记录）", r["run"]))
-            self._solved_rows[iid] = r
-        self.lbl_solved.set(f"已解出 {len(rows)} 题（选中后点「生成/查看复现」）")
+        days = theme.group_by_date(rows)
+        total = 0
+        for day, items in days:
+            node = tv.insert("", "end", text=theme.date_header_text(day, len(items)),
+                             open=True, tags=("date",))
+            for r in items:
+                iid = tv.insert(node, "end", text=r["name"],
+                                values=(r["cat"], r["flag"] or "（未记录）", r["run"]))
+                self._solved_rows[iid] = r
+                total += 1
+        tv.tag_configure("date", font=theme.heading_font(10),
+                         foreground=theme.TEXT_MUTED)
+        if total:
+            self.lbl_solved.set(
+                f"已解出 {total} 题 · {len(days)} 个日期（选中后点「生成/查看复现」）")
+        else:
+            self.lbl_solved.set("未发现已解出的题目（跑完一题后点「刷新已解出」）")
+        self._solved_loading(False)
 
     def _gen_writeup_selected(self) -> None:
         sel = self.tv_solved.selection()
@@ -406,6 +584,7 @@ class App:
             return
         row = self._solved_rows.get(sel[0])
         if not row:
+            messagebox.showinfo("复现", "请选择具体题目（日期分组标题下面那一行）。")
             return
         # 运行中不能改 self.run_id：_tail_transcript / _export_report 都靠它定位当前 run，
         # 改了会让过程日志断流、导出写到历史目录去。
@@ -423,24 +602,31 @@ class App:
                     "tokens": "Tokens", "cost": "花费", "elapsed": "用时"}
 
     def _build_board_tab(self, nb) -> None:
-        f = ttk.Frame(nb)
+        f = tk.Frame(nb, bg=theme.PAGE)
         nb.add(f, text="任务面板")
-        bar = ttk.Frame(f)
-        bar.pack(fill="x")
+        bar = tk.Frame(f, bg=theme.PAGE)
+        bar.pack(fill="x", padx=10, pady=(10, 6))
         self.lbl_board = tk.StringVar(value="还没有任务")
-        ttk.Label(bar, textvariable=self.lbl_board, foreground="#666").pack(side="left")
-        ttk.Button(bar, text="清空", command=self._board_clear).pack(side="right")
+        tk.Label(bar, textvariable=self.lbl_board, bg=theme.PAGE, fg=theme.TEXT_MUTED,
+                 font=theme.body_font(9)).pack(side="left")
+        theme.RoundedButton(bar, text="清空", icon="trash", variant="secondary",
+                            pad_y=8, pad_x=16,
+                            command=self._board_clear).pack(side="right")
+        card = theme.Card(f, padding=(2, 2), radius=16, hug=False)
+        card.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         widths = {"title": 150, "status": 78, "detail": 280, "rounds": 56,
                   "tokens": 70, "cost": 56, "elapsed": 72}
-        self.tv_board = ttk.Treeview(f, columns=self._BOARD_COLS, show="headings", height=14)
+        self.tv_board = ttk.Treeview(card.body, columns=self._BOARD_COLS,
+                                     show="headings", height=14)
         for col in self._BOARD_COLS:
             self.tv_board.heading(col, text=self._BOARD_HEADS[col])
-            self.tv_board.column(col, width=widths[col], stretch=col in ("title", "detail"),
+            self.tv_board.column(col, width=widths[col],
+                                 stretch=col in ("title", "detail"),
                                  anchor="w" if col in ("title", "detail") else "center")
-        sb = ttk.Scrollbar(f, orient="vertical", command=self.tv_board.yview)
+        sb = ttk.Scrollbar(card.body, orient="vertical", command=self.tv_board.yview)
         self.tv_board.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        self.tv_board.pack(fill="both", expand=True, pady=(4, 0))
+        self.tv_board.pack(side="left", fill="both", expand=True)
 
     def _board_clear(self) -> None:
         for iid in self.tv_board.get_children():
@@ -657,15 +843,23 @@ class App:
         if self.mode == "offline":
             self.frm_plat.pack_forget()
             self.frm_off.pack(fill="x")
+            self.foot_plat.pack_forget()
+            self.foot_off.pack(fill="x")
         else:
             self.frm_off.pack_forget()
             self.frm_plat.pack(fill="x")
+            self.foot_off.pack_forget()
+            self.foot_plat.pack(fill="x")
 
     def _connect_platform(self) -> None:
         if self.running:
             return
         self._apply_profile(self.cb_prof.get())
         self.lbl_conn.set("连接中…")
+        try:
+            self.spin_conn.start()
+        except (AttributeError, tk.TclError):
+            pass
         threading.Thread(target=platform_worker.test_connection,
                          args=(self.config, self.q), daemon=True).start()
 
@@ -677,6 +871,7 @@ class App:
             messagebox.showwarning("未选比赛", "请先点「连接平台」，拿到比赛列表后再选。")
             return
         self.lbl_conn.set("拉取题单…")
+        self._chal_loading(True)
         threading.Thread(target=platform_worker.fetch_challenges,
                          args=(self.config, cid, self.q), daemon=True).start()
 
@@ -695,13 +890,42 @@ class App:
         self.var_conc.set(cur)
         self.lbl_conc.set(f"最大 {eff}（" + "；".join(info["reasons"]) + "）")
 
+    def _solved_cids_for_run(self, rid: str) -> set[str]:
+        """读某次 run 的 state.json，返回「已解出」的题目 id 集合（跑题库跳过用）。"""
+        st = PROJECT_ROOT / "runs" / (rid or "run") / "state.json"
+        try:
+            data = json.loads(st.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return set()
+        out: set[str] = set()
+        for cid, ch in (data.get("challenges") or {}).items():
+            if not isinstance(ch, dict):
+                continue
+            if ch.get("submitted_ok") or str(ch.get("flag_value") or ""):
+                out.add(str(cid))
+        return out
+
     def _start_platform(self) -> None:
         rows = self._checked_rows()
         if not rows:
-            messagebox.showwarning("未勾选题目", "请先在题目列表里勾选（可点「全选」）。")
+            messagebox.showwarning("未勾选题目", "请先在题库列表里勾选（可点「全选」）。")
             return
         comp = self.comp_choices.get(self.cb_comp.get(), "")
         rid = (self.var_run_p.get() or "").strip() or "plat"
+        # 跑题库选项：跳过 / 重跑「已解出」（以该 run-id 的 state.json 为准）
+        solved = self._solved_cids_for_run(rid)
+        skip = bool(getattr(self, "var_skip_solved", None) and self.var_skip_solved.get())
+        rows, skipped = theme.filter_solved(rows, solved, skip)
+        if skipped:
+            names = "、".join(str(r.get("id") or "") for r in skipped[:6])
+            more = f"… 共 {len(skipped)} 道" if len(skipped) > 6 else ""
+            self._log(f"[跑题库] 跳过已解出：{names}{more}")
+        if not rows:
+            messagebox.showinfo(
+                "无需重跑",
+                f"勾选的题在 run={rid} 里都已解出。\n"
+                "要继续跑请把选项切到「重跑已解出」，或换一个运行名。")
+            return
         self.run_id = rid
         self._apply_profile(self.cb_prof.get())
         try:
@@ -729,6 +953,10 @@ class App:
                             self.graceful))
 
     def _on_conn_ok(self, data: dict) -> None:
+        try:
+            self.spin_conn.stop()
+        except (AttributeError, tk.TclError):
+            pass
         comps = data.get("competitions") or []
         self.comp_choices = {}
         labels: list[str] = []
@@ -750,7 +978,21 @@ class App:
         else:
             self.lbl_conn.set("已连接（无比赛信息）")
 
+    def _chal_loading(self, on: bool) -> None:
+        """题单骨架屏：拉取期间盖住列表，拉完收起。"""
+        try:
+            if on:
+                self.skel_chal.place(relx=0, rely=0, relwidth=1, relheight=1)
+                self.skel_chal.lift()
+                self.skel_chal.start()
+            else:
+                self.skel_chal.stop()
+                self.skel_chal.place_forget()
+        except (tk.TclError, AttributeError):
+            pass
+
     def _on_challenges(self, data: dict) -> None:
+        self._chal_loading(False)
         rows = data.get("items") or []
         self.challenge_rows = rows
         self.tv.delete(*self.tv.get_children())
@@ -792,7 +1034,21 @@ class App:
         return out
 
     def _update_sel_label(self) -> None:
-        self.lbl_sel_chal.set(f"已勾选 {len(self._checked_rows())} 道")
+        rows = self._checked_rows()
+        rid = ""
+        try:
+            rid = (self.var_run_p.get() or "").strip()
+        except (AttributeError, tk.TclError):
+            rid = ""
+        solved = self._solved_cids_for_run(rid or "plat") if rows else set()
+        done = [r for r in rows if str(r.get("id") or "") in solved]
+        skip = True
+        try:
+            skip = bool(self.var_skip_solved.get())
+        except (AttributeError, tk.TclError):
+            skip = True
+        tail = f" · 其中 {len(done)} 道已解出（{'将跳过' if skip else '将重跑'}）" if done else ""
+        self.lbl_sel_chal.set(f"已勾选 {len(rows)} 道{tail}")
 
     def _refresh_profiles(self) -> None:
         data = profiles.load()
@@ -1334,11 +1590,16 @@ class App:
             elif kind == "conn_ok":
                 self._on_conn_ok(item[1])
             elif kind == "conn_err":
+                try:
+                    self.spin_conn.stop()
+                except (AttributeError, tk.TclError):
+                    pass
                 self.lbl_conn.set("连接失败")
                 messagebox.showerror("连接失败", item[1])
             elif kind == "challenges":
                 self._on_challenges(item[1])
             elif kind == "challenges_err":
+                self._chal_loading(False)
                 self.lbl_conn.set("题单拉取失败")
                 messagebox.showerror("拉取失败", item[1])
             elif kind == "task_start":
@@ -1482,6 +1743,13 @@ class App:
         for btn in (getattr(self, "btn_stop", None), getattr(self, "btn_stop_p", None)):
             if btn is not None:
                 btn.config(state="normal" if v else "disabled")
+        if not v:  # 结束后收掉所有旋转指示器（骨架屏由各自的 _loading 收）
+            for sp in (getattr(self, "spin_conn", None), getattr(self, "spin_solved", None)):
+                if sp is not None:
+                    try:
+                        sp.stop()
+                    except (tk.TclError, AttributeError):
+                        pass
 
     # ---------------- 输出 ----------------
 
@@ -1528,13 +1796,15 @@ class App:
 
     def _config_writeup_tags(self) -> None:
         w = self.txt_writeup
-        w.tag_configure("sec", foreground="#1a4d80", font=("Consolas", 11, "bold"), spacing1=10, spacing3=4)
-        w.tag_configure("meta_l", foreground="#8a8a8a", font=("Consolas", 10, "bold"))
-        w.tag_configure("round", foreground="#9a5b00", font=("Consolas", 10, "bold"))
-        w.tag_configure("rep_t", foreground="#111111", font=("Consolas", 10, "bold"))
+        w.tag_configure("sec", foreground=theme.PRIMARY, font=theme.mono_font(11, bold=True),
+                        spacing1=10, spacing3=4)
+        w.tag_configure("meta_l", foreground=theme.TEXT_SUBTLE,
+                        font=theme.mono_font(10, bold=True))
+        w.tag_configure("round", foreground=theme.WARN, font=theme.mono_font(10, bold=True))
+        w.tag_configure("rep_t", foreground=theme.TEXT, font=theme.mono_font(10, bold=True))
         w.tag_configure("rep", lmargin1=18, lmargin2=18, spacing3=10)
-        w.tag_configure("flag", foreground="#0a7a1a", font=("Consolas", 12, "bold"),
-                        background="#e8f4e8", spacing1=8, spacing3=2)
+        w.tag_configure("flag", foreground=theme.SUCCESS, font=theme.mono_font(12, bold=True),
+                        background=theme.SUCCESS_SOFT, spacing1=8, spacing3=2)
 
     def _tail_transcript(self) -> None:
         tdir = PROJECT_ROOT / "runs" / self.run_id / "transcripts"
