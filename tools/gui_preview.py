@@ -39,7 +39,11 @@ CHECKED = (
 
 
 def _grab(root, out: Path) -> tuple[int, int, str]:
-    """截 root 客户区；有 Pillow 存 PNG，否则用纯 stdlib 写 BMP。"""
+    """截 root 客户区；有 Pillow 存 PNG，否则用纯 stdlib 写 BMP。
+
+    Windows 上优先 PrintWindow(PW_RENDERFULLCONTENT)：抓的是窗口自己的内容，
+    即使窗口被别的窗口压住也不会截到别人（屏幕 BitBlt 会被遮挡影响）。
+    """
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
     x, y = root.winfo_rootx(), root.winfo_rooty()
@@ -48,7 +52,14 @@ def _grab(root, out: Path) -> tuple[int, int, str]:
     hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
     bmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
     gdi32.SelectObject(hdc_mem, bmp)
-    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, 0x00CC0020)
+    hwnd = int(root.winfo_id())
+    rendered = False
+    try:
+        rendered = bool(user32.PrintWindow(hwnd, hdc_mem, 2))
+    except Exception:  # noqa: BLE001
+        rendered = False
+    if not rendered:  # 兜底：直接抓屏幕（窗口置顶时可用）
+        gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, 0x00CC0020)
 
     class BIH(ctypes.Structure):
         _fields_ = [("biSize", ctypes.c_ulong), ("biWidth", ctypes.c_long),
