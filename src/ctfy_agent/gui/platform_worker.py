@@ -364,7 +364,12 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 ok = bool((summary or {}).get("submitted")) or bool(flag)
                 # 「已解出」是平台/缓存给的现成结论（0 token、0 轮次），界面要能区分出「跳过」
                 presolved = str((summary or {}).get("reason") or "") == "already_solved"
-                return {"id": cid, "ok": ok, "flag": flag, "note": "",
+                note = ""
+                if ok and not flag:
+                    # 平台说已解、本地没有 flag（常见于平台侧已解但本 agent 没记到 flag）：
+                    # 不能既显示「已解出」又在详情写「未解出」，要说明真实原因。
+                    note = "平台已解出（本地无 flag 记录）"
+                return {"id": cid, "ok": ok, "flag": flag, "note": note,
                         "presolved": presolved}
             except Exception as exc:  # noqa: BLE001 - 单题失败不中断批量
                 return {"id": cid, "ok": False, "flag": "", "note": str(exc)[:200]}

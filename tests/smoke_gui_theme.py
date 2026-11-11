@@ -559,6 +559,91 @@ def case_board_columns_work() -> None:
             pass
 
 
+def case_board_status_colors() -> None:
+    """任务面板状态要自洽 + 有颜色：不能再出现「已解出 / 未解出」这种矛盾行。"""
+    from ctfy_agent.gui import theme
+    from ctfy_agent.gui.app import App
+
+    app = App()
+    try:
+        app.root.update()
+        idx = app._BOARD_COLS.index
+
+        # 状态 → 配色 tag 的映射规则
+        assert app._board_tag("已解出") == "ok"
+        assert app._board_tag("已解出（跳过）") == "ok_skip"
+        assert app._board_tag("平台已解") == "ok"
+        assert app._board_tag("解题中") == "running"
+        assert app._board_tag("未解出") == "fail"
+        assert app._board_tag("待开始") == "idle"
+        # 颜色真的配到了 Treeview 上（前景 + 浅底）；tag_configure 查询返回 Tcl color 对象，转字符串比
+        def tag_color(tag, option):
+            return str(app.tv_board.tag_configure(tag, option)).upper()
+
+        assert tag_color("ok", "foreground") == theme.SUCCESS.upper()
+        assert tag_color("ok", "background") == theme.SUCCESS_SOFT.upper()
+        assert tag_color("running", "foreground") == theme.PRIMARY.upper()
+        assert tag_color("fail", "foreground") == theme.DANGER.upper()
+        assert tag_color("fail", "background") == theme.DANGER_SOFT.upper()
+        ok("状态色：已解出绿 / 解题中蓝 / 未解出红 / 待开始灰，且都有浅色底")
+
+        def row(cid):
+            rec = app._board[cid]
+            return app.tv_board.item(rec["iid"], "values"), app.tv_board.item(rec["iid"], "tags")
+
+        # 1) 真跑出 flag
+        app._board_row("c-ok", "有 flag")
+        app._board_finish("c-ok", True, "FLAG{abc}", "")
+        vals, tags = row("c-ok")
+        assert str(vals[idx("status")]) == "已解出", vals
+        assert str(vals[idx("detail")]) == "FLAG{abc}", vals
+        assert tags == ("ok",), tags
+
+        # 2) 平台已解、本地没有 flag：不能写成「未解出」
+        app._board_row("c-plat", "平台已解")
+        app._board_finish("c-plat", True, "", "平台已解出（本地无 flag 记录）", True)
+        vals, tags = row("c-plat")
+        assert str(vals[idx("status")]) == "平台已解", vals
+        assert "未解出" not in str(vals[idx("detail")]), vals
+        assert "无 flag" in str(vals[idx("detail")]), vals
+        assert tags == ("ok",), tags
+        # 平台已解也是终态：用时必须停表
+        assert app._board["c-plat"].get("finished"), "平台已解也应视为终态停表"
+        frozen = str(vals[idx("elapsed")])
+        time.sleep(1.1)
+        app._board_tick()
+        assert str(row("c-plat")[0][idx("elapsed")]) == frozen
+
+        # 3) 真未解出
+        app._board_row("c-fail", "没解出")
+        app._board_finish("c-fail", False, "", "预算耗尽")
+        vals, tags = row("c-fail")
+        assert str(vals[idx("status")]) == "未解出", vals
+        assert str(vals[idx("detail")]) == "预算耗尽", vals
+        assert tags == ("fail",), tags
+
+        # 4) 解题中 → 蓝色
+        app._board_row("c-run", "在跑")
+        app._board_set("c-run", status="解题中")
+        assert row("c-run")[1] == ("running",), row("c-run")
+
+        # 5) 事件路径也走同一收口：task_done 里 ok=True 但没 flag 时不能出现「未解出」
+        app.q.put(("task_done", {"id": "c-evt", "ok": True, "flag": "", "note": "",
+                                 "presolved": False}))
+        app._board_row("c-evt", "事件题")
+        app._drain()
+        vals, tags = row("c-evt")
+        assert str(vals[idx("status")]) == "平台已解", vals
+        assert "未解出" not in str(vals[idx("detail")]), vals
+        assert tags == ("ok",), tags
+        ok("状态/详情自洽：已解出显示 flag，平台已解标注无记录，未解出显示原因，事件路径同口径")
+    finally:
+        try:
+            app.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def case_table_scrollbars() -> None:
     """三张表都要有「上下 + 左右」滚动条，而且是真的能滚（内容比可视区宽）。
 
@@ -843,6 +928,7 @@ def main() -> int:
         case_app_integration()
         case_dpi_and_tabs()
         case_board_columns_work()
+        case_board_status_colors()
         case_table_scrollbars()
         case_settings_dialog()
         case_force_rerun_really_reruns()

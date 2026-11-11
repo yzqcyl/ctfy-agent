@@ -667,6 +667,37 @@ class App:
         self.tv_board.grid(row=0, column=0, sticky="nsew")
         self.vsb_board.grid(row=0, column=1, sticky="ns")
         self.hsb_board.grid(row=1, column=0, sticky="ew")
+        # 状态配色（前景 + 浅底）：一眼分清 已解出 / 解题中 / 未解出 / 待开始
+        self.tv_board.tag_configure("ok", foreground=theme.SUCCESS,
+                                    background=theme.SUCCESS_SOFT)
+        self.tv_board.tag_configure("ok_skip", foreground=theme.SUCCESS,
+                                    background=theme.HOVER)
+        self.tv_board.tag_configure("running", foreground=theme.PRIMARY,
+                                    background=theme.PRIMARY_SOFT)
+        self.tv_board.tag_configure("fail", foreground=theme.DANGER,
+                                    background=theme.DANGER_SOFT)
+        self.tv_board.tag_configure("muted", foreground=theme.TEXT_MUTED,
+                                    background=theme.CANVAS)
+        self.tv_board.tag_configure("idle", foreground=theme.TEXT_MUTED,
+                                    background=theme.CANVAS)
+
+    # 状态 → 配色 tag（按前缀匹配，文案调整不影响配色）
+    _BOARD_TAG_RULES = (
+        ("已解出（跳过）", "ok_skip"),
+        ("已解出", "ok"),
+        ("平台已解", "ok"),
+        ("解题中", "running"),
+        ("未解出", "fail"),
+        ("已取消", "muted"),
+        ("出错", "fail"),
+    )
+
+    def _board_tag(self, status: str) -> str:
+        text = str(status or "")
+        for prefix, tag in self._BOARD_TAG_RULES:
+            if text.startswith(prefix):
+                return tag
+        return "idle"
 
     def _board_clear(self) -> None:
         for iid in self.tv_board.get_children():
@@ -675,13 +706,14 @@ class App:
         self.lbl_board.set("还没有任务")
 
     # 这些状态表示这一题已经停了：用时列必须冻结，不跟着整批 run 一直走
-    _BOARD_FINAL = ("已解出", "已解出（跳过）", "未解出", "已取消", "出错")
+    _BOARD_FINAL = ("已解出", "已解出（跳过）", "平台已解", "未解出", "已取消", "出错")
 
     def _board_row(self, cid: str, title: str = "") -> dict:
         rec = self._board.get(cid)
         if rec is None:
             iid = self.tv_board.insert(
-                "", "end", values=(title or cid[:8], "待开始", "", 0, 0, "-", "00:00"))
+                "", "end", values=(title or cid[:8], "待开始", "", 0, 0, "-", "00:00"),
+                tags=("idle",))
             rec = {"iid": iid, "started": time.monotonic(), "finished": None}
             self._board[cid] = rec
             self.lbl_board.set(f"共 {len(self._board)} 题")
@@ -707,6 +739,26 @@ class App:
             if key in self._BOARD_COLS:
                 vals[self._BOARD_COLS.index(key)] = value
         self.tv_board.item(rec["iid"], values=vals)
+        # 状态文字变了就换配色（未给 status 的更新沿用当前状态色）
+        current = str(vals[self._BOARD_COLS.index("status")])
+        self.tv_board.item(rec["iid"], tags=(self._board_tag(current),))
+
+    def _board_finish(self, cid: str, ok: bool, flag: str = "", note: str = "",
+                      presolved: bool = False) -> None:
+        """统一的「一题结束」收口：状态与详情必须自洽，不能出现「已解出 / 未解出」。"""
+        flag = str(flag or "").strip()
+        note = str(note or "").strip()
+        if ok and flag and presolved:
+            status, detail = "已解出（跳过）", flag
+        elif ok and flag:
+            status, detail = "已解出", flag
+        elif ok:
+            # 平台/记录说已解，但本地没有 flag：如实标注，不能写「未解出」
+            status = "平台已解"
+            detail = note or "平台标记已解，本地未记录 flag"
+        else:
+            status, detail = "未解出", (note or "未解出")
+        self._board_set(cid, status=status, detail=detail[:120])
 
     def _board_bump_round(self, cid: str) -> None:
         rec = self._board.get(cid)
@@ -1797,16 +1849,13 @@ class App:
                 d = item[1]
                 cid = str(d.get("id") or "")
                 presolved = bool(d.get("presolved"))
+                self._board_finish(cid, bool(d.get("ok")), d.get("flag") or "",
+                                   d.get("note") or "", presolved)
                 if d.get("ok"):
-                    # 「已解出（跳过）」= 平台/缓存已有结论，0 token 零成本收口；
-                    # 这样界面上突然出现一批「已解出」时，原因一眼可见。
-                    status = "已解出（跳过）" if presolved else "已解出"
-                    self._board_set(cid, status=status, detail=str(d.get("flag") or ""))
                     tail = "（已有解出记录，未重烧）" if presolved else ""
-                    self._log(f"✓ {d.get('id')}  {d.get('flag') or ''}{tail}")
+                    extra = "" if d.get("flag") else f"  [{d.get('note') or '本地无 flag 记录'}]"
+                    self._log(f"✓ {d.get('id')}  {d.get('flag') or ''}{extra}{tail}")
                 else:
-                    self._board_set(cid, status="未解出",
-                                    detail=str(d.get("note") or "未解出")[:60])
                     self._log(f"✗ {d.get('id')}  {d.get('note') or '未解出'}")
             elif kind == "batch_note":
                 self._log(str(item[1]))
@@ -2000,9 +2049,9 @@ class App:
                           + ("（跳过：已有解出记录）" if presolved else ""))
                 cid = str(r.get("id") or "")
                 if cid in self._board:
-                    status = ("已解出（跳过）" if presolved else "已解出") if r.get("ok") \
-                        else "未解出"
-                    self._board_set(cid, status=status, detail=str(detail)[:60])
+                    # 统一收口：状态/详情自洽（平台已解但本地无 flag 时不再显示「未解出」）
+                    self._board_finish(cid, bool(r.get("ok")), r.get("flag") or "",
+                                       r.get("note") or "", presolved)
             self._set_status(f"批量完成：{okn}/{len(res)} 题成功")
         else:
             if fv:

@@ -17,6 +17,7 @@
 
 | 文件 | 会话 | 区间 | 结果 |
 |---|---|---|---|
+| src/ctfy_agent/gui/{app.py,platform_worker.py} + tests/smoke_gui_theme.py + docs/ui-design-2026-11-10.md | W（GUI 六轮：状态自洽 + 配色 2026-11-11 凌晨） | 11-11 05:40–06:20 | 用户发现任务面板出现「已解出 / 未解出」自相矛盾行。根因：`ok = submitted or flag` 为真但本地没有 flag 时，状态写「已解出」而详情落到兜底文案「未解出」（典型场景：平台 `my_solved_ids` 说已解、本 agent 没记到 flag）。新增统一收口 `_board_finish()`：有 flag → 已解出；ok 但无 flag → **平台已解** + 「平台已解出（本地无 flag 记录）」（worker 也补了这个 note）；失败 → 未解出 + 具体原因（预算耗尽/超时/异常），并纳入终态停表。状态加配色 tag：已解出绿+浅绿底、已解出（跳过）绿字灰底、解题中蓝+浅蓝底、未解出/出错红+浅红底、待开始/已取消灰字白底。`smoke_gui_theme` 36 条（新增状态自洽+配色用例：四种收口、tag 颜色、平台已解停表、事件路径同口径）；44 个 smoke 全绿、GUI selftest OK |
 | src/ctfy_agent/solver.py + src/ctfy_agent/platform.py + tests/smoke_instance_id_repair.py | W（本地 plat 测试监视轮 2026-11-11） | 11-11 17:55–18:05 | 本地 plat 测试里 `verify_exploit` 的 instance_id 被填成 host/host 前缀（SAMPLE-008 两次 404、2026-10-29 SAMPLE-007 同形态）→ 新增 `looks_like_instance_uuid()` + solver 参数修正：**只**把「本题实例回执里出现过的 host / host 前缀」纠回登记的 UUID，合法 UUID / 别的 UUID / 无关值一律不动；已失败回执追加含本题 UUID 的确定性提示；无实例时仍抛原 PlatformError。新增 21 条回归（含「正确 UUID 判题通过仍返回 solved=True 并落库 submitted / 正确路径零纠正记录」的不破坏断言）。44 个 smoke 文件全绿（smoke.py 180/0、耗时 170s） |
 
 | 文件 | 会话 | 区间 | 结果 |
