@@ -704,6 +704,90 @@ class Solver:
         "实例不存在",
     )
 
+    _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+    _ALREADY_RUNNING_MARKS = ("[已在运行]", "已在运行", "already running")
+
+    def _instance_id_in_text(self, text: str) -> str:
+        """从回执文本里抠出第一个 UUID 形态的实例 id（没有就返回空串）。"""
+        match = self._UUID_RE.search(str(text or ""))
+        return match.group(0) if match else ""
+
+    def _instance_liveness(self, instance_id: str) -> str:
+        """用 get_instance 确定性探活：absent=平台明确说没有这个实例；live=查得到；unknown=没工具/探活失败。
+
+        [fix 2026-11-11 本地 plat 重跑] SAMPLE-019/016 实测：实例早被平台回收，但 start_instance
+        一直回「[已在运行] 本题实例已存在（instance_id=…）」，get_instance 却报 instance_not_found，
+        端点只剩平台边缘的 Go 式 404 —— 本地幂等短路 + 平台墓碑回执，让模型永远重建不出实例。
+        这里只做「平台自己都说没有」的确定性判定，查不到/没工具一律 unknown（维持旧行为）。
+        """
+        iid = str(instance_id or "").strip()
+        if not iid:
+            return "unknown"
+        if not self.platform.try_resolve("get_instance"):
+            return "unknown"
+        try:
+            text = str(self.platform.call_text("get_instance", {"instance_id": iid}) or "")
+        except Exception:  # noqa: BLE001 - 探活失败按未知处理，绝不因此改变主流程
+            return "unknown"
+        low = text.lower()
+        if any(mark in low for mark in self._DEAD_INSTANCE_MARKERS):
+            return "absent"
+        return "live"
+
+    def _forget_instance(self, challenge_id: str) -> None:
+        """清掉本地登记的实例（被平台回收的墓碑 id），状态不动（instance_up 仍是合法中间态）。"""
+        challenge = self.store.require(challenge_id)
+        challenge.instance_id = ""
+        challenge.instance = {}
+        self.store.save()
+
+    def _maybe_rebuild_tombstone(self, challenge_id: str, name: str, args: dict, text) -> str:
+        """start 回「已在运行」但探活说实例不存在 → stop 旧 id（尽力）→ 真 start 一次。
+
+        只在 get_instance 明确报 not found 时执行（平台自己说没有），并且额外那次 start 也计入
+        instance_ops_limit（烧不出配额）。任何一步失败都保持原回执，只追加说明，不影响主流程。
+        """
+        raw = str(text or "")
+        if not any(mark in raw for mark in self._ALREADY_RUNNING_MARKS):
+            return raw
+        old_id = self._instance_id_in_text(raw) or str(self.store.require(challenge_id).instance_id or "")
+        if not old_id or self._instance_liveness(old_id) != "absent":
+            return raw
+        stop_name = self.platform.try_resolve("stop_instance")
+        if stop_name:
+            try:
+                self.platform.call_text(stop_name, {"instance_id": old_id})
+            except Exception:  # noqa: BLE001 - 回收是尽力而为
+                pass
+        if not self.store.record_call(challenge_id, name, self.config.instance_ops_limit):
+            return raw + (
+                f"\n[实例守卫] 平台登记的实例 {old_id} 已不存在，但本次尝试的实例操作配额已用尽，"
+                "无法自动重建；不要再重试同一参数，直接 report/done 收口。"
+            )
+        self._forget_instance(challenge_id)
+        try:
+            rebuilt = self.platform.call_text(name, args)
+        except Exception as exc:  # noqa: BLE001 - 重建失败就保留原回执 + 说明
+            return raw + f"\n[实例守卫] 自动重建实例失败（{type(exc).__name__}: {exc}），请直接收口。"
+        self.store.append_transcript(challenge_id, {
+            "role": "tool",
+            "note": f"[实例守卫] 平台登记的实例 {old_id} 已被回收（get_instance 报不存在），"
+                    "已 stop 旧 id 并重新 start_instance",
+        })
+        parsed = self.platform._as_json(rebuilt)
+        if isinstance(parsed, dict):
+            item = self.store.require(challenge_id)
+            item.instance = parsed
+            item.instance_id = str(parsed.get("id") or parsed.get("instance_id") or "")
+            if item.status in ("new", "parsed"):
+                self.store.set_status(challenge_id, "instance_up")
+            self.store.save()
+            return str(rebuilt) + (
+                f"\n[实例守卫] 旧实例 {old_id} 已失效（平台报 instance_not_found），"
+                f"已自动重建为 {item.instance_id or '(新实例)'}，请用新端点。"
+            )
+        return str(rebuilt) + "\n[实例守卫] 已自动重新 start 一次；若回执仍无端点，直接收口，不要反复重试。"
+
     def _maybe_recover_instance(self, challenge_id: str, text: str) -> str:
         """实例被平台换节点/回收后自愈：作废旧 UUID → 重新 start_instance → 把新端点回灌给模型。
 
@@ -900,15 +984,24 @@ class Solver:
                 return self._submit(args, challenge_id)
             # 幂等拦截：实例已在运行时，模型再调 start 直接回「已在运行」，不再打到平台
             # （实测模型常在 auto-start 成功后几十秒又冗余调一次，撞上限流）。
+            # [fix 2026-11-11 本地 plat 重跑] 先用 get_instance 探活：平台明确说实例不存在（墓碑）
+            # 时不能短路——否则本地登记的死 id 永远挡住重建（SAMPLE-019/016 实测）。
             if name == self.platform.try_resolve("start_instance"):
                 existing = self.store.require(challenge_id)
                 if existing.instance_id:
-                    extra = (
-                        f" 实例信息：{json.dumps(existing.instance, ensure_ascii=False)[:400]}"
-                        if existing.instance
-                        else ""
-                    )
-                    return f"[已在运行] 本题实例已存在（instance_id={existing.instance_id}），无需重复启动。{extra}", False
+                    if self._instance_liveness(existing.instance_id) != "absent":
+                        extra = (
+                            f" 实例信息：{json.dumps(existing.instance, ensure_ascii=False)[:400]}"
+                            if existing.instance
+                            else ""
+                        )
+                        return f"[已在运行] 本题实例已存在（instance_id={existing.instance_id}），无需重复启动。{extra}", False
+                    self.store.append_transcript(challenge_id, {
+                        "role": "tool",
+                        "note": f"[实例守卫] 本地登记的实例 {existing.instance_id} 已被平台回收"
+                                "（get_instance 报 instance_not_found），清掉登记后重新 start",
+                    })
+                    self._forget_instance(challenge_id)
             # 审计 M2：start/stop 实例这类写操作加频控，防止模型（或被注入后）反复启停
             if name in self._instance_op_names():
                 if not self.store.record_call(challenge_id, name, self.config.instance_ops_limit):
@@ -983,6 +1076,9 @@ class Solver:
                         "先 list_instances 查看占用者，确认是**已废弃**的实例再 stop_instance，"
                         "不要盲停正在并行的兄弟任务。"
                     )
+                # [fix 2026-11-11 本地 plat 重跑] 平台把已被回收的实例仍以「[已在运行]」回执返回时，
+                # 靠 get_instance 探活确认后 stop 旧 id + 重新 start（详见 _maybe_rebuild_tombstone）。
+                text = self._maybe_rebuild_tombstone(challenge_id, name, args, text)
                 parsed = self.platform._as_json(text)
                 local.allow_many(parsed if parsed is not None else text)
                 if parsed is not None:
