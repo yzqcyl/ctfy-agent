@@ -49,6 +49,29 @@ def _untrusted(text: str) -> str:
     return UNTRUSTED_PREFIX + text
 
 
+# [fix 2026-11-11 本地 plat 重跑] 上一轮的「收口结论」会在重跑时把模型锚死：SAMPLE-003 第 4 轮
+# 开局 30 秒内就引用历史 note 里的「接入层不可达/维持历史判定」直接 done，而这一轮真正的问题
+# （实例配额被旧账锁死）已经修好。这里只在历史笔记命中「收口/不可解/不可达/配额」这类字样时，
+# 追加一句「先重测关键卡点」的提示——不是指令、不删历史，避免把已知死路当成本轮事实。
+_HISTORY_CLOSURE_MARKS = (
+    "收口", "不可解", "不可达", "硬性", "不再派活", "维持历史判定",
+    "配额", "已达本题上限", "5 次",
+)
+
+
+def history_caution(notes) -> str:
+    """历史笔记里出现过「收口/不可解」类结论时，返回一句重新验证提示；否则返回空串。"""
+    text = "\n".join(str(n) for n in (notes or [])[-5:])
+    if not any(mark in text for mark in _HISTORY_CLOSURE_MARKS):
+        return ""
+    return (
+        "[注意] 上面「历史笔记」可能来自**上一轮**（当时的代码/平台状态可能已经变化，例如实例配额修复、"
+        "实例已重建）。其中「不可解 / 接入层不可达 / 配额耗尽 / 维持历史判定」这类结论**不是本轮事实**："
+        "先花 1-2 步重测关键卡点（start_instance 是否可用、实例 host 是否可达），确认仍不通再沿用旧结论收口，"
+        "不要开局就直接 done。"
+    )
+
+
 def _verify_passed(text: str) -> bool:
     """判断 verify_answer 回执是否为「通过」。
 
@@ -2261,6 +2284,9 @@ class Solver:
             parts.append(_untrusted("实例：\n" + json.dumps(challenge.instance, ensure_ascii=False)[:800]))
         if challenge.notes:
             parts.append(_untrusted("历史笔记：\n" + "\n".join(challenge.notes[-5:])))
+            caution = history_caution(challenge.notes)
+            if caution:
+                parts.append(caution)
         parts.append(
             "可用工具见函数定义。允许访问的实例地址："
             + (", ".join(sorted(local.allowed_hosts | local.allowed_endpoints)) or "(还没有，先 start_instance)")

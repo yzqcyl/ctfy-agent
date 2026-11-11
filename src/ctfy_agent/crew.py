@@ -36,7 +36,7 @@ from .config import Config
 from .ledger import FLAG_RE, Ledger
 from .llm import LLMError
 from .platform import CtfyPlatform
-from .solver import Solver, _compact_history, _untrusted, MAX_TOOL_TEXT
+from .solver import Solver, _compact_history, _untrusted, MAX_TOOL_TEXT, history_caution
 from .state import Store
 from .tools_local import (
     BURST_SPEC,
@@ -2173,6 +2173,9 @@ class Crew:
             parts.append(_untrusted("实例：\n" + json.dumps(challenge.instance, ensure_ascii=False)[:800]))
         if challenge.notes:
             parts.append(_untrusted("历史笔记：\n" + "\n".join(challenge.notes[-8:])))
+            caution = history_caution(challenge.notes)
+            if caution:
+                parts.append(caution)
         info = getattr(self, "_question_info", None) or {}
         all_qids = self._question_ids(info)
         if len(all_qids) > 1:
