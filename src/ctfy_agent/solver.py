@@ -1029,35 +1029,41 @@ class Solver:
                         break
                     time.sleep(wait)
                     text = self.platform.call_text(name, args)
-                if self._is_capacity_error(text):
+                if self._is_capacity_error(text) or self._is_start_rate_limited(text):
                     # [fix 2026-11-05 P3] 团队实例配额有限（arena 实测 1，TPCTF 智能体赛道 3）。
                     # 旧逻辑把失败调用也计入 instance_ops_limit=5，两三次失败就把额度烧光。
                     # 这里：回滚计数 -> 清掉残留实例（按配额选策略）-> 重试一次，
                     # 仍失败才把排查动作写给模型。
+                    # [fix 2026-11-11 本地 plat 重跑] 额外按 state 回收「已解出/已结束」题的实例
+                    # （mock list_instances 为空时也能腾名额，SAMPLE-003 实测就是被这类旧实例占满）。
                     try:
                         self.store.refund_call(challenge_id, name)
                     except Exception:  # noqa: BLE001 - 计数回滚是增强项
                         pass
                     quota = self._capacity_quota(text)
                     cleaned = self._evict_stale_instances(challenge_id, quota)
+                    freed = self._evict_finished_instances(challenge_id)
                     slots = f"平台团队实例配额是 {quota} 个" if quota else "平台团队实例配额很小"
-                    if cleaned:
+                    if cleaned or freed:
                         self.store.append_transcript(
                             challenge_id,
-                            {"role": "tool", "note": f"[实例守卫] 清掉 {cleaned} 个残留实例后重试 {name}"},
+                            {"role": "tool",
+                             "note": f"[实例守卫] 清掉 {cleaned} 个残留 + {freed} 个已解出题的旧实例后重试 {name}"},
                         )
-                        text = self.platform.call_text(name, args)
-                        if self._is_capacity_error(text):
+                        retried = self.store.record_call(challenge_id, name, self.config.instance_ops_limit)
+                        if retried:
+                            text = self.platform.call_text(name, args)
+                        if self._is_capacity_error(text) or self._is_start_rate_limited(text):
                             text += (
-                                f"\n[实例守卫] 已清理 {cleaned} 个残留实例仍被拒：{slots}，"
+                                f"\n[实例守卫] 已清理 {cleaned + freed} 个旧实例仍被拒：{slots}，"
                                 "且可能被并行跑的其它题占用。先 list_instances 看清是谁在占，"
                                 "不要连续重试（本地已回滚本次计数）。"
                             )
                     else:
                         text += (
-                            f"\n[实例守卫] {slots}（429 team_capacity_exceeded），"
-                            "且当前没有可清理的残留实例——可能是本队其它题正在并行使用，"
-                            "先 list_instances 确认占用者，不要盲停别人的实例，也不要连续重试。"
+                            f"\n[实例守卫] {slots}（团队并发实例被占满：team_capacity_exceeded / "
+                            "Rate limited by upstream），且当前没有可清理的残留实例——可能是本队其它题"
+                            "正在并行使用，先 list_instances 确认占用者，不要盲停别人的实例，也不要连续重试。"
                         )
                 elif self._is_transient(text):
                     # [fix 2026-11-05 P7] 瞬时失败（SSE 读超时/MCP 响应超时/上游限流）时平台并未
@@ -1164,6 +1170,49 @@ class Solver:
         """平台团队实例配额拒绝（429）判定。"""
         low = str(text or "").lower()
         return "team_capacity_exceeded" in low or "concurrent instances" in low
+
+    @staticmethod
+    def _is_start_rate_limited(text: str) -> bool:
+        """「团队并发实例配额被占满」类拒绝（本地 plat 文案：Rate limited by upstream API, please retry later）。"""
+        low = str(text or "").lower()
+        return (
+            "rate limited" in low
+            or "rate_limited" in low
+            or "too many instances" in low
+            or "team_capacity_exceeded" in low
+            or "concurrent instances" in low
+        )
+
+    def _evict_finished_instances(self, challenge_id: str) -> int:
+        """回收「已解出/已结束」题的旧实例，腾团队并发名额；返回停掉的个数。
+
+        [fix 2026-11-11 本地 plat 重跑] SAMPLE-003 实测：团队并发实例配额被前几轮遗留的实例
+        （绝大多数属于**已经解出**的题）占满，start_instance 回 "Rate limited by upstream API"；
+        而 mock 的 list_instances 返回空，模型无法定位占用者，只能收口。这里按 state 里各题登记的
+        instance_id 做确定性回收：**只动状态为 submitted/done 的题**，绝不碰并行中的兄弟题。
+        """
+        stop_name = self.platform.try_resolve("stop_instance")
+        if not stop_name:
+            return 0
+        stopped = 0
+        for cid, item in list(self.store.challenges.items()):
+            if cid == challenge_id:
+                continue
+            if str(getattr(item, "status", "")) not in ("submitted", "done"):
+                continue
+            iid = str(getattr(item, "instance_id", "") or "").strip()
+            if not iid:
+                continue
+            try:
+                self.platform.call_text(stop_name, {"instance_id": iid})
+            except Exception:  # noqa: BLE001 - 回收是尽力而为
+                continue
+            item.instance_id = ""
+            item.instance = {}
+            stopped += 1
+        if stopped:
+            self.store.save()
+        return stopped
 
     @staticmethod
     def _capacity_quota(text: str) -> int | None:
