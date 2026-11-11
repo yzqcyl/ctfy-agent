@@ -2786,11 +2786,17 @@ class LocalTools:
             siblings = [p.name for p in runs_dir.iterdir() if p.is_dir()]
         except OSError:
             return ""
+        # [修正 2026-11-11 二次实测] 必须匹配「<兄弟 run 名>\sandbox」这种**路径段**，
+        # 不能只匹配名字：runs/ 下正好有个历史误建目录叫 `runs`，只按名字匹配会把
+        # `cd E:\...\runs\plat\sandbox\SAMPLE-003 && ...` 这类**合法命令**也拒掉（本地 plat
+        # 测试里真实误伤 5 次，模型因此绕去 wsl/绝对路径，浪费了步数）。
         for name in siblings:
             low_name = name.lower()
-            if low_name == current or len(low_name) < 3:
+            if low_name in (current, runs_dir.name.lower()) or len(low_name) < 3:
                 continue
-            if re.search(r"(?<![a-z0-9_-])" + re.escape(low_name) + r"(?![a-z0-9_-])", low):
+            pattern = (r"(?<![a-z0-9_-])" + re.escape(low_name)
+                       + r"(?![a-z0-9_-])\\sandbox(?![a-z0-9_-])")
+            if re.search(pattern, low):
                 return (
                     f"[拒绝] 命令引用了其它运行目录 runs\\{name}\\sandbox。每个 run 的沙盒互相隔离，"
                     "那里只会有历史运行残留（例如旧 run 从官方仓库下载的占位 flag.txt，提交必然判错）。"

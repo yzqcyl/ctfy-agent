@@ -1130,7 +1130,13 @@ class Solver:
         if instance_mode:
             instance_id = self.store.require(challenge_id).instance_id
             if not instance_id:
-                return "[提交失败] 本题还没有实例（instance_id 为空），先 start_instance 再提交。", False
+                return (
+                    "[提交失败] 本题还没有实例（instance_id 为空）。先 start_instance 再提交；"
+                    "若 start 被限流（Rate limit），说明团队并发实例配额被别的题占着——"
+                    "先 list_instances 看占用者并回收，或等其它题结束，再回来提交。"
+                    "重复提交同一个值不会成功。",
+                    False,
+                )
             payload["instance_id"] = instance_id
         else:
             payload["challenge_id"] = challenge_id

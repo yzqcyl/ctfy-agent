@@ -143,6 +143,17 @@ def _run(tmp: pathlib.Path) -> int:
           "其它运行目录" in guard("cat ../plat/sandbox/old-cid/src/flag.txt"))
     check("本 run 内正常命令放行", guard("type work\\exp.py") == "" and guard("python s1.py") == "")
     check("不含 sandbox 的命令不受影响", guard("cd .. && dir") == "")
+    # [回归 2026-11-11 二次实测] runs/ 下有个历史误建目录就**叫 `runs`**；只按名字裸匹配会把
+    # 合法命令也拒掉（本地 plat 测试真实误伤 5 次：`cd E:\...\runs\plat\sandbox\SAMPLE-003 && ...`
+    # 与 `wsl.exe -e bash /mnt/e/.../runs/plat/sandbox/...` 都被拦，模型只好绕路浪费步数）。
+    (tmp / "runs").mkdir(parents=True, exist_ok=True)
+    check("兄弟目录名叫 runs 时不误伤本 run 绝对路径",
+          guard("cd /d E:\\x\\runs\\store\\sandbox\\web-01 && python s1.py") == "",
+          guard("cd /d E:\\x\\runs\\store\\sandbox\\web-01 && python s1.py"))
+    check("兄弟目录名叫 runs 时不误伤 wsl 绝对路径",
+          guard("wsl.exe -e bash /mnt/e/x/runs/store/sandbox/web-01/run1.sh") == "")
+    check("跨 run 仍被拒（路径段精确匹配）",
+          "其它运行目录" in guard("type ..\\..\\plat\\sandbox\\old-cid\\src\\flag.txt"))
     try:
         local.shell("type ..\\..\\plat\\sandbox\\old-cid\\src\\flag.txt")
         check("shell() 真的拒绝跨 run 读取", False)

@@ -183,6 +183,14 @@ def main() -> int:
           crew_mod._action_signature("submit", {"answer": "A"}) !=
           crew_mod._action_signature("submit", {"answer": "B"}))
     check("提交拦截被识别", crew_mod._looks_blocked("[提交被拦截] 这个答案之前已经提交过…"))
+    # [回归 2026-11-11 本地 plat 测试实测] 确定性失败（无实例）不占提交额度，旧标记表不含它，
+    # 断路器不触发 → SAMPLE-015/016 把同一个答案各交了 34/37 次。
+    check("确定性提交失败也识别",
+          crew_mod._looks_blocked("[提交失败] 本题还没有实例（instance_id 为空），先 start_instance 再提交。"))
+    check("参数缺失的提交失败也识别", crew_mod._looks_blocked("[提交失败] 缺少 answer/flag 参数"))
+    # [回归 2026-11-11] 同一调用被 ledger 判重后原样重发（本地 plat 测试 75 次）也要计入断路器
+    check("ledger 判重也计入断路器",
+          crew_mod._looks_blocked("[ledger 拦截] 与第 11 步（rev）完全相同的调用，本 run 内第 1 次重复，未再执行。"))
     check("派活拒绝被识别", crew_mod._looks_blocked("[拒绝] delegate 缺少 objective"))
     check("正常结果不算拦截", not crew_mod._looks_blocked('{"accepted": true}'))
     check("平台判错不算拦截", not crew_mod._looks_blocked("----- 工具返回 -----\n{\"accepted\":false}"))
@@ -237,6 +245,29 @@ def main() -> int:
     check("不重复时每次都真提交", len(plat2.submitted) == 3, f"实际 {len(plat2.submitted)} 次")
     tr2 = _transcript_notes(store2)
     check("不重复时 submit 不被断路器摘除", "断路器：submit" not in tr2)
+
+    # ---------- 4b) 确定性失败（本题没有实例）→ 也必须被断路器收口 ----------
+    # 本地 plat 测试实测 SAMPLE-015/016：submit_flag 的 schema 要 instance_id，题又没有实例，
+    # solver 在 reserve_submit 之前就返回「[提交失败] 本题还没有实例…」，模型原样重试 34/37 次。
+    class NoInstancePlatform(StubPlatform):
+        def prop_names(self, name: str) -> set[str]:
+            if name == "submit_flag":
+                return {"answer", "challenge_id", "instance_id"}
+            return set()
+
+        def call_raw(self, name, arguments=None, *, retries: int = 0):
+            raise AssertionError("确定性失败（无实例）不应真正调用平台")
+
+    plat3 = NoInstancePlatform()
+    llm3 = ScriptedLLM([{"name": "submit", "args": {"answer": "FLAG{same}"}}] * 20)
+    store3, crew3 = _fresh(cfg, plat3, llm3, "loop3")
+    summary3 = crew3.solve(CID)
+    check("无实例重复提交 → action_loop 收口", summary3.get("reason") == "action_loop",
+          str(summary3.get("reason")))
+    check("无实例重复提交被断路器截断（<=4 次）", llm3.calls <= crew_mod.REPEAT_BLOCK_LIMIT + 1,
+          f"实际 {llm3.calls} 次")
+    check("无实例重复提交有确定性说明",
+          "提交失败" in _transcript_notes(store3), _transcript_notes(store3)[-300:])
 
     # ---------- 5) 不同值被判错但不算「被拦」---------- 
     check("不同参数会重置连续计数",
