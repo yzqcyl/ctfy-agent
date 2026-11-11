@@ -34,12 +34,13 @@ from .llm import DeepSeekLLM
 from .platform import CtfyPlatform
 from .state import Store
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # v3（2026-11-05）：平台预启实例、token 单题作用域；见 runs/site/standards-live/CTFY-0001.md
 DEFAULT_WORK_DIR = "/ctfy/work"
 DEFAULT_MAX_TURNS = 160         # task.json.max_turns 为 null（无预算）时的保守上限（80→160：配合协调者 24 轮）
 DEFAULT_MAX_TOKENS = 8192       # 4096 会在 thinking 块截断、一步即「无动作结束」
 DEFAULT_MAX_CONTEXT = 32000  # 对齐 agent.json 与各角色提示词的「上下文 32k」承诺（原 16000 导致 16k 就丢旧步骤，模型按 32k 规划却提前失忆）
 DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
+ATTACH_COPY_LIMIT_MIB = 4  # v3：平台单次把附件预放进 /ctfy/work/attachments/ 的上限；超过则 path=null
 
 # 协议（CTFY-0001）定义的 5 种 run_mode 里，我们只真正实现了 instance / qa。
 # 下面三个语义完全不同，照 instance 跑只会白烧预算，仍然直接拒绝：
@@ -409,11 +410,13 @@ def _seed_challenge(store: Store, task: dict | None, env) -> str:
                 "url": str(raw.get("url") or ""),
             }
         )
-    attachments = [
-        {"name": str(a.get("name") or ""), "path": str(a.get("path") or ""), "size": a.get("size")}
-        for a in (task.get("attachments") or [])
-        if isinstance(a, dict)
-    ]
+    attachments = []
+    for a in (task.get("attachments") or []):
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name") or "")
+        path = str(a.get("path") or "").strip()
+        attachments.append({"name": name, "path": path, "size": a.get("size")})
     scope = [str(item) for item in (task.get("scope") or []) if str(item).strip()]
     platform_env = bool(instance_id or endpoints or attachments)
     if platform_env:
@@ -424,7 +427,18 @@ def _seed_challenge(store: Store, task: dict | None, env) -> str:
             target = f"{ep['host']}:{ep['port']}" if ep["port"] else ep["host"]
             lines.append(f"- 可达端点（{ep['label'] or ep['type'] or 'target'}）：{target}（可直接连）")
         for att in attachments:
-            lines.append(f"- 附件已就位：{att['path']}（直接读本地文件，不要调下载接口）")
+            if att["path"]:
+                lines.append(f"- 附件已就位：{att['path']}（直接读本地文件，不要调下载接口）")
+            else:
+                # [v3 修复 A3] path:null 表示单次拷贝 >4MiB 未预放本地，须走平台通道下载；
+                # 旧提示「不要调下载接口」会把模型引向一个不存在的本地文件，附件题直接 0 分。
+                # 主通道 = MCP 工具 download_instance_attachment（MODEL_TOOLS 已放行）；
+                # REST GET 会被 http_request 的靶场白名单拦（平台域名不在 target_endpoints）。
+                lines.append(
+                    f"- 附件 {att['name']} 未拷贝到本地（>{ATTACH_COPY_LIMIT_MIB}MiB，size={att['size']}B）："
+                    f"用平台工具 list_instance_attachments 确认后以 download_instance_attachment 下载"
+                    f"（参数用上面的实例 id 和附件名）；不要用 http_request 打平台 API（会被白名单拦）"
+                )
         if scope:
             lines.append(f"- 允许访问范围：{', '.join(scope)}")
         desc = (desc + "\n\n" if desc else "") + "\n".join(lines)

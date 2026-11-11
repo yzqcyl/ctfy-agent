@@ -622,6 +622,17 @@ class Solver:
             return text
         if not self.config.extra.get("auto_start_instance", True):
             return text
+        # [v3 修复 A2] 平台预下发实例时（instance_preissued），实例生命周期归平台管：
+        # 本 token 无权 start_instance（403 token_missing_scope），「重建」在 v3 下不可能。
+        # 旧逻辑会白撞 403 且文案「平台未能重建实例」误导模型去等一个不会来的重建。
+        # 这里直接短路，改引导模型收口（平台会在下一轮用同一靶场重开，见 v3 §3.3）。
+        if self.config.extra.get("instance_preissued"):
+            return (
+                text
+                + "\n[实例已失效] 本题实例由平台托管、本 token 无权重建（v3 预下发模式）："
+                "不要调 start_instance（会 403）。环境故障由平台判定（unservable，不计入镜像问题）；"
+                "现在把已有发现整理好，直接 report/done 收口。"
+            )
         limit = int(self.config.extra.get("instance_recover_limit", 2) or 2)
         used = int((challenge.tool_counts or {}).get("instance_recover", 0) or 0)
         if used >= limit:

@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "run_mode": "instance",
   "challenge": { "id": "web-01", "name": "Login Bypass", "description": "登录处存在逻辑缺陷，拿到 admin 的 flag。" },
   "competition_id": "arena",

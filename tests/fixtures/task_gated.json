@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "run_mode": "instance",
   "challenge": { "id": "gated-01", "name": "Gated Chain", "description": "链式解锁题。" },
   "competition_id": "arena",

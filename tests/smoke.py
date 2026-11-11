@@ -3613,7 +3613,7 @@ def _read_result(result_path: Path) -> dict:
     text = result_path.read_text(encoding="utf-8")
     assert len(text.encode("utf-8")) <= 4 * 1024 * 1024, "result.json 超 4MiB"
     rollup = json.loads(text)
-    assert rollup["schema_version"] == 2, rollup
+    assert rollup["schema_version"] == 3, rollup
     assert not list(result_path.parent.glob(result_path.name + ".tmp.*")), "残留 .tmp 临时文件"
     return rollup
 
@@ -3793,7 +3793,7 @@ def case_agent_cli_entry(tmp: Path) -> None:
     # 本地直跑：不带 result.path（否则按规范 result.path 会赢，结果写到 /ctfy/work），
     # 默认 result.json 落 task 同目录，好验证 --task → work_dir 推导。
     task_path.write_text(
-        json.dumps({"schema_version": 2, "run_mode": "instance", "dry_run": True,
+        json.dumps({"schema_version": 3, "run_mode": "instance", "dry_run": True,
                     "challenge": {"id": "web-01"}}, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -4966,7 +4966,19 @@ def case_v64_llm_and_instance(tmp: Path) -> None:
             store.save()
             last = solver._maybe_recover_instance("web-01", "instance_not_found")
         assert "用尽" in last, last
-        ok("v6.4 LLM 限速整轮恢复 + 失效实例自愈（含自愈次数上限）")
+
+        # [v3 A2] 预下发模式（instance_preissued）：实例生命周期归平台，死标记必须短路——
+        # 不调 start_instance（403）、不清 instance_id、不耗自愈次数，文案引导收口
+        config.extra["instance_preissued"] = True
+        store.require("web-01").instance_id = "preissued-uuid-1"
+        store.require("web-01").tool_counts.pop("instance_recover", None)
+        store.save()
+        pre = solver._maybe_recover_instance("web-01", "instance_not_found")
+        assert "无权重建" in pre and "收口" in pre, pre
+        assert store.require("web-01").instance_id == "preissued-uuid-1", "预下发短路不得清 instance_id"
+        assert not store.require("web-01").tool_counts.get("instance_recover"), "预下发短路不得耗自愈次数"
+        config.extra["instance_preissued"] = False
+        ok("v6.4 LLM 限速整轮恢复 + 失效实例自愈（含自愈次数上限）+ v3 预下发短路")
     finally:
         server.shutdown()
         server.server_close()

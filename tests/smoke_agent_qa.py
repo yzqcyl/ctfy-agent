@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 FIXTURE_QA = {
-    "schema_version": 2,
+    "schema_version": 3,
     "run_mode": "qa",
     "challenge": {"id": "qa-01", "name": "SecQA MCQ", "description": "……"},
     "competition_id": "arena",

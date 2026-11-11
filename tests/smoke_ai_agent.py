@@ -134,7 +134,7 @@ def case_ai_agent_e2e(tmp: Path) -> None:
         result_path = work / "result.json"
         chat_url = f"http://127.0.0.1:{port}/api/chat"
         task = {
-            "schema_version": 2,
+            "schema_version": 3,
             "run_mode": "instance",
             "challenge": {
                 "id": AI_CHALLENGE["id"],

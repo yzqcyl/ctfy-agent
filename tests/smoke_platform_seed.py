@@ -44,7 +44,10 @@ TASK = {
     "scope": ["sppiazvvbp42beia5.internal:31313"],
     "target_instance": "f69a8be6-1ccf-4901-a7e6-a592397f7042",
     "target_endpoints": [{"label": "chal", "type": "tcp", "url": "sppiazvvbp42beia5.internal:31313"}],
-    "attachments": [{"name": "README.txt", "size": 236, "path": "/ctfy/work/attachments/README.txt"}],
+    "attachments": [
+        {"name": "README.txt", "size": 236, "path": "/ctfy/work/attachments/README.txt"},
+        {"name": "huge_dump.bin", "size": 9000000, "path": None},  # v3：>4MiB 未拷贝
+    ],
 }
 
 
@@ -70,9 +73,14 @@ def case_platform_seed(tmp: Path) -> None:
     endpoint = challenge.instance["endpoints"][0]
     assert endpoint["host"] == "sppiazvvbp42beia5.internal" and endpoint["port"] == 31313, endpoint
     assert challenge.instance.get("attachments"), challenge.instance
+    assert len(challenge.instance["attachments"]) == 2, challenge.instance["attachments"]
     assert "sppiazvvbp42beia5.internal:31313" in challenge.description, challenge.description
     assert "禁止调用 start_instance" in challenge.description, challenge.description
     assert "/ctfy/work/attachments/README.txt" in challenge.description, challenge.description
+    # [v3 A3] path:null（>4MiB 未拷贝）：提示必须指向平台下载工具，绝不能再说「不要调下载接口」
+    null_lines = [ln for ln in challenge.description.splitlines() if "huge_dump.bin" in ln]
+    assert null_lines and "不要调下载接口" not in null_lines[0], null_lines
+    assert null_lines and "download_instance_attachment" in null_lines[0], null_lines
     _ok("P0 seed：实例/端点/附件/范围落库，host:port 与「禁止 start_instance」进 description")
 
     # --- 2) 白名单：下发的端点自动放行（http + tcp），其它主机仍被拦 ---
