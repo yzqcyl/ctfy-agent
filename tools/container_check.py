@@ -205,8 +205,8 @@ def run_case(tag: str, name: str, task: dict | None, env_extra: dict, expect_rea
     reason = data.get("stop_reason")
     if reason != expect_reason:
         raise Fail(f"[{name}] stop_reason={reason!r}，期望 {expect_reason!r}；result={json.dumps(data, ensure_ascii=False)[:600]}")
-    if data.get("schema_version") != 2:
-        raise Fail(f"[{name}] schema_version={data.get('schema_version')!r}，期望 2")
+    if data.get("schema_version") != 3:
+        raise Fail(f"[{name}] schema_version={data.get('schema_version')!r}，期望 3")
     ans = data.get("answers")
     if not isinstance(ans, dict):
         raise Fail(f"[{name}] answers 不是对象：{ans!r}")
@@ -229,13 +229,14 @@ def posture(tag: str) -> None:
 
 
 def contract_cases(tag: str, local: bool = False) -> None:
-    inst = {"schema_version": 2, "run_mode": "instance", "challenge": {"id": "ctf-smoke"}}
+    inst = {"schema_version": 3, "run_mode": "instance", "challenge": {"id": "ctf-smoke"}}
     # 4.1 dry run：最便宜的注册门
     run_case(tag, "dry_run", {**inst, "dry_run": True}, {"CTFY_EVAL_DRY_RUN": "1"}, "dry_run", local)
-    # 4.2 task.json 缺失、且没有任何 env 兜底
-    run_case(tag, "no_task", None, {}, "halted", local)
+    # 4.2 task.json 缺失、且没有任何 env 兜底（AGENT_TASK_WAIT_TIMEOUT=0 关掉 G9 轮询，
+    #     保持「缺 task → 立即 halted」的确定性契约语义；轮询行为由 smoke.py 单独覆盖）
+    run_case(tag, "no_task", None, {"AGENT_TASK_WAIT_TIMEOUT": "0"}, "halted", local)
     # 4.3 不支持的 run_mode（本适配器只做 instance/qa，其余如 defence 显式拒跑）
-    run_case(tag, "bad_run_mode", {"schema_version": 2, "run_mode": "defence", "challenge": {"id": "x"}}, {}, "refused", local)
+    run_case(tag, "bad_run_mode", {"schema_version": 3, "run_mode": "defence", "challenge": {"id": "x"}}, {}, "refused", local)
     # 4.4 凭证缺失：必须 fail loudly，不许烧钱
     run_case(tag, "no_creds", inst, {"LLM_FLAVOR": "openai"}, "refused", local)
     # 4.5 没有 MCP 端点（没有 mcp.json，也没给 CTFY_PLATFORM_URL）

@@ -41,11 +41,11 @@ DEFAULT_MAX_TOKENS = 8192       # 4096 会在 thinking 块截断、一步即「�
 DEFAULT_MAX_CONTEXT = 32000  # 对齐 agent.json 与各角色提示词的「上下文 32k」承诺（原 16000 导致 16k 就丢旧步骤，模型按 32k 规划却提前失忆）
 DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
 ATTACH_COPY_LIMIT_MIB = 4  # v3：平台单次把附件预放进 /ctfy/work/attachments/ 的上限；超过则 path=null
-# [v7.2 G9] task.json 缺失时的短轮询等待（秒）。平台托管形态下 task.json 在容器启动前就位，
-# 缺失通常是环境错误；但万一 11-14/15 实际是「常驻形态、题稍后才放」，短暂轮询能兜住「题还没到」
-# 的窗口，避免立即 halted 弃权。默认 60s（足够覆盖放题延迟，又不至于空烧容器生命周期），
-# env AGENT_TASK_WAIT_TIMEOUT 可调；0 = 不等待，恢复旧行为（立即 halted）。
-TASK_WAIT_TIMEOUT_DEFAULT = 60.0
+# [v7.2 G9] task.json 缺失时的短轮询等待（秒）。平台托管形态（v3 管辖，11-14/15 主流）下
+# task.json 在容器启动前就位，缺失通常是环境错误；但万一 11-14/15 实际是「常驻形态、题稍后才放」，
+# 短暂轮询能兜住「题还没到」的窗口，避免立即 halted 弃权。默认 30s（覆盖放题延迟，又不至于在
+# 环境错误时长时间空烧容器生命周期），env AGENT_TASK_WAIT_TIMEOUT 可调；0 = 不等待（恢复旧行为）。
+TASK_WAIT_TIMEOUT_DEFAULT = 30.0
 TASK_POLL_INTERVAL = 5.0
 
 # 协议（CTFY-0001）定义的 5 种 run_mode 里，我们只真正实现了 instance / qa。
