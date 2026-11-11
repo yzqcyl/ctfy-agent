@@ -1,6 +1,22 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
-## ✅ v6.3 已构建、匿名可拉取、平台 admission=admitted（2026-11-04）——**提交用这个**
+## ✅ v7.2 已构建、匿名可拉取（2026-11-11）——**提交用这个**
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v7.2` |
+| digest（index） | `sha256:060a8fdefbe85d70a35f95f77a9075d3da6f5019a35f4b2085032baa04d0317d` |
+| digest（amd64） | `sha256:a8ca4635a0ebcb38df21a1fb9316ec5192414c9a6ffd65aa8318e0cc42fe5f99` |
+| 构建 | GitHub Actions run `42982226027`（branch `ctfarena/fix`、sha `a39f3e9`）→ 14 步全绿 |
+| 本次变更 | ① **A4 换值重交**（对齐 v3 §3.3 per-question wrong-attempt cap）：`state.wrong_by_qid` 按题号记错交，`reserve_submit`/`can_submit` 额度闸 per-question 化，换题号不再被别的题号锁死；同值仍幂等去重。② **G9 无 task.json 兜底**：缺 task.json 短轮询等待（`AGENT_TASK_WAIT_TIMEOUT`，默认 30s）而非立即 halted，对冲「常驻形态题稍后才放」的尾部风险。③ container_check schema_version 断言 2→3（A1 遗留） |
+| 单测 | `tests/smoke.py` **180 passed / 0 failed**（新增 A4 2 条 + G9 3 条）；独立套件全绿；密钥扫描干净 |
+| 体积/层数 | 19 层，197.7 MB（平台上限 400 MB） |
+| 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app`（非 root）/ `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` / `LLM_ENABLE_THINKING=0` |
+| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v7.2`） |
+
+---
+
+## 历史：v6.3 已构建、匿名可拉取、平台 admission=admitted（2026-11-04）——已被 v7.2 取代
 
 | 项 | 值 |
 |---|---|
