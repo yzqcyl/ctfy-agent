@@ -216,7 +216,7 @@ def main() -> int:
     store.upsert({"id": CID, "name": "x", "category": "web", "description": "d", "points": 100})
     store.save()
     waiting = "Rate limited by upstream API, please retry later"
-    platform = FakePlatform(start_queue=[waiting, waiting, waiting])
+    platform = FakePlatform(start_queue=[waiting, waiting, waiting, waiting, waiting])
     solver = _solver(store, platform)
     real_sleep, solver_mod.time.sleep = solver_mod.time.sleep, lambda _s: None
     try:
@@ -224,7 +224,25 @@ def main() -> int:
     finally:
         solver_mod.time.sleep = real_sleep
     check("无残留：不误杀", len(stop_calls(platform)) == 0, str(stop_calls(platform)))
+    check("无残留：等一个窗口后重试了一次", len(start_calls(platform)) == 4, str(len(start_calls(platform))))
     check("无残留：给模型确定性说明", "团队并发实例" in text, text[:200])
+
+    # ---- 5) 端到端：没有可回收实例，但等一个窗口后重试就拿到实例（SAMPLE-003 的真实场景）----
+    store = _store(tmp / "waitwin")
+    store.challenges.clear()
+    store.upsert({"id": CID, "name": "x", "category": "web", "description": "d", "points": 100})
+    store.save()
+    platform = FakePlatform(start_queue=[waiting, waiting, waiting])
+    solver = _solver(store, platform)
+    real_sleep, solver_mod.time.sleep = solver_mod.time.sleep, lambda _s: None
+    try:
+        text, _ = solver._execute("start_instance", {"challenge_id": CID}, LocalTools(store, CID), CID)
+    finally:
+        solver_mod.time.sleep = real_sleep
+    check("等窗口重试：拿到实例并登记", store.require(CID).instance_id == NEW_ID, store.require(CID).instance_id)
+    check("等窗口重试：回执含新实例", NEW_ID in text, text[:200])
+    check("等窗口重试：配额只算 1 次", store.call_count(CID, "start_instance") == 1,
+          str(store.call_count(CID, "start_instance")))
 
     print()
     if FAILS:

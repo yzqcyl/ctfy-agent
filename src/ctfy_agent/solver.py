@@ -1060,11 +1060,23 @@ class Solver:
                                 "不要连续重试（本地已回滚本次计数）。"
                             )
                     else:
-                        text += (
-                            f"\n[实例守卫] {slots}（团队并发实例被占满：team_capacity_exceeded / "
-                            "Rate limited by upstream），且当前没有可清理的残留实例——可能是本队其它题"
-                            "正在并行使用，先 list_instances 确认占用者，不要盲停别人的实例，也不要连续重试。"
-                        )
+                        # [fix 2026-11-11 本地 plat 重跑] 没有可回收的实例时，并发名额多半是
+                        # 「并行跑的兄弟题正在用」或上游短时限流：一瞬间收口代价太大（SAMPLE-003
+                        # 就是这样整题 stalled）。这里再等一个可配的窗口（默认 30s）重试一次，
+                        # 仍失败才把排查动作写给模型；重试照样经 record_call 受配额约束。
+                        wait_s = float(self.config.extra.get("instance_capacity_wait_seconds", 30) or 0)
+                        retried = False
+                        if wait_s > 0:
+                            time.sleep(wait_s)
+                            if self.store.record_call(challenge_id, name, self.config.instance_ops_limit):
+                                text = self.platform.call_text(name, args)
+                                retried = True
+                        if not retried or self._is_capacity_error(text) or self._is_start_rate_limited(text):
+                            text += (
+                                f"\n[实例守卫] {slots}（团队并发实例被占满：team_capacity_exceeded / "
+                                "Rate limited by upstream），且当前没有可清理的残留实例——可能是本队其它题"
+                                "正在并行使用，先 list_instances 确认占用者，不要盲停别人的实例，也不要连续重试。"
+                            )
                 elif self._is_transient(text):
                     # [fix 2026-11-05 P7] 瞬时失败（SSE 读超时/MCP 响应超时/上游限流）时平台并未
                     # 真正开实例，不能占用本地 instance_ops_limit。实测 Run3b CTFARENA-084 在平台
