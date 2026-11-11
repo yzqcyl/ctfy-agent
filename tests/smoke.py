@@ -208,6 +208,60 @@ def case_submit_limit(tmp: Path) -> None:
         server.server_close()
 
 
+def case_a4_retry_requestion(tmp: Path) -> None:
+    """[v7.2 A4] 换值重交：per-question 错交额度独立，换题号不被别的题号锁死。
+
+    CTFY-0001 v3 §3.3：平台在「wrong 且该题还有次数」时重启我们（同一工作目录、
+    同一靶场，最多 5 轮），让我们换值再交。本地必须做到：
+      1) 同一题号错交满额后，再交新值也被拦（该题的 wrong-attempt cap 用尽）；
+      2) 换一个题号，额度独立，不受别的题号已烧掉的额度影响；
+      3) 同一个值永远拦（duplicate，同值不重交，协议「never repeats a submitted value」）。
+    """
+    from ctfy_agent.state import flag_hash  # noqa: PLC0415
+
+    # ---- 单元级：store 的 per-question 额度闸 ----
+    store = Store(tmp / "a4").load()
+    store.challenges.clear()
+    store.upsert({"id": "web-01", "name": "multi", "description": "两问题题"})
+    store.save()
+
+    # 题号 slug 错交 3 次（limit=3）→ 用尽
+    for i in range(3):
+        assert store.reserve_submit("web-01", f"flag{{slug_{i}}}", 3, question_id="slug") == "ok", i
+        store.mark_submitted("web-01", f"flag{{slug_{i}}}", accepted=False, question_id="slug")
+    # 换新值仍交题号 slug → 被 per-question 闸拦
+    assert store.reserve_submit("web-01", "flag{slug_fresh}", 3, question_id="slug") == "limit"
+    # 换题号 flag（从未交过）→ 额度独立，放行
+    assert store.reserve_submit("web-01", "flag{flag_1}", 3, question_id="flag") == "ok"
+    store.mark_submitted("web-01", "flag{flag_1}", accepted=False, question_id="flag")
+    # 同值再交 → duplicate（幂等去重，同值不重交）
+    assert store.reserve_submit("web-01", "flag{flag_1}", 3, question_id="flag") == "duplicate"
+    ok("A4 store：per-question 额度独立，换题号放行、同值拦、同题号满额拦")
+
+    # ---- 集成级：solver._submit 走完整链路 ----
+    server, url = fake_llm.start_fake_mcp()
+    try:
+        config = make_config(url, tmp / "a4b", submit_limit=3)
+        platform = CtfyPlatform(url, config.token)
+        platform.connect()
+        store2 = Store(tmp / "a4b").load()
+        store2.challenges.clear()
+        seed_challenge(store2)
+        solver = Solver(config, platform, fake_llm.ScriptedLLM([]), store2)
+
+        # 题号 slug 错交满 3 次（fake 服务只认 ACCEPT_FLAG，其余都判 wrong）
+        for i in range(3):
+            text, accepted = solver._submit({"flag": f"flag{{slug_{i}}}", "question_id": "slug"}, "web-01")
+            assert accepted is False, (text, accepted)
+        # 换题号 flag 仍能提交（不被 slug 的 3 次锁死）
+        text, accepted = solver._submit({"flag": "flag{flag_first}", "question_id": "flag"}, "web-01")
+        assert accepted is False and "上限" not in text, text  # 判错但没被额度闸拦
+        ok("A4 solver：slug 满额后换 flag 题号仍可提交")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def case_budget_limits(tmp: Path | None = None) -> None:
     """三层刹车单独验证：token / 调用次数 / 金额。"""
     tokens = Budget(max_tokens=1000, max_calls=3, max_cost=2.0, price_input=1000.0, price_output=1000.0)
@@ -3698,8 +3752,8 @@ def case_agent_degraded(tmp: Path) -> None:
     # (fixture 名, env_extra, 期望 stop_reason, writeup 关键词)
     scenarios = [
         ("task_qa.json", {}, "halted", "MCP"),     # qa 模式已支持：过了闸门，卡在无 MCP 端点
-        (None, {}, "halted", "task.json"),               # task.json 缺失
-        ("task_broken.json", {}, "halted", "task.json"),  # task.json 坏 JSON
+        (None, {"AGENT_TASK_WAIT_TIMEOUT": "0"}, "halted", "task.json"),   # task.json 缺失（不轮询）
+        ("task_broken.json", {"AGENT_TASK_WAIT_TIMEOUT": "0"}, "halted", "task.json"),  # task.json 坏 JSON
         ("task_instance.json", {"LLM_FLAVOR": "anthropic"}, "refused", "anthropic"),
         ("task_instance.json", {"LLM_API_KEY": ""}, "refused", "CTFY_TOKEN"),
     ]
@@ -3716,6 +3770,59 @@ def case_agent_degraded(tmp: Path) -> None:
         assert rollup["stop_reason"] == expect, (idx, rollup)
         assert note_frag in rollup["writeup"], (idx, rollup)
     ok("B1 agent：qa 模式 / 缺任务 / 坏任务 / 非 openai flavor / 缺凭证 全优雅降级 + exit 0")
+
+
+def case_agent_g9_task_wait(tmp: Path) -> None:
+    """[v7.2 G9] task.json 缺失时的短轮询兜底。
+
+    万一 11-14/15 实际是常驻形态（平台稍后才放题），短暂轮询能兜住「题还没到」的窗口；
+    AGENT_TASK_WAIT_TIMEOUT 控制等待上限，0 = 不等待（立即 halted，恢复旧行为）。
+    """
+    import threading  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from ctfy_agent.agent_main import run_agent  # noqa: PLC0415
+
+    # 1) wait=0：不等待，立即 halted
+    work = _fresh_dir(tmp / "g9_nowait")
+    task_path = work / "task.json"
+    result_path = work / "result.json"
+    code = run_agent(task_path=task_path, work_dir=work,
+                     env={"AGENT_TASK_WAIT_TIMEOUT": "0"}, result_path=result_path)
+    assert code == 0, code
+    rollup = _read_result(result_path)
+    assert rollup["stop_reason"] == "halted" and "task.json" in rollup["writeup"], rollup
+    ok("G9：wait=0 立即 halted（旧行为保留）")
+
+    # 2) wait>0 但等不到 → 轮询超时后 halted，writeup 记「轮询等待」
+    work2 = _fresh_dir(tmp / "g9_timeout")
+    task_path2 = work2 / "task.json"
+    result_path2 = work2 / "result.json"
+    code = run_agent(task_path=task_path2, work_dir=work2,
+                     env={"AGENT_TASK_WAIT_TIMEOUT": "1"}, result_path=result_path2)
+    assert code == 0, code
+    rollup2 = _read_result(result_path2)
+    assert rollup2["stop_reason"] == "halted" and "轮询等待" in rollup2["writeup"], rollup2
+    ok("G9：wait>0 超时后 halted，writeup 记「轮询等待」")
+
+    # 3) wait>0 且延迟放题 → 等到后继续正常流程（dry_run 立即返回）
+    work3 = _fresh_dir(tmp / "g9_late")
+    task_path3 = work3 / "task.json"
+    result_path3 = work3 / "result.json"
+
+    def _write_late():
+        time.sleep(0.4)
+        task_path3.write_text((FIXTURES / "task_dry_run.json").read_text(encoding="utf-8"), encoding="utf-8")
+
+    thread = threading.Thread(target=_write_late, daemon=True)
+    thread.start()
+    code = run_agent(task_path=task_path3, work_dir=work3,
+                     env={"AGENT_TASK_WAIT_TIMEOUT": "5"}, result_path=result_path3)
+    thread.join(timeout=5)
+    assert code == 0, code
+    rollup3 = _read_result(result_path3)
+    assert rollup3["stop_reason"] == "dry_run", rollup3  # 等到 task 后走 dry_run 正常返回
+    ok("G9：延迟放题后等到 task.json 并继续正常流程")
 
 
 def case_agent_exception_safe(tmp: Path) -> None:
@@ -5133,6 +5240,7 @@ def main() -> int:
         ("resolution", case_resolution),
         ("solver", case_solver),
         ("submit_limit", case_submit_limit),
+        ("a4_retry_requestion", case_a4_retry_requestion),
         ("budget_limits", case_budget_limits),
         ("budget_gate", case_budget_gate),
         ("crew", case_crew),
@@ -5196,6 +5304,7 @@ def main() -> int:
         ("agent_e2e", case_agent_e2e),
         ("agent_dry_run", case_agent_dry_run),
         ("agent_degraded", case_agent_degraded),
+        ("agent_g9_task_wait", case_agent_g9_task_wait),
         ("agent_exception_safe", case_agent_exception_safe),
         ("agent_seed", case_agent_seed),
         ("agent_cli_entry", case_agent_cli_entry),

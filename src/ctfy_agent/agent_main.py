@@ -41,6 +41,12 @@ DEFAULT_MAX_TOKENS = 8192       # 4096 会在 thinking 块截断、一步即「�
 DEFAULT_MAX_CONTEXT = 32000  # 对齐 agent.json 与各角色提示词的「上下文 32k」承诺（原 16000 导致 16k 就丢旧步骤，模型按 32k 规划却提前失忆）
 DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
 ATTACH_COPY_LIMIT_MIB = 4  # v3：平台单次把附件预放进 /ctfy/work/attachments/ 的上限；超过则 path=null
+# [v7.2 G9] task.json 缺失时的短轮询等待（秒）。平台托管形态下 task.json 在容器启动前就位，
+# 缺失通常是环境错误；但万一 11-14/15 实际是「常驻形态、题稍后才放」，短暂轮询能兜住「题还没到」
+# 的窗口，避免立即 halted 弃权。默认 60s（足够覆盖放题延迟，又不至于空烧容器生命周期），
+# env AGENT_TASK_WAIT_TIMEOUT 可调；0 = 不等待，恢复旧行为（立即 halted）。
+TASK_WAIT_TIMEOUT_DEFAULT = 60.0
+TASK_POLL_INTERVAL = 5.0
 
 # 协议（CTFY-0001）定义的 5 种 run_mode 里，我们只真正实现了 instance / qa。
 # 下面三个语义完全不同，照 instance 跑只会白烧预算，仍然直接拒绝：
@@ -618,21 +624,40 @@ def run_agent(
         _rollup(challenge_id=challenge_id, stop_reason="halted", writeup="provisional"),
     )
 
-    # 1) dry run：注册门，最便宜，且不碰网络、不要凭证
+    # 1) task.json 必须存在且可解析。
+    #    [v7.2 G9] 缺失时不再立即 halted，而是短轮询等待一段时间：万一 11-14/15 实际是
+    #    常驻形态（平台稍后才放题），短暂等待能兜住「题还没到」的窗口。默认 60s，
+    #    AGENT_TASK_WAIT_TIMEOUT 可调，0 = 不等待（恢复旧行为）。
+    if task is None:
+        wait_s = _as_float(env.get("AGENT_TASK_WAIT_TIMEOUT"), TASK_WAIT_TIMEOUT_DEFAULT)
+        wait_s = max(0.0, wait_s)
+        if wait_s > 0:
+            _log(f"[G9] task.json 缺失，短轮询等待（最多 {wait_s:.0f}s，每 {TASK_POLL_INTERVAL:.0f}s 一次）…")
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                time.sleep(min(TASK_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+                task = _load_json(Path(task_path))
+                if task is not None:
+                    _log(f"[G9] 等到 task.json，继续正常流程")
+                    challenge_id = str(task.get("challenge", {}).get("id")
+                                       or env.get("CTFY_EVAL_CHALLENGE_ID", ""))
+                    _CHALLENGE_ID = challenge_id
+                    break
+        if task is None:
+            _write_rollup(
+                result_path,
+                _rollup(challenge_id=challenge_id, stop_reason="halted",
+                        writeup=(f"task.json missing or malformed（已轮询等待 {wait_s:.0f}s，"
+                                 "疑似常驻形态但未等到题，或平台环境错误）")),
+                announce=True,
+            )
+            return 0
+
+    # 2) dry run：注册门，最便宜，且不碰网络、不要凭证
     if env.get("CTFY_EVAL_DRY_RUN") == "1" or (task or {}).get("dry_run"):
         _write_rollup(
             result_path,
             _rollup(challenge_id=challenge_id, stop_reason="dry_run"),
-            announce=True,
-        )
-        return 0
-
-    # 2) task.json 必须存在且可解析
-    if task is None:
-        _write_rollup(
-            result_path,
-            _rollup(challenge_id=challenge_id, stop_reason="halted",
-                    writeup="task.json missing or malformed"),
             announce=True,
         )
         return 0

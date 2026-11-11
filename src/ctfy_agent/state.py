@@ -187,6 +187,11 @@ class Challenge:
     # P2-4：平台判定为错的**明文**答案（只留最近几条，用于回显「别再交这些」）。
     # 与 flags_tried 的分工：那个是幂等去重（哈希、永久），这个是给模型的负样本提示。
     rejected_answers: list[str] = field(default_factory=list)
+    # [v7.2 A4] 按题号记平台判错的提交次数（per-question wrong-attempt cap，对齐 CTFY-0001 v3 §3.3）。
+    # 与 attempts 的分工：attempts 是整题提交总计数（绝对安全上限，防失控），wrong_by_qid 是
+    # 「每个题号各自错了几次」——v3 多轮里平台按每题号判 wrong 后重启我们以允许换值重交，
+    # 换新题号不该被别的题号已烧掉的额度锁死。
+    wrong_by_qid: dict = field(default_factory=dict)
     flag_value: str = ""          # 只在校验通过后记录
     # 多问题题（slug+flag / flag+root 这类）：question_id → 已通过答案。
     # 单值 flag_value 在第二问通过时会被覆盖，导致 result.json 的 answers 张冠李戴
@@ -378,6 +383,14 @@ class Store:
         # 并集（去重保序）
         item.flags_tried = list(dict.fromkeys(list(item.flags_tried) + list(disk.get("flags_tried") or [])))
         item.rejected_answers = list(dict.fromkeys(list(item.rejected_answers) + list(disk.get("rejected_answers") or [])))
+        # wrong_by_qid：每 key 取 max（错交次数单调递增，跨 lane 不回退）
+        disk_wrong = disk.get("wrong_by_qid") or {}
+        if isinstance(disk_wrong, dict):
+            for qid, cnt in disk_wrong.items():
+                try:
+                    item.wrong_by_qid[str(qid)] = max(int(item.wrong_by_qid.get(str(qid)) or 0), int(cnt))
+                except (TypeError, ValueError):
+                    continue
         # 单调取 max
         item.attempts = max(item.attempts, int(disk.get("attempts") or 0))
         item.oracle_calls = max(item.oracle_calls, int(disk.get("oracle_calls") or 0))
@@ -420,10 +433,15 @@ class Store:
         if disk.get("next_question_id") and not item.next_question_id:
             item.next_question_id = disk.get("next_question_id")
 
-    def reserve_submit(self, challenge_id: str, flag: str, limit: int) -> str:
+    def reserve_submit(self, challenge_id: str, flag: str, limit: int, *, question_id: str = "") -> str:
         """原子地预留一次提交（并发下同一条 flag 只会成功预留一次）。
 
         返回 'ok' / 'duplicate' / 'limit'。预留成功后必须调用 mark_submitted 回写结果。
+
+        [v7.2 A4] 额度闸改为 per-question：`limit` 对应「每个题号的 wrong-attempt cap」
+        （CTFY-0001 v3 的 per-question wrong-attempt cap），`attempts` 退为整题绝对安全上限
+        （`limit * 16`，防失控，正常题号数远达不到）。v3 多轮里平台判某题 wrong 后会
+        重启我们以允许换值重交，换一个题号不该被别的题号已烧掉的额度锁死。
         """
         with _lock_exclusive(self._lock_path()):
             self._refresh_flags(challenge_id)
@@ -431,7 +449,15 @@ class Store:
             digest = flag_hash(flag)
             if digest in item.flags_tried:
                 return "duplicate"
-            if item.attempts >= limit:
+            # 整题绝对安全上限（防失控，正常题号数远达不到）：题号由 task.json 的
+            # questions+gated 限定，且 _submit 会经 platform 权威题号集校验、不会无限增多，
+            # 所以这里只需一个宽松兜底，真正的额度控制交给下面的 per-question 闸。
+            if item.attempts >= limit * 16:
+                return "limit"
+            # per-question 错交闸：该题号已经判错 limit 次，不能再交同一个题号（换新值也一样，
+            # 平台已用尽该题的 wrong-attempt cap）；换别的题号不受影响。
+            qid = str(question_id or "flag")
+            if int(item.wrong_by_qid.get(qid) or 0) >= limit:
                 return "limit"
             item.flags_tried.append(digest)
             item.attempts += 1
@@ -451,11 +477,19 @@ class Store:
 
         [fix 2026-11-03 v6.3] question_id 记录到 answers_by_qid：多问题题每个题号各自留档，
         最终 result.json 的 answers 才不会把第一问的答案写给第二问（SAMPLE-001 实测）。
+
+        [v7.2 A4] accepted=False 时按题号记错交次数（wrong_by_qid），供 reserve_submit 的
+        per-question 额度闸用——v3 多轮里平台判 wrong 后重启，换题号重交不被别题锁死。
         """
-        if not accepted:
-            return
         with _lock_exclusive(self._lock_path()):
+            self._refresh_flags(challenge_id)
             item = self.require(challenge_id)
+            if not accepted:
+                qid = str(question_id or "flag")
+                item.wrong_by_qid[qid] = int(item.wrong_by_qid.get(qid) or 0) + 1
+                item.touch()
+                self.save()
+                return
             if fully_solved:
                 item.submitted_ok = True
             if question_id:
@@ -484,8 +518,16 @@ class Store:
             item.touch()
             self.save()
 
-    def can_submit(self, challenge_id: str, limit: int) -> bool:
-        return self.require(challenge_id).attempts < limit
+    def can_submit(self, challenge_id: str, limit: int, *, question_id: str = "") -> bool:
+        """per-question 额度预判（与 reserve_submit 的闸一致，非原子，仅用于提前给友好提示）。
+
+        [v7.2 A4] 不再只看整题 attempts：该题号已判错 limit 次即返回 False，换题号不受影响。
+        """
+        item = self.require(challenge_id)
+        if item.attempts >= limit * 16:
+            return False
+        qid = str(question_id or "flag")
+        return int(item.wrong_by_qid.get(qid) or 0) < limit
 
     def note_rejected(self, challenge_id: str, answer: str, cap: int = 8) -> None:
         """记下平台判错的答案（P2-4）。只保留最近 cap 条，去重保序。

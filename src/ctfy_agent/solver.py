@@ -1139,13 +1139,14 @@ class Solver:
         # 门已开」时仍返回 false，导致 SAMPLE-001 的 flag 候选四版从未真正提交（platform wrong_attempts=0）。
         # 预检的价值只剩「拦 false」，去掉它，直接真实提交，让平台判定；额度由 can_submit/reserve_submit 兜底。
         # 友好预判；真正的原子防重/防超在 reserve_submit 里（并发安全）
-        if not self.store.can_submit(challenge_id, self.config.submit_limit):
+        if not self.store.can_submit(challenge_id, self.config.submit_limit, question_id=question_id):
             return (
-                f"[提交被拦截] 本题已达到提交上限 {self.config.submit_limit} 次，换思路或标记 stalled。",
+                f"[提交被拦截] 题号 `{question_id or 'flag'}` 已达到提交上限 {self.config.submit_limit} 次，换思路或标记 stalled。",
                 False,
             )
 
-        reservation = self.store.reserve_submit(challenge_id, answer, self.config.submit_limit)
+        reservation = self.store.reserve_submit(challenge_id, answer, self.config.submit_limit,
+                                                question_id=question_id)
         if reservation == "duplicate":
             # [v6.4] 到这里说明这个值之前交过且平台判错（已答对的值早被上面的 accepted_map 分支拦下）。
             # 旧文案「已经提交过」太含糊，模型误以为还没成功，实测 001 把同一个错值重交 ~37 次。
@@ -1190,6 +1191,8 @@ class Solver:
         if accepted is False:
             # P2-4：记下这次错交，并回显全部已判错值——提交次数只有 3 次，错交一次就少 1/3
             self.store.note_rejected(challenge_id, answer)
+            # [v7.2 A4] 按题号记错交次数，供 per-question 额度闸用（v3 多轮换题号重交不被锁死）
+            self.store.mark_submitted(challenge_id, answer, accepted=False, question_id=question_id)
         return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
 
     def _fully_solved_from(self, result, text: str) -> bool:
