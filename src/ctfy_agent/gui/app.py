@@ -84,6 +84,10 @@ class App:
         self._board: dict[str, dict] = {}   # 任务面板：cid -> {iid, started}
         self._solved: list[dict] = []
         self._solved_rows: dict[str, dict] = {}
+        # 本次运行口径：每题的「本次增量」与合计（顶栏显示合计，行内显示单题本次）
+        self._run_task: dict[str, dict] = {}
+        self._batch_size = 1
+        self._offline_base: dict | None = None
 
         self.root = root or tk.Tk()
         self.root.title("CTF 自动解题（离线 / 平台）")
@@ -712,6 +716,18 @@ class App:
         vals[self._BOARD_COLS.index("rounds")] = int(vals[self._BOARD_COLS.index("rounds")] or 0) + 1
         self.tv_board.item(rec["iid"], values=vals)
 
+    def _board_set_round(self, cid: str, step: int) -> None:
+        """轮次列写事件的绝对轮次（续跑时可能是 3、5…），只增不减，避免并发事件回退。"""
+        rec = self._board.get(cid)
+        if not rec:
+            return
+        idx = self._BOARD_COLS.index("rounds")
+        vals = list(self.tv_board.item(rec["iid"], "values"))
+        current = int(vals[idx] or 0)
+        if int(step or 0) > current:
+            vals[idx] = int(step)
+            self.tv_board.item(rec["iid"], values=vals)
+
     def _board_tick(self) -> None:
         """运行中刷新「用时」列：已到终态的题不再计时（否则会出现「已解出还在走表」）。"""
         idx = self._BOARD_COLS.index("elapsed")
@@ -820,7 +836,7 @@ class App:
         self.run_id = spec["run_id"]
         self._begin_thread(worker.start_hunt, (self.config, spec, self.q, self.cancel))
 
-    def _begin_thread(self, fn, args) -> None:
+    def _begin_thread(self, fn, args, batch_size: int = 1) -> None:
         self.cancel.clear()
         self.graceful.clear()
         self.running = True
@@ -830,11 +846,17 @@ class App:
         for box in (self.txt_events, self.txt_writeup):
             box.delete("1.0", "end")
         self._board_clear()
+        self._run_task = {}
+        self._offline_base = None
+        self._batch_size = max(1, int(batch_size or 1))
         self._tpos = {}
         self._reset_budget()
-        if not self._priced():
-            self._log("[提示] 未配置单价（agent.json 的 price_input/output_per_mtok=0）："
-                      "任务面板「花费」列显示 -，填了单价后自动按 token 计价。")
+        if self._prices()[2]:
+            pin, pout, _ = self._prices()
+            self._log(
+                f"[提示] 未配置 token 单价（agent.json 的 price_input/output_per_mtok=0）："
+                f"「费用」按默认费率 ≈{pin:g}/{pout:g} 元每百万 token 估算（带 ≈ 前缀）；"
+                "填了真实单价会自动改用真实计费。")
         self._set_status("运行中")
         self._set_running(True)
         self.thread = threading.Thread(target=fn, args=args, daemon=True)
@@ -1014,7 +1036,8 @@ class App:
         chals = [{"id": str(r.get("id") or ""), "name": str(r.get("name") or "")} for r in rows]
         self._begin_thread(platform_worker.solve_many,
                            (self.config, chals, rid, comp, self.q, self.cancel, conc,
-                            self.graceful, forced))
+                            self.graceful, forced),
+                           batch_size=len(chals))
 
     def _on_conn_ok(self, data: dict) -> None:
         try:
@@ -1803,18 +1826,15 @@ class App:
             self._log(f"{tag}[!] 记录候选通过")
             self._tool_line(f"{tag}[!] 候选通过")
         elif kind == "budget":
-            self._update_budget(p or {})
-            if cid and cid in self._board:
-                tok = int((p or {}).get("total_tokens") or 0)
-                cost = (p or {}).get("cost")
-                self._board_set(cid, tokens=tok, cost=self._fmt_cost(cost))
+            self._on_budget_event(p or {}, cid)
         elif kind == "budget_exhausted":
             self._log(f"{tag}[{_NOW()}] 预算耗尽：{p.get('note') or p}")
             self.bar_tokens["value"] = 1000
             self.bar_calls["value"] = 1000
         elif kind == "step":
             if cid:
-                self._board_bump_round(cid)
+                # 轮次用事件里的绝对值（续跑可能从第 N 轮开始），不是简单自增
+                self._board_set_round(cid, int(p.get("step") or 0))
             self._tool_line(f"{tag}◆ 第{p.get('step')}步：{self._short(p.get('content'))}")
         elif kind == "tool":
             self._tool_line(f"{tag}• [{self.active_role or '?'}] {p.get('name')} {self._short(p.get('args'))} → {self._short(p.get('result'))}")
@@ -1844,40 +1864,125 @@ class App:
     def _reset_budget(self) -> None:
         self.bar_tokens["value"] = 0
         self.bar_calls["value"] = 0
-        self.lbl_tokens.set("token 预算：—")
-        self.lbl_calls.set("调用：—")
+        self.lbl_tokens.set("本次合计 token：—")
+        self.lbl_calls.set("本次合计调用：—")
         self.lbl_cost.set("费用：—")
-        self.lbl_budget.set("预算：—")
+        self.lbl_budget.set("本次合计：—")
+
+    # 未配单价时的估算费率（CNY / 百万 token）。只用于界面估算，显示时带 ≈，
+    # 真单价以 config/agent.json 的 price_input/output_per_mtok（或 AGENT_PRICE_* 环境变量）为准。
+    _DEFAULT_PRICE_IN = 2.0
+    _DEFAULT_PRICE_OUT = 8.0
+
+    def _prices(self) -> tuple[float, float, bool]:
+        """返回 (输入单价, 输出单价, 是否估算)。没配单价 → 用默认费率估算。"""
+        pin = float(getattr(self.config, "price_input_per_mtok", 0.0) or 0.0)
+        pout = float(getattr(self.config, "price_output_per_mtok", 0.0) or 0.0)
+        if pin > 0 or pout > 0:
+            return pin, pout, False
+        return self._DEFAULT_PRICE_IN, self._DEFAULT_PRICE_OUT, True
 
     def _priced(self) -> bool:
-        """有没有配 token 单价（没配时花费恒为 0，显示 - 而不是误导性的 0.0）。"""
-        return bool(getattr(self.config, "price_input_per_mtok", 0.0)
-                    or getattr(self.config, "price_output_per_mtok", 0.0))
+        return not self._prices()[2]
 
-    def _fmt_cost(self, cost) -> str:
-        if cost is None:
-            return "-"
+    def _cost_text(self, cost, prompt: int = 0, completion: int = 0) -> str:
+        """花费文本：配了单价用真实 cost；没配就用 prompt/completion × 默认费率估算（带 ≈）。"""
+        pin, pout, estimated = self._prices()
+        if estimated:
+            value = (int(prompt) / 1e6) * pin + (int(completion) / 1e6) * pout
+            if value <= 0:
+                return "≈0"
+            return f"≈{value:.4f}"
         try:
-            value = float(cost)
+            value = float(cost or 0.0)
         except (TypeError, ValueError):
-            return "-"
-        if value <= 0 and not self._priced():
             return "-"
         return f"{value:.4f}"
 
-    def _update_budget(self, b: dict) -> None:
-        tok = int(b.get("total_tokens") or 0)
-        calls = int(b.get("calls") or 0)
-        mtok = int(b.get("max_tokens") or getattr(self.config, "max_tokens_per_challenge", 0) or 0)
-        mcalls = int(b.get("max_calls") or getattr(self.config, "max_llm_calls", 0) or 0)
-        cost = b.get("cost")
+    def _fmt_cost(self, cost) -> str:
+        """兼容老调用：只有总价、没有分项时的花费文本。"""
+        pin, pout, estimated = self._prices()
+        if estimated:
+            return "-" if cost in (None, 0, 0.0) else f"≈{float(cost):.4f}"
+        try:
+            return f"{float(cost or 0.0):.4f}"
+        except (TypeError, ValueError):
+            return "-"
+
+    def _refresh_run_totals(self) -> None:
+        """顶栏显示「本次运行合计」：所有题的本次增量之和（而不是最后一条单题快照）。"""
+        tasks = list(self._run_task.values())
+        tok = sum(int(t.get("tokens") or 0) for t in tasks)
+        calls = sum(int(t.get("calls") or 0) for t in tasks)
+        prompt = sum(int(t.get("prompt") or 0) for t in tasks)
+        completion = sum(int(t.get("completion") or 0) for t in tasks)
+        n = max(1, int(getattr(self, "_batch_size", 0) or 1))
+        mtok = int(getattr(self.config, "max_tokens_per_challenge", 0) or 0) * n
+        mcalls = int(getattr(self.config, "max_llm_calls", 0) or 0) * n
         self.bar_tokens["value"] = min(1000, int(tok / mtok * 1000)) if mtok else 0
         self.bar_calls["value"] = min(1000, int(calls / mcalls * 1000)) if mcalls else 0
-        self.lbl_tokens.set(f"token 预算：{tok}/{mtok}" if mtok else f"token：{tok}")
-        self.lbl_calls.set(f"调用：{calls}/{mcalls}" if mcalls else f"调用：{calls}")
-        if cost is not None:
-            self.lbl_cost.set(f"费用：{self._fmt_cost(cost)}")
-        self.lbl_budget.set(f"预算：token {tok} / 调用 {calls}")
+        self.lbl_tokens.set(f"本次合计 token：{tok}/{mtok}" if mtok else f"本次合计 token：{tok}")
+        self.lbl_calls.set(f"本次合计调用：{calls}/{mcalls}" if mcalls else f"本次合计调用：{calls}")
+        self.lbl_cost.set(f"费用：{self._cost_text(None, prompt, completion)}")
+        self.lbl_budget.set(f"本次合计：token {tok} / 调用 {calls}（{n} 题）")
+
+    def _on_budget_event(self, p: dict, cid: str) -> None:
+        """处理预算事件。
+
+        run_* 是新口径（本次运行增量，来自 Crew.solve）；没带 run_* 的是离线单题老口径，
+        沿用 snapshot（该题累计 vs 单题上限）。
+        """
+        run_tok = p.get("run_tokens")
+        if run_tok is None:
+            # 老口径（离线单题 / 未升级的事件）：沿用该题累计快照
+            self._update_budget(p)
+            if cid and cid in self._board:
+                tok = int(p.get("total_tokens") or 0)
+                prompt = int(p.get("prompt_tokens") or 0)
+                completion = int(p.get("completion_tokens") or 0)
+                self._board_set(cid, tokens=tok,
+                                cost=self._cost_text(p.get("cost"), prompt, completion))
+            return
+        rt = int(run_tok)
+        rc = int(p.get("run_calls") or 0)
+        rp = int(p.get("run_prompt_tokens") or 0)
+        rcm = int(p.get("run_completion_tokens") or 0)
+        if cid:
+            self._run_task[cid] = {"tokens": rt, "calls": rc,
+                                   "prompt": rp, "completion": rcm,
+                                   "cost": p.get("run_cost")}
+            if cid in self._board:
+                self._board_set(cid, tokens=rt,
+                                cost=self._cost_text(p.get("run_cost"), rp, rcm))
+        self._refresh_run_totals()
+
+    def _update_budget(self, b: dict) -> None:
+        """离线单题口径：把第一条 budget 当基线，标签/进度条也只显示本次增量。"""
+        tok = int(b.get("total_tokens") or 0)
+        calls = int(b.get("calls") or 0)
+        prompt = int(b.get("prompt_tokens") or 0)
+        completion = int(b.get("completion_tokens") or 0)
+        cost = b.get("cost")
+        base = getattr(self, "_offline_base", None)
+        if base is None:
+            base = {"total": tok, "calls": calls, "prompt": prompt,
+                    "completion": completion, "cost": float(cost or 0.0)}
+            self._offline_base = base
+        run_tok = max(0, tok - base["total"])
+        run_calls = max(0, calls - base["calls"])
+        run_prompt = max(0, prompt - base["prompt"])
+        run_completion = max(0, completion - base["completion"])
+        run_cost = max(0.0, float(cost or 0.0) - base["cost"])
+        mtok = int(b.get("max_tokens") or getattr(self.config, "max_tokens_per_challenge", 0) or 0)
+        mcalls = int(b.get("max_calls") or getattr(self.config, "max_llm_calls", 0) or 0)
+        self.bar_tokens["value"] = min(1000, int(run_tok / mtok * 1000)) if mtok else 0
+        self.bar_calls["value"] = min(1000, int(run_calls / mcalls * 1000)) if mcalls else 0
+        self.lbl_tokens.set(f"本次合计 token：{run_tok}/{mtok}" if mtok
+                            else f"本次合计 token：{run_tok}")
+        self.lbl_calls.set(f"本次合计调用：{run_calls}/{mcalls}" if mcalls
+                           else f"本次合计调用：{run_calls}")
+        self.lbl_cost.set(f"费用：{self._cost_text(run_cost, run_prompt, run_completion)}")
+        self.lbl_budget.set(f"本次合计：token {run_tok} / 调用 {run_calls}")
 
     def _on_done(self, result: dict) -> None:
         self._set_running(False)

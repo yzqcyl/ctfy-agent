@@ -950,9 +950,30 @@ class Crew:
             spending.set_attempt_caps(attempt_caps)
         start_usage = spending.snapshot()
         # [GUI 任务面板] 平台批量路径走的是 Crew.solve（不是 Solver.solve），原先这里不发
-        # budget/step 事件 → 任务面板的「轮次 / Tokens / 花费」永远是 0 和 -。这里补发：
-        # 开跑先同步一次基线（含历史累计），之后每轮结束再发增量快照。
-        self.on_event("budget", start_usage)
+        # budget/step 事件 → 任务面板的「轮次 / Tokens / 花费」永远是 0 和 -。
+        # 口径：snapshot_* = 该题历史累计（state.json 跨轮继承，预算闸用）；
+        #       run_*      = 本次运行消耗（= 快照 - 开跑基线），界面只显示这一套，
+        #                    否则会出现「面板 519147 / 顶栏 19457」这种两套口径打架。
+        _base_total = int(start_usage.get("total_tokens") or 0)
+        _base_calls = int(start_usage.get("calls") or 0)
+        _base_cost = float(start_usage.get("cost") or 0.0)
+        _base_prompt = int(start_usage.get("prompt_tokens") or 0)
+        _base_completion = int(start_usage.get("completion_tokens") or 0)
+
+        def _emit_budget() -> None:
+            snap = dict(spending.snapshot())
+            snap["challenge_id"] = challenge_id
+            snap["run_tokens"] = max(0, int(snap.get("total_tokens") or 0) - _base_total)
+            snap["run_calls"] = max(0, int(snap.get("calls") or 0) - _base_calls)
+            snap["run_cost"] = round(max(0.0, float(snap.get("cost") or 0.0) - _base_cost), 6)
+            # 分项也发：界面在没配单价时要用 prompt/completion 自己估算费用
+            snap["run_prompt_tokens"] = max(
+                0, int(snap.get("prompt_tokens") or 0) - _base_prompt)
+            snap["run_completion_tokens"] = max(
+                0, int(snap.get("completion_tokens") or 0) - _base_completion)
+            self.on_event("budget", snap)
+
+        _emit_budget()
 
         # [接手 2026-11-11] 把「这次真正生效的预算 + 来源」落成确定性事实：
         # 平台托管跑法里 `task.max_turns` 会覆盖 agent.json 的 max_llm_calls，历史交接里
@@ -1175,10 +1196,10 @@ class Crew:
                 finally:
                     self.store.set_tokens(challenge_id, spending.snapshot())
                     self.store.save()
-                # [GUI 任务面板] 一轮协调结束：把轮次 + 最新用量推给界面。
+                # [GUI 任务面板] 一轮协调结束：把轮次 + 本次用量增量推给界面。
                 # 少了这两个事件，面板的「轮次」不动、「Tokens/花费」永远是 0/-（平台批量路径实测）。
                 self.on_event("step", {"step": rnd, "challenge_id": challenge_id})
-                self.on_event("budget", spending.snapshot())
+                _emit_budget()
 
                 # [fix 2026-11-06 P8] 协调者补全被 reasoning 占满（finish=length、content 空、无
                 # tool_calls）时，不算“空动作”消耗守卫，而是放大 max_tokens 后重试。
@@ -1593,7 +1614,7 @@ class Crew:
         self.store.save()
         _ckpt_discard(ckpt_path)  # 正常收尾：清掉快照，避免下一跑误当崩溃残留而续跑
         end_usage = spending.snapshot()
-        self.on_event("budget", end_usage)  # 收口：任务面板的最终 tokens/花费
+        _emit_budget()  # 收口：任务面板的最终「本次」tokens/调用/花费
         usage = _usage_delta(start_usage, end_usage)
         # 账本快照落转录：M2（跨 delegate 重复）与 M3（open→refuted）都从这里取证
         self.store.append_transcript(

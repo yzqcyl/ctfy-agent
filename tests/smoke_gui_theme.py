@@ -443,7 +443,7 @@ def case_dpi_and_tabs() -> None:
             app._select_all(True)
             app.var_skip_solved.set(False)
             captured: dict = {}
-            app._begin_thread = lambda fn, args: captured.update(fn=fn, args=args)  # noqa: SLF001
+            app._begin_thread = lambda fn, args, **kw: captured.update(fn=fn, args=args, kw=kw)  # noqa: SLF001
             app._apply_profile = lambda *a, **k: None  # noqa: SLF001
             app._start_platform()
             assert captured, "没走到批量启动"
@@ -462,21 +462,25 @@ def case_dpi_and_tabs() -> None:
 
 
 def case_board_columns_work() -> None:
-    """任务面板的「轮次 / Tokens / 花费」必须是活的。
+    """任务面板的「轮次 / Tokens / 花费」必须是活的，而且要是**本次运行**的口径。
 
-    背景（用户实测）：平台批量走 Crew.solve，而 Crew 原来只发 budget_plan，不发 budget/step
-    → 面板这三列永远是 0/0/-。这里两侧都钉住：
-      A. 发出端：crew.solve 必须发 budget（开跑/每轮/收口）和 step（每轮）；
-      B. 消费端：把 step/budget 事件灌进 App._drain，面板三列必须真的变化。
+    背景（用户实测两次）：
+      ① 平台批量走 Crew.solve，原先只发 budget_plan → 三列恒为 0/0/-；
+      ② 补发后用 snapshot 口径 → 面板显示该题**历史累计**（面板 519147 / 顶栏 19457 打架）。
+    现在 crew 发 run_*（本次增量）+ snapshot_*（历史累计，供预算闸），界面只显示 run_*；
+    顶栏显示所有题 run_* 的**合计**。这里把两端都钉死。
     """
     import inspect
 
     from ctfy_agent.crew import Crew
 
     src = inspect.getsource(Crew.solve)
-    assert src.count('on_event("budget"') >= 2, "Crew.solve 里 budget 事件少于 2 处（开跑/每轮/收口）"
+    assert src.count('on_event("budget"') >= 1, "Crew.solve 没发 budget 事件"
+    assert "_emit_budget()" in src, "Crew.solve 没走统一的 _emit_budget（缺 run_* 口径）"
+    assert "run_tokens" in src, "budget 事件里没有 run_tokens（会退化成历史累计口径）"
+    assert "run_prompt_tokens" in src, "budget 事件里没有 run_prompt_tokens（无法估算费用）"
     assert 'on_event("step"' in src, "Crew.solve 没有发 step 事件 → 轮次不会动"
-    ok("发出端：Crew.solve 会发 budget（基线/每轮/收口）与 step（每轮）事件")
+    ok("发出端：Crew.solve 发 budget（带 run_* 本次增量）与 step（每轮）")
 
     from ctfy_agent.gui.app import App
 
@@ -484,31 +488,70 @@ def case_board_columns_work() -> None:
     try:
         app.root.update()
         cid = "c-cols"
+        app._begin_thread(lambda *a, **k: None, (), batch_size=2)  # 重置本次口径 + 2 题
         app._board_row(cid, "列测试题")
-        # step → 轮次 +1；budget → tokens/calls/cost
-        app.q.put(("event", "step", {"_cid": cid, "step": 1}))
-        app.q.put(("event", "step", {"_cid": cid, "step": 2}))
-        app.q.put(("event", "budget", {"_cid": cid, "total_tokens": 12345,
-                                       "calls": 7, "cost": 0.0,
-                                       "max_tokens": 800000, "max_calls": 20}))
-        app._drain()
-        values = app.tv_board.item(app._board[cid]["iid"], "values")
         idx = app._BOARD_COLS.index
-        assert int(values[idx("rounds")]) == 2, values
-        assert int(values[idx("tokens")]) == 12345, values
-        assert values[idx("cost")] == "-", ("未配单价时应显示 -", values)
-        # 配了单价后才显示金额（4 位小数）
-        app.config.price_input_per_mtok = 0.5
-        app.q.put(("event", "budget", {"_cid": cid, "total_tokens": 20000,
-                                       "calls": 9, "cost": 0.01234,
-                                       "max_tokens": 800000, "max_calls": 20}))
+
+        def values():
+            return list(app.tv_board.item(app._board[cid]["iid"], "values"))
+
+        # 1) 轮次用绝对步数（续跑从第 3 轮开始也不会算成 1）
+        app.q.put(("event", "step", {"_cid": cid, "step": 3}))
+        app.q.put(("event", "step", {"_cid": cid, "step": 1}))
         app._drain()
-        values = app.tv_board.item(app._board[cid]["iid"], "values")
-        assert values[idx("cost")] == "0.0123", values
-        assert int(values[idx("tokens")]) == 20000, values
-        # 顶部预算条也跟着走
-        assert "20000" in app.lbl_tokens.get(), app.lbl_tokens.get()
-        ok("消费端：step/budget 事件能刷新 轮次/Tokens/花费（未配单价显示 -，配了显示金额）")
+        assert int(values()[idx("rounds")]) == 3, values()
+
+        # 2) 新口径：history 累计 500000，但本次只有 1234 → 面板必须显示 1234
+        app.q.put(("event", "budget", {
+            "_cid": cid, "total_tokens": 500000, "calls": 88, "cost": 0.0,
+            "prompt_tokens": 400000, "completion_tokens": 100000,
+            "run_tokens": 1234, "run_calls": 3,
+            "run_prompt_tokens": 1000, "run_completion_tokens": 234,
+            "max_tokens": 800000, "max_calls": 240,
+        }))
+        app._drain()
+        assert int(values()[idx("tokens")]) == 1234, values()
+        # 未配单价 → 用默认费率估算，带 ≈ 前缀（不再是 "-"）
+        cost_text = str(values()[idx("cost")])
+        assert cost_text.startswith("≈"), cost_text
+        assert "本次合计" in app.lbl_tokens.get(), app.lbl_tokens.get()
+        assert "1234/" in app.lbl_tokens.get(), app.lbl_tokens.get()
+
+        # 3) 第二题并发：顶栏合计 = 两题本次之和
+        cid2 = "c-cols-2"
+        app._board_row(cid2, "第二题")
+        app.q.put(("event", "budget", {
+            "_cid": cid2, "total_tokens": 999999, "calls": 99, "cost": 0.0,
+            "run_tokens": 766, "run_calls": 2,
+            "run_prompt_tokens": 600, "run_completion_tokens": 166,
+            "max_tokens": 800000, "max_calls": 240,
+        }))
+        app._drain()
+        assert "2000/" in app.lbl_tokens.get(), app.lbl_tokens.get()  # 1234+766
+        assert "本次合计调用：5/" in app.lbl_calls.get(), app.lbl_calls.get()  # 3+2
+        # 上限按题数放大：800000×2
+        assert "1600000" in app.lbl_tokens.get(), app.lbl_tokens.get()
+
+        # 4) 配了真实单价 → 用事件里的真实 cost，不再带 ≈
+        app.config.price_input_per_mtok = 0.5
+        app.config.price_output_per_mtok = 1.0
+        app.q.put(("event", "budget", {
+            "_cid": cid, "total_tokens": 500000, "calls": 88, "cost": 0.0,
+            "run_tokens": 2000, "run_calls": 5, "run_cost": 0.01234,
+            "run_prompt_tokens": 1500, "run_completion_tokens": 500,
+            "max_tokens": 800000, "max_calls": 240,
+        }))
+        app._drain()
+        assert str(values()[idx("cost")]) == "0.0123", values()
+        assert int(values()[idx("tokens")]) == 2000, values()
+
+        # 5) 老口径（离线单题，无 run_*）仍按累计快照显示，不能坏
+        app.q.put(("event", "budget", {"_cid": cid, "total_tokens": 4321, "calls": 6,
+                                       "cost": 0.0, "max_tokens": 800000,
+                                       "max_calls": 240}))
+        app._drain()
+        assert int(values()[idx("tokens")]) == 4321, values()
+        ok("消费端：面板显示本次增量、轮次取绝对值、顶栏是各题本次合计、无单价有 ≈ 估算")
     finally:
         try:
             app.root.destroy()
