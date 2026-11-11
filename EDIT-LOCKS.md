@@ -11,9 +11,13 @@
 
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
-| （无活动锁） | — | — | 二次接手轮（2026-11-11）已收尾，见下方「已释放」最前 3 行 |
+| （无活动锁） | — | — | 本地 plat 测试监视轮（2026-11-11 17:55）已收尾，见下方「已释放」首行 |
 
 ## 已释放
+
+| 文件 | 会话 | 区间 | 结果 |
+|---|---|---|---|
+| src/ctfy_agent/solver.py + src/ctfy_agent/platform.py + tests/smoke_instance_id_repair.py | W（本地 plat 测试监视轮 2026-11-11） | 11-11 17:55–18:05 | 本地 plat 测试里 `verify_exploit` 的 instance_id 被填成 host/host 前缀（SAMPLE-008 两次 404、2026-10-29 SAMPLE-007 同形态）→ 新增 `looks_like_instance_uuid()` + solver 参数修正：**只**把「本题实例回执里出现过的 host / host 前缀」纠回登记的 UUID，合法 UUID / 别的 UUID / 无关值一律不动；已失败回执追加含本题 UUID 的确定性提示；无实例时仍抛原 PlatformError。新增 21 条回归（含「正确 UUID 判题通过仍返回 solved=True 并落库 submitted / 正确路径零纠正记录」的不破坏断言）。44 个 smoke 文件全绿（smoke.py 180/0、耗时 170s） |
 
 | 文件 | 会话 | 区间 | 结果 |
 |---|---|---|---|

@@ -30,7 +30,7 @@ from .ledger import NO_DEDUPE, Ledger, claims_discovery
 from .llm import DeepSeekLLM, LLMError
 from .mcp_client import render_call_result
 from .method_cards import domain_cards, is_asi_tag, method_cards
-from .platform import CtfyPlatform, PlatformError
+from .platform import CtfyPlatform, PlatformError, looks_like_instance_uuid
 from .progress import BudgetPhase, EnvFailureTracker, ObservationTracker
 from .state import Store
 from .tools_local import LocalTools, ToolError, as_bool
@@ -450,6 +450,67 @@ class Solver:
             ), ""
         return None, ""
 
+    @staticmethod
+    def _instance_hosts(instance: dict | None) -> list[str]:
+        """从本题实例回执里收集 host（`surface.services[].host`、顶层 `host`/`access_url`）。
+
+        只用来识别「模型把 host 当 instance_id」这一种确定错误，不做 DNS/网络解析。
+        """
+        hosts: list[str] = []
+
+        def _add(value: object) -> None:
+            if not isinstance(value, str):
+                return
+            text = value.strip()
+            if text and "://" in text:  # access_url 形态：取 netloc 的 host 部分
+                text = text.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
+            if text and text not in hosts:
+                hosts.append(text)
+
+        if not isinstance(instance, dict):
+            return hosts
+        _add(instance.get("host"))
+        _add(instance.get("access_url"))
+        surface = instance.get("surface")
+        if isinstance(surface, dict):
+            for service in surface.get("services") or []:
+                if isinstance(service, dict):
+                    _add(service.get("host"))
+                    _add(service.get("access_url"))
+        return hosts
+
+    def _repair_model_instance_id(self, challenge_id: str, value: object) -> str:
+        """模型把 `instance_id` 填成实例 host / host 前缀时，纠回本题登记的实例 UUID。
+
+        证据（都是实体回执，不是猜的）：
+          - 2026-10-29 SAMPLE-007：verify_exploit 传 instance_id="s2mzomar64iepo3qh"（host 前缀）
+            → instance_not_found，平台始终没记解（见 platform.py 顶部注释）。
+          - 2026-11-11 本地 plat 测试 SAMPLE-008：`sspvi6rzgeqvjxpc3.node4.ctfy.run`（完整 host）
+            与 `sspvi6rzgeqvjxpc3`（前缀）各 404 一次，前一次用正确 UUID 已经 passed=true。
+
+        安全边界（故意保守，宁可漏纠也不误改）：
+          - 值已经是 UUID → 不猜（可能是别的实例，交给平台报错）；
+          - 值不是「本题实例回执里出现过的 host / host 前缀」→ 不猜；
+          - 只替换 `instance_id` 一个字段，绝不动其它参数。
+        返回空串表示「不纠正」。
+        """
+        if not isinstance(value, str):
+            return ""
+        probe = value.strip()
+        if not probe or looks_like_instance_uuid(probe):
+            return ""
+        try:
+            item = self.store.require(challenge_id)
+        except ValueError:
+            return ""
+        registered = str(item.instance_id or "").strip()
+        if not registered or probe == registered:
+            return ""
+        for host in self._instance_hosts(item.instance):
+            if probe == host or probe == host.split(".", 1)[0]:
+                return registered
+        return ""
+
     def _autofill(self, name: str, args: dict, challenge_id: str) -> dict:
         """按工具 schema 补齐我们已知的上下文（challenge_id / competition_id / instance_id）。"""
         props = self.platform.prop_names(name)
@@ -460,11 +521,25 @@ class Solver:
             competition_id = self._competition_id(challenge_id)
             if competition_id:
                 filled["competition_id"] = competition_id
-        if "instance_id" in props and not filled.get("instance_id"):
-            instance_id = self.store.require(challenge_id).instance_id
-            if not instance_id:
-                raise PlatformError(f"{name} 需要 instance_id：本题还没有实例，先调 start_instance")
-            filled["instance_id"] = instance_id
+        if "instance_id" in props:
+            if not filled.get("instance_id"):
+                instance_id = self.store.require(challenge_id).instance_id
+                if not instance_id:
+                    raise PlatformError(f"{name} 需要 instance_id：本题还没有实例，先调 start_instance")
+                filled["instance_id"] = instance_id
+            else:
+                # 模型给了值：只在「明确是本题实例 host/前缀」时纠成 UUID（见方法注释的安全边界）
+                corrected = self._repair_model_instance_id(challenge_id, filled["instance_id"])
+                if corrected:
+                    filled["instance_id"] = corrected
+                    try:
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "tool", "note": f"[参数纠正] {name} 的 instance_id 是实例 host/前缀，"
+                                                    f"已改用本题登记实例 {corrected}"},
+                        )
+                    except Exception:  # noqa: BLE001 - 记账失败不能拦主流程
+                        pass
         return filled
 
     def _instance_op_names(self) -> set[str]:
@@ -897,6 +972,23 @@ class Solver:
                     if item.status in ("new", "parsed"):
                         self.store.set_status(challenge_id, "instance_up")
                 self.store.save()
+            # [接手 2026-11-11 本地 plat 测试] instance_id 填错（host/前缀/旧 id）时平台只回
+            # 「instance_not_found」——模型看不出该填什么，就接着换着花样 404（SAMPLE-008 实测 3 次，
+            # 其中 2 次是实例被平台回收后拿旧 UUID 重试）。这里只在**已经失败**的回执后追加确定性
+            # 排查方向，不改变调用本身，也不影响成功路径。
+            if "instance_not_found" in text:
+                try:
+                    known_id = str(self.store.require(challenge_id).instance_id or "").strip()
+                except ValueError:
+                    known_id = ""
+                registered = f"本题登记：{known_id}" if known_id else "本题未登记实例"
+                text += (
+                    "\n[提示] instance_not_found 只有两种原因："
+                    f"① instance_id 填错——必须用 start_instance 回执里的 UUID（{registered}），"
+                    "不能填 host、host 前缀或自己拼的值；"
+                    "② 原实例已被平台回收/过期——旧 UUID 和 host 一起失效，需要重新 start_instance。"
+                    "先确认是哪种（实例还在就照 UUID 重发一次，实例没了就先申请），不要拿同一个旧值反复重试。"
+                )
             if name in DOWNLOAD_TOOLS:
                 # 附件落盘：长 JSON（源码/二进制 base64）若进上下文会被 shrink 掉中段，
                 # 模型永远看不到完整文件（SAMPLE-010/011 实测本因）。落盘后只回摘要。

@@ -39,6 +39,15 @@ from .mcp_client import McpHttpClient, mcp_tool_to_openai, render_call_result, s
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def looks_like_instance_uuid(value: object) -> bool:
+    """value 是否是平台实例 UUID（`start_instance` 回执里的 id 形态）。
+
+    只做形态判断，不做「是否属于本题」的判断：调用方（solver 参数修正）用它区分
+    「模型填了 host/前缀」与「模型填了另一个 UUID」——后者不猜，交给平台报错。
+    """
+    return isinstance(value, str) and bool(_UUID_RE.match(value.strip()))
 # 这些工具以 instance_id 为键（平台文档：instance UUID returned by start_instance）
 _INSTANCE_TOOLS = frozenset({
     "verify_exploit", "verify_answer", "submit_answer", "submit_qa_answer", "submit_flag",
