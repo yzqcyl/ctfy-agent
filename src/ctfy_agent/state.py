@@ -273,11 +273,32 @@ class Store:
         with cls._save_locks_guard:
             return cls._save_locks.setdefault(path, threading.Lock())
 
+    # [fix 2026-11-11 本地 plat 重跑] 写操作频控计数改成「按运行（进程）作用域」：
+    # `tool_counts` 是持久化审计账，跨轮继承；但 instance_ops_limit 的闸门如果也读持久化
+    # 计数，同一个 run 目录重跑时第一次 start 就会被上一轮用掉的配额拦死（实测 17 题里 12 题
+    # 计数已到 5，第二轮 52 次 start 被本地拦下、8 题无法起实例）。平台自己的硬上限仍然存在，
+    # 本地闸门只需拦住「同一次运行内反复启停」，因此这里按 state.json 路径在进程内记一份
+    # 本次运行的调用次数：同一进程内的多个 lane 共享（并发安全），新进程/新运行从 0 开始。
+    _run_call_counts: dict[str, dict[tuple[str, str], int]] = {}
+    _run_call_guard = threading.Lock()
+
     def __init__(self, run_dir: Path):
         self.run_dir = Path(run_dir)
         self.path = self.run_dir / "state.json"
         self.challenges: dict[str, Challenge] = {}
         self.meta: dict = {}
+
+    def _run_calls(self) -> dict[tuple[str, str], int]:
+        """本次运行（进程）内的写操作计数，按 state.json 路径隔离。"""
+        key = str(self.path.resolve())
+        with Store._run_call_guard:
+            return Store._run_call_counts.setdefault(key, {})
+
+    def call_count(self, challenge_id: str, name: str) -> int:
+        """本次运行内该题该写操作已经发生的次数（不读持久化审计账）。"""
+        key = str(challenge_id)
+        with Store._run_call_guard:
+            return int(Store._run_call_counts.get(str(self.path.resolve()), {}).get((key, str(name)), 0))
 
     # ---------- 读写 ----------
 
@@ -549,12 +570,22 @@ class Store:
     # ---------- 写操作频控 ----------
 
     def record_call(self, challenge_id: str, name: str, limit: int) -> bool:
-        """登记一次写操作；返回 False 表示已达上限。"""
+        """登记一次写操作；返回 False 表示本次运行已达上限。
+
+        [fix 2026-11-11 本地 plat 重跑] 闸门读「本次运行」计数（`_run_calls()`），持久化的
+        `tool_counts` 只当审计账继续累加。旧实现读持久化计数，于是同一 run 目录重跑时配额
+        已被上一轮用光 → 重跑第一次 start_instance 就被本地拦死（实测 52 次拦截、8 题无法起
+        实例）。平台自己的每题硬上限仍在，被平台拒时会走 refund_call 回滚。
+        """
         item = self.require(challenge_id)
-        count = item.tool_counts.get(name, 0)
-        if count >= limit:
+        counts = self._run_calls()
+        key = (str(challenge_id), str(name))
+        used = int(counts.get(key, 0))
+        if used >= int(limit):
             return False
-        item.tool_counts[name] = count + 1
+        counts[key] = used + 1
+        # 审计账：跨轮累计，只增不减（供人工核对，不参与闸门）
+        item.tool_counts[str(name)] = int(item.tool_counts.get(str(name), 0) or 0) + 1
         item.touch()
         return True
 
@@ -563,11 +594,17 @@ class Store:
 
         [fix 2026-11-05 P3] CTFARENA-001 实证：start_instance 前两次被 429 team_capacity_exceeded
         拒掉，却照样计入 instance_ops_limit=5，随后真正可用的调用被本地上限封死。
+        [fix 2026-11-11] 本次运行计数与持久化审计账一起回滚（审计账不回滚会越记越高）。
         """
         item = self.require(challenge_id)
-        count = int(item.tool_counts.get(name, 0) or 0)
+        counts = self._run_calls()
+        key = (str(challenge_id), str(name))
+        used = int(counts.get(key, 0))
+        if used > 0:
+            counts[key] = used - 1
+        count = int(item.tool_counts.get(str(name)) or 0)
         if count > 0:
-            item.tool_counts[name] = count - 1
+            item.tool_counts[str(name)] = count - 1
             item.touch()
 
     def bump_oracle(self, challenge_id: str, limit: int) -> bool:

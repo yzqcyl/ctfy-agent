@@ -289,13 +289,22 @@ def reap(
 
 
 def start_remaining(store, challenge_id: str, limit: int) -> int:
-    """本题还剩几次 start_instance 配额（平台每题硬上限 5 次，用尽当天作废）。"""
+    """本题本次运行还剩几次 start_instance 配额。
+
+    [fix 2026-11-11 本地 plat 重跑] 读「本次运行」计数（`Store.call_count`），不再读持久化
+    `tool_counts`：持久化账跨轮继承，会让同一 run 目录的重跑第一次 start 就被上一轮配额拦死
+    （实测第二轮 52 次拦截）。平台每题硬上限依然在，本地只拦「同一次运行内反复启停」。
+    """
     try:
-        item = store.require(challenge_id)
-    except Exception:  # noqa: BLE001 - 题不在库里时按"满额"处理，由平台自己报错
-        return int(limit)
-    used = int((item.tool_counts or {}).get("start_instance", 0))
-    return max(0, int(limit) - used)
+        remaining_from_session = int(limit) - int(store.call_count(challenge_id, "start_instance"))
+        return max(0, remaining_from_session)
+    except Exception:  # noqa: BLE001 - 题不在库里/旧 Store 无该方法时退回持久化读数
+        try:
+            item = store.require(challenge_id)
+        except Exception:  # noqa: BLE001 - 题不在库里时按"满额"处理，由平台自己报错
+            return int(limit)
+        used = int((item.tool_counts or {}).get("start_instance", 0))
+        return max(0, int(limit) - used)
 
 
 def looks_rate_limited(text: str) -> bool:
