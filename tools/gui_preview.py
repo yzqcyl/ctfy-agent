@@ -145,7 +145,7 @@ def main() -> int:
     # 左栏不能横向压到右栏
     left_right = application.frm_form.winfo_rootx() + application.frm_form.winfo_width()
     nb_left = application.nb.winfo_rootx()
-    print(f"  left content right={left_right} notebook left={nb_left}")
+    print(f"  left content right={left_right} notebook left={nb_left} rootx={root.winfo_rootx()}")
     if left_right > nb_left + 4:
         bad.append(f"左栏横向溢出右栏 {left_right}>{nb_left}")
 

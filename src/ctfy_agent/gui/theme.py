@@ -32,9 +32,76 @@ Tk 的能力边界（如实说明，不假装做到了）
 from __future__ import annotations
 
 import math
+import sys
 import tkinter as tk
 from tkinter import font as tkfont
 from typing import Callable, Iterable, Sequence
+
+
+# ---------------------------------------------------------------------------
+# 高 DPI：先声明「我自己按物理像素画」，否则 Windows 会把整窗位图拉伸 → 字发虚
+# ---------------------------------------------------------------------------
+def enable_dpi_awareness() -> bool:
+    """让本进程 DPI-aware（幂等、失败不抛）。Windows 10+ 用 Per-Monitor V2。
+
+    这是「字体清晰」的关键：不声明的话，系统缩放 150% 时窗口会被位图放大 1.5 倍，
+    任何字体都会糊；声明之后 Tk 直接用物理像素绘制，再配 ``apply_dpi_scaling`` 就清晰。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes  # noqa: PLC0415 - 仅 Windows 需要
+    except Exception:  # noqa: BLE001
+        return False
+    # Windows 10 1703+：DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # 老系统退路：shcore.SetProcessDpiAwareness(2=PER_MONITOR) / user32.SetProcessDPIAware()
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return bool(ctypes.windll.user32.SetProcessDPIAware())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def apply_dpi_scaling(root: tk.Misc) -> float:
+    """按真实 DPI 设 tk scaling（保持旧版观感大小，但按物理像素渲染 → 不发虚）。
+
+    旧实现固定 ``tk scaling 1.2``：在 150% 缩放的屏上等于 1.2pt 像素比再被系统位图放大 1.5 倍，
+    所以又大又糊。这里取 ``(dpi/72)*0.9``：96dpi 仍是 1.2（老机器不变），144dpi 变 1.8
+    （等效像素比不变，但由 Tk 直接按物理像素画）。同时刷新 ``UI_SCALE`` 供像素尺寸换算。
+    """
+    global UI_SCALE
+    dpi = 96.0
+    try:
+        dpi = float(root.winfo_fpixels("1i"))
+    except Exception:  # noqa: BLE001
+        pass
+    if dpi <= 0:
+        dpi = 96.0
+    scaling = round(min(2.6, max(1.0, (dpi / 72.0) * 0.9)), 3)
+    try:
+        root.tk.call("tk", "scaling", scaling)
+    except Exception:  # noqa: BLE001
+        pass
+    UI_SCALE = scaling
+    return scaling
+
+
+#: 当前 UI 缩放（由 apply_dpi_scaling 设置；基线 1.2 = 96dpi 下的历史观感）
+UI_SCALE = 1.2
+
+
+def ui_px(base: float) -> int:
+    """把「96dpi 下的设计像素」换算成当前 DPI 的物理像素（列宽/行高/间距用）。"""
+    return max(1, int(round(float(base) * UI_SCALE / 1.2)))
 
 # ---------------------------------------------------------------------------
 # 设计令牌：GitHub 浅色配色
@@ -638,6 +705,12 @@ class RoundedButton(tk.Canvas):
             self._command()
 
     # -- 兼容 ttk.Button 的最小接口 -------------------------------------
+    def set_variant(self, variant: str) -> None:
+        """切换配色变体并立即重绘（页签「选中=主色 / 未选中=白底」用它）。"""
+        if variant in self.VARIANTS:
+            self._variant = variant
+            self._draw()
+
     def config(self, **kw):  # noqa: N802 - 对齐 tk 习惯
         if "state" in kw:
             self._state = "disabled" if str(kw.pop("state")) == "disabled" else "normal"
@@ -923,6 +996,92 @@ class Pill(tk.Canvas):
         self.create_text(w / 2.0, h / 2.0, text=self._text, fill=self._color, font=self._font)
 
 
+class TabBar(tk.Frame):
+    """圆角胶囊页签栏（替代 ttk.Notebook）。
+
+    ttk 的页签做不到「选中蓝色填充+白字 / 未选中白底+深字 / 页签之间留空隙 / 圆角」，
+    所以自己实现，同时保留 ``select()`` / ``add()`` 这两个调用方在用的 API。
+
+    page 必须是 ``tabbar.body`` 的子控件（创建时用 ``nb.body`` 当父容器）。
+    """
+
+    def __init__(self, master: tk.Misc, *, bg: str | None = None, gap: int = 8,
+                 pad: tuple[int, int] = (10, 8), radius: int = 10, **kw):
+        self._page_bg = bg or _bg_of(master)
+        super().__init__(master, bg=self._page_bg, **kw)
+        self._gap = int(gap)
+        self._radius = int(radius)
+        self._tabbar = tk.Frame(self, bg=self._page_bg)
+        self._tabbar.pack(fill="x", padx=10, pady=pad)
+        self.body = tk.Frame(self, bg=self._page_bg)
+        self.body.pack(fill="both", expand=True)
+        self.body.rowconfigure(0, weight=1)
+        self.body.columnconfigure(0, weight=1)
+        self._tabs: list[dict] = []
+        self._current = -1
+
+    # -- 构建 ----------------------------------------------------------
+    def add(self, page: tk.Misc, text: str = "", icon: str | None = None) -> int:
+        idx = len(self._tabs)
+        btn = RoundedButton(self._tabbar, text=text, icon=icon, variant="secondary",
+                            radius=self._radius, pad_x=18, pad_y=8,
+                            font=body_font(10),
+                            command=lambda i=idx: self.select(i))
+        btn.pack(side="left", padx=(0, self._gap))
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_remove()
+        self._tabs.append({"btn": btn, "page": page})
+        if self._current < 0:
+            self.select(0)
+        return idx
+
+    # -- 选中 ----------------------------------------------------------
+    def _index_of(self, which) -> int:
+        if isinstance(which, int) and not isinstance(which, bool):
+            return which if 0 <= which < len(self._tabs) else -1
+        if which is None:
+            return -1
+        text = str(which)
+        if text in ("", "current"):
+            return self._current
+        for i, tab in enumerate(self._tabs):
+            if tab["page"] is which or str(tab["page"]) == text:
+                return i
+        if text.isdigit():
+            idx = int(text)
+            return idx if 0 <= idx < len(self._tabs) else -1
+        return -1
+
+    def select(self, which) -> None:
+        idx = self._index_of(which)
+        if idx < 0:
+            return
+        if self._current == idx:
+            self._tabs[idx]["page"].grid()
+            return
+        if 0 <= self._current < len(self._tabs):
+            self._tabs[self._current]["page"].grid_remove()
+        self._current = idx
+        page = self._tabs[idx]["page"]
+        page.grid()
+        page.lift()
+        for i, tab in enumerate(self._tabs):
+            # 选中=主色填充+白字；未选中=白底+深字
+            tab["btn"].set_variant("primary" if i == idx else "secondary")
+
+    def index(self, which) -> int:
+        return self._index_of(which)
+
+    def current(self) -> int:
+        return self._current
+
+    def tabs(self) -> list:
+        return [tab["page"] for tab in self._tabs]
+
+    def tab_buttons(self) -> list:
+        return [tab["btn"] for tab in self._tabs]
+
+
 def textbox(master: tk.Misc, *, height: int = 5, mono: bool = False, size: int = 10,
             bg: str = CANVAS, **kw) -> tk.Text:
     """规范输入文本域：白底、无边框、正文行高 1.5~1.7、选中色跟主色。"""
@@ -1133,11 +1292,17 @@ def apply(root: tk.Misc):  # noqa: N802 - 返回 style 方便调用方微调
     root.option_add("*TCombobox*Listbox.selectBackground", PRIMARY_SOFT)
     root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
 
-    # 表格
+    # 表格：行高跟字体走（高 DPI 下固定像素会把字挤扁），正文比标签略大一点更清楚
+    try:
+        row_h = tkfont.Font(root=root, font=body_font(11)).metrics("linespace") + ui_px(10)
+    except Exception:  # noqa: BLE001
+        row_h = ui_px(30)
+    row_h = max(ui_px(28), row_h)
     style.configure("Treeview", background=CANVAS, fieldbackground=CANVAS, foreground=TEXT,
-                    rowheight=30, borderwidth=0, relief="flat", font=body)
-    style.configure("Treeview.Heading", background=PAGE, foreground=TEXT_MUTED, font=bold,
-                    relief="flat", padding=(8, 8), bordercolor=BORDER)
+                    rowheight=row_h, borderwidth=0, relief="flat", font=body_font(11))
+    style.configure("Treeview.Heading", background=PAGE, foreground=TEXT_MUTED,
+                    font=heading_font(10), relief="flat",
+                    padding=(ui_px(8), ui_px(7)), bordercolor=BORDER)
     style.map("Treeview",
               background=[("selected", PRIMARY)],
               foreground=[("selected", INVERT)],

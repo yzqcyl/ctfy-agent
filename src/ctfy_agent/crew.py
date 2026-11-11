@@ -884,7 +884,8 @@ class Crew:
 
     def solve(self, challenge_id: str, *, attempt_caps: dict | None = None,
               prior_text: str = "", temperature: float | None = None,
-              keep_instance: bool | None = None, cancel_event=None) -> dict:
+              keep_instance: bool | None = None, cancel_event=None,
+              force_rerun: bool = False) -> dict:
         """跑一整轮协调+专家协作（= 集群-B 口径下的一次尝试）。
 
         默认参数（全 None/空）与旧行为**逐字等价**；集群-B 的编排入口见 solve_clusterb()。
@@ -895,20 +896,29 @@ class Crew:
           cancel_event: 集群-A 并行取消信号（threading.Event）；None=不取消。置位后本路在
                         **下一轮开跑前**让出（reason=superseded），不再烧预算——软取消升级为
                         轮粒度真取消。
+          force_rerun:  True=跳过下面两层「已解出」预检，强制真正重跑。只给 GUI「重跑已解出」
+                        用；默认 False 与旧行为逐字等价（旧行为：已解出的题零成本直接返回）。
         """
         challenge = self.store.require(challenge_id)
         # [fix 2026-11-05 CTFARENA-001] 已解出的题绝不再跑：旧行为在 CLI 重跑/续跑时会把已解
         # 题完整重烧一遍（实测 001 重跑又烧 9 万 token，且平台新实例未就绪 → 继续空转探测）。
         # 与 _solve_clustera 预检同口径：只认终态 done 或全解 submitted_ok；平台 my_solved_ids
         # 作为事实兜底（容器/多进程场景 state 可能落后）。
-        if challenge.status == "done" or getattr(challenge, "submitted_ok", False):
-            return self._presolved_summary(challenge_id, challenge)
-        try:
-            if challenge_id in self.platform.my_solved_ids():
-                challenge.status = "submitted"
+        if force_rerun:
+            # 用户显式勾了「重跑已解出」：两层预检都跳过，但留痕，事后能解释钱花在哪。
+            self.store.append_transcript(
+                challenge_id,
+                {"role": "note", "content": "强制重跑：用户勾选「重跑已解出」，忽略已解出预检"},
+            )
+        else:
+            if challenge.status == "done" or getattr(challenge, "submitted_ok", False):
                 return self._presolved_summary(challenge_id, challenge)
-        except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不拦解题
-            pass
+            try:
+                if challenge_id in self.platform.my_solved_ids():
+                    challenge.status = "submitted"
+                    return self._presolved_summary(challenge_id, challenge)
+            except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不拦解题
+                pass
         # P2-2：按域编排档位（只动编排参数；未识别题型 → {} 即旧行为）
         self._profile = domain_profile(
             self.config.extra, challenge,

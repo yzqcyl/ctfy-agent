@@ -60,6 +60,8 @@ def _history_entries() -> list[str]:
 
 class App:
     def __init__(self, root: tk.Tk | None = None):
+        # 必须在建 Tk 窗口之前声明 DPI 感知，否则系统先把窗口位图放大，字体就糊了（幂等）
+        theme.enable_dpi_awareness()
         self.config = load(None)
         # 离线模式走 OfflinePlatform（不读 token/mcp_url），平台模式走真实平台；
         # 两种模式共用同一份真实配置，所以这里绝不清空 token / 改写 mcp_url。
@@ -85,16 +87,13 @@ class App:
 
         self.root = root or tk.Tk()
         self.root.title("CTF 自动解题（离线 / 平台）")
-        # 自适应窗口：保证左栏「开始/停止」不用滚动就能看见（1280×900 下正好放下整张表单）
+        # 按真实 DPI 设 tk scaling：96dpi→1.2（保持旧观感），150%→1.8，字体按物理像素渲染
+        self.ui_scale = theme.apply_dpi_scaling(self.root)
         _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        _w = min(1320, max(1060, _sw - 140))
-        _h = min(900, max(680, _sh - 140))
+        _w = max(1100, min(1600, int(_sw * 0.60)))
+        _h = max(700, min(980, int(_sh * 0.58)))
         self.root.geometry(f"{_w}x{_h}")
         self.root.minsize(1040, 660)
-        try:
-            self.root.tk.call("tk", "scaling", 1.2)
-        except Exception:  # noqa: BLE001
-            pass
         self._build_ui()
         self._refresh_history()
         self._refresh_solved(background=True)  # 不卡启动：扫 runs/* 放后台线程
@@ -166,7 +165,7 @@ class App:
         left_foot = tk.Frame(left_holder, bg=theme.PAGE)
         left_foot.pack(side="bottom", fill="x", padx=10, pady=(6, 8))
         left_sf = theme.ScrollFrame(left_holder, bg=theme.PAGE)
-        left_sf.canvas.configure(width=372)
+        left_sf.canvas.configure(width=theme.ui_px(372))
         left_sf.pack(side="top", fill="both", expand=True)
         left = left_sf.inner
         side = {"padx": 10}
@@ -270,7 +269,8 @@ class App:
         for col, width, text in (("sel", 34, "选"), ("id", 118, "ID"),
                                  ("cat", 54, "分类"), ("name", 168, "名称")):
             self.tv.heading(col, text=text)
-            self.tv.column(col, width=width, anchor="center" if col == "sel" else "w",
+            self.tv.column(col, width=theme.ui_px(width),
+                           anchor="center" if col == "sel" else "w",
                            stretch=(col == "name"))
         vsb = ttk.Scrollbar(chal_panel, orient="vertical", command=self.tv.yview)
         self.tv.configure(yscrollcommand=vsb.set)
@@ -296,12 +296,16 @@ class App:
         tk.Label(opt, text="跑题库", bg=theme.CANVAS, fg=theme.TEXT_MUTED,
                  font=theme.body_font(9)).pack(side="left")
         self.var_skip_solved = tk.BooleanVar(value=True)
-        ttk.Radiobutton(opt, text="跳过已解出", variable=self.var_skip_solved, value=True,
-                        style="Card.TRadiobutton",
+        ttk.Radiobutton(opt, text="跳过已解出（省 token）", variable=self.var_skip_solved,
+                        value=True, style="Card.TRadiobutton",
                         command=self._update_sel_label).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(opt, text="重跑已解出", variable=self.var_skip_solved, value=False,
-                        style="Card.TRadiobutton",
+        ttk.Radiobutton(opt, text="重跑已解出（真重跑）", variable=self.var_skip_solved,
+                        value=False, style="Card.TRadiobutton",
                         command=self._update_sel_label).pack(side="left", padx=(10, 0))
+        theme.label(self.frm_plat,
+                    "重跑会忽略平台/本地「已解出」记录重新解题，会真实消耗 token；"
+                    "已有结论的题在任务面板显示为「已解出（跳过）」。",
+                    muted=True, size=9).pack(anchor="w", pady=(2, 0))
 
         theme.label(self.frm_plat, "运行名（run-id）", muted=True,
                     size=9).pack(anchor="w", pady=(10, 0))
@@ -369,7 +373,8 @@ class App:
         # ---------- 右栏：复现 / 任务面板 / 日志 ----------
         right = tk.Frame(body, bg=theme.PAGE)
         body.add(right, weight=1)
-        nb = ttk.Notebook(right)
+        # 圆角胶囊页签：选中蓝底白字、未选中白底深字、页签之间留空隙（ttk.Notebook 做不到）
+        nb = theme.TabBar(right, pad=(10, 10))
         nb.pack(fill="both", expand=True)
         self.nb = nb
 
@@ -417,7 +422,7 @@ class App:
         self.pill_status.set(text[:18], color=color, bg=bg)
 
     def _add_text_tab(self, nb, title: str) -> tk.Text:
-        f = tk.Frame(nb, bg=theme.PAGE)
+        f = tk.Frame(nb.body, bg=theme.PAGE)
         nb.add(f, text=title)
         card = theme.Card(f, padding=(2, 2), radius=16, hug=False)
         card.pack(fill="both", expand=True, padx=10, pady=10)
@@ -431,7 +436,7 @@ class App:
     # ---------------- 复现：已解出列表 + 按需生成 ----------------
 
     def _build_writeup_tab(self, nb) -> None:
-        f = tk.Frame(nb, bg=theme.PAGE)
+        f = tk.Frame(nb.body, bg=theme.PAGE)
         nb.add(f, text="复现")
         bar = tk.Frame(f, bg=theme.PAGE)
         bar.pack(fill="x", padx=10, pady=(10, 6))
@@ -457,11 +462,12 @@ class App:
         self.tv_solved = ttk.Treeview(lcard.body, columns=("cat", "flag", "run"),
                                       show="tree headings", height=12, selectmode="browse")
         self.tv_solved.heading("#0", text="日期 / 题目")
-        self.tv_solved.column("#0", width=190, stretch=True, anchor="w")
+        self.tv_solved.column("#0", width=theme.ui_px(190), stretch=True, anchor="w")
         for col, width, text in (("cat", 54, "分类"), ("flag", 168, "flag"),
                                  ("run", 74, "运行")):
             self.tv_solved.heading(col, text=text)
-            self.tv_solved.column(col, width=width, anchor="w", stretch=col in ("flag",))
+            self.tv_solved.column(col, width=theme.ui_px(width), anchor="w",
+                                  stretch=col in ("flag",))
         sbv = ttk.Scrollbar(lcard.body, orient="vertical", command=self.tv_solved.yview)
         self.tv_solved.configure(yscrollcommand=sbv.set)
         sbv.pack(side="right", fill="y")
@@ -602,7 +608,7 @@ class App:
                     "tokens": "Tokens", "cost": "花费", "elapsed": "用时"}
 
     def _build_board_tab(self, nb) -> None:
-        f = tk.Frame(nb, bg=theme.PAGE)
+        f = tk.Frame(nb.body, bg=theme.PAGE)
         nb.add(f, text="任务面板")
         bar = tk.Frame(f, bg=theme.PAGE)
         bar.pack(fill="x", padx=10, pady=(10, 6))
@@ -620,7 +626,7 @@ class App:
                                      show="headings", height=14)
         for col in self._BOARD_COLS:
             self.tv_board.heading(col, text=self._BOARD_HEADS[col])
-            self.tv_board.column(col, width=widths[col],
+            self.tv_board.column(col, width=theme.ui_px(widths[col]),
                                  stretch=col in ("title", "detail"),
                                  anchor="w" if col in ("title", "detail") else "center")
         sb = ttk.Scrollbar(card.body, orient="vertical", command=self.tv_board.yview)
@@ -634,12 +640,15 @@ class App:
         self._board.clear()
         self.lbl_board.set("还没有任务")
 
+    # 这些状态表示这一题已经停了：用时列必须冻结，不跟着整批 run 一直走
+    _BOARD_FINAL = ("已解出", "已解出（跳过）", "未解出", "已取消", "出错")
+
     def _board_row(self, cid: str, title: str = "") -> dict:
         rec = self._board.get(cid)
         if rec is None:
             iid = self.tv_board.insert(
                 "", "end", values=(title or cid[:8], "待开始", "", 0, 0, "-", "00:00"))
-            rec = {"iid": iid, "started": time.monotonic()}
+            rec = {"iid": iid, "started": time.monotonic(), "finished": None}
             self._board[cid] = rec
             self.lbl_board.set(f"共 {len(self._board)} 题")
         elif title:
@@ -651,6 +660,15 @@ class App:
         if not rec:
             return
         vals = list(self.tv_board.item(rec["iid"], "values"))
+        status = kw.get("status")
+        if status in self._BOARD_FINAL and not rec.get("finished"):
+            # 第一次进入终态：记下停表时刻，并把用时列就地定死
+            rec["finished"] = time.monotonic()
+            sec = int(rec["finished"] - float(rec.get("started") or rec["finished"]))
+            vals[self._BOARD_COLS.index("elapsed")] = f"{sec // 60:02d}:{sec % 60:02d}"
+        elif status == "解题中":
+            rec["started"] = time.monotonic()
+            rec["finished"] = None
         for key, value in kw.items():
             if key in self._BOARD_COLS:
                 vals[self._BOARD_COLS.index(key)] = value
@@ -665,11 +683,14 @@ class App:
         self.tv_board.item(rec["iid"], values=vals)
 
     def _board_tick(self) -> None:
-        """运行中刷新「用时」列。"""
+        """运行中刷新「用时」列：已到终态的题不再计时（否则会出现「已解出还在走表」）。"""
         idx = self._BOARD_COLS.index("elapsed")
+        now = time.monotonic()
         for rec in self._board.values():
+            if rec.get("finished"):
+                continue
             vals = list(self.tv_board.item(rec["iid"], "values"))
-            sec = int(time.monotonic() - rec["started"])
+            sec = int(now - float(rec.get("started") or now))
             vals[idx] = f"{sec // 60:02d}:{sec % 60:02d}"
             self.tv_board.item(rec["iid"], values=vals)
 
@@ -920,6 +941,16 @@ class App:
             names = "、".join(str(r.get("id") or "") for r in skipped[:6])
             more = f"… 共 {len(skipped)} 道" if len(skipped) > 6 else ""
             self._log(f"[跑题库] 跳过已解出：{names}{more}")
+        # 「重跑已解出」：Crew 默认对已解出的题零成本直接返回（平台 my_solved_ids /
+        # state.json 的 submitted_ok）。要真的重跑就必须显式跳过这两层预检，否则会
+        # 「瞬间全部已解出、0 token」——这正是之前看起来像 bug 的现象。
+        forced: frozenset[str] = frozenset()
+        if not skip and solved:
+            forced = frozenset(str(r.get("id") or "") for r in rows
+                               if str(r.get("id") or "") in solved)
+            if forced:
+                self._log(f"[跑题库] 强制重跑已解出 {len(forced)} 道"
+                          f"（忽略平台/缓存已解记录，会真实消耗 token）")
         if not rows:
             messagebox.showinfo(
                 "无需重跑",
@@ -950,7 +981,7 @@ class App:
         chals = [{"id": str(r.get("id") or ""), "name": str(r.get("name") or "")} for r in rows]
         self._begin_thread(platform_worker.solve_many,
                            (self.config, chals, rid, comp, self.q, self.cancel, conc,
-                            self.graceful))
+                            self.graceful, forced))
 
     def _on_conn_ok(self, data: dict) -> None:
         try:
@@ -1564,7 +1595,10 @@ class App:
             self._tail_transcript()
             self._board_tick()
             self.lbl_elapsed.set(f"耗时：{self._fmt_elapsed()}")
-        self.root.after(100, self._poll)
+        try:
+            self.root.after(100, self._poll)
+        except tk.TclError:  # 窗口已销毁（关窗/selftest），别再排队
+            pass
 
     def _fmt_elapsed(self) -> str:
         s = int(time.monotonic() - self.started_at)
@@ -1612,9 +1646,14 @@ class App:
             elif kind == "task_done":
                 d = item[1]
                 cid = str(d.get("id") or "")
+                presolved = bool(d.get("presolved"))
                 if d.get("ok"):
-                    self._board_set(cid, status="已解出", detail=str(d.get("flag") or ""))
-                    self._log(f"✓ {d.get('id')}  {d.get('flag') or ''}")
+                    # 「已解出（跳过）」= 平台/缓存已有结论，0 token 零成本收口；
+                    # 这样界面上突然出现一批「已解出」时，原因一眼可见。
+                    status = "已解出（跳过）" if presolved else "已解出"
+                    self._board_set(cid, status=status, detail=str(d.get("flag") or ""))
+                    tail = "（已有解出记录，未重烧）" if presolved else ""
+                    self._log(f"✓ {d.get('id')}  {d.get('flag') or ''}{tail}")
                 else:
                     self._board_set(cid, status="未解出",
                                     detail=str(d.get("note") or "未解出")[:60])
@@ -1708,11 +1747,14 @@ class App:
             for r in res:
                 mark = "✓" if r.get("ok") else "✗"
                 detail = r.get("flag") or r.get("note") or "未解出"
-                self._log(f"{mark} {r.get('id')}  {detail}")
+                presolved = bool(r.get("presolved"))
+                self._log(f"{mark} {r.get('id')}  {detail}"
+                          + ("（跳过：已有解出记录）" if presolved else ""))
                 cid = str(r.get("id") or "")
                 if cid in self._board:
-                    self._board_set(cid, status="已解出" if r.get("ok") else "未解出",
-                                    detail=str(detail)[:60])
+                    status = ("已解出（跳过）" if presolved else "已解出") if r.get("ok") \
+                        else "未解出"
+                    self._board_set(cid, status=status, detail=str(detail)[:60])
             self._set_status(f"批量完成：{okn}/{len(res)} 题成功")
         else:
             if fv:

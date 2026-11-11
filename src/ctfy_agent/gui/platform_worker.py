@@ -298,13 +298,15 @@ def solve(config, challenge_id: str, run_id: str, competition_id: str,
 
 def solve_many(config, challenges: list, run_id: str, competition_id: str,
                q: queue.Queue, cancel: threading.Event, concurrency: int = 1,
-               stop_after: threading.Event | None = None) -> None:
+               stop_after: threading.Event | None = None,
+               force_ids: frozenset[str] | set[str] | None = None) -> None:
     """按勾选批量解题，可并发。连接/Store 共享，每个任务自建 Platform 连接与 Crew。
 
     challenges: [{"id": ..., "name": ...}]，顺序即执行顺序。
     concurrency: 并发度；<=1 串行。
     cancel: 硬停止——立即掐断正在解的题。
     stop_after: 优雅停止——置位后不再开新题，等正在跑的题跑完。
+    force_ids: 「重跑已解出」选中的题号——跳过 Crew 的两层已解出预检，真正重跑。
     事件：("task_start") / ("task_done") / ("batch_note") / ("done", {batch:True})
     """
     try:
@@ -320,6 +322,7 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
             store.meta["competition_id"] = competition_id
             store.save()
 
+        forced = frozenset(str(x) for x in (force_ids or ()))
         total = len(challenges)
         conc = max(1, min(int(concurrency or 1), max(1, total)))
 
@@ -355,11 +358,14 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
 
                 crew = Crew(config, platform, store,
                             lambda model=None: make_llm(config, model=model), on_event=on_event)
-                summary = crew.solve(cid, cancel_event=cancel)
+                summary = crew.solve(cid, cancel_event=cancel, force_rerun=cid in forced)
                 ch = store.get(cid)
                 flag = getattr(ch, "flag_value", "") if ch else ""
                 ok = bool((summary or {}).get("submitted")) or bool(flag)
-                return {"id": cid, "ok": ok, "flag": flag, "note": ""}
+                # 「已解出」是平台/缓存给的现成结论（0 token、0 轮次），界面要能区分出「跳过」
+                presolved = str((summary or {}).get("reason") or "") == "already_solved"
+                return {"id": cid, "ok": ok, "flag": flag, "note": "",
+                        "presolved": presolved}
             except Exception as exc:  # noqa: BLE001 - 单题失败不中断批量
                 return {"id": cid, "ok": False, "flag": "", "note": str(exc)[:200]}
 

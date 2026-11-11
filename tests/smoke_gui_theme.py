@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 
@@ -318,6 +319,265 @@ def case_app_integration() -> None:
         shutil.rmtree(rdir, ignore_errors=True)
 
 
+def case_dpi_and_tabs() -> None:
+    from ctfy_agent.gui import theme
+
+    root = tk.Tk()
+    root.geometry("900x600+3000+2000")
+    try:
+        # DPI：缩放必须 >=1，px 换算与缩放一致；DPI-aware 调用不能抛
+        scale = theme.apply_dpi_scaling(root)
+        assert scale >= 1.0, scale
+        assert abs(theme.UI_SCALE - scale) < 1e-9
+        assert theme.ui_px(120) == max(1, round(120 * scale / 1.2)), theme.ui_px(120)
+        assert isinstance(theme.enable_dpi_awareness(), bool)
+        ok("高DPI：DPI-aware 调用安全、tk scaling 与 ui_px 换算一致")
+
+        # 页签：选中=主色填充+白字；未选中=白底+深字；页签之间有间隙；圆角
+        nb = theme.TabBar(root, pad=(10, 10))
+        nb.pack(fill="both", expand=True)
+        pages = [tk.Frame(nb.body, bg=theme.PAGE) for _ in range(3)]
+        for page, title in zip(pages, ("复现", "任务面板", "日志")):
+            nb.add(page, text=title)
+        for _ in range(4):
+            root.update()
+            time.sleep(0.05)
+
+        def fills(btn):
+            out = set()
+            for item in btn.find_all():
+                try:
+                    out.add(str(btn.itemcget(item, "fill")).upper())
+                except Exception:  # noqa: BLE001
+                    pass
+            return out
+
+        def text_colors(btn):
+            out = set()
+            for item in btn.find_all():
+                if btn.type(item) == "text":
+                    out.add(str(btn.itemcget(item, "fill")).upper())
+            return out
+
+        btns = nb.tab_buttons()
+        assert len(btns) == 3
+        assert nb.current() == 0, nb.current()
+        assert theme.PRIMARY.upper() in fills(btns[0]), fills(btns[0])
+        assert theme.CANVAS.upper() in fills(btns[1]), fills(btns[1])
+        assert text_colors(btns[0]) == {theme.INVERT.upper()}, text_colors(btns[0])
+        assert text_colors(btns[1]) == {theme.TEXT.upper()}, text_colors(btns[1])
+        # 圆角 + 不相邻（右边界 < 下一个左边界）
+        assert all(int(b._radius) >= 8 for b in btns)  # noqa: SLF001
+        for _ in range(3):
+            root.update()
+            time.sleep(0.05)
+        gaps = [btns[i + 1].winfo_x() - (btns[i].winfo_x() + btns[i].winfo_width())
+                for i in range(2)]
+        assert all(g >= 6 for g in gaps), gaps
+        # 切换
+        nb.select(1)
+        root.update()
+        assert nb.current() == 1
+        assert pages[1].winfo_ismapped()
+        assert nb.index(pages[2]) == 2
+        ok("页签：选中主色+白字 / 未选中白底+深字、圆角、彼此留空隙、可切换")
+
+        # 任务面板：终态停表（不能「已解出还在走表」）
+        app = __import__("ctfy_agent.gui.app", fromlist=["App"]).App()
+        try:
+            app.root.update()
+            cid = "c-freeze"
+            app._board_row(cid, "测试题")
+            app._board_set(cid, status="解题中")
+            for _ in range(3):
+                app.root.update()
+                time.sleep(0.05)
+            app._board_tick()
+            app._board_set(cid, status="已解出", detail="FLAG{x}")
+            frozen = str(app.tv_board.item(app._board[cid]["iid"], "values")[6])
+            time.sleep(1.1)
+            app._board_tick()
+            later = str(app.tv_board.item(app._board[cid]["iid"], "values")[6])
+            assert frozen == later, (frozen, later)
+            rec = app._board[cid]
+            assert rec["finished"], "终态必须记录停表时刻"
+
+            # presolved 结果由事件层标成「已解出（跳过）」
+            app.q.put(("task_done", {"id": cid, "ok": True, "flag": "FLAG{x}",
+                                     "presolved": True}))
+            app._drain()
+            vals = app.tv_board.item(app._board[cid]["iid"], "values")
+            assert str(vals[1]) == "已解出（跳过）", vals
+            app.q.put(("task_done", {"id": "c-real", "ok": True, "flag": "FLAG{y}"}))
+            app._board_row("c-real", "真题")
+            app._drain()
+            assert str(app.tv_board.item(app._board["c-real"]["iid"], "values")[1]) == "已解出"
+            ok("任务面板：已解出即停表；平台现成结论显示「已解出（跳过）」，与真跑区分")
+
+            # 契约：强制重跑参数真的从 GUI 一路传到 Crew
+            import inspect
+
+            from ctfy_agent.crew import Crew
+            from ctfy_agent.gui import platform_worker
+
+            solve_sig = inspect.signature(Crew.solve)
+            assert "force_rerun" in solve_sig.parameters
+            assert solve_sig.parameters["force_rerun"].default is False  # 默认行为不变
+            many_sig = inspect.signature(platform_worker.solve_many)
+            assert "force_ids" in many_sig.parameters
+            ok("重跑链路：solve_many(force_ids) → Crew.solve(force_rerun) 参数存在且默认关")
+
+            # 勾选「重跑已解出」时，GUI 必须把已解出的题号放进 force 集合
+            rdir = ROOT / "runs" / "_ui_test_run"
+            shutil.rmtree(rdir, ignore_errors=True)
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "state.json").write_text(json.dumps({"challenges": {
+                "c1": {"name": "已解一", "flag_value": "FLAG{a}", "submitted_ok": True},
+            }}, ensure_ascii=False), encoding="utf-8")
+            app._on_challenges({"items": [
+                {"id": "c1", "name": "已解一", "category": "web"},
+                {"id": "c2", "name": "未解二", "category": "pwn"},
+            ]})
+            app.root.update()
+            app.var_run_p.set("_ui_test_run")
+            app._select_all(True)
+            app.var_skip_solved.set(False)
+            captured: dict = {}
+            app._begin_thread = lambda fn, args: captured.update(fn=fn, args=args)  # noqa: SLF001
+            app._apply_profile = lambda *a, **k: None  # noqa: SLF001
+            app._start_platform()
+            assert captured, "没走到批量启动"
+            assert captured["fn"] is platform_worker.solve_many
+            forced = captured["args"][-1]
+            assert forced == frozenset({"c1"}), forced
+            shutil.rmtree(rdir, ignore_errors=True)
+            ok("重跑已解出：GUI 把已解出的题号作为 force 集合传给批量 worker")
+        finally:
+            try:
+                app.root.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        root.destroy()
+
+
+def case_force_rerun_really_reruns() -> None:
+    """证据级验证：「重跑已解出」不是换个界面文案，而是真的越过已解出预检重跑。
+
+    A. Crew 层：同一道已解出的题，默认调用零成本返回 already_solved；
+       force_rerun=True 时必须继续往下走（这里用「预算已耗尽」当探针——能走到预算闸
+       就说明两层预检被越过、进入了真实求解流程，且不烧任何 token）。
+    B. worker 层：solve_many(force_ids=...) 只对集合内的题传 force_rerun=True。
+    """
+    from ctfy_agent.config import load as load_config
+    from ctfy_agent.crew import Crew
+    from ctfy_agent.state import Store
+
+    run_dir = ROOT / "runs" / "_force_test_run"
+    shutil.rmtree(run_dir, ignore_errors=True)
+    try:
+        cfg = load_config(None)
+        store = Store(run_dir).load()
+        store.upsert({
+            "id": "c1", "name": "已解出的题", "submitted_ok": True,
+            "flag_value": "FLAG{a}", "status": "done",
+        })
+
+        class FakePlatform:
+            def my_solved_ids(self):
+                return {"c1"}
+
+        crew = Crew(cfg, FakePlatform(), store, lambda model=None: None)
+
+        # 用 spy 盯住「秒解收口」函数：force_rerun 时它绝不能被调用
+        calls: list[str] = []
+        orig = Crew._presolved_summary
+
+        def spy(self, cid, ch):
+            calls.append(cid)
+            return orig(self, cid, ch)
+
+        Crew._presolved_summary = spy
+        try:
+            base = crew.solve("c1")
+            assert base.get("reason") == "already_solved", base.get("reason")
+            assert calls == ["c1"], "默认路径本就该走秒解收口"
+            calls.clear()
+            try:
+                # force 之后会因为没有真实 LLM/平台而失败（这里只关心是否越过预检）
+                crew.solve("c1", force_rerun=True)
+            except Exception:  # noqa: BLE001
+                pass
+            assert calls == [], "force_rerun 仍然走了「已解出」秒解分支，说明没真重跑"
+        finally:
+            Crew._presolved_summary = orig
+        # 强制重跑要在 transcript 留痕，事后能解释这笔钱
+        tr = store.transcript_path("c1")
+        text = tr.read_text(encoding="utf-8", errors="replace")
+        assert "强制重跑" in text, "transcript 缺少强制重跑留痕"
+        ok("强制重跑真生效：默认零成本秒返回 already_solved；force_rerun 越过预检进入真实流程")
+
+        # B. worker 只对 force_ids 里的题传 force_rerun=True
+        from types import SimpleNamespace
+
+        from ctfy_agent import cli as cli_mod
+        from ctfy_agent import crew as crew_mod
+        from ctfy_agent.gui import platform_worker
+
+        recorded: list[tuple[str, bool]] = []
+
+        class RecordingCrew:
+            def __init__(self, *a, **k):
+                pass
+
+            def solve(self, cid, *, cancel_event=None, force_rerun=False):
+                recorded.append((cid, force_rerun))
+                return {"submitted": True, "reason": "done"}
+
+        class FakePlatform:
+            def __init__(self, *a, **k):
+                pass
+
+            def connect(self):
+                pass
+
+        class FakeStore:
+            def __init__(self):
+                self.meta = {}
+
+            def save(self):
+                pass
+
+            def get(self, _cid):
+                return SimpleNamespace(flag_value="FLAG{w}")
+
+        originals = {
+            (platform_worker, "_platform"): lambda *a, **k: FakePlatform(),
+            (platform_worker, "_seed_bridge"): lambda *a, **k: None,
+            (platform_worker, "_preflight_instances"): lambda *a, **k: None,
+            (platform_worker, "_hydrate_attachments"): lambda *a, **k: None,
+            (cli_mod, "open_store"): lambda *a, **k: FakeStore(),
+            (cli_mod, "ensure_challenge_meta"): lambda *a, **k: None,
+            (cli_mod, "make_llm"): lambda *a, **k: None,
+            (crew_mod, "Crew"): RecordingCrew,
+        }
+        for (mod, name), value in originals.items():
+            setattr(mod, name, value)
+        try:
+            q = __import__("queue").Queue()
+            platform_worker.solve_many(
+                cfg, [{"id": "ok-1"}, {"id": "ok-2"}], "rid", "", q,
+                __import__("threading").Event(), 1, None, frozenset({"ok-1"}),
+            )
+        finally:
+            for (mod, name), _value in originals.items():
+                delattr(mod, name)
+        assert recorded == [("ok-1", True), ("ok-2", False)], recorded
+        ok("批量 worker：force_ids 内的题传 force_rerun=True，未勾选的题保持默认跳过")
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
 def main() -> int:
     try:
         case_tokens()
@@ -326,6 +586,8 @@ def main() -> int:
         case_filter_solved()
         case_widgets()
         case_app_integration()
+        case_dpi_and_tabs()
+        case_force_rerun_really_reruns()
     except AssertionError as exc:  # 断言失败直接报出上下文
         print(f"FAIL: {exc}")
         raise
