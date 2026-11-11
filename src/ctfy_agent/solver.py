@@ -1460,6 +1460,15 @@ class Solver:
             self.store.reset_run_calls(challenge_id)
         except Exception:  # noqa: BLE001 - 记账清理失败不拦解题
             pass
+        # 确定性「代码版本」标记：驱动可能是长驻进程（加载的是旧代码），没有这行时只能靠行为猜
+        # 「新修复有没有生效」（2026-11-11 第三轮就这么被旧进程白跑了一轮）。一行 note 即可判读。
+        try:
+            self.store.append_transcript(challenge_id, {
+                "role": "note",
+                "content": "[配额口径] 实例操作配额按「每次尝试」计数（长驻进程重跑可重新起实例）",
+            })
+        except Exception:  # noqa: BLE001 - 诊断标记不拦解题
+            pass
         challenge = self.store.require(challenge_id)
         budget = int(max_steps or self.config.max_steps)
 
