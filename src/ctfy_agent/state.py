@@ -300,6 +300,25 @@ class Store:
         with Store._run_call_guard:
             return int(Store._run_call_counts.get(str(self.path.resolve()), {}).get((key, str(name)), 0))
 
+    def reset_run_calls(self, challenge_id: str, names: tuple[str, ...] | None = None) -> None:
+        """把该题「本次运行」的写操作计数清零（= 新一轮尝试重新获得配额）。
+
+        [fix 2026-11-11 本地 plat 重跑] 驱动可能是一个**长驻进程**（GUI/批量跑题库：进程不退出，
+        连着跑好几轮）。只把闸门改成进程作用域还不够——长驻进程里上一轮的计数会一直带进下一轮。
+        因此每一轮解题入口（`Crew.solve` / `Solver.solve`）显式重置本题计数：
+        一次尝试最多 5 次 start_instance（保护不变），但下一轮尝试重新从 5 开始。
+        持久化 `tool_counts` 审计账不动（跨轮累计核对用）。
+        """
+        key = str(challenge_id)
+        with Store._run_call_guard:
+            counts = Store._run_call_counts.setdefault(str(self.path.resolve()), {})
+            if names is None:
+                for k in [k for k in counts if k[0] == key]:
+                    counts.pop(k, None)
+            else:
+                for name in names:
+                    counts.pop((key, str(name)), None)
+
     # ---------- 读写 ----------
 
     def load(self) -> "Store":

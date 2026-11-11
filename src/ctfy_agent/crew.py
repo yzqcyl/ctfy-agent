@@ -928,6 +928,14 @@ class Crew:
                     return self._presolved_summary(challenge_id, challenge)
             except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不拦解题
                 pass
+        # [fix 2026-11-11 本地 plat 重跑] 每次尝试重新获得本题的实例操作配额：长驻进程（GUI 批量
+        # 跑题库连着跑好几轮）里上一轮的 start_instance 计数会带进下一轮，重跑第一次 start 就被
+        # 「已达本题上限」拦死（实测第二轮 52 次拦截、8 题起不了实例）。这里清空**本次运行**计数，
+        # 一次尝试内部仍然最多 5 次（保护不变），持久化审计账 tool_counts 不动。
+        try:
+            self.store.reset_run_calls(challenge_id)
+        except Exception:  # noqa: BLE001 - 记账清理失败不拦解题
+            pass
         # P2-2：按域编排档位（只动编排参数；未识别题型 → {} 即旧行为）
         self._profile = domain_profile(
             self.config.extra, challenge,

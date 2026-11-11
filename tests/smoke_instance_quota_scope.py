@@ -148,6 +148,28 @@ def main() -> int:
     check("solver：同一轮配额用尽仍返回 None（闸门还在）", blocked is None, str(blocked))
     check("solver：配额用尽时平台没被调用", solver.platform.calls == [], str(solver.platform.calls))
 
+    # ---- 5) 长驻进程内「下一轮尝试」：reset_run_calls 重新给满配额，审计账不动 ----
+    store = _seed(tmp / "r5")
+    for _ in range(5):
+        store.record_call(CID, "start_instance", 5)
+    store.save()
+    check("长驻：本轮用尽（第 6 次被拦）", store.record_call(CID, "start_instance", 5) is False)
+    store.reset_run_calls(CID)
+    check("长驻：reset 后 call_count=0", store.call_count(CID, "start_instance") == 0)
+    check("长驻：reset 后又能 start（一次尝试 5 次的保护仍在）",
+          store.record_call(CID, "start_instance", 5) is True)
+    store.save()
+    check("长驻：reset 不动持久化审计账（=6，跨轮核对用）", _audit(store) == 6, str(_audit(store)))
+    store.reset_run_calls(CID, names=("start_instance",))
+    check("长驻：按名单 reset 生效", store.call_count(CID, "start_instance") == 0)
+
+    # ---- 6) 自愈次数（instance_recover）同口径：一次尝试 2 次，下一轮重新给 ----
+    check("自愈：前 2 次放行",
+          store.record_call(CID, "instance_recover", 2) and store.record_call(CID, "instance_recover", 2))
+    check("自愈：第 3 次被拦", store.record_call(CID, "instance_recover", 2) is False)
+    store.reset_run_calls(CID)
+    check("自愈：下一轮重置后又能自愈", store.record_call(CID, "instance_recover", 2) is True)
+
     print()
     if FAILS:
         print(f"smoke_instance_quota_scope 失败 {len(FAILS)} 项：{FAILS}")

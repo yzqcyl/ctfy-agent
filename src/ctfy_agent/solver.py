@@ -709,10 +709,10 @@ class Solver:
                 "现在把已有发现整理好，直接 report/done 收口。"
             )
         limit = int(self.config.extra.get("instance_recover_limit", 2) or 2)
-        used = int((challenge.tool_counts or {}).get("instance_recover", 0) or 0)
-        if used >= limit:
+        # [fix 2026-11-11 本地 plat 重跑] 自愈次数也改成「本次尝试」口径（同 start_instance 的
+        # 跨轮持久化问题：旧实现读持久化计数，第二轮重跑时自愈次数早已用尽，实例失效只能等死）。
+        if not self.store.record_call(challenge_id, "instance_recover", limit):
             return text + "\n[实例已失效] 本题自愈次数已用尽：不要再打旧端点，直接 report/done 收口。"
-        challenge.tool_counts["instance_recover"] = used + 1
         challenge.instance_id = ""
         challenge.instance = {}
         self.store.save()
@@ -1451,6 +1451,15 @@ class Solver:
         self._http_cache.clear()
         self._cookie_jar.clear()
         self._chats.clear()
+        # [fix 2026-11-11 本地 plat 重跑] 每次尝试重新获得本题的实例操作配额：驱动可能是长驻进程
+        # （GUI 批量跑题库：进程不退出、连着跑好几轮），上一轮的 start_instance 计数会一直带进
+        # 下一轮，导致重跑第一次 start 就被「已达本题上限」拦死（实测第二轮 52 次拦截、8 题起不了
+        # 实例）。这里在每次尝试入口清空**本次运行**计数；一次尝试内部仍然最多 5 次（保护不变），
+        # 持久化审计账 tool_counts 不动（跨轮核对用）。
+        try:
+            self.store.reset_run_calls(challenge_id)
+        except Exception:  # noqa: BLE001 - 记账清理失败不拦解题
+            pass
         challenge = self.store.require(challenge_id)
         budget = int(max_steps or self.config.max_steps)
 

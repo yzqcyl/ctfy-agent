@@ -11,7 +11,7 @@
 
 | 文件 | 会话 | 开始 | 说明 |
 |---|---|---|---|
-| src/ctfy_agent/state.py + src/ctfy_agent/instance_guard.py + tests/smoke_instance_quota_scope.py（新建，不改 gui/） | W（本地 plat 重跑：instance_ops_limit 作用域修复 2026-11-11） | 11-11 19:20 | 重跑 17 题时 8 题第一轮已记满 5 次 start_instance，旧闸门读**持久化** `tool_counts` → 第二轮 52 次「已达本题上限」拦截、无法起实例。改为闸门读「本次运行（进程）」计数（`Store._run_calls`，按 state.json 路径隔离、同进程 lane 共享），持久化 `tool_counts` 降级为审计账；`start_remaining` 同口径。新增 16 条回归（含「上一轮用满 → 新进程能重新 start / 同轮仍拦得住」）。 |
+| src/ctfy_agent/{state.py,solver.py,crew.py} + src/ctfy_agent/instance_guard.py + tests/smoke_instance_quota_scope.py（新建，不改 gui/） | W（本地 plat 重跑：instance_ops_limit 作用域修复 2026-11-11） | 11-11 19:20 | 重跑 17 题时 8 题第一轮已记满 5 次 start_instance，旧闸门读**持久化** `tool_counts` → 第二轮 52 次「已达本题上限」拦截、无法起实例。改为：① 闸门读「本次运行（进程）」计数（`Store._run_calls`，按 state.json 路径隔离、同进程 lane 共享）；② 每轮解题入口（`Solver._solve_once` / `Crew.solve`）`reset_run_calls` 清零本题计数——长驻进程（GUI 批量跑题库不退出）连跑多轮也能重新获得配额；③ `instance_recover` 自愈次数同口径；④ 持久化 `tool_counts` 降级为审计账；`start_remaining` 同口径。新增 23 条回归（含「上一轮用满 → 新一轮能重新 start / 同轮仍拦得住 / 长驻进程 reset 后放行 / 自愈次数重置」）。 |
 | （无活动锁） | — | — | 本地 plat 测试监视轮（2026-11-11 17:55）已收尾，见下方「已释放」首行 |
 
 ## 已释放
