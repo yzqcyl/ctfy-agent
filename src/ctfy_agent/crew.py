@@ -1190,7 +1190,10 @@ class Crew:
                     status = self._answers_status(challenge)
                     messages[1] = {"role": "user", "content": (base + "\n\n" + status).strip() if status else base}
                 # P0-2：预算阶段每轮注入协调者（实测 500k ≈ 40 次调用，agent 需要剩余量感知）
-                budget_line = BudgetPhase.line(getattr(coordinator, "budget", None))
+                # [fix 2026-11-11 本地 plat 重跑] 传入本次 solve 的基线：重跑时按「本轮额度」算阶段，
+                # 否则被旧账烧到 95% 的题（SAMPLE-003）一开局就是「收口期」，配额修好也解不了。
+                budget_line = BudgetPhase.line(
+                    getattr(coordinator, "budget", None), _base_total, _base_calls)
                 if budget_line:
                     messages.append({"role": "user", "content": budget_line})
                     self.store.append_transcript(
