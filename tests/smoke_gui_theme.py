@@ -461,6 +461,218 @@ def case_dpi_and_tabs() -> None:
         root.destroy()
 
 
+def case_board_columns_work() -> None:
+    """任务面板的「轮次 / Tokens / 花费」必须是活的。
+
+    背景（用户实测）：平台批量走 Crew.solve，而 Crew 原来只发 budget_plan，不发 budget/step
+    → 面板这三列永远是 0/0/-。这里两侧都钉住：
+      A. 发出端：crew.solve 必须发 budget（开跑/每轮/收口）和 step（每轮）；
+      B. 消费端：把 step/budget 事件灌进 App._drain，面板三列必须真的变化。
+    """
+    import inspect
+
+    from ctfy_agent.crew import Crew
+
+    src = inspect.getsource(Crew.solve)
+    assert src.count('on_event("budget"') >= 2, "Crew.solve 里 budget 事件少于 2 处（开跑/每轮/收口）"
+    assert 'on_event("step"' in src, "Crew.solve 没有发 step 事件 → 轮次不会动"
+    ok("发出端：Crew.solve 会发 budget（基线/每轮/收口）与 step（每轮）事件")
+
+    from ctfy_agent.gui.app import App
+
+    app = App()
+    try:
+        app.root.update()
+        cid = "c-cols"
+        app._board_row(cid, "列测试题")
+        # step → 轮次 +1；budget → tokens/calls/cost
+        app.q.put(("event", "step", {"_cid": cid, "step": 1}))
+        app.q.put(("event", "step", {"_cid": cid, "step": 2}))
+        app.q.put(("event", "budget", {"_cid": cid, "total_tokens": 12345,
+                                       "calls": 7, "cost": 0.0,
+                                       "max_tokens": 800000, "max_calls": 20}))
+        app._drain()
+        values = app.tv_board.item(app._board[cid]["iid"], "values")
+        idx = app._BOARD_COLS.index
+        assert int(values[idx("rounds")]) == 2, values
+        assert int(values[idx("tokens")]) == 12345, values
+        assert values[idx("cost")] == "-", ("未配单价时应显示 -", values)
+        # 配了单价后才显示金额（4 位小数）
+        app.config.price_input_per_mtok = 0.5
+        app.q.put(("event", "budget", {"_cid": cid, "total_tokens": 20000,
+                                       "calls": 9, "cost": 0.01234,
+                                       "max_tokens": 800000, "max_calls": 20}))
+        app._drain()
+        values = app.tv_board.item(app._board[cid]["iid"], "values")
+        assert values[idx("cost")] == "0.0123", values
+        assert int(values[idx("tokens")]) == 20000, values
+        # 顶部预算条也跟着走
+        assert "20000" in app.lbl_tokens.get(), app.lbl_tokens.get()
+        ok("消费端：step/budget 事件能刷新 轮次/Tokens/花费（未配单价显示 -，配了显示金额）")
+    finally:
+        try:
+            app.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def case_table_scrollbars() -> None:
+    """三张表都要有「上下 + 左右」滚动条，而且是真的能滚（内容比可视区宽）。
+
+    以前只给竖条且 arrowsize=0 → ttk 滚动条退化成 1px，等于看不见；这里连厚度一起钉住。
+    """
+    from ctfy_agent.gui.app import App
+
+    app = App()
+    try:
+        app.root.geometry("1200x760+0+0")
+        for _ in range(3):
+            app.root.update()
+            time.sleep(0.05)
+
+        def check(name, tree, vsb, hsb, need_x: bool = True):
+            app.root.update()
+            cols = tree["columns"]
+            names = cols.split() if isinstance(cols, str) else list(cols)
+            if need_x and not tree.get_children():
+                # 空表时 xview 必然是 (0,1)；塞一行超长内容再判断横条是否真的能滚
+                values = tuple("X" * 60 for _ in names)
+                if "tree" in str(tree["show"]):
+                    tree.insert("", "end", text="X" * 80, values=values)
+                else:
+                    tree.insert("", "end", values=values)
+                app.root.update()
+            for widget, label in ((tree, "表格"), (vsb, "竖条"), (hsb, "横条")):
+                assert widget.winfo_ismapped(), f"{name} 的{label}没有显示"
+            assert vsb.winfo_width() >= 8, f"{name} 竖条厚度 {vsb.winfo_width()}px（1px 等于看不见）"
+            assert hsb.winfo_height() >= 8, f"{name} 横条厚度 {hsb.winfo_height()}px"
+            assert tree.cget("yscrollcommand") and tree.cget("xscrollcommand"), \
+                f"{name} 没绑定滚动条命令"
+            if need_x:
+                total = sum(int(tree.column(c, "width")) for c in names)
+                if total <= tree.winfo_width():
+                    # 窗口特别宽时内容本来就不超宽；临时加宽最后一列，验证横条确实能滚
+                    tree.column(names[-1], width=total + tree.winfo_width())
+                    app.root.update()
+                first, last = tree.xview()
+                assert float(last) < 1.0, f"{name} 内容没超宽，横条不可滚（xview={tree.xview()}）"
+
+        # 复现页（默认选中）
+        check("已解出表", app.tv_solved, app.vsb_solved, app.hsb_solved)
+        # 任务面板
+        app.nb.select(1)
+        check("任务面板", app.tv_board, app.vsb_board, app.hsb_board)
+        # 题库（平台模式）
+        app.var_mode.set("platform")
+        app._on_mode()
+        check("题库", app.tv, app.vsb_chal, app.hsb_chal)
+        ok("三张表都有可见的上下+左右滚动条（厚 16px），且横向真的可滚")
+    finally:
+        try:
+            app.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _descendants(widget):
+    yield widget
+    for child in widget.winfo_children():
+        yield from _descendants(child)
+
+
+def case_settings_dialog() -> None:
+    """设置对话框也要同一套 UI：圆角蓝页签、卡片、圆角输入框、主题按钮、尺寸自适应+滚动条。"""
+    from ctfy_agent.gui import theme  # noqa: PLC0415 - 与其它用例一致，按需导入
+    from ctfy_agent.gui.app import App
+
+    app = App()
+    root = app.root
+    try:
+        root.update()
+        app._open_settings()
+        root.update()
+        wins = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+        assert wins, "没打开设置窗口"
+        win = wins[-1]
+        win.attributes("-topmost", True)
+        for _ in range(4):
+            root.update()
+            time.sleep(0.05)
+
+        scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = win.winfo_width(), win.winfo_height()
+        assert w <= int(scr_w * 0.95) and h <= int(scr_h * 0.95), \
+            f"设置窗口超出屏幕：{w}x{h} vs {scr_w}x{scr_h}"
+        assert w >= theme.ui_px(480) and h >= theme.ui_px(380), f"设置窗口过小：{w}x{h}"
+        assert str(win.cget("bg")) == theme.PAGE
+        ok(f"设置窗口尺寸自适应：{w}x{h}（屏幕 {scr_w}x{scr_h} 内）")
+
+        widgets = list(_descendants(win))
+        tabbars = [x for x in widgets if isinstance(x, theme.TabBar)]
+        assert len(tabbars) == 1, f"设置里应有 1 个 TabBar，实际 {len(tabbars)}"
+        nb = tabbars[0]
+        btns = nb.tab_buttons()
+        assert len(btns) == 3, f"设置页签数 {len(btns)}"
+        assert all(int(b._radius) >= 8 for b in btns)  # noqa: SLF001
+
+        def fills(btn):
+            out = set()
+            for item in btn.find_all():
+                try:
+                    out.add(str(btn.itemcget(item, "fill")).upper())
+                except Exception:  # noqa: BLE001
+                    pass
+            return out
+
+        def text_fills(btn):
+            return {str(btn.itemcget(i, "fill")).upper()
+                    for i in btn.find_all() if btn.type(i) == "text"}
+
+        assert theme.PRIMARY.upper() in fills(btns[0]), "选中页签不是主色填充"
+        assert text_fills(btns[0]) == {theme.INVERT.upper()}, "选中页签文字不是白色"
+        assert theme.CANVAS.upper() in fills(btns[1]), "未选中页签不是白底"
+        assert text_fills(btns[1]) == {theme.TEXT.upper()}, "未选中页签文字不是深色"
+        ok("设置页签：圆角 + 选中蓝底白字 / 未选中白底深字")
+
+        entries = [x for x in widgets if isinstance(x, theme.RoundedEntry)]
+        buttons = [x for x in widgets if isinstance(x, theme.RoundedButton)]
+        cards = [x for x in widgets if isinstance(x, theme.Card)]
+        assert len(entries) >= 6, f"圆角输入框只有 {len(entries)} 个"
+        assert len(cards) >= 3, f"卡片只有 {len(cards)} 张"
+        labels = {str(b.cget("text")) for b in buttons}
+        assert {"保存", "取消", "测试连接"} <= labels, labels
+        ok(f"设置控件：{len(entries)} 个圆角输入框 / {len(cards)} 张卡片 / 主题按钮齐全")
+
+        # 三页都能切；缩到最小尺寸后内容可滚动（滚动条/滚动区真的生效）
+        for idx in range(3):
+            nb.select(idx)
+            root.update()
+            assert nb.current() == idx
+        nb.select(0)
+        win.geometry(f"{theme.ui_px(600)}x{theme.ui_px(430)}")
+        root.update()
+        time.sleep(0.1)
+        root.update()
+        sfs = [x for x in widgets if isinstance(x, theme.ScrollFrame)]
+        assert len(sfs) == 3, f"设置页滚动容器 {len(sfs)} 个"
+        page = nb.tabs()[nb.current()]
+        page_sf = [x for x in _descendants(page) if isinstance(x, theme.ScrollFrame)][0]
+        first, last = page_sf.canvas.yview()
+        assert float(last) < 1.0 or page_sf.vsb.winfo_ismapped(), \
+            "窗口缩小时设置内容没有出现滚动条/滚动区"
+        ok("设置：三页可切换；窗口缩小后内容走滚动条，不会截断")
+    finally:
+        for win in [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            app.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def case_force_rerun_really_reruns() -> None:
     """证据级验证：「重跑已解出」不是换个界面文案，而是真的越过已解出预检重跑。
 
@@ -587,6 +799,9 @@ def main() -> int:
         case_widgets()
         case_app_integration()
         case_dpi_and_tabs()
+        case_board_columns_work()
+        case_table_scrollbars()
+        case_settings_dialog()
         case_force_rerun_really_reruns()
     except AssertionError as exc:  # 断言失败直接报出上下文
         print(f"FAIL: {exc}")

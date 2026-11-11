@@ -940,6 +940,10 @@ class Crew:
             # 集群-B：本次尝试切片（空/None = 不切片，行为同旧）。必须在首个 spending.check() 之前设。
             spending.set_attempt_caps(attempt_caps)
         start_usage = spending.snapshot()
+        # [GUI 任务面板] 平台批量路径走的是 Crew.solve（不是 Solver.solve），原先这里不发
+        # budget/step 事件 → 任务面板的「轮次 / Tokens / 花费」永远是 0 和 -。这里补发：
+        # 开跑先同步一次基线（含历史累计），之后每轮结束再发增量快照。
+        self.on_event("budget", start_usage)
 
         # [接手 2026-11-11] 把「这次真正生效的预算 + 来源」落成确定性事实：
         # 平台托管跑法里 `task.max_turns` 会覆盖 agent.json 的 max_llm_calls，历史交接里
@@ -1162,6 +1166,10 @@ class Crew:
                 finally:
                     self.store.set_tokens(challenge_id, spending.snapshot())
                     self.store.save()
+                # [GUI 任务面板] 一轮协调结束：把轮次 + 最新用量推给界面。
+                # 少了这两个事件，面板的「轮次」不动、「Tokens/花费」永远是 0/-（平台批量路径实测）。
+                self.on_event("step", {"step": rnd, "challenge_id": challenge_id})
+                self.on_event("budget", spending.snapshot())
 
                 # [fix 2026-11-06 P8] 协调者补全被 reasoning 占满（finish=length、content 空、无
                 # tool_calls）时，不算“空动作”消耗守卫，而是放大 max_tokens 后重试。
@@ -1576,6 +1584,7 @@ class Crew:
         self.store.save()
         _ckpt_discard(ckpt_path)  # 正常收尾：清掉快照，避免下一跑误当崩溃残留而续跑
         end_usage = spending.snapshot()
+        self.on_event("budget", end_usage)  # 收口：任务面板的最终 tokens/花费
         usage = _usage_delta(start_usage, end_usage)
         # 账本快照落转录：M2（跨 delegate 重复）与 M3（open→refuted）都从这里取证
         self.store.append_transcript(

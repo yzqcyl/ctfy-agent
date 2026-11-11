@@ -1098,7 +1098,7 @@ class RoundedEntry(tk.Frame):
 
     def __init__(self, master: tk.Misc, *, textvariable: tk.StringVar | None = None,
                  placeholder: str = "", width: int | None = None, radius: int = RADIUS_INPUT,
-                 font: tuple | None = None, **kw):
+                 font: tuple | None = None, show: str = "", **kw):
         self._page = _bg_of(master)
         super().__init__(master, bg=self._page, bd=0, highlightthickness=0, **kw)
         self.radius = int(radius)
@@ -1109,7 +1109,7 @@ class RoundedEntry(tk.Frame):
                                 width=width or 200, height=38)
         self.canvas.pack(fill="both", expand=True)
         self.entry = tk.Entry(self.canvas, textvariable=self.var, relief="flat", bd=0,
-                              highlightthickness=0, bg=SUBTLE, fg=TEXT,
+                              highlightthickness=0, bg=SUBTLE, fg=TEXT, show=show,
                               insertbackground=PRIMARY, selectbackground=PRIMARY_SOFT,
                               selectforeground=TEXT, font=font or body_font(10))
         self._win = self.canvas.create_window(12, 19, anchor="w", window=self.entry)
@@ -1212,7 +1212,10 @@ def panel(master: tk.Misc, *, height: int | None = None, bg: str = CANVAS,
                  highlightbackground=border, highlightcolor=border)
     if height:
         f.configure(height=int(height))
+        # 内容可能用 pack 也可能用 grid（如表格+两条滚动条），两种传播都要关掉，
+        # 否则子控件的请求尺寸会把固定高度的面板撑大。
         f.pack_propagate(False)
+        f.grid_propagate(False)
     return f
 
 
@@ -1323,12 +1326,19 @@ def apply(root: tk.Misc):  # noqa: N802 - 返回 style 方便调用方微调
     # 进度条 / 滚动条
     style.configure("Horizontal.TProgressbar", troughcolor=BORDER, background=PRIMARY,
                     bordercolor=BORDER, lightcolor=PRIMARY, darkcolor=PRIMARY, thickness=6)
+    # ttk 滚动条的「厚度」由 arrowsize 决定（arrowsize=0 会退化成 1px，等于看不见），
+    # 箭头颜色配成和底色同色，视觉上是一条干净的细滚动条。
+    _sb = ui_px(11)
     style.configure("Vertical.TScrollbar", background=BORDER, troughcolor=PAGE,
-                    bordercolor=PAGE, lightcolor=BORDER, darkcolor=BORDER, arrowsize=0,
-                    width=8, relief="flat")
+                    bordercolor=PAGE, lightcolor=BORDER, darkcolor=BORDER,
+                    arrowcolor=PAGE, arrowsize=_sb, width=_sb, sliderlength=ui_px(34),
+                    relief="flat")
     style.map("Vertical.TScrollbar", background=[("active", BORDER_STRONG)])
     style.configure("Horizontal.TScrollbar", background=BORDER, troughcolor=PAGE,
-                    bordercolor=PAGE, arrowsize=0, relief="flat")
+                    bordercolor=PAGE, lightcolor=BORDER, darkcolor=BORDER,
+                    arrowcolor=PAGE, arrowsize=_sb, width=_sb, sliderlength=ui_px(46),
+                    relief="flat")
+    style.map("Horizontal.TScrollbar", background=[("active", BORDER_STRONG)])
 
     # 单选/复选/容器（卡片内用 Card.* 变体，白底）
     for name in ("Card.TRadiobutton", "Card.TCheckbutton"):

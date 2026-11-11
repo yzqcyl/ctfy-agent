@@ -97,6 +97,8 @@ class App:
         self._build_ui()
         self._refresh_history()
         self._refresh_solved(background=True)  # 不卡启动：扫 runs/* 放后台线程
+        self._poll_job: str | None = None
+        self.root.bind("<Destroy>", lambda _e: self._cancel_poll(), add="+")
         self._poll()
 
     # ---------------- UI ----------------
@@ -262,20 +264,30 @@ class App:
                             command=self._fetch_challenges).pack(fill="x", pady=(8, 0))
         theme.label(self.frm_plat, "题库（勾选要跑的题，可全选）", muted=True,
                     size=9).pack(anchor="w", pady=(10, 0))
-        chal_panel = theme.panel(self.frm_plat, height=236)
+        chal_panel = theme.panel(self.frm_plat, height=theme.ui_px(236))
         chal_panel.pack(fill="x", pady=(4, 0))
+        # 上下 + 左右滚动条都要：题名很长（如 "Layered Archive — 套娃压缩包"），
+        # 只给竖条会把名称截断，横条让整行可以拖着看全。
+        chal_panel.rowconfigure(0, weight=1)
+        chal_panel.columnconfigure(0, weight=1)
         self.tv = ttk.Treeview(chal_panel, columns=("sel", "id", "cat", "name"),
                                show="headings", height=8)
-        for col, width, text in (("sel", 34, "选"), ("id", 118, "ID"),
-                                 ("cat", 54, "分类"), ("name", 168, "名称")):
+        # 列宽固定（不 stretch）：总宽超出可视区时横条才有意义，名称不再被硬截断；
+        # 取「比可视区略宽」的尺寸，既不把左栏撑到挤压右栏，又保证横条真的能滚
+        for col, width, text in (("sel", 38, "选"), ("id", 110, "ID"),
+                                 ("cat", 58, "分类"), ("name", 180, "名称")):
             self.tv.heading(col, text=text)
             self.tv.column(col, width=theme.ui_px(width),
+                           minwidth=theme.ui_px(max(28, width - 12)),
                            anchor="center" if col == "sel" else "w",
-                           stretch=(col == "name"))
-        vsb = ttk.Scrollbar(chal_panel, orient="vertical", command=self.tv.yview)
-        self.tv.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        self.tv.pack(side="left", fill="both", expand=True)
+                           stretch=False)
+        self.vsb_chal = ttk.Scrollbar(chal_panel, orient="vertical", command=self.tv.yview)
+        self.hsb_chal = ttk.Scrollbar(chal_panel, orient="horizontal", command=self.tv.xview)
+        self.tv.configure(yscrollcommand=self.vsb_chal.set,
+                          xscrollcommand=self.hsb_chal.set)
+        self.tv.grid(row=0, column=0, sticky="nsew")
+        self.vsb_chal.grid(row=0, column=1, sticky="ns")
+        self.hsb_chal.grid(row=1, column=0, sticky="ew")
         self.tv.bind("<Button-1>", self._toggle_row)
         self.skel_chal = theme.Skeleton(chal_panel, rows=5, row_height=20, gap=8)
 
@@ -459,19 +471,27 @@ class App:
         lcard = theme.Card(pane, padding=(2, 2), radius=16, hug=False)
         pane.add(lcard, weight=2)
         # tree 列放「日期分组标题」，题目作为子节点 → 按日期分层
-        self.tv_solved = ttk.Treeview(lcard.body, columns=("cat", "flag", "run"),
+        lbody = lcard.body
+        lbody.rowconfigure(0, weight=1)
+        lbody.columnconfigure(0, weight=1)
+        self.tv_solved = ttk.Treeview(lbody, columns=("cat", "flag", "run"),
                                       show="tree headings", height=12, selectmode="browse")
         self.tv_solved.heading("#0", text="日期 / 题目")
-        self.tv_solved.column("#0", width=theme.ui_px(190), stretch=True, anchor="w")
-        for col, width, text in (("cat", 54, "分类"), ("flag", 168, "flag"),
-                                 ("run", 74, "运行")):
+        self.tv_solved.column("#0", width=theme.ui_px(190), stretch=False, anchor="w")
+        for col, width, text in (("cat", 54, "分类"), ("flag", 210, "flag"),
+                                 ("run", 90, "运行")):
             self.tv_solved.heading(col, text=text)
             self.tv_solved.column(col, width=theme.ui_px(width), anchor="w",
-                                  stretch=col in ("flag",))
-        sbv = ttk.Scrollbar(lcard.body, orient="vertical", command=self.tv_solved.yview)
-        self.tv_solved.configure(yscrollcommand=sbv.set)
-        sbv.pack(side="right", fill="y")
-        self.tv_solved.pack(side="left", fill="both", expand=True)
+                                  stretch=False)
+        self.vsb_solved = ttk.Scrollbar(lbody, orient="vertical",
+                                        command=self.tv_solved.yview)
+        self.hsb_solved = ttk.Scrollbar(lbody, orient="horizontal",
+                                        command=self.tv_solved.xview)
+        self.tv_solved.configure(yscrollcommand=self.vsb_solved.set,
+                                 xscrollcommand=self.hsb_solved.set)
+        self.tv_solved.grid(row=0, column=0, sticky="nsew")
+        self.vsb_solved.grid(row=0, column=1, sticky="ns")
+        self.hsb_solved.grid(row=1, column=0, sticky="ew")
         self.tv_solved.bind("<Double-Button-1>", lambda e: self._gen_writeup_selected())
         self.skel_solved = theme.Skeleton(lcard.body, rows=7, row_height=22, gap=9)
 
@@ -620,19 +640,29 @@ class App:
                             command=self._board_clear).pack(side="right")
         card = theme.Card(f, padding=(2, 2), radius=16, hug=False)
         card.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        widths = {"title": 150, "status": 78, "detail": 280, "rounds": 56,
-                  "tokens": 70, "cost": 56, "elapsed": 72}
-        self.tv_board = ttk.Treeview(card.body, columns=self._BOARD_COLS,
+        body = card.body
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        widths = {"title": 150, "status": 78, "detail": 280, "rounds": 58,
+                  "tokens": 78, "cost": 66, "elapsed": 72}
+        self.tv_board = ttk.Treeview(body, columns=self._BOARD_COLS,
                                      show="headings", height=14)
         for col in self._BOARD_COLS:
             self.tv_board.heading(col, text=self._BOARD_HEADS[col])
             self.tv_board.column(col, width=theme.ui_px(widths[col]),
-                                 stretch=col in ("title", "detail"),
+                                 minwidth=theme.ui_px(max(30, widths[col] - 20)),
+                                 stretch=False,
                                  anchor="w" if col in ("title", "detail") else "center")
-        sb = ttk.Scrollbar(card.body, orient="vertical", command=self.tv_board.yview)
-        self.tv_board.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.tv_board.pack(side="left", fill="both", expand=True)
+        # 上下 + 左右滚动条：详情/题目名较长时，横条能看全，不被硬截断
+        self.vsb_board = ttk.Scrollbar(body, orient="vertical",
+                                       command=self.tv_board.yview)
+        self.hsb_board = ttk.Scrollbar(body, orient="horizontal",
+                                       command=self.tv_board.xview)
+        self.tv_board.configure(yscrollcommand=self.vsb_board.set,
+                                xscrollcommand=self.hsb_board.set)
+        self.tv_board.grid(row=0, column=0, sticky="nsew")
+        self.vsb_board.grid(row=0, column=1, sticky="ns")
+        self.hsb_board.grid(row=1, column=0, sticky="ew")
 
     def _board_clear(self) -> None:
         for iid in self.tv_board.get_children():
@@ -802,6 +832,9 @@ class App:
         self._board_clear()
         self._tpos = {}
         self._reset_budget()
+        if not self._priced():
+            self._log("[提示] 未配置单价（agent.json 的 price_input/output_per_mtok=0）："
+                      "任务面板「花费」列显示 -，填了单价后自动按 token 计价。")
         self._set_status("运行中")
         self._set_running(True)
         self.thread = threading.Thread(target=fn, args=args, daemon=True)
@@ -1110,66 +1143,120 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("设置")
         win.transient(self.root)
-        win.resizable(False, False)
-        win.geometry("700x560")
+        win.configure(bg=theme.PAGE)
+        theme.enable_dpi_awareness()
+        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        _w = min(theme.ui_px(760), max(theme.ui_px(640), _sw - theme.ui_px(120)))
+        _h = min(theme.ui_px(640), max(theme.ui_px(480), _sh - theme.ui_px(140)))
+        win.geometry(f"{_w}x{_h}")
+        win.minsize(theme.ui_px(620), theme.ui_px(460))
+        win.resizable(True, True)
 
-        nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=12, pady=(12, 0))
+        # 顶部毛玻璃标题条（和主窗口同一套视觉）
+        head = theme.Card(win, padding=(18, 10), radius=16, glass=True)
+        head.pack(fill="x", padx=12, pady=(12, 8))
+        tk.Label(head.body, text="设置", bg=theme.GLASS, fg=theme.TEXT,
+                 font=theme.heading_font(15)).pack(side="left")
+        theme.label(head.body, "平台档案 · 模型 · 预算", muted=True,
+                    size=9).pack(side="left", padx=(10, 0))
+
+        # 圆角胶囊页签：选中蓝底白字、未选中白底深字、彼此留空隙（与主界面同一套）
+        nb = theme.TabBar(win, pad=(8, 8))
+        nb.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+
+        def _page(title: str):
+            """建一页：滚动容器 + 白卡片，内容放 card.body（超长自动出滚动条）。"""
+            page = tk.Frame(nb.body, bg=theme.PAGE)
+            sf = theme.ScrollFrame(page, bg=theme.PAGE)
+            # 给滚动容器一个「舒服」的期望尺寸：窗口按它自适应，缩小后自动出滚动条
+            sf.canvas.configure(width=theme.ui_px(540), height=theme.ui_px(300))
+            sf.pack(fill="both", expand=True)
+            card = theme.Card(sf.inner, padding=(18, 16), radius=16)
+            card.pack(fill="x", padx=6, pady=(0, 10))
+            nb.add(page, text=title)
+            body = card.body
+            body.columnconfigure(1, weight=1)
+            return body
+
+        _lb = dict(size=9)
 
         # ---------- 平台档案 ----------
-        t1 = ttk.Frame(nb, padding=10)
-        nb.add(t1, text="平台档案")
-        ttk.Label(t1, text="档案").grid(row=0, column=0, sticky="w", pady=3)
+        t1 = _page("平台档案")
+        theme.label(t1, "档案", **_lb).grid(row=0, column=0, sticky="w", pady=4)
         prof_name = tk.StringVar(value=data.get("active") or "")
-        cb_prof = ttk.Combobox(t1, textvariable=prof_name, state="readonly", width=30)
-        cb_prof.grid(row=0, column=1, sticky="w", pady=3)
+        cb_prof = ttk.Combobox(t1, textvariable=prof_name, state="readonly", width=22)
+        cb_prof.grid(row=0, column=1, sticky="we", pady=4)
         cb_prof["values"] = list(data["profiles"].keys())
-        ttk.Button(t1, text="新建", command=lambda: _new_prof()).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(t1, text="重命名", command=lambda: _rename_prof()).grid(row=0, column=3, padx=(4, 0))
-        ttk.Button(t1, text="删除", command=lambda: _del_prof()).grid(row=0, column=4, padx=(4, 0))
-        ttk.Button(t1, text="恢复", command=lambda: _restore_prof()).grid(row=0, column=5, padx=(4, 0))
+        prof_btns = tk.Frame(t1, bg=theme.CANVAS)
+        prof_btns.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        for _text, _cmdf in (("新建", lambda: _new_prof()),
+                             ("重命名", lambda: _rename_prof()),
+                             ("删除", lambda: _del_prof()),
+                             ("恢复", lambda: _restore_prof())):
+            theme.RoundedButton(prof_btns, text=_text, variant="secondary",
+                                pad_x=10, pad_y=6, command=_cmdf).pack(side="left",
+                                                                       padx=(0, 6))
 
-        ttk.Label(t1, text="MCP 地址").grid(row=1, column=0, sticky="w", pady=3)
+        theme.label(t1, "MCP 地址", **_lb).grid(row=1, column=0, sticky="w", pady=4)
         prof_url = tk.StringVar()
-        ttk.Entry(t1, textvariable=prof_url, width=62).grid(row=1, column=1, columnspan=4, sticky="we", pady=3)
-        ttk.Label(t1, text="Token").grid(row=2, column=0, sticky="w", pady=3)
+        theme.RoundedEntry(t1, textvariable=prof_url).grid(
+            row=1, column=1, columnspan=2, sticky="we", pady=4)
+
+        theme.label(t1, "Token", **_lb).grid(row=2, column=0, sticky="w", pady=4)
         prof_tok = tk.StringVar()
-        ttk.Entry(t1, textvariable=prof_tok, show="*", width=62).grid(row=2, column=1, columnspan=4, sticky="we", pady=3)
+        theme.RoundedEntry(t1, textvariable=prof_tok, show="*").grid(
+            row=2, column=1, columnspan=2, sticky="we", pady=4)
+
         tok_hint = tk.StringVar()
-        ttk.Label(t1, textvariable=tok_hint, foreground="#888").grid(row=3, column=1, columnspan=4, sticky="w")
-        ttk.Label(t1, text="工具名映射（可选 JSON；留空=自动识别。不同平台工具名不一致时再填）",
-                  foreground="#888").grid(row=4, column=1, columnspan=4, sticky="w", pady=(6, 0))
-        prof_tm = tk.Text(t1, height=6, width=62, font=("Consolas", 9))
-        prof_tm.grid(row=5, column=1, columnspan=4, sticky="we", pady=3)
-        ttk.Button(t1, text="自动生成映射…", command=lambda: _gen_map()).grid(
-            row=6, column=1, sticky="w", pady=(2, 0))
-        ttk.Button(t1, text="一键接入（自动识别）", command=lambda: _onboard()).grid(
-            row=6, column=2, columnspan=2, sticky="w", padx=(6, 0), pady=(2, 0))
+        theme.label(t1, textvariable=tok_hint, muted=True,
+                    size=9).grid(row=3, column=1, columnspan=2, sticky="w")
+        theme.label(t1, "工具名映射（可选 JSON；留空=自动识别。不同平台工具名不一致时再填）",
+                    muted=True, size=9).grid(row=4, column=1, columnspan=2,
+                                             sticky="w", pady=(8, 2))
+
+        tm_card = theme.Card(t1, radius=theme.RADIUS_INPUT, padding=(1, 1))
+        tm_card.grid(row=5, column=1, columnspan=2, sticky="we")
+        prof_tm = theme.textbox(tm_card.body, height=6, mono=True, size=9)
+        prof_tm.pack(fill="both", expand=True)
+
+        map_btns = tk.Frame(t1, bg=theme.CANVAS)
+        map_btns.grid(row=6, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        theme.RoundedButton(map_btns, text="自动生成映射…", variant="secondary",
+                            pad_x=12, pad_y=7,
+                            command=lambda: _gen_map()).pack(side="left")
+        theme.RoundedButton(map_btns, text="一键接入（自动识别）", variant="secondary",
+                            pad_x=12, pad_y=7,
+                            command=lambda: _onboard()).pack(side="left", padx=(8, 0))
 
         # ---------- 模型 ----------
-        t2 = ttk.Frame(nb, padding=10)
-        nb.add(t2, text="模型")
+        t2 = _page("模型")
         base = tk.StringVar(value=cur["llm_base_url"])
         model = tk.StringVar(value=cur["model"])
         key = tk.StringVar()
-        ttk.Label(t2, text="API Key").grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Entry(t2, textvariable=key, show="*", width=56).grid(row=0, column=1, sticky="we", pady=3)
-        ttk.Label(t2, text=("已配置，留空则不修改" if cur["llm_api_key_set"] else "未配置，请填写"),
-                  foreground="#888").grid(row=1, column=1, sticky="w")
-        ttk.Label(t2, text="Base URL").grid(row=2, column=0, sticky="w", pady=3)
-        ttk.Entry(t2, textvariable=base, width=56).grid(row=2, column=1, sticky="we", pady=3)
-        ttk.Label(t2, text="模型名").grid(row=3, column=0, sticky="w", pady=3)
-        ttk.Entry(t2, textvariable=model, width=56).grid(row=3, column=1, sticky="we", pady=3)
+        theme.label(t2, "API Key", **_lb).grid(row=0, column=0, sticky="w", pady=4)
+        theme.RoundedEntry(t2, textvariable=key, show="*").grid(
+            row=0, column=1, sticky="we", pady=4)
+        theme.label(t2, "已配置，留空不修改" if cur["llm_api_key_set"] else "未配置，请填写",
+                    muted=True, size=9).grid(row=1, column=1, sticky="w")
+        theme.label(t2, "Base URL", **_lb).grid(row=2, column=0, sticky="w", pady=4)
+        theme.RoundedEntry(t2, textvariable=base).grid(row=2, column=1, sticky="we", pady=4)
+        theme.label(t2, "模型名", **_lb).grid(row=3, column=0, sticky="w", pady=4)
+        theme.RoundedEntry(t2, textvariable=model).grid(row=3, column=1, sticky="we", pady=4)
+        theme.label(t2, "单价在 config/agent.json 的 price_*_per_mtok 配置；配了才会算花费。",
+                    muted=True, size=9).grid(row=4, column=1, sticky="w", pady=(6, 0))
 
         # ---------- 预算 ----------
-        t3 = ttk.Frame(nb, padding=10)
-        nb.add(t3, text="预算")
+        t3 = _page("预算")
         mtok = tk.StringVar(value=cur["max_tokens_per_challenge"])
         mcalls = tk.StringVar(value=cur["max_llm_calls"])
-        ttk.Label(t3, text="单题 token 上限").grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Entry(t3, textvariable=mtok, width=18).grid(row=0, column=1, sticky="w", pady=3)
-        ttk.Label(t3, text="单题调用次数上限").grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Entry(t3, textvariable=mcalls, width=18).grid(row=1, column=1, sticky="w", pady=3)
+        theme.label(t3, "单题 token 上限", **_lb).grid(row=0, column=0, sticky="w", pady=4)
+        theme.RoundedEntry(t3, textvariable=mtok,
+                           width=theme.ui_px(180)).grid(row=0, column=1, sticky="w", pady=4)
+        theme.label(t3, "单题调用次数上限", **_lb).grid(row=1, column=0, sticky="w", pady=4)
+        theme.RoundedEntry(t3, textvariable=mcalls,
+                           width=theme.ui_px(180)).grid(row=1, column=1, sticky="w", pady=4)
+        theme.label(t3, "预算按题累计（跨进程继承）；改小不会退钱，只影响后续开跑。",
+                    muted=True, size=9).grid(row=2, column=1, sticky="w", pady=(6, 0))
 
         def _load_prof_fields(name):
             prof = data["profiles"].get(name) or {}
@@ -1266,19 +1353,21 @@ class App:
             gw = tk.Toplevel(win)
             gw.title("自动生成工具映射")
             gw.transient(win)
-            gw.geometry("780x660")
+            gw.configure(bg=theme.PAGE)
+            gw.geometry(f"{theme.ui_px(720)}x{theme.ui_px(640)}")
+            gw.minsize(theme.ui_px(560), theme.ui_px(480))
             gstatus = tk.StringVar(value="")
             mode_var = tk.StringVar(value="competition")
 
-            ttk.Label(gw, text="① 获取平台工具清单（第一条最准）",
-                      font=("", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+            theme.label(gw, "① 读取平台工具清单（下一步标准化）", size=11,
+                        bold=True).pack(anchor="w", padx=12, pady=(10, 2))
             src_row = ttk.Frame(gw)
             src_row.pack(fill="x", padx=12)
-            gstatus_lbl = ttk.Label(src_row, textvariable=gstatus, foreground="#0a6a9a")
+            gstatus_lbl = theme.label(src_row, textvariable=gstatus, muted=True, size=9)
 
-            ttk.Label(gw, text="工具清单（每行一个；可直接粘贴，或在下面修正）",
-                      foreground="#666").pack(anchor="w", padx=12, pady=(8, 0))
-            names_box = tk.Text(gw, height=8, font=("Consolas", 9))
+            theme.label(gw, "工具清单（每行一个；也可直接粘贴参数名或表格）",
+                        muted=True, size=9).pack(anchor="w", padx=12, pady=(8, 0))
+            names_box = theme.textbox(gw, height=8, mono=True, size=9)
             names_box.pack(fill="both", expand=True, padx=12, pady=(2, 0))
 
             mode_row = ttk.Frame(gw)
@@ -1288,12 +1377,13 @@ class App:
                             value="competition").pack(side="left")
             ttk.Radiobutton(mode_row, text="练习场", variable=mode_var,
                             value="practice").pack(side="left")
-            ttk.Button(mode_row, text="③ 自动分析", command=lambda: _analyze()).pack(
-                side="left", padx=(14, 0))
+            theme.RoundedButton(mode_row, text="③ 自动分析", variant="secondary",
+                                pad_x=12, pad_y=6,
+                                command=lambda: _analyze()).pack(side="left", padx=(14, 0))
 
-            ttk.Label(gw, text="生成的映射（JSON，点「应用」写回档案）",
-                      foreground="#666").pack(anchor="w", padx=12, pady=(8, 0))
-            prev_box = tk.Text(gw, height=10, font=("Consolas", 9))
+            theme.label(gw, "生成的映射（JSON；点「应用」写回档案）",
+                        muted=True, size=9).pack(anchor="w", padx=12, pady=(8, 0))
+            prev_box = theme.textbox(gw, height=10, mono=True, size=9)
             prev_box.pack(fill="both", expand=True, padx=12, pady=(2, 0))
 
             def _set_names(names):
@@ -1421,14 +1511,19 @@ class App:
 
                 gw.after(150, poll)
 
-            ttk.Button(src_row, text="从平台读取（最准）", command=_read_remote).pack(side="left")
-            ttk.Button(src_row, text="选择截图 OCR…", command=_pick_image).pack(side="left", padx=(6, 0))
+            theme.RoundedButton(src_row, text="从平台读取（标准化）", variant="secondary",
+                                pad_x=12, pad_y=7, command=_read_remote).pack(side="left")
+            theme.RoundedButton(src_row, text="选择题图 OCR…", variant="secondary",
+                                pad_x=12, pad_y=7,
+                                command=_pick_image).pack(side="left", padx=(6, 0))
             gstatus_lbl.pack(side="left", padx=(10, 0))
 
             btns = ttk.Frame(gw)
             btns.pack(fill="x", padx=12, pady=(8, 10))
-            ttk.Button(btns, text="应用", command=_apply_map).pack(side="right")
-            ttk.Button(btns, text="取消", command=gw.destroy).pack(side="right", padx=(0, 8))
+            theme.RoundedButton(btns, text="应用", variant="primary", pad_x=18, pad_y=8,
+                                command=_apply_map).pack(side="right")
+            theme.RoundedButton(btns, text="取消", variant="secondary", pad_x=16, pad_y=8,
+                                command=gw.destroy).pack(side="right", padx=(0, 8))
 
         def _onboard():
             """一键接入：读平台契约 → 自动生成映射 → 只读实测 → 体检报告。"""
@@ -1445,11 +1540,13 @@ class App:
             ow = tk.Toplevel(win)
             ow.title("一键接入 · 自动识别")
             ow.transient(win)
-            ow.geometry("780x600")
+            ow.configure(bg=theme.PAGE)
+            ow.geometry(f"{theme.ui_px(720)}x{theme.ui_px(580)}")
+            ow.minsize(theme.ui_px(560), theme.ui_px(440))
             head = tk.StringVar(value="正在连接平台…")
-            ttk.Label(ow, textvariable=head, font=("", 10, "bold")).pack(
+            theme.label(ow, textvariable=head, size=11, bold=True).pack(
                 anchor="w", padx=12, pady=(10, 4))
-            box = tk.Text(ow, font=("Consolas", 9))
+            box = theme.textbox(ow, mono=True, size=9)
             box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
             bar = ttk.Frame(ow)
             bar.pack(fill="x", padx=12, pady=(0, 10))
@@ -1492,8 +1589,12 @@ class App:
                 box.see("end")
                 prof_tm.delete("1.0", "end")
                 prof_tm.insert("1.0", toolmap.mapping_json(report.get("mapping") or {}))
-                ttk.Button(bar, text="保存到档案", command=close_and_save).pack(side="right")
-                ttk.Button(bar, text="关闭", command=ow.destroy).pack(side="right", padx=(0, 8))
+                theme.RoundedButton(bar, text="保存到档案", variant="primary",
+                                    pad_x=18, pad_y=8,
+                                    command=close_and_save).pack(side="right")
+                theme.RoundedButton(bar, text="关闭", variant="secondary",
+                                    pad_x=16, pad_y=8,
+                                    command=ow.destroy).pack(side="right", padx=(0, 8))
 
             def poll():
                 try:
@@ -1519,9 +1620,10 @@ class App:
         _load_prof_fields(prof_name.get() or next(iter(data["profiles"])))
 
         status = tk.StringVar(value="")
-        bf = ttk.Frame(win)
-        bf.pack(fill="x", padx=14, pady=(10, 10))
-        ttk.Label(bf, textvariable=status, foreground="#0a6a9a").pack(side="left")
+        theme.separator(win).pack(fill="x", padx=14, pady=(0, 8))
+        bf = tk.Frame(win, bg=theme.PAGE)
+        bf.pack(fill="x", padx=14, pady=(0, 12))
+        theme.label(bf, textvariable=status, muted=True, size=9).pack(side="left")
 
         def _test():
             import copy
@@ -1580,9 +1682,26 @@ class App:
             self._refresh_profiles()
             messagebox.showinfo("设置", "\n".join(msgs))
 
-        ttk.Button(bf, text="测试连接", command=_test).pack(side="left", padx=(10, 0))
-        ttk.Button(bf, text="取消", command=win.destroy).pack(side="right")
-        ttk.Button(bf, text="保存", command=_save).pack(side="right", padx=(0, 8))
+        theme.RoundedButton(bf, text="测试连接", icon="bolt", variant="secondary",
+                            pad_x=14, pad_y=8,
+                            command=_test).pack(side="left", padx=(12, 0))
+        theme.RoundedButton(bf, text="保存", icon="check", variant="primary",
+                            pad_x=18, pad_y=8, command=_save).pack(side="right")
+        theme.RoundedButton(bf, text="取消", variant="secondary",
+                            pad_x=16, pad_y=8,
+                            command=win.destroy).pack(side="right", padx=(0, 8))
+        # 尺寸自适应：先按内容期望大小算，再夹到屏幕 90%（小屏/高 DPI 都不会超出屏幕）
+        try:
+            win.update_idletasks()
+            req_w = max((p.winfo_reqwidth() for p in nb.tabs()), default=theme.ui_px(540))
+            req_h = max((p.winfo_reqheight() for p in nb.tabs()), default=theme.ui_px(300))
+            f_w = min(int(_sw * 0.90), max(req_w + theme.ui_px(60), theme.ui_px(620)))
+            f_h = min(int(_sh * 0.88), max(req_h + theme.ui_px(150), theme.ui_px(470)))
+            win.geometry(f"{f_w}x{f_h}")
+            win.minsize(theme.ui_px(560), theme.ui_px(420))
+        except (tk.TclError, ValueError):
+            pass
+
 
     # ---------------- 事件循环 ----------------
 
@@ -1596,9 +1715,17 @@ class App:
             self._board_tick()
             self.lbl_elapsed.set(f"耗时：{self._fmt_elapsed()}")
         try:
-            self.root.after(100, self._poll)
+            self._poll_job = self.root.after(100, self._poll)
         except tk.TclError:  # 窗口已销毁（关窗/selftest），别再排队
-            pass
+            self._poll_job = None
+
+    def _cancel_poll(self) -> None:
+        job, self._poll_job = getattr(self, "_poll_job", None), None
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
 
     def _fmt_elapsed(self) -> str:
         s = int(time.monotonic() - self.started_at)
@@ -1680,7 +1807,7 @@ class App:
             if cid and cid in self._board:
                 tok = int((p or {}).get("total_tokens") or 0)
                 cost = (p or {}).get("cost")
-                self._board_set(cid, tokens=tok, cost="-" if cost is None else cost)
+                self._board_set(cid, tokens=tok, cost=self._fmt_cost(cost))
         elif kind == "budget_exhausted":
             self._log(f"{tag}[{_NOW()}] 预算耗尽：{p.get('note') or p}")
             self.bar_tokens["value"] = 1000
@@ -1722,6 +1849,22 @@ class App:
         self.lbl_cost.set("费用：—")
         self.lbl_budget.set("预算：—")
 
+    def _priced(self) -> bool:
+        """有没有配 token 单价（没配时花费恒为 0，显示 - 而不是误导性的 0.0）。"""
+        return bool(getattr(self.config, "price_input_per_mtok", 0.0)
+                    or getattr(self.config, "price_output_per_mtok", 0.0))
+
+    def _fmt_cost(self, cost) -> str:
+        if cost is None:
+            return "-"
+        try:
+            value = float(cost)
+        except (TypeError, ValueError):
+            return "-"
+        if value <= 0 and not self._priced():
+            return "-"
+        return f"{value:.4f}"
+
     def _update_budget(self, b: dict) -> None:
         tok = int(b.get("total_tokens") or 0)
         calls = int(b.get("calls") or 0)
@@ -1733,7 +1876,7 @@ class App:
         self.lbl_tokens.set(f"token 预算：{tok}/{mtok}" if mtok else f"token：{tok}")
         self.lbl_calls.set(f"调用：{calls}/{mcalls}" if mcalls else f"调用：{calls}")
         if cost is not None:
-            self.lbl_cost.set(f"费用：{cost}")
+            self.lbl_cost.set(f"费用：{self._fmt_cost(cost)}")
         self.lbl_budget.set(f"预算：token {tok} / 调用 {calls}")
 
     def _on_done(self, result: dict) -> None:

@@ -109,6 +109,8 @@ def _grab(root, out: Path) -> tuple[int, int, str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--size", default="", help="窗口尺寸，如 1400x940；默认用 App 自己的自适应尺寸")
+    ap.add_argument("--mode", default="", choices=("", "offline", "platform"),
+                    help="启动后切到哪个模式（platform 才能看到题库列表/两个滚动条）")
     ap.add_argument("--out", default=str(ROOT / "runs" / "_gui_preview.png"))
     args = ap.parse_args()
 
@@ -119,6 +121,9 @@ def main() -> int:
     root.attributes("-topmost", True)
     if args.size:
         root.geometry(args.size.replace("X", "x") + "+0+0")
+    if args.mode:
+        application.var_mode.set(args.mode)
+        application._on_mode()
     for _ in range(8):
         root.update()
         time.sleep(0.12)
