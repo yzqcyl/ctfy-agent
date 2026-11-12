@@ -148,8 +148,8 @@ CLI 开放，**不给模型**（防误操作烧配额）。已核对接线无孤
 - 明确不含：Sage、Ghidra/IDA、volatility、浏览器内核、pwndbg（只用 gdb 批处理）、ROPgadget（用 `pwnrop`）；
   GUI 与多平台适配器（见 runbook 红线）。
 - 体积：v7.2 实测 197.7 MB；**v7.3 实测 251.7 MB / 19 层**（门禁 400 MB 有余量；gdb 调试符号比预估的 25 MB 大）。
-  构建证据：run `43215294520`（sha `e454453`）12 步全绿，index digest `sha256:7afd38ed…f2a6c14bde`、
-  amd64 `sha256:c356c0f7…e2d8aaac36`，`tools/verify_image.py` 匿名核验通过。
+  构建证据：run `43217713946`（sha `903dc23`）12 步全绿，index digest `sha256:2700685e…5cd39fa6`、
+  amd64 `sha256:71ce3141…5d6189f32`，`tools/verify_image.py` 匿名核验通过（Entrypoint/User=app/PYTHONPATH 均符合契约）。
 - 镜像内自检（构建日志原文）：`z3 selftest ok 5.4.1`、`ext-libs selftest ok: Crypto 4.4.0 | gmpy2 2.3.2 |
   sympy 1.14.0 | pwntools 4.15.0`、`GNU gdb (Debian 16.3-1) 16.3`、`patchelf 0.18.0`。
 

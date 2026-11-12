@@ -5,16 +5,16 @@
 | 项 | 值 |
 |---|---|
 | 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v7.3` |
-| digest（index） | `sha256:7afd38ed80170196c78be563072447a10f25aa21a4fbf0364716b8f2a6c14bde` |
-| digest（amd64） | `sha256:c356c0f7fc7280b6ed99a71f4b77c1a8df6203ef893760db4c47e5e2d8aaac36` |
-| 构建 | GitHub Actions run `43215294520`（branch `ctfarena/fix`、sha `e454453`）→ 12 步全绿 |
+| digest（index） | `sha256:2700685e7663ddca82888d1216b77070cf40d05e9196ab4a663035c95cd39fa6` |
+| digest（amd64） | `sha256:71ce31416fd007a51e2c117b23d49038743baaf06ff035b856259cc5d6189f32` |
+| 构建 | GitHub Actions run `43217713946`（branch `ctfarena/fix`、sha `903dc23`）→ 12 步全绿（首个 v7.3 构建 run `43215294520` / sha `e454453` 已被本次覆盖：只差外部审计对照的两处代码改动） |
 | 本次变更（相对 v7.2） | ① 补装 **z3-solver 5.4.1**（v7.2 漏装 → 官方镜像里 `z3solve` 必失败）；② apt 装 **gdb 16.3 + patchelf 0.18**（PWN 调试短板）；③ 新增 **`lattice_math.py`**（LLL + Coppersmith 单变量小根）并接线 `rsatool op=lll/coppersmith`（CRYPTO 短板）；④ 修 `smoke_libs` 在无 `tools/pylibs` 的干净检出里误判失败（CI 专属坑） |
 | 单测 | `tests/smoke.py` 180 passed / 0 failed；独立套件（含 `smoke_lattice` 30 项、`smoke_libs`、`smoke_secret_scan` 9 项）全绿；`secret_scan --all` 扫 211 文件干净 |
 | 体积/层数 | 19 层，251.7 MB（平台上限 400 MB） |
 | 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app`（非 root）/ `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` |
 | 匿名拉取 | ✅ token / manifest / config 全 200；`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v7.3` → "平台可匿名拉取，且运行契约符合 CTFY-0001 v2" |
 
-> ### ✅ v7.3 构建必带清单（全部已在 run `43215294520` 日志中核验）
+> ### ✅ v7.3 构建必带清单（全部已在 run `43217713946` 日志中核验）
 > 1. **z3-solver**：日志 `z3 selftest ok 5.4.1`；
 > 2. **gdb + patchelf**：日志 `GNU gdb (Debian 16.3-1) 16.3` / `patchelf 0.18.0`；
 > 3. **格攻击**：`smoke_lattice.py` 在 CI 独立套件步骤 PASS（LLL+Coppersmith 真跑过，不只是 import）；
