@@ -159,7 +159,12 @@ def main() -> int:
     check("默认候选含项目 tools/pylibs", (ROOT / "tools" / "pylibs") in dirs, str(dirs))
     check("候选目录去重", len(dirs) == len(set(map(str, dirs))), str(dirs))
     added = pylibs.ensure_on_path()
-    check("ensure_on_path 返回已挂目录", bool(added) and str((ROOT / "tools" / "pylibs")) in added, str(added))
+    # tools/pylibs 是本机开发外挂（.gitignore 排除，312MB 不进仓库）：CI / 干净检出里不存在，
+    # 此时 ensure_on_path() 返回空是**正确行为**，不能因此判失败（2026-11-12 CI 实测踩过）。
+    if (ROOT / "tools" / "pylibs").is_dir():
+        check("ensure_on_path 返回已挂目录", bool(added) and str((ROOT / "tools" / "pylibs")) in added, str(added))
+    else:
+        check("ensure_on_path 在无外挂目录时安全返回空", added == [], str(added))
     before = list(sys.path)
     pylibs.ensure_on_path()
     check("ensure_on_path 幂等（不重复插入）", list(sys.path) == before)
