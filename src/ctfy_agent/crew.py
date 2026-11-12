@@ -566,6 +566,10 @@ COORDINATOR_PROMPT = """你是 CTF 解题**协调者**。你不亲自探测，�
    其中「载体是对话」（有聊天端点、要诱导助手开口拿值）必派 ai；
    若 agent_defense 题其实是静态陷阱页（只要求翻页面/爬站取 flag），派 web 也可以——防御方法卡会照样进它的题目背景。
    传统 web 漏洞（注入、越权、逻辑、上传）仍派 web。
+- **约束/校验器类题**：rev 的 flag 校验器、crypto 的方程组/模方程，派 rev 或 crypto 并写上
+  「先把比较/约束翻成 SMT-LIB2 交给 z3solve」；pwn 的 ROP 让 pwn 走 pwnrop
+  （checksec → symbols → rop func=system arg_strings=/bin/sh）。这些是 2026-11-12 新接入的
+  外挂库工具（本地 tools/pylibs；缺库时工具会明确提示，不会给错答案）。
    AI 类题**不要拆成「先侦察、再攻击」两段**：每次派活专家都是从零开始的独立上下文，
    重复侦察会把预算吃光。一次就把整条链交给 ai（读文档摸工具面 → 注册/登录 →
    提交带注入的业务输入 → 取回显并摘出目标值），done_when 直接写「拿到 flag 或目标值原文」。

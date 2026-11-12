@@ -21,9 +21,17 @@ pip 解包时必须往自己的临时目录里写 `.whl.metadata` → 直接 `Er
 
 用法
 ----
-    python tools/fetch_pylibs.py                 # 默认装 CRYPTO/PWN 常用集
-    python tools/fetch_pylibs.py pycryptodome z3 # 只装指定包
+    python tools/fetch_pylibs.py                 # 默认装 CRYPTO/PWN 常用集（含 z3-solver / pwntools）
+    python tools/fetch_pylibs.py pycryptodome z3-solver   # 只装指定包
     python tools/fetch_pylibs.py --list          # 看当前已装了什么
+
+装完的库怎么进解题链路
+----------------------
+* `shell()` 子进程：自动挂 PYTHONPATH（tools_local.shell）；
+* agent 进程内工具：`src/ctfy_agent/pylibs.py` 把该目录 append 进 sys.path，
+  新增的 `z3solve` / `pycrypt` / `pwnrop` 就是用这份库（详见 docs/pylibs-bridge.md）。
+注意：Windows 若开了 Smart App Control，会拦未签名 .pyd/.dll（z3 的 libz3.dll、
+pycryptodome 的 _raw_ecb 等），表现为「装了但加载失败」——Linux 镜像无此限制。
 """
 from __future__ import annotations
 
@@ -37,7 +45,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 TARGET = ROOT / "tools" / "pylibs"
 TMPROOT = ROOT / "runs" / "_tmp" / "pylibs-install"
 
-DEFAULT_PACKAGES = ["pycryptodome", "sympy", "gmpy2", "pwntools"]
+DEFAULT_PACKAGES = ["pycryptodome", "sympy", "gmpy2", "pwntools", "z3-solver"]
 
 
 def _patch_tempfile() -> None:

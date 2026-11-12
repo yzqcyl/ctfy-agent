@@ -791,6 +791,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     force_utf8_when_piped()
     args = build_parser().parse_args(argv)
+    # [libs 2026-11-12] 外挂库（tools/pylibs）接进当前进程；不存在时零影响
+    try:
+        from . import pylibs as _pylibs
+
+        _pylibs.ensure_on_path()
+    except Exception:  # noqa: BLE001 - 探测失败不阻断 CLI
+        pass
     handlers = {
         "doctor": cmd_doctor,
         "tools": cmd_tools,

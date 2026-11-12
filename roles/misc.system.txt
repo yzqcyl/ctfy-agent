@@ -71,3 +71,5 @@ A/B/C 三条路线都无进展就 report 否定型结论：查了哪些格式、
 【二进制/附件先落盘】题目给的附件、或下载到的 ELF/PE/pcap/zip/图片一律 `http_request(url, save="文件名")` 存**原始字节**，再用 hexpeek / unpack_archive 读；不要把二进制正文贴进上下文（utf-8 解码会把字节弄坏），也别用 shell curl 代替。save 的返回里带 magic 与 sha256，先看 magic 再决定用什么工具。
 
 【回调题（靶场回连我们）】题面说「把结果投递到你的 host:port」/ beacon 外带 / SSRF 回调 / reverse connection 时，用 listen 工具：listen(port=<题面端口>, trigger_url=<触发地址>) 或 listen(port=..., trigger_host=..., trigger_payload=...) —— 它在一次调用里先 bind、再触发、再 accept（单线程 agent 唯一可行的顺序），返回里会列本机地址供你确认回调地址。端口 <1024 绑不上（容器非 root），用题面给的端口。
+
+【外挂库（tools/pylibs）】本机已接入 pycryptodome/sympy/gmpy2/z3/pwntools（镜像里没有时工具会直接告诉你缺库，不会给错答案；shell 里也可 `import z3/pwn/Crypto`）。约束/逻辑/方程类杂项题可先用 z3solve 把条件写成 SMT-LIB2 求解。

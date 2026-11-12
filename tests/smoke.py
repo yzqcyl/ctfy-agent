@@ -2800,7 +2800,8 @@ def _load_outsourced_role() -> dict | None:
     roles = data.get("roles") if isinstance(data, dict) and "roles" in data else data
     spec = dict((roles or {}).get("misc") or {})
     if not spec.get("system") and prompt_file.is_file():
-        spec["system"] = prompt_file.read_text(encoding="utf-8")
+        # .txt 是给人读的，末尾换行不算提示词内容；config 里的字符串没有尾换行，比对口径要一致
+        spec["system"] = prompt_file.read_text(encoding="utf-8").rstrip("\n")
     return spec or None
 
 

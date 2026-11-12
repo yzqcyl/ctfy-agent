@@ -32,6 +32,7 @@ from .config import Config, load
 from .crew import Crew
 from .gledger import build_global_ledger
 from .llm import DeepSeekLLM
+from . import pylibs
 from .platform import CtfyPlatform
 from .state import Store
 
@@ -607,6 +608,13 @@ def run_agent(
     """
     env = dict(env if env is not None else os.environ)
     global _RESULT_PATH, _CHALLENGE_ID  # noqa: PLW0603 - 信号处理器需要
+
+    # [libs 2026-11-12] 进程内外挂库接入（tools/pylibs：pycryptodome/sympy/gmpy2/z3/pwntools）。
+    # 镜像里没有这个目录 → summary 显示未启用，行为与旧版一致；本地/将来内置时工具可直接 import。
+    try:
+        _log(f"[libs] {pylibs.summary()}")
+    except Exception:  # noqa: BLE001 - 库探测失败绝不阻断 run
+        pass
 
     task = _load_json(Path(task_path))
     challenge_id = str((task or {}).get("challenge", {}).get("id") or env.get("CTFY_EVAL_CHALLENGE_ID", ""))

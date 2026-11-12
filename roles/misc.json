@@ -20,7 +20,8 @@
         "tcp",
         "tcp_batch",
         "netcheck",
-        "listen"
+        "listen",
+        "z3solve"
       ]
     }
   }

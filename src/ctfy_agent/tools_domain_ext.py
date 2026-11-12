@@ -29,6 +29,8 @@ import types  # [rev-toolbox] bytecode 视图：CodeType 判定
 import zlib  # [rev-toolbox] bytecode 视图：PyInstaller/PYZ 的 zlib 载荷
 from pathlib import Path
 
+from . import pylibs as _pylibs  # [libs 2026-11-12] 进程内外挂库（z3/pycryptodome/pwntools）接入
+
 TOOL_TEXT_MAX = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
 # O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
 MAX_READ = 65536
@@ -2295,6 +2297,350 @@ def listen(port: int, bind: str = "", proto: str = "tcp", timeout: float = 30.0,
     return _clip("\n".join([*head, *results]))
 
 
+# ---------------------------------------------------------------- 外挂库工具（z3 / pycryptodome / pwntools）
+# [libs 2026-11-12] 动机：镜像只带 capstone，CRYPTO/PWN 长期解不动，收尾结论反复是
+# 「本地没有库只能纯 stdlib」。tools/fetch_pylibs.py 把 pycryptodome/sympy/gmpy2/z3/pwntools
+# 装到 tools/pylibs（git 忽略、不进镜像），此前只有 shell 子进程能用；这里接进进程内工具面：
+#   z3solve → rev 的 flag 校验器 / crypto 模方程 / pwn 约束（纯 stdlib 做不到，最高价值）
+#   pycrypt → pycryptodome 的 AES-GCM/CFB/OFB、3DES 等（aesblock 只覆盖 ECB/CBC/CTR）
+#   pwnrop  → pwntools 的 ELF checksec / plt-got / ROP 链拼接（不用手拼 p64 链）
+# 缺库时统一抛「怎么装」的可回显错误（不回退成错误结果）；纯 stdlib 工具不受影响。
+
+
+def _z3_value(z3, value) -> str:
+    """把 z3 模型值格式化成「十进制 + hex（+ 可打印预览）」。"""
+    try:
+        if z3.is_int_value(value):
+            num = value.as_long()
+            text = "%d (0x%x)" % (num, num) if num >= 0 else "%d" % num
+            if 0 <= num < (1 << 64):
+                width = max(1, (num.bit_length() + 7) // 8)
+                raw = num.to_bytes(width, "big")
+                printable = "".join(chr(b) if 32 <= b < 127 else "." for b in raw)
+                if any(32 <= b < 127 for b in raw):
+                    text += "  ascii≈%r" % printable
+            return text
+        if z3.is_bv_value(value):
+            num = value.as_long()
+            size = value.size()
+            return "0x%x (%d)  [bv%d]" % (num, num, size)
+        if z3.is_string_value(value):
+            return repr(value.as_string())
+        if z3.is_rational_value(value):
+            return "%s/%s" % (value.numerator_as_long(), value.denominator_as_long())
+        return str(value)
+    except Exception:  # noqa: BLE001 - 模型值格式化失败不该让整次求解失败
+        return str(value)
+
+
+def z3solve(smt2: str = "", vars: str = "", timeout: float = 10.0, count: int = 1) -> str:
+    """用 z3 解 SMT-LIB2 约束（rev flag 校验器 / crypto 模方程 / pwn 约束）。"""
+    z3 = _pylibs.import_or_none("z3")
+    if z3 is None:
+        raise DomainToolError(_pylibs.unavailable_hint("z3-solver", "z3"))
+    text = str(smt2 or "").strip()
+    if not text:
+        raise DomainToolError(
+            "需要 smt2（SMT-LIB2 文本：至少 declare-const + assert；z3py 里 `solver.sexpr()` "
+            "的输出可直接贴）。例：`(declare-const x Int)(assert (= x 7))`")
+    if len(text) > 200_000:
+        raise DomainToolError("smt2 太长（%d 字符 > 200000）：只贴与未知数相关的约束，别把整份反编译结果粘进来" % len(text))
+    try:
+        assertions = z3.parse_smt2_string(text)
+    except z3.Z3Exception as exc:
+        raise DomainToolError("SMT-LIB2 解析失败：%s" % exc)
+    budget = max(1.0, min(float(timeout or 10.0), 30.0))
+    want = max(1, min(_to_int(count, 1, "count"), 5))
+    names = [v.strip() for v in str(vars or "").replace(";", ",").split(",") if v.strip()]
+    solver = z3.Solver()
+    solver.set("timeout", int(budget * 1000))
+    try:
+        solver.add(assertions)
+    except z3.Z3Exception as exc:
+        raise DomainToolError("约束添加失败：%s" % exc)
+
+    out: list[str] = []
+    solutions = 0
+    while solutions < want:
+        result = solver.check()
+        if result == z3.unsat:
+            out.append("unsat（无解）" if solutions == 0 else "枚举 %d 组解后 unsat（没有更多解）" % solutions)
+            break
+        if result == z3.unknown:
+            out.append("unknown（超时/理论不支持）：%s" % (solver.reason_unknown() or "无原因"))
+            break
+        model = solver.model()
+        solutions += 1
+        out.append("解 #%d（sat）：" % solutions)
+        decls = {str(d.name()): d for d in model.decls()}
+        for name in (names or list(decls)):
+            decl = decls.get(name)
+            if decl is None:
+                out.append("  %s = （未出现在模型里；检查 vars 拼写）" % name)
+                continue
+            value = model.eval(z3.Const(name, decl.range()), model_completion=True)
+            out.append("  %s = %s" % (name, _z3_value(z3, value)))
+        # 阻塞当前解继续枚举
+        block = []
+        for name, decl in decls.items():
+            const = z3.Const(name, decl.range())
+            block.append(const != model.eval(const, model_completion=True))
+        if not block:
+            break  # 没有常量可阻塞（纯布尔断言），不可能有第二个不同的解
+        solver.add(z3.Or(*block) if len(block) > 1 else block[0])
+    return _clip("\n".join(out))
+
+
+def _native_guard(what: str, fn):
+    """执行可能触发原生模块加载的调用；被系统策略拦截时转成可回显的工具错误。
+
+    pycryptodome/pwntools 的 .pyd/.dll 在 import 阶段常常不加载、真正 new 对象时才加载，
+    此时 Windows Smart App Control 会抛 WinError 4551 的 OSError——不兜住就会裸穿透到模型层。
+    """
+    try:
+        return fn()
+    except DomainToolError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        hint = _pylibs.blocked_hint(what, exc)
+        if hint:
+            raise DomainToolError(hint)
+        raise
+
+
+def pycrypt(op: str = "aes_encrypt", mode: str = "cbc", key: str = "", data: str = "",
+            iv: str = "", nonce: str = "", aad: str = "", tag: str = "") -> str:
+    """pycryptodome 原语的受控入口（原生库被系统策略拦截时给可操作提示）。"""
+    return _native_guard("pycryptodome", lambda: _pycrypt_impl(
+        op=op, mode=mode, key=key, data=data, iv=iv, nonce=nonce, aad=aad, tag=tag))
+
+
+def _pycrypt_impl(op: str = "aes_encrypt", mode: str = "cbc", key: str = "", data: str = "",
+                  iv: str = "", nonce: str = "", aad: str = "", tag: str = "") -> str:
+    """pycryptodome 原语：AES 的 GCM/CFB/OFB/EAX 模式、3DES（aesblock 之外的补齐）。"""
+    aes_mod = _pylibs.import_or_none("Crypto.Cipher.AES")
+    if aes_mod is None:
+        raise DomainToolError(_pylibs.unavailable_hint("pycryptodome", "Crypto.Cipher.AES"))
+    op = (op or "aes_encrypt").strip().lower()
+    mode = (mode or "cbc").strip().lower()
+    key_b = _hexbytes(key, "key")
+    data_b = _hexbytes(data, "data")
+    if not key_b:
+        raise DomainToolError("需要 key（hex）")
+    if not data_b:
+        raise DomainToolError("需要 data（hex）")
+
+    if op in ("des3_encrypt", "des3_decrypt"):
+        des3_mod = _pylibs.import_or_none("Crypto.Cipher.DES3")
+        if des3_mod is None:
+            raise DomainToolError(_pylibs.unavailable_hint("pycryptodome", "Crypto.Cipher.DES3"))
+        if len(key_b) not in (16, 24):
+            raise DomainToolError("3DES key 需要 16 或 24 字节（hex），当前 %d" % len(key_b))
+        mode = mode if mode in ("ecb", "cbc") else "cbc"
+        iv_b = _hexbytes(iv, "iv")
+        pad_mod = _pylibs.import_or_none("Crypto.Util.Padding")
+        if pad_mod is None:
+            raise DomainToolError(_pylibs.unavailable_hint("pycryptodome", "Crypto.Util.Padding"))
+        if op == "des3_encrypt":
+            payload = pad_mod.pad(data_b, des3_mod.block_size)
+            if mode == "ecb":
+                cipher = des3_mod.new(key_b, des3_mod.MODE_ECB)
+            else:
+                if len(iv_b) != 8:
+                    raise DomainToolError("3DES-CBC 需要 8 字节 IV（hex），当前 %d" % len(iv_b))
+                cipher = des3_mod.new(key_b, des3_mod.MODE_CBC, iv_b)
+            out = cipher.encrypt(payload)
+            return "3DES-%s 加密：%d 字节明文 → %d 字节密文\nhex=%s" % (
+                mode.upper(), len(data_b), len(out), out.hex())
+        if mode == "ecb":
+            cipher = des3_mod.new(key_b, des3_mod.MODE_ECB)
+        else:
+            if len(iv_b) != 8:
+                raise DomainToolError("3DES-CBC 需要 8 字节 IV（hex），当前 %d" % len(iv_b))
+            cipher = des3_mod.new(key_b, des3_mod.MODE_CBC, iv_b)
+        plain = cipher.decrypt(data_b)
+        try:
+            plain = pad_mod.unpad(plain, des3_mod.block_size)
+        except ValueError:
+            pass  # 保留原始明文，下面标注
+        return "3DES-%s 解密：%d 字节密文 → %d 字节明文\nhex=%s\nascii=%s" % (
+            mode.upper(), len(data_b), len(plain), plain.hex(), _ascii_preview(plain, 300))
+
+    if op not in ("aes_encrypt", "aes_decrypt"):
+        raise DomainToolError("未知 op=%r（可用 aes_encrypt/aes_decrypt/des3_encrypt/des3_decrypt）" % op)
+    if len(key_b) not in (16, 24, 32):
+        raise DomainToolError("AES key 需要 16/24/32 字节（hex），当前 %d" % len(key_b))
+    nonce_b = _hexbytes(nonce, "nonce")
+    iv_b = _hexbytes(iv, "iv")
+    aad_b = _hexbytes(aad, "aad")
+    tag_b = _hexbytes(tag, "tag")
+    pad_mod = _pylibs.import_or_none("Crypto.Util.Padding")
+    if pad_mod is None:
+        raise DomainToolError(_pylibs.unavailable_hint("pycryptodome", "Crypto.Util.Padding"))
+
+    def _new_cipher():
+        if mode == "ecb":
+            return aes_mod.new(key_b, aes_mod.MODE_ECB)
+        if mode in ("cbc", "cfb", "ofb", "ctr"):
+            if not iv_b:
+                raise DomainToolError("mode=%s 需要 iv（hex，16 字节）" % mode)
+            table = {
+                "cbc": aes_mod.MODE_CBC, "cfb": aes_mod.MODE_CFB,
+                "ofb": aes_mod.MODE_OFB, "ctr": aes_mod.MODE_CTR,
+            }
+            if mode == "ctr":
+                # pycryptodome 的 CTR 只接受 ≤15 字节 nonce；16 字节就按「完整计数器初值」处理
+                if len(iv_b) == 16:
+                    counter_mod = _pylibs.import_or_none("Crypto.Util.Counter")
+                    if counter_mod is not None:
+                        return aes_mod.new(key_b, aes_mod.MODE_CTR,
+                                           counter=counter_mod.new(128, initial_value=int.from_bytes(iv_b, "big")))
+                if len(iv_b) > 15:
+                    raise DomainToolError("CTR 的 iv 需 ≤15 字节（nonce）或 16 字节（完整计数器初值），当前 %d" % len(iv_b))
+                return aes_mod.new(key_b, table[mode], nonce=iv_b)
+            return aes_mod.new(key_b, table[mode], iv_b)
+        if mode in ("gcm", "eax"):
+            nonce_use = nonce_b or iv_b or b"\x00" * 12
+            table = {"gcm": aes_mod.MODE_GCM, "eax": aes_mod.MODE_EAX}
+            return aes_mod.new(key_b, table[mode], nonce=nonce_use)
+        raise DomainToolError("未知 mode=%r（可用 ecb/cbc/cfb/ofb/ctr/gcm/eax）" % mode)
+
+    if op == "aes_encrypt":
+        cipher = _new_cipher()
+        payload = data_b
+        if mode in ("ecb", "cbc"):
+            payload = pad_mod.pad(data_b, aes_mod.block_size)
+        if mode in ("gcm", "eax"):
+            if aad_b:
+                cipher.update(aad_b)
+            out = cipher.encrypt(payload)
+            tag_out = cipher.digest()
+            return (
+                "AES-%s 加密：%d 字节 → %d 字节\nnonce=%s\nhex=%s\ntag=%s\n"
+                "（解密时把 nonce/tag 原样带回，aad 若用过也要带回）"
+                % (mode.upper(), len(data_b), len(out), (nonce_b or iv_b or b"\x00" * 12).hex(),
+                   out.hex(), tag_out.hex()))
+        out = cipher.encrypt(payload)
+        note = "（已 PKCS7 填充到 %d 字节）" % len(payload) if mode in ("ecb", "cbc") else ""
+        return "AES-%s 加密：%d 字节 → %d 字节%s\nhex=%s" % (
+            mode.upper(), len(data_b), len(out), note, out.hex())
+
+    cipher = _new_cipher()
+    if mode in ("gcm", "eax"):
+        if not tag_b:
+            raise DomainToolError("AEAD 解密需要 tag（hex）")
+        if aad_b:
+            cipher.update(aad_b)
+        try:
+            plain = cipher.decrypt_and_verify(data_b, tag_b)
+        except ValueError as exc:
+            raise DomainToolError("认证失败（key/nonce/tag/aad 不匹配）：%s" % exc)
+        return "AES-%s 解密（认证通过）：%d 字节明文\nhex=%s\nascii=%s" % (
+            mode.upper(), len(plain), plain.hex(), _ascii_preview(plain, 300))
+    plain = cipher.decrypt(data_b)
+    note = ""
+    if mode in ("ecb", "cbc") and pad_mod is not None:
+        try:
+            plain = pad_mod.unpad(plain, aes_mod.block_size)
+        except ValueError:
+            note = "（PKCS7 去填充失败，返回原始明文）"
+    return "AES-%s 解密：%d 字节密文 → %d 字节明文%s\nhex=%s\nascii=%s" % (
+        mode.upper(), len(data_b), len(plain), note, plain.hex(), _ascii_preview(plain, 300))
+
+
+def _pwn_module():
+    """惰性拿 pwntools 顶层模块（缺失返回 None）。"""
+    return _pylibs.import_or_none("pwn")
+
+
+def pwnrop(path: str = "", op: str = "rop", func: str = "", args: str = "",
+           arg_strings: str = "", filt: str = "", limit: int = 40) -> str:
+    """pwntools ELF/ROP 的受控入口（原生库被系统策略拦截时给可操作提示）。"""
+    return _native_guard("pwntools", lambda: _pwnrop_impl(
+        path=path, op=op, func=func, args=args,
+        arg_strings=arg_strings, filt=filt, limit=limit))
+
+
+def _pwnrop_impl(path: str = "", op: str = "rop", func: str = "", args: str = "",
+                 arg_strings: str = "", filt: str = "", limit: int = 40) -> str:
+    """pwntools：ELF checksec / plt-got / ROP gadget 搜索 / 自动拼 ROP 链。"""
+    pwn = _pwn_module()
+    if pwn is None:
+        raise DomainToolError(_pylibs.unavailable_hint("pwntools", "pwn"))
+    p = Path(path or "")
+    if not path or not p.exists():
+        raise DomainToolError("文件不存在：%s（先用 download_*_attachment 落盘到沙盒）" % path)
+    op = (op or "rop").strip().lower()
+    try:
+        pwn.context.log_level = "error"
+        elf = pwn.ELF(str(p), checksec=False)
+    except Exception as exc:  # noqa: BLE001 - 非 ELF/解析失败都回显
+        raise DomainToolError("ELF 解析失败：%s" % exc)
+    lim = max(1, min(_to_int(limit, 40, "limit"), 200))
+
+    if op == "checksec":
+        return _clip("ELF：%s\n%s" % (p, "\n".join(
+            line for line in str(elf.checksec()).splitlines() if line.strip())))
+    if op == "symbols":
+        rows = []
+        for name, addr in sorted(elf.plt.items()):
+            rows.append("plt  %-28s 0x%x" % (name, addr))
+        for name, addr in sorted(elf.got.items()):
+            rows.append("got  %-28s 0x%x" % (name, addr))
+        for name, addr in sorted(elf.symbols.items()):
+            if name in elf.plt or name.startswith("_"):
+                continue
+            rows.append("sym  %-28s 0x%x" % (name, addr))
+        if not rows:
+            return "没有可枚举的符号（静态链接/去符号）"
+        return _clip("符号 %d 条（前 %d）：\n%s" % (len(rows), lim, "\n".join(rows[:lim])))
+    if op == "gadgets":
+        rop = pwn.ROP(elf)
+        filters = [f.strip() for f in str(filt or "").replace(";", ",").split(",") if f.strip()]
+        lines = []
+        for gadget in rop.gadgets.values():
+            insns = "; ".join(gadget.insns)
+            if filters and not any(f in insns for f in filters):
+                continue
+            lines.append("0x%x  %s" % (gadget.address, insns))
+            if len(lines) >= lim:
+                break
+        if not lines:
+            return "没有匹配的 gadget（filt=%r；可留空列出前 %d 个）" % (filt, lim)
+        return _clip("gadget %d 个：\n%s" % (len(lines), "\n".join(lines)))
+    if op == "rop":
+        target = str(func or "").strip()
+        if not target:
+            raise DomainToolError("op=rop 需要 func（如 system / execve / win）")
+        argv: list[int] = []
+        for token in str(args or "").replace(";", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                argv.append(int(token, 0))
+            except ValueError:
+                raise DomainToolError("args 里的 %r 不是整数（0x 前缀可）" % token)
+        for token in str(arg_strings or "").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            addr = next(elf.search(token.encode()), None)
+            if addr is None:
+                raise DomainToolError("ELF 里找不到字符串 %r" % token)
+            argv.append(int(addr))
+        try:
+            rop = pwn.ROP(elf)
+            rop.call(target, argv)
+        except Exception as exc:  # noqa: BLE001 - 符号缺失/链拼不出来都回显
+            raise DomainToolError("ROP 链拼接失败：%s（检查 func/参数个数/PIE；PIE 需先拿到基址）" % exc)
+        chain = rop.chain()
+        return _clip(
+            "ROP 链 %d 字节（%d 个 gadget）：\nhex=%s\n%s"
+            % (len(chain), len(rop.gadgets), chain.hex(), str(rop.dump())[:2000]))
+    raise DomainToolError("未知 op=%r（可用 checksec/symbols/gadgets/rop）" % op)
+
+
 # ---------------------------------------------------------------- 规格与分发
 
 
@@ -2545,6 +2891,88 @@ PRNG_SPEC = {
 }
 # <<< [crypto-toolbox 2026-10-30]
 
+# [libs 2026-11-12] 外挂库工具（z3 / pycryptodome / pwntools）：缺库时给「怎么装」的可回显错误。
+Z3SOLVE_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "z3solve",
+        "description": (
+            "用 z3 求解 SMT-LIB2 约束 —— rev 的 flag 校验器、crypto 的模方程、pwn 的约束都靠它。"
+            "smt2 直接贴 SMT-LIB2 文本（z3py 里 `print(solver.sexpr())` 的输出可整段复制）；"
+            "vars 用逗号列出要看的变量（留空=模型里全部）；count>1 可枚举多组解（同一约束的不同候选）。"
+            "本机无 z3 时按提示装（tools/pylibs），不会退回错误答案。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "smt2": {"type": "string",
+                         "description": "SMT-LIB2 全文：declare-const/declare-fun + assert；"
+                                        "如 `(declare-const x Int)(assert (= (+ x 3) 10))`"},
+                "vars": {"type": "string", "description": "要输出的变量名，逗号分隔（默认模型全部）"},
+                "timeout": {"type": "number", "description": "求解超时秒（默认 10，上限 30）"},
+                "count": {"type": "integer", "description": "枚举解的个数（默认 1，上限 5）"},
+            },
+            "required": ["smt2"],
+        },
+    },
+}
+
+PYCRYPT_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "pycrypt",
+        "description": (
+            "pycryptodome 原语（补齐 aesblock 没有的模式）：op=aes_encrypt/aes_decrypt，"
+            "mode=ecb/cbc/cfb/ofb/ctr/gcm/eax（gcm/eax 会自动产出/校验 tag，aad 可选，"
+            "ecb/cbc 自动 PKCS7）；op=des3_encrypt/des3_decrypt（mode ecb/cbc）。"
+            "key/data/iv/nonce/aad/tag 都是 hex。缺库时提示安装路径。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string",
+                       "enum": ["aes_encrypt", "aes_decrypt", "des3_encrypt", "des3_decrypt"]},
+                "mode": {"type": "string",
+                         "enum": ["ecb", "cbc", "cfb", "ofb", "ctr", "gcm", "eax"],
+                         "description": "默认 cbc；gcm/eax 走 AEAD（tag）"},
+                "key": {"type": "string", "description": "key（hex；AES 16/24/32 字节，3DES 16/24）"},
+                "data": {"type": "string", "description": "输入数据（hex）：加密=明文，解密=密文"},
+                "iv": {"type": "string", "description": "CBC/CFB/OFB 的 IV 或 CTR 的 nonce（hex）"},
+                "nonce": {"type": "string", "description": "GCM/EAX 的 nonce（hex；不给则 iv 或全零 12 字节）"},
+                "aad": {"type": "string", "description": "GCM/EAX 附加认证数据（hex，可选）"},
+                "tag": {"type": "string", "description": "GCM/EAX 解密所需的 tag（hex）"},
+            },
+            "required": ["op", "key", "data"],
+        },
+    },
+}
+
+PWNROP_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "pwnrop",
+        "description": (
+            "pwntools 的 ELF/ROP 工具：op=checksec（PIE/NX/canary/RELRO）、symbols（plt/got/函数地址）、"
+            "gadgets（filt 过滤指令序列，如 \"pop rdi; ret\"）、rop（按 func + args 自动拼 ROP 链并给 hex）。"
+            "rop 示例：func=system, arg_strings=/bin/sh → 直接得到调 system('/bin/sh') 的链。"
+            "PIE 程序先 leak 基址再用（本工具只给链，不含交互）。缺库时提示安装路径。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "ELF 文件路径（沙盒内）"},
+                "op": {"type": "string", "enum": ["checksec", "symbols", "gadgets", "rop"]},
+                "func": {"type": "string", "description": "op=rop：要调用的函数名（system/execve/后门函数名）"},
+                "args": {"type": "string", "description": "op=rop：整数参数，逗号分隔（支持 0x 前缀）"},
+                "arg_strings": {"type": "string", "description": "op=rop：要在 ELF 里搜索的字符串参数（逗号分隔，如 /bin/sh）"},
+                "filt": {"type": "string", "description": "op=gadgets：指令过滤（逗号分隔子串）"},
+                "limit": {"type": "integer", "description": "最多输出条数（默认 40，上限 200）"},
+            },
+            "required": ["path", "op"],
+        },
+    },
+}
+
 LISTEN_SPEC = {
     "type": "function",
     "function": {
@@ -2586,7 +3014,8 @@ LISTEN_SPEC = {
 }
 
 DOMAIN_SPECS = [TCP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC, PWNGEN_SPEC, PWNFIND_SPEC,
-                RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC, LISTEN_SPEC]
+                RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC, LISTEN_SPEC,
+                Z3SOLVE_SPEC, PYCRYPT_SPEC, PWNROP_SPEC]
 
 DOMAIN_NAMES = {s["function"]["name"] for s in DOMAIN_SPECS}
 
@@ -2700,6 +3129,31 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
                 trigger_port=_to_int(args.get("trigger_port"), 0, "trigger_port"),
                 trigger_payload=str(args.get("trigger_payload") or ""),
                 trigger_hex=bool(args.get("trigger_hex", False)),
+            )
+        if name == "z3solve":  # [libs 2026-11-12]
+            return z3solve(
+                smt2=str(args.get("smt2") or ""),
+                vars=str(args.get("vars") or ""),
+                timeout=_to_float(args.get("timeout"), 10.0, "timeout"),
+                count=_to_int(args.get("count"), 1, "count"),
+            )
+        if name == "pycrypt":  # [libs 2026-11-12]
+            return pycrypt(
+                op=str(args.get("op") or "aes_encrypt"),
+                mode=str(args.get("mode") or "cbc"),
+                key=str(args.get("key") or ""), data=str(args.get("data") or ""),
+                iv=str(args.get("iv") or ""), nonce=str(args.get("nonce") or ""),
+                aad=str(args.get("aad") or ""), tag=str(args.get("tag") or ""),
+            )
+        if name == "pwnrop":  # [libs 2026-11-12]
+            return pwnrop(
+                path=str(args.get("path") or ""),
+                op=str(args.get("op") or "rop"),
+                func=str(args.get("func") or ""),
+                args=str(args.get("args") or ""),
+                arg_strings=str(args.get("arg_strings") or ""),
+                filt=str(args.get("filt") or ""),
+                limit=_to_int(args.get("limit"), 40, "limit"),
             )
     except DomainToolError as exc:
         _fail(str(exc))

@@ -8,7 +8,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `src/ctfy_agent/tools_domain_ext.py` | 5 个工具：`tcp` / `tcp_batch` / `elfpeek` / `netcheck` / `listen`（纯 stdlib） |
+| `src/ctfy_agent/tools_domain_ext.py` | 8 个工具：`tcp` / `tcp_batch` / `elfpeek` / `netcheck` / `listen`（纯 stdlib）+ `z3solve` / `pycrypt` / `pwnrop`（外挂库，见 `docs/pylibs-bridge.md`） |
 
 ## 工具说明
 
@@ -19,6 +19,9 @@
 | `elfpeek(path, view, min_len, limit)` | 纯 stdlib ELF 解析：`info`（架构/入口/PIE/NX/canary/RELRO）/`sections`/`symbols`/`strings`/`gadgets` | pwn 偏移与缓解、reverse 静态 |
 | `netcheck(host, port)` | DNS 是否解析 + TCP 是否可连；`*.internal` 解析失败时明确提示「VPN 隧道未接入」 | pwn/crypto 连不上时先诊断，避免盲目重试烧预算 |
 | `listen(port, bind, proto, timeout, max_conns, reply, send_first, trigger_url, trigger_host, …)` | 本地起监听等靶场**主动回连**，取回它发来的数据；可选**先 bind 再触发**（`trigger_url` / `trigger_host`）后 accept，解决单线程 agent 做不了「后台监听」的顺序问题；返回里列出本机 IP | beacon 外带 / SSRF 回调 / reverse connection / 「把结果投递到你的 host:port」类题 |
+| `z3solve(smt2, vars, timeout, count)` | z3 解 SMT-LIB2 约束（`count>1` 枚举多解，`vars` 过滤输出）；缺 z3 时明确提示安装 | rev 的 flag 校验器、crypto 模方程/多变量约束、字节级比较 |
+| `pycrypt(op, mode, key, data, iv, nonce, aad, tag)` | pycryptodome：AES 的 `gcm/eax/cfb/ofb`（AEAD 自动出/验 tag）、`des3_*`；补齐 `aesblock` 只有 ECB/CBC/CTR 的缺口 | AES-GCM 认证加密、3DES、CBC 变体 |
+| `pwnrop(path, op, func, args, arg_strings, filt, limit)` | pwntools：`checksec` / `symbols`（plt+got）/ `gadgets` / `rop`（`func=system, arg_strings=/bin/sh` 直接出链 hex） | pwn 缓解判断、地址泄漏后的 ROP 链拼装 |
 
 ### `listen` 的由来（2026-11-12）
 
@@ -37,9 +40,11 @@ SAMPLE-024 是「靶场回连我们」的题型（beacon 把 flag 投递到 `ctf
 - 分发放行：`LocalTools.call()` 对 `DOMAIN_NAMES` 走 `_call_domain_tool()`（`tools_local.py`），
   先做**沙盒路径锚定**与**实例端点白名单校验**（复用 `allowed_hosts/allowed_endpoints`，与 `http_request` 同一套合规），
   再交给 `tools_domain_ext.call_domain()`。
-- 角色授权（`config/agent.json`）：`rev.local += [elfpeek, tcp, tcp_batch, netcheck, listen]`；`crypto.local += [tcp, tcp_batch, netcheck, listen]`；
-  `pwn.local += [pwngen, pwnfind, tcp, tcp_batch, netcheck, listen]`；`misc.local += [tcp, tcp_batch, netcheck, listen]`；
-  `web.local += [listen]`（SSRF 回调）。ai/coordinator 不可见（门禁断言已覆盖）。
+- 角色授权（`config/agent.json`）：`rev.local += [elfpeek, tcp, tcp_batch, netcheck, listen, z3solve]`；
+  `crypto.local += [tcp, tcp_batch, netcheck, listen, z3solve, pycrypt]`；
+  `pwn.local += [pwngen, pwnfind, tcp, tcp_batch, netcheck, listen, z3solve, pwnrop]`；
+  `misc.local += [tcp, tcp_batch, netcheck, listen, z3solve]`；`web.local += [listen]`（SSRF 回调）。
+  ai/coordinator 不可见（门禁断言已覆盖）。
 
 ## 验收
 
