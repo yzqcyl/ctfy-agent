@@ -4,8 +4,10 @@
 
 背景
 ----
-镜像只装了 capstone（`Dockerfile` 有意不动）。pycryptodome / sympy / gmpy2 / z3 /
-pwntools 由 `tools/fetch_pylibs.py` 装到 `tools/pylibs/`（git 忽略、不进镜像）。
+镜像（v7 起）已内置 capstone + pwntools / pycryptodome / gmpy2 / sympy（pip 装 site-packages），
+2026-11-12 又补了 z3-solver；所以**线上镜像里这些库直接 import 即可**，本模块在线上是
+「有则用、无则静默退回」的兜底。本机 Windows 开发环境不方便装进系统 Python，由
+`tools/fetch_pylibs.py` 把同一批库装到 `tools/pylibs/`（git 忽略、不进镜像）。
 在此之前只有 `shell()` 子进程会把该目录塞进 `PYTHONPATH`（`tools_local.py`），
 **进程内工具看不到**——所以 z3/ROP/大整数只能靠 shell 里现写脚本，还常被引号守卫拦。
 

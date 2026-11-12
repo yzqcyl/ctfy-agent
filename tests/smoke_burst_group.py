@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """smoke_burst_group.py — O2' 验收：http_burst 分组前归一化（消 payload 回显碎片）。
 
-规格：docs/spec-o2-o3-tools.md §2.3（5 条验收）。全部离线：127.0.0.1 小服务 + 计数。
+规格：docs/archive/spec-o2-o3-tools.md §2.3（5 条验收）。全部离线：127.0.0.1 小服务 + 计数。
 运行: python tests/smoke_burst_group.py
 """
 from __future__ import annotations

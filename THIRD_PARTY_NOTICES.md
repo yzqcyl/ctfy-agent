@@ -68,7 +68,7 @@ Apache-2.0 全文：https://www.apache.org/licenses/LICENSE-2.0
 | 安装位置 | `site-packages/capstone/`，随 wheel 打包 `libcapstone` |
 | 使用方式 | 仅由 `tools_domain_ext._capstone_for()` 经 `importlib` 动态加载，供 `elfpeek view=disasm/gadgets` 使用 |
 
-**为什么引入**：`docs/rev-toolbox-plan.md` 的 R2 项（v4 重建时漏做）；不装则 `disasm` 只能退化
+**为什么引入**：`docs/archive/rev-toolbox-plan.md` 的 R2 项（v4 重建时漏做）；不装则 `disasm` 只能退化
 成字节视图，而 rev/pwn 角色提示词按「镜像含 capstone」写，两者不一致会白烧步数。
 
 **义务**：BSD-3-Clause 要求保留版权声明、许可全文、不得用作者名义背书。本仓库附
@@ -93,7 +93,7 @@ stdlib 退化路径（永不 `ImportError`）。因此本地 `python tests/smoke
 - `ctf-forge`（AGPL-3.0，作者私有仓库）：仅借鉴**机制思路**（实例池清扫、有界输出收割、墙钟预算、
   输入指纹、隔离自检），**未复制任何源码/注释/文档原文**。因此本仓库不因之受 AGPL 约束。
 - 开源 agent 的机制调研（Cybench / HackSynth / PentestGPT / D-CIPHER / EnIGMA）见
-  `PROGRESS.md §3.5`，同样只借鉴思路。
+  `docs/archive/PROGRESS-2026-11-10.md §3.5`，同样只借鉴思路。
 
 ---
 

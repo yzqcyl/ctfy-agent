@@ -9,7 +9,7 @@
   3. 日志一律走 stderr，stdout 最多留一行最终 rollup JSON（用户镜像的 stdout 本就不被读，
      只当本地调试用）。
 
-关键决策（与草稿 b1-adapter-plan 的差别见 docs/b1-adapter-plan.md 附注）：
+关键决策（与草稿 b1-adapter-plan 的差别见 docs/archive/b1-adapter-plan.md 附注）：
   - 容器内**永不自己 stop_instance**：平台注入 `CTFY_EVAL_KEEP_INSTANCE=1`，dispatcher 回收。
   - `solved` 是**题目 id 列表**，`answers` 才是平台代交通道；两者都只写已校验的答案。
   - flavor 未知时 fail loudly：非 `openai` 一律 `refused`，不烧钱。

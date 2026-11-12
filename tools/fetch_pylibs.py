@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 """fetch_pylibs.py — 把这些依赖装进工作区私有目录 tools/pylibs/（不进 git、不改运行时装机）。
 
-为什么需要（2026-11-10 接手核实）
-----------------------------------
-镜像（Dockerfile）只装了 capstone，**没有** pycryptodome / gmpy2 / sympy / pwntools / z3。
+为什么需要（2026-11-10 接手核实，2026-11-12 更新）
+--------------------------------------------------
+v6 镜像（Dockerfile）只装了 capstone，**没有** pycryptodome / gmpy2 / sympy / pwntools / z3，
 于是 runs/plat 26 题里 CRYPTO 0/5、PWN 0/4，收尾结论反复是「本地没有库，只能纯 stdlib」。
-平台赛镜像不该动（改镜像要重新出包），但**本地 GUI/CLI 跑**可以外挂一份只在工作区里的库：
+v7 镜像已用 pip 内置 pwntools/pycryptodome/gmpy2/sympy/capstone，2026-11-12 又补了 z3-solver
+（见 Dockerfile L194–231），**线上镜像不再需要这份外挂**。本脚本现在的用途是：给**本机
+Windows 开发/本机 GUI/CLI 跑**补同一批库（本机不方便装进系统 Python）：
   * 只写 tools/pylibs/（git 忽略，二进制不该进 git）；
   * shell() 子进程会把该目录加进 PYTHONPATH（tools_local.shell）；
-  * 容器里没有这个目录 → 自动退回「纯 stdlib」，与旧行为一致。
+  * 容器里没有这个目录 → 自动退回 site-packages / 纯 stdlib，与旧行为一致。
 
 本机为什么不能直接 pip install
 -----------------------------

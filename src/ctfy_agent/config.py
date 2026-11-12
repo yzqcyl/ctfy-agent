@@ -24,7 +24,7 @@ DEFAULTS = {
     "timeout": 120.0,
     # 握手（initialize / tools/list / notify）专用超时：容器连 ctfy.io 会 TLS/SSE 挂死，
     # 用短超时让「平台恢复后被 1 分钟内重连」；tools/call 与 LLM 仍走 timeout（长）。实测 submit 单次 242s，
-    # 故 timeout 在容器侧抬到 240s。参见 docs/pending-fixes-2026-11-09.md P1。
+    # 故 timeout 在容器侧抬到 240s。参见 docs/archive/pending-fixes-2026-11-09.md P1。
     "connect_timeout": 40.0,
     # MCP 建连总等待窗口（秒）：平台整机故障时能兜 60–90 分钟（SAMPLE-001/002 靠熬过去才解出）。
     "connect_deadline": 5400.0,

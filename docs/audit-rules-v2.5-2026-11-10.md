@@ -13,7 +13,7 @@
 |---|---|---|---|---|---|
 | 1 | **P0** | 完全没有出题（authoring）能力 | §二(二)(四)(六)（P2/P3） | 代码 0 实现；`run_mode` 未知值已降级不再弃权 | **待做**（11/15 后窗口） |
 | 2 | **P0** | 正式赛智谱 1B token 总量，无全局账本 | §二(五)（P3） | 只有单题 `max_tokens_per_challenge=800k` | **已修**（2026-11-12 `gledger.py`，见 §3 状态更新） |
-| 3 | P1 | 晋级口径（**30** 支）与首关 **11/14** 记错 | §二(一)（P2） | `PROGRESS.md` 时间线已改对 | **已修**（`241c845`） |
+| 3 | P1 | 晋级口径（**30** 支）与首关 **11/14** 记错 | §二(一)（P2） | `docs/archive/PROGRESS-2026-11-10.md` 时间线已改对 | **已修**（`241c845`） |
 | 4 | P1 | 切智谱时 `enable_thinking` 字段外发可能 400 | §二(五)（P3） | 只对 `*.aliyuncs.com` 端点发送 | **已修**（`241c845`） |
 | 5 | P1 | 双赛道报名冲突未核实 | §二(二)/§五(一)（P1/P6） | 仓库无记录 | **需人工**（今晚 5 分钟） |
 | 6 | P1 | 正式赛 LLM 注入失败 = 整场报废（回落链路会打百炼） | §二(五)（P3） | 平台不注入 `LLM_*` 时回落 agent.json 的 DashScope | **待做**（开跑前核查 + 告警） |
@@ -62,7 +62,7 @@
 
 出题基础镜像白名单（§二(五) P5，部署必须从中选）：`python:2.7.18-slim`、`python:3.12-slim-bookworm`、`node:22-bookworm-slim`、`node:24-bookworm-slim`、`php:5.6-apache`、`php:7.4-apache`、`php:8.3-apache`、`nginx:stable-alpine`、`eclipse-temurin:17-jdk`、`eclipse-temurin:8-jdk`、`golang:1.25-bookworm`、`ubuntu:24.04`、`alpine:3.22`。
 
-### 1.4 平台实测（2026-11-10 21:20，`PROGRESS.md` §2 同源）
+### 1.4 平台实测（2026-11-10 21:20，`docs/archive/PROGRESS-2026-11-10.md` §2 同源）
 
 赛事 id `c0d8b4e3dd3b42c095d63d7dfa66431f`；sessions 三段各 10h、段末 `session_end_mode=delete`+900s 宽限；`internet_policy=deny`；`flag_prefix=FLAG`；`expects_report=false`；`max_instances_per_team_effective=3`（CTFARENA 练习套=1）；MCP `https://ctfy.tsinghua.edu.cn/api/v1/mcp/`（97 tools，出题工具族 23 个见 `docs/mcp-tools.json`）。
 
@@ -215,7 +215,7 @@
 
 | 项 | 改动 | 回归 |
 |---|---|---|
-| #3 晋级口径 | `PROGRESS.md` 时间线/名额改对 | 文档 |
+| #3 晋级口径 | `docs/archive/PROGRESS-2026-11-10.md` 时间线/名额改对 | 文档 |
 | #4 智谱字段 | `llm.py`：`enable_thinking` 仅 `*.aliyuncs.com` 发送 | `smoke_llm_retry` 绿 |
 | #8 oracle 上限 | `config/agent.json`：300→100 | `smoke.py` 175/0 |
 | #1 止损 | `agent_main.py`：未知/空 `run_mode` 降级按 instance 跑并记 `degraded_run_mode` | `smoke.py` 175/0 |

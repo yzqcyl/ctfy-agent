@@ -19,7 +19,7 @@
   - attempt_cap（本次尝试切片用尽、题级还有配额）→ near_miss（尾步近目标）/ retryable
   - env_bound/capability_gap tag → hopeless（环境/能力硬缺口，不白烧钱）
 
-设计依据：[docs/plan-concurrency.md](../docs/plan-concurrency.md)；spec-by-example：runs/_clusterb_fixtures.py
+设计依据：[docs/archive/plan-concurrency.md](../docs/archive/plan-concurrency.md)；spec-by-example：runs/_clusterb_fixtures.py
 纪律：本模块 0 LLM、0 平台调用、0 文件写（除 __main__ 自检的 stdout）。
 
 安全红线（调用方必须遵守，本模块只负责约定）：

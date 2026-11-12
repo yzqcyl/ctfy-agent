@@ -14,12 +14,21 @@
 | 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app`（非 root）/ `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` / `LLM_ENABLE_THINKING=0` |
 | 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v7.2`） |
 
+> ### ⚠️ v7.3 重建必带（2026-11-12 发现并已改 Dockerfile，待下次构建生效）
+> **v7.2 漏装 z3-solver**：`z3solve` 工具自 2026-11-12 上线并被 rev/crypto/pwn/misc 四个角色派发，
+> 但 v7.2 镜像只装了 pwntools/pycryptodome/gmpy2/sympy/capstone → 官方镜像里 `import z3` 必失败、
+> `z3solve` 恒报缺库（本机靠 `tools/pylibs` 外挂所以一直没暴露）。
+> 已修：`Dockerfile` 增加 `Z3_VERSION=5.4.1.0` + sha256 锁安装 + 求解式 selftest（x>3∧x<5→4），
+> 镜像约 +21MB（~220MB，仍低于 400MB 门禁）。**重建后必须确认构建日志出现 `z3 selftest ok`。**
+
 > ### 🚫 范围红线（用户 2026-11-12 定，之后每次重建都必须遵守）
 > 提交镜像**不得打包**两类内容：
 > 1. **可视化界面**：`src/ctfy_agent/gui/` 下的 `app.py / worker.py / settings.py / limits.py / onboard.py`；
-> 2. **跨平台连接**：多平台档案与适配器 `gui/platform_adapter.py`、`gui/platform_worker.py`、`gui/profiles.py`、`gui/toolmap.py`，以及本机 Windows↔WSL 的开发脚手架 `tools/fetch_pylibs.py`、`tests/_libs_linux_probe.py`（这些本就不随 `COPY src/` 进入镜像）。
+> 2. **多平台连接适配器**：`gui/platform_adapter.py`、`gui/platform_worker.py`、`gui/profiles.py`、`gui/toolmap.py`（「切到其他平台」的档案与适配器）。
 >
-> 当前 v7.2 **已满足**：`.dockerignore` L18–22 整包排除 `src/ctfy_agent/gui/`，`Dockerfile` L251–259 有构建期断言（`find_spec('ctfy_agent.gui') is None`，误加回即构建失败）。`pylibs.py` 里的「WSL/跨平台」只出现在*用户提示文案*里，无 subprocess/外连，可随 src/ 入镜像。
+> ✅ **允许进镜像**：本机 Windows↔WSL 的**跨平台库连接能力**（`pylibs.py` 的 `CTFY_PYLIBS`/`CTFY_PYLIBS_STRICT` 路径搜索、`tools/fetch_pylibs.py` 取库脚本、Linux 侧库目录约定）。镜像本身是 Linux，这些能力不外连、不依赖 host，属于允许保留的通用能力（用户 2026-11-12 确认「2 可以进」）。
+>
+> 当前 v7.2 **已满足**：`.dockerignore` L18–22 整包排除 `src/ctfy_agent/gui/`，`Dockerfile` L251–259 有构建期断言（`find_spec('ctfy_agent.gui') is None`，误加回即构建失败）。`tools/` 与 `tests/` 本就不随 `COPY src/` 进入镜像，无需额外处理。
 
 ---
 
@@ -53,7 +62,7 @@
 | digest | `sha256:183e0d1ec8d28c7305ce9f3d79d02816133f31d3b79bcb8f7335dd398e26aab9` |
 | 构建 | GitHub Actions run `41656534124`（branch `v3`、sha `2b381c1`）→ **14 步全绿** |
 | 本次变更 | ① 单题预算统一 **800k token**（agent.json / config.DEFAULTS / `_build_config` 三处此前打架，生效值本是硬写的 800k）；② **提高步数**：协调者 14→**24 轮**、web/ai/rev/crypto/pwn 14→**20 步**、misc 10→**16 步**；③ 提示词只改步数行（总步数+各阶段分配），方法/工具面/流程/安全底线未动；④ `roles/*.json`、`roles/*.system.txt`、`config/agent.json` 三处同步 |
-| 依据 | 官方规则提取件确认**平台不规定步数上限**：`docs/report-ctfy-rules.md:143/227/342`（`task.json.max_turns` 是预算，`null`=不限）、`qa-official-2026-10-28.md:20`（只有「并发 ≤ 3」）。v6.1 实测瓶颈是自定的 14 轮（SAMPLE-011 在 24 turns 撞 `step_limit`，token 仅用 22.9k/800k）|
+| 依据 | 官方规则提取件确认**平台不规定步数上限**：`docs/archive/report-ctfy-rules.md:143/227/342`（`task.json.max_turns` 是预算，`null`=不限）、`qa-official-2026-10-28.md:20`（只有「并发 ≤ 3」）。v6.1 实测瓶颈是自定的 14 轮（SAMPLE-011 在 24 turns 撞 `step_limit`，token 仅用 22.9k/800k）|
 | 单测 | `tests/smoke.py` **167 passed / 0 failed**；全部 35 个 `tests/smoke_*.py` 全绿（`PYTHONPATH=src`）|
 | 体积/层数 | 17 层，匿名传输 **62.7 MB** |
 | 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app` / `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` |
@@ -109,7 +118,7 @@
 
 ### 下一步（浏览器，人工）
 
-> **逐屏操作单（含预期结果与失败排查）：[docs/platform-submit-opsheet.md](platform-submit-opsheet.md)**
+> **逐屏操作单（含预期结果与失败排查）：[docs/archive/platform-submit-opsheet.md](platform-submit-opsheet.md)**
 
 1. 平台「配置本次测评」→ 镜像地址填 `ghcr.io/yzqcyl/ctfy-agent-pub:v5`
 2. 点「重新检查」→ 注册 / 协议检查 / 试运行 / 审核 全绿
@@ -154,7 +163,7 @@
 
 ### 与 v2.1 的差异（净改进，无行为回归）
 
-- `config/agent.json` 不加 `clusterb_k` → k=1 路径与 v2.1 逐字等价（10-29 实测：k=3@511k 花 493,615 tok 未解出，k=1@511k 用 313,076 tok 达成，见 `docs/clusterb-p1-result.md`）。
+- `config/agent.json` 不加 `clusterb_k` → k=1 路径与 v2.1 逐字等价（10-29 实测：k=3@511k 花 493,615 tok 未解出，k=1@511k 用 313,076 tok 达成，见 `docs/archive/clusterb-p1-result.md`）。
 - 新增 LLM 读超时兜底：单次模型挂起不再让整题报废（`llm.py` 把裸 `TimeoutError` 归一为可重试 `LLMError` + 1 次重试；容器默认读超时 120→240s）。
 - 新增 web 工具链：ffuf 2.1.0 + SecLists 三张表 + sqlmap 1.10.10（版本/字节数/sha256 全钉死，构建期实测跑通）。
 

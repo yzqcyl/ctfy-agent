@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """观测级去重 / 同目标重复刹车 / 预算阶段线 / 环境失败断路器（P0+A1，bank-500k-v1 实测驱动）。
 
-实机证据（docs/report-large-scale-test.md §10）：
+实机证据（docs/archive/report-large-scale-test.md §10）：
 - 未解出题 49 次单点 http_request：同一 JS 文件取 13 次、/api/auth/login 取 12 次、
   /api/auth/me 取 12 次；解出题仅 7 次。失败模式 = 重复探索 + 无预算感知；
 - 预算上限实际等价于调用次数上限（500k ÷ ~12.6k/call ≈ 40 次），agent 对此无感知；
@@ -30,7 +30,7 @@ REPEAT_TARGET_NOTE_AT = 4    # 同一 (tool,target) 第几次调用时开始注�
 REPEAT_NOTE_EVERY = 4        # 之后每再 N 次提示一次（第 4、8、12…次），避免刷屏
 REPEAT_OMIT_HEAD = 160       # 重复观测保留的头部字符数
 
-# ---- A1 环境失败断路器（实测依据 docs/audit-agent-2026-10-30.md §4）----
+# ---- A1 环境失败断路器（实测依据 docs/archive/audit-agent-2026-10-30.md §4）----
 # v0 批 2134 次工具调用里 379 次（17.8%）是接入/环境类失败：SAMPLE-003 烧 30 次（53% 预算）、
 # SAMPLE-004 28 次（54%）、最长连续 9 次；而题目攻击面其实早有结论（SAMPLE-012 主动收口那题
 # 正是正确做法）。这里只做**提示**不做硬拦截：环境问题不是模型换法能解决的，但模型常会一直试。

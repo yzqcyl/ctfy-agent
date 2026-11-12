@@ -597,7 +597,7 @@ class Ledger:
           2. NFKC（全角括号/标点 → 半角）；
           3. **解出嵌套 JSON 的内层字符串**再比——模型逐字复制的常是解码后的响应体字段，
              而账本原文带转义（`\\\"body\\\": \\\"{...}\\\"`），不归一必然误杀
-             （v0 实测 14 次拒收里 10 次属此；修复依据见 docs/audit-agent-2026-10-30.md）。
+             （v0 实测 14 次拒收里 10 次属此；修复依据见 docs/archive/audit-agent-2026-10-30.md）。
         """
         raw_evidence = _norm_scalar(evidence).strip()
         if len(raw_evidence) < 4:

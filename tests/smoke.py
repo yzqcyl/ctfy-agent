@@ -4832,7 +4832,7 @@ def case_sqli_functional(tmp: Path) -> None:
 
 
 def case_ai_direction_dod(tmp: Path) -> None:
-    """AI 安全方向按 extending-agent.md §9 Definition-of-Done 收口（见 docs/ai-plan.md §11）。
+    """AI 安全方向按 extending-agent.md §9 Definition-of-Done 收口（见 docs/archive/ai-plan.md §11）。
 
     钉四处：角色字段齐全不越权（§3）｜专属提示词不重复写 4 纪律、_role_system 自动补（§6）｜
     _role_specs("ai") 暴露方向工具（chat/shell/decode_blob）与 verify_exploit 通道（§5/§9.6，

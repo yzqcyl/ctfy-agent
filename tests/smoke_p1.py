@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """P1 验收：工具 schema 按实测门控（traffic）+ 事实块硬值保真（ctxcompress）。
 
-依据（docs/report-large-scale-test.md §10.7 + 本会话补测）：
+依据（docs/archive/report-large-scale-test.md §10.7 + 本会话补测）：
   - bank-500k-v1 全部 1495 次工具调用中，traffic 工具仅 9 次且全部出自 web 角色，
     但其 schema（~413 tok）无条件随每次调用发给所有角色；
   - 压缩只保留 flag/路径/凭据/表单的逐字片段，JWT/长hex id/ISO 时间戳/token 键值

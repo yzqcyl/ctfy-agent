@@ -556,7 +556,7 @@ class _Elf:
 
 
 # >>> [rev-toolbox 2026-10-30] elfpeek 升级：新增 disasm / bytecode 视图；gadgets v2；strings 支持 utf16。
-# 详细说明与验收见 docs/rev-toolbox-plan.md。capstone 为可选引擎：**v5 起才装进镜像**（v4 及以前没有——R2 项漏做），缺失时走 stdlib 退化路径。
+# 详细说明与验收见 docs/archive/rev-toolbox-plan.md。capstone 为可选引擎：**v5 起才装进镜像**（v4 及以前没有——R2 项漏做），缺失时走 stdlib 退化路径。
 def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60,
             offset: int = 0, length: int = 128, count: int = 40, arch: str = "",
             extract: str = "", func: str = "", utf16: bool = False, filt: str = "",
@@ -666,7 +666,7 @@ def _capstone_for(elf, arch=""):
     """[rev-toolbox] capstone 可选引擎：不可用返回 None，由调用方走退化路径。
 
     用 importlib 动态加载而非静态 import：case_stdlib_only 静态扫描禁止第三方 import。
-    capstone 自 v5 起装进镜像（v4 及以前实际没装，见 docs/rev-toolbox-plan.md 的 R2 项）；
+    capstone 自 v5 起装进镜像（v4 及以前实际没装，见 docs/archive/rev-toolbox-plan.md 的 R2 项）；
     缺失时永不 ImportError，一律走退化路径。
     """
     try:
@@ -2298,9 +2298,11 @@ def listen(port: int, bind: str = "", proto: str = "tcp", timeout: float = 30.0,
 
 
 # ---------------------------------------------------------------- 外挂库工具（z3 / pycryptodome / pwntools）
-# [libs 2026-11-12] 动机：镜像只带 capstone，CRYPTO/PWN 长期解不动，收尾结论反复是
-# 「本地没有库只能纯 stdlib」。tools/fetch_pylibs.py 把 pycryptodome/sympy/gmpy2/z3/pwntools
-# 装到 tools/pylibs（git 忽略、不进镜像），此前只有 shell 子进程能用；这里接进进程内工具面：
+# [libs 2026-11-12] 动机：v6 镜像只带 capstone，CRYPTO/PWN 长期解不动，收尾结论反复是
+# 「本地没有库只能纯 stdlib」。v7 镜像已内置 pwntools/pycryptodome/gmpy2/sympy，2026-11-12
+# 又补装 z3-solver（Dockerfile L194–231）——线上镜像里这些库直接可用。本机 Windows 开发环境
+# 用 tools/fetch_pylibs.py 把同一批包装到 tools/pylibs（git 忽略、不进镜像），由 pylibs.py
+# 接进进程内工具面：
 #   z3solve → rev 的 flag 校验器 / crypto 模方程 / pwn 约束（纯 stdlib 做不到，最高价值）
 #   pycrypt → pycryptodome 的 AES-GCM/CFB/OFB、3DES 等（aesblock 只覆盖 ECB/CBC/CTR）
 #   pwnrop  → pwntools 的 ELF checksec / plt-got / ROP 链拼接（不用手拼 p64 链）

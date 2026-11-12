@@ -7,10 +7,13 @@
 
 ## 1. 库从哪来
 
-- 安装器：`python tools/fetch_pylibs.py [包名…]`（默认 `pycryptodome sympy gmpy2 pwntools`；
-  **z3-solver 需要显式点名**）。装到 `tools/pylibs/`。
-- `tools/pylibs/` **进 .gitignore、不进镜像**（约 80MB+，且含二进制；许可证/体积另行评估）。
-- 镜像内默认仍只有 capstone —— 与旧行为一致。
+- 安装器：`python tools/fetch_pylibs.py [包名…]`（默认 `pycryptodome sympy gmpy2 pwntools z3-solver`）。
+  装到 `tools/pylibs/`。
+- `tools/pylibs/` **进 .gitignore、不进镜像**（约 312MB，且含二进制）。
+- **镜像侧（2026-11-12 更新）**：v7 镜像已用 pip 内置 capstone + pwntools + pycryptodome +
+  gmpy2 + sympy（`Dockerfile` L177–231）；2026-11-12 又补装 **z3-solver 5.4.1.0**
+  （此前 `z3solve` 工具已上线但镜像漏装 z3 → 官方镜像里恒报缺库，本机靠外挂没暴露）。
+  所以「外挂」现在的语义 = **本机 Windows 开发环境补同一批库**，线上镜像不需要 `tools/pylibs`。
 
 ## 2. 进程内接入（`src/ctfy_agent/pylibs.py`）
 
@@ -82,11 +85,18 @@ pwn 走 pwnrop」的路由规则。改完 `python tools/sync_roles.py --write` �
 - **域工具接线**：`python runs/_verify_domain_tools.py`。
 - **全量**：`python runs/_mon/run_all_tests.py`。
 
-## 6. 若将来要内置进镜像
+## 6. 镜像内置现状（2026-11-12）
 
-代码侧已就绪：把库目录放到 `/ctfy/pylibs` 即可（`candidate_dirs()` 第 2 优先级）。
-当前 `tools/pylibs` 实测 **312 MB**（sympy 66 + unicorn 57 + capstone 40 + pwnlib 40 + z3 21 + pip 11 +
-cryptography 10 + pygments 8 + Crypto 8 + …），镜像门槛 400 MB，直接全量塞进去风险大。若要内置，建议：
-① 只保留 `pwnlib/`（ROP/ELF，约 40MB，需 capstone+pyelftools）、`z3/`（21MB）、`Crypto/`（8MB）；
-② 去掉 pwntools 的 `unicorn`/`rpyc`/`paramiko`/`docs`（ROP/ELF 用不到；需实测 `import pwn` 是否仍成立）；
-③ 复核许可证与镜像内容合规后再改 Dockerfile。在此之前，**本地练习靠外挂、线上镜像靠纯 stdlib** 是明确取舍。
+| 库 | 镜像状态 | 体积（解包） |
+|---|---|---|
+| capstone 5.0.3 | ✅ v5 起内置（`--require-hashes` 双钉死） | ~40MB（含 wheel 内 libcapstone） |
+| pwntools 4.15.0 + 传递依赖 | ✅ v7 内置 | ~40MB（pwnlib）+ unicorn 57MB 等 |
+| pycryptodome 4.4.0 | ✅ v7 内置（sha256 锁） | ~8MB |
+| gmpy2 2.3.2 | ✅ v7 内置（sha256 锁） | ~2MB |
+| sympy 1.14.0 | ✅ v7 内置 | ~66MB |
+| z3-solver 5.4.1.0 | ✅ **2026-11-12 补装**（sha256 锁 `e680ce08…`） | ~21MB |
+
+镜像体积口径见 `docs/submit-image-runbook.md`（v7.2 实测 197.7MB，门禁 400MB；补 z3 后约 +21MB）。
+`tools/pylibs`（312MB）**不进镜像**，只作本机开发补库。重建镜像时 `Dockerfile` 段的
+`ext-libs selftest` 会真 import + 求解（z3 断言 x>3∧x<5 → 4），漏装/装坏会构建失败。
+许可证复核与镜像内容合规仍按 `docs/submit-image-runbook.md` 走。

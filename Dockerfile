@@ -175,7 +175,7 @@ ENV PYTHONUNBUFFERED=1 \
 ENV LLM_ENABLE_THINKING=0
 
 # ---------- rev/pwn 工具箱：capstone 反汇编引擎（v5 新增） ----------
-# 为什么现在才装：docs/rev-toolbox-plan.md 的 R2 项写着「capstone 进镜像，随 v4 重建一起做」，
+# 为什么现在才装：docs/archive/rev-toolbox-plan.md 的 R2 项写着「capstone 进镜像，随 v4 重建一起做」，
 # v4 建了但这一步漏做，于是 elfpeek 的 disasm / gadgets 在镜像里一直走 stdlib 字节退化路径；
 # 更糟的是 rev/pwn 角色提示词和代码注释都写着「v4 镜像含 capstone」——提示词在骗模型，
 # 每个 rev 题会白烧 1–2 步去调一个注定退化的视图。v5 补上（HANDOFF 缺口 #12）。
@@ -191,7 +191,7 @@ RUN set -eux; \
     rm -f /tmp/capstone-req.txt; \
     python -c "import capstone; assert capstone.__version__=='5.0.3', capstone.__version__; cs=capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64); ins=list(cs.disasm(bytes([0x55,0x48,0x89,0xe5]), 0x1000)); assert len(ins)==2 and ins[0].mnemonic=='push', ins; print('capstone selftest ok:', capstone.__version__, len(ins), 'insns')"
 
-# ---------- crypto/pwn 扩展库：pwntools + pycryptodome + gmpy2 + sympy（v7 新增） ----------
+# ---------- crypto/pwn 扩展库：pwntools + pycryptodome + gmpy2 + sympy + z3（v7 新增） ----------
 # 为什么现在才装：上一轮（HANDOFF-2026-11-10-r2 §8）实测 runs/plat 26 题 CRYPTO 0/5、PWN 0/4，
 # 收尾结论反复是「镜像里没有第三方库，只能纯 stdlib」；unipickle 19 次手工拼 opcode 全被拒。
 # 模型是通过 shell() 子进程写脚本、脚本里 `import pwn/Crypto/...`，代码本体零 import——
@@ -200,11 +200,14 @@ RUN set -eux; \
 # 体积口径：基线 126.5MB，门禁 400MB（tools/container_check.py 默认），可用约 270MB。
 # 本段合计约 +55~65MB（pwntools 12.3 + unicorn 15.7 + zstandard 5.3 + cryptography 4.5 +
 # pycryptodome 3.0 + gmpy2 1.8 + sympy 6.0 + 纯 Python 小依赖 ~8），仍远低于门禁。
+# z3（2026-11-12 补）：z3solve 工具早已上线并被 rev/crypto/pwn/misc 四个角色派发，但此前
+# 镜像漏装 z3-solver → 官方镜像里 `import z3` 必失败、z3solve 恒报缺库（本机靠 tools/pylibs
+# 外挂所以没暴露）。安装后 z3 包约 +21MB（解包体积），总计仍 ~220MB，低于 400MB 门禁。
 #
 # 为什么是「C 扩展锁 sha256 + 纯 Python 锁版本」而非全量 --require-hashes：
 # pwntools 有 24 个传递依赖，--require-hashes 要求每个都有 hash，手工维护极易漏、
-# 且任意一个依赖发新版就会让构建炸掉；这里对「带二进制 wheel、被换包体危害最大」的两个
-# C 扩展包（pycryptodome/gmpy2）单独 --require-hashes 锁 sha256，pwntools/sympy 及
+# 且任意一个依赖发新版就会让构建炸掉；这里对「带二进制 wheel、被换包体危害最大」的三个
+# C 扩展包（pycryptodome/gmpy2/z3-solver）单独 --require-hashes 锁 sha256，pwntools/sympy 及
 # 纯 Python 依赖链交给 pip 解析器按顶层版本约束解决（与 capstone 的「版本+sha256 双钉死」同口径地保守）。
 #
 # ⚠️ 必须放在下面「删 pip」那段之前（装完才删 pip）；wheel 都选 manylinux x86_64（CI 只建 amd64）。
@@ -214,15 +217,19 @@ ARG GMPY2_VERSION=2.3.2
 ARG GMPY2_SHA256=c3021ec352e1b26baf4752f99d88adc9e930f115a053162c127d1c1b2f5783c2
 ARG PWNYTOOLS_VERSION=4.15.0
 ARG SYMPY_VERSION=1.14.0
+ARG Z3_VERSION=5.4.1.0
+ARG Z3_SHA256=e680ce083683abca5d07c3e55c2f620ff9a29cb91c548eeeea27ae29e8060522
 RUN set -eux; \
     printf 'pycryptodome==%s --hash=sha256:%s\n' "${PYCRYPTODOME_VERSION}" "${PYCRYPTODOME_SHA256}" > /tmp/ext-req.txt; \
     printf 'gmpy2==%s --hash=sha256:%s\n' "${GMPY2_VERSION}" "${GMPY2_SHA256}" >> /tmp/ext-req.txt; \
+    printf 'z3-solver==%s --hash=sha256:%s\n' "${Z3_VERSION}" "${Z3_SHA256}" >> /tmp/ext-req.txt; \
     python -m pip install --no-cache-dir --require-hashes -r /tmp/ext-req.txt; \
     python -m pip install --no-cache-dir "pwntools==${PWNYTOOLS_VERSION}" "sympy==${SYMPY_VERSION}"; \
     rm -f /tmp/ext-req.txt; \
     for b in as cpp gcc objdump readelf; do \
         command -v "$b" >/dev/null || { echo "缺工具链 $b（pwntools asm = cpp 预处理 + as 汇编，ROP/disasm 要 objdump/readelf）" >&2; exit 1; }; \
     done; \
+    python -c "import z3; x=z3.Int('x'); s=z3.Solver(); s.add(x>3, x<5); assert s.check()==z3.sat and s.model()[x].as_long()==4, 'z3 求解异常'; print('z3 selftest ok', z3.get_version_string())"; \
     python -c "import Crypto, gmpy2, sympy, pwnlib; from pwn import remote, process, cyclic, p64, p32, context, ELF, asm, cyclic_find; assert len(cyclic(128))==128, 'cyclic 异常'; assert cyclic_find(p32(0x61616162))==4, 'cyclic_find 异常'; assert p64(0x41424344)==b'DCBA\x00\x00\x00\x00', 'p64 异常'; assert asm('nop')==b'\x90', 'asm 异常'; print('ext-libs selftest ok: Crypto', Crypto.__version__, '| gmpy2', gmpy2.version(), '| sympy', sympy.__version__, '| pwntools', pwnlib.__version__)"
 
 # 瘦身（主办方：镜像太大传不上去）。运行时只用 stdlib，下列都是死重量（约 20MB）：

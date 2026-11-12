@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """AI 基建（AI infrastructure）离线靶子验收。
 
-背景：M7（docs/ai-plan.md §10）把 AI 基建打法注入到 tools_local 指纹 / method_cards /
+背景：M7（docs/archive/ai-plan.md §10）把 AI 基建打法注入到 tools_local 指纹 / method_cards /
 ai.system 提示词三层，但 §10.4 诚实清单承认「结构洞打法无任何靶子验证过」。本验收
 把「指纹定型 → 按 next 打法利用」整条链钉在本地标准库靶子上（无外网、无模型调用）。
 

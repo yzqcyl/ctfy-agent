@@ -490,7 +490,7 @@ _BURST_VOLATILE = (
 def _wall_advice(status_counter: dict, total: int) -> str:
     """撞墙判据（确定性版）：整批响应几乎全 401/403 或全 404 时，直接给出换法提示。
 
-    依据 docs/audit-budget-exhausted-2026-10-31.md 的 M1/M2：历史失败题里出现过
+    依据 docs/archive/audit-budget-exhausted-2026-10-31.md 的 M1/M2：历史失败题里出现过
     单端点 94 次 401（其中一次 70×POST /api/auth/otp，76 秒内盲猜 OTP）与 162 次连续 404。
     提示词约束不了「一次 burst 打 24 个值」这种形态，所以在工具输出里直接下判据。
     """
@@ -2698,7 +2698,7 @@ class LocalTools:
         return "；".join(notes) if notes else None
 
     # B2：Windows cmd 里「叫法不同」但不是「能力缺失」的命令 → 安全等价物。
-    # 依据 docs/audit-agent-2026-10-30.md §4：v0 批 265 次 shell 调用被守卫直接拒收，
+    # 依据 docs/archive/audit-agent-2026-10-30.md §4：v0 批 265 次 shell 调用被守卫直接拒收，
     # 每次拒收都逼模型再花一整轮（≈12k tok）重写命令；直接改写是零成本的。
     _WINDOWS_ALIASES = {
         "python3": "python", "python3.11": "python", "python3.12": "python", "python3.13": "python",

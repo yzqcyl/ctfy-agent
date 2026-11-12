@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """smoke_local_tools.py — B1 write_file / B2 shell 自动改写 / A1 环境失败断路器 的离线回归。
 
-依据 docs/audit-agent-2026-10-30.md §4-5：
+依据 docs/archive/audit-agent-2026-10-30.md §4-5：
 - v0 批 265 次 shell 调用被 Windows 守卫直接拒收（每次再烧一轮 ≈12k tok）；
 - 14 次 report 被拒之外，SAMPLE-003/004 各把 53%/54% 预算烧在接入层；
 - 模型写脚本只能用 shell 拼引号，跨平台极易写坏 → 新增 write_file。

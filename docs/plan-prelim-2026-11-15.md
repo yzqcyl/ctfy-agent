@@ -2,7 +2,7 @@
 
 > 依据：CCF-TPCTF 赛事规则手册 **v2.5**（2026-11-10 发布，平台附件 `4154270c`，与本地 PDF 同一份）
 > + 平台 `/api/v1/competitions` 只读实测（2026-11-10 21:20 CST）
-> 本文只覆盖**入围测试 + 初选赛**；出题（11-21）另见 `docs/authoring-plan.md`。
+> 本文只覆盖**入围测试 + 初选赛**；出题（11-21）另见 `docs/archive/authoring-plan.md`。
 
 ---
 
@@ -34,7 +34,7 @@ SAMPLE / practice 机制下发若干模拟题。我们 11-09 已经用 v6.9 在 
 ## 2. 手册 v2.5 里真正约束我们的 5 条
 
 1. **解题范围是全类别**：初选赛「解答命题团队提供的**常规 CTF 赛题**」，Crypto/Reverse/Misc/Web/Pwn/AI 都算。
-   只有**出题**限定 Web/Pwn/AI Security。以前文档写成「赛道仅 Web/Pwn/AI」是错的，已改 `PROGRESS.md`。
+   只有**出题**限定 Web/Pwn/AI Security。以前文档写成「赛道仅 Web/Pwn/AI」是错的，已改 `docs/archive/PROGRESS-2026-11-10.md`。
 2. **网络**：解题 Agent 无公网，只能访问平台接口、大模型网关、题目入口；工具依赖须预装；
    不得用代理/重定向/子进程绕过。
 3. **模型**：入围及初选赛可用白名单 **12 家**（含百炼 `compatible-mode`、DeepSeek 官方），团队自备 key；
@@ -161,7 +161,7 @@ Get-ChildItem -Recurse -Filter result.json | ForEach-Object {
 - [ ] `llm_endpoint_alert` 非空的题 = 注入问题，申报
 
 赛后当晚（允许窗口，须登记）：
-- [ ] 统计回填 `PROGRESS.md`；定 11-15 档位
+- [ ] 统计回填 `docs/archive/PROGRESS-2026-11-10.md`；定 11-15 档位
 - [ ] 需要改就出 v7.2 提审
 - [ ] 给平台提工单问三件事（出题下发形态 / 运行记录归档 / 本队题标记）——11-15 之后就要用答案了
 

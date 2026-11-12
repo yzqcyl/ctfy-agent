@@ -220,7 +220,7 @@ def case_ai_chat(tmp: Path) -> None:
         assert ledger.seen("chat", {**probe, "reset": True}) is None, "reset 后重发应放行"
         # 已知限制（钉子）：normalize_args 通用分支保留全部键 → 同句 + history=N 是不同 key，
         # 不判重。若哪天这里变成 is not None，说明 ledger 加了 chat 语义归一化，请同步更新
-        # docs/ai-plan.md 的已知限制清单。
+        # docs/archive/ai-plan.md 的已知限制清单。
         assert ledger.seen("chat", {**probe, "history": 3}) is None, "history 变体开始被判重了？"
 
         _ok("AI/M1 chat：多轮才泄露（单轮必拒）+ 工具侧历史 + cookie 复用 + session 隔离 + reset")

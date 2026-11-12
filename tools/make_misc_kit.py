@@ -12,13 +12,13 @@
 
 为什么要有这个脚本（而不是一条 cp 命令）
 --------------------------------------
-v1 工单里手敲的 `cp -r ... HANDOFF.md` 把内部文档也打了进去：`competition_id`、平台内部结论、
+v1 工单里手敲的 `cp -r ... docs/archive/HANDOFF-2026-11-08-对外交接版.md` 把内部文档也打了进去：`competition_id`、平台内部结论、
 历史判断全在里面，而工单 §6 明令「不能给外包方这些」。手敲命令没法防止这种手滑，
 所以把「该给什么 / 不该给什么」写成代码里的断言，一次写对，每次都用。
 
 三条硬保证
 ----------
-1. kit 里**不含** ``.env`` / ``runs/`` / ``HANDOFF.md`` / ``PROGRESS.md`` / ``docs/mcp-tools.json``；
+1. kit 里**不含** ``.env`` / ``runs/`` / ``docs/archive/HANDOFF-2026-11-08-对外交接版.md`` / ``docs/archive/PROGRESS-2026-11-10.md`` / ``docs/mcp-tools.json``；
 2. kit 里**不含**任何形如 ``CTFY_TOKEN=`` / ``*_API_KEY=`` 的赋值（扫文本文件，命中即失败）；
 3. ``--verify`` 会在 kit 目录里实跑 ``tests/smoke.py``，必须 ``0 failed`` 才允许继续打包。
 
@@ -41,10 +41,10 @@ DEFAULT_OUT = ROOT / "dist" / "misc-kit"
 
 # 拷进 kit 的白名单（目录 + 单文件）；不在表里的一律不进 kit
 COPY_DIRS = ("src", "tests", "config", "roles")
-COPY_FILES = ("Dockerfile", "README.md", "docs/misc-module-brief.md", "docs/report-ctfy-rules.md")
+COPY_FILES = ("Dockerfile", "README.md", "docs/archive/misc-module-brief.md", "docs/archive/report-ctfy-rules.md")
 
 # 绝不进 kit 的路径片段 / 文件名（双保险：即便白名单写错也拦住）
-FORBIDDEN_NAMES = {".env", ".env.example", "HANDOFF.md", "PROGRESS.md", "mcp-tools.json", "state.json"}
+FORBIDDEN_NAMES = {".env", ".env.example", "docs/archive/HANDOFF-2026-11-08-对外交接版.md", "docs/archive/PROGRESS-2026-11-10.md", "mcp-tools.json", "state.json"}
 FORBIDDEN_DIRS = {"runs", "__pycache__", ".git", ".tools", ".ref", ".workbuddy", "dist"}
 
 # 泄密扫描：只认「带引号的字面量」或「原始形态的密钥」，避免把代码里的取值表达式误判成密钥。
@@ -291,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         "kit": str(dest),
         "baseline": "tests/smoke.py 期望 51 passed / 0 failed",
         "verified": bool(args.verify),
-        "brief": "docs/misc-module-brief.md (v2)",
+        "brief": "docs/archive/misc-module-brief.md (v2)",
     }
     (dest / "KIT-MANIFEST.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"

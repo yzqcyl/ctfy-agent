@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """smoke_http_cache.py — O1 验收：多 pattern grep（O1a）+ 非 200 响应缓存/fresh（O1b）。
 
-规格：docs/spec-o1-http-cache.md §5（12 条验收）。
+规格：docs/archive/spec-o1-http-cache.md §5（12 条验收）。
 全部离线：grep 渲染直接调 `LocalTools._render_http`；缓存用 127.0.0.1 上的真实小服务 + 计数。
 运行: python tests/smoke_http_cache.py
 """

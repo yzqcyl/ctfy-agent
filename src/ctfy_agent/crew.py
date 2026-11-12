@@ -1720,7 +1720,7 @@ class Crew:
             cfg, self.store.require(challenge_id),
             cfg.get("competition_id") or self.store.meta.get("competition_id") or "",
         )
-        # 集群-A：无状态题同题并行（与集群-B 串行互斥；A 拖广度 / B 挖深度，见 docs/plan-cluster-a.md）
+        # 集群-A：无状态题同题并行（与集群-B 串行互斥；A 拖广度 / B 挖深度，见 docs/archive/plan-cluster-a.md）
         try:
             n_a = int(cfg.get("cluster_a_concurrency") or 0)
         except (TypeError, ValueError):

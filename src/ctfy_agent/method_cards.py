@@ -253,7 +253,8 @@ AI_CARDS: list[tuple[tuple[str, ...], str]] = [
 
 # 方向方法卡（rev/pwn/crypto/misc）：与 web 卡分表，避免泛键（python/tcp）污染 web 打法块。
 # 键取自平台真实 tag 词表（`runs/_nonweb_inventory.py`）；卡面只讲「用现有工具怎么走」，
-# 不写镜像里没有的东西（无 gdb/objdump/ROPgadget/pycryptodome，disasm 依赖 v4 capstone）。
+# 不写镜像里没有的东西（无 gdb/ROPgadget；反汇编走 capstone，v5 起镜像内置；
+# crypto 的 pycrypt / pwn 的 pwnrop 自 v7 镜像起可用）。
 DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
     (("reverse", "stripped", "per_team_artifact", "per-team-artifact"),
      "REV 定型四步：hexpeek 看魔数判型（ELF/PE/pyc/脚本）→ elfpeek view=info（架构/PIE/入口）→ "

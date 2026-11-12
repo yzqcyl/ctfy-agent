@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """P0 验收：观测去重 / 同目标重复刹车 / 预算阶段线（src/ctfy_agent/progress.py）。
 
-依据 bank-500k-v1 实测（docs/report-large-scale-test.md §10）：
+依据 bank-500k-v1 实测（docs/archive/report-large-scale-test.md §10）：
   未解出题 49 次单点请求、同目标 12-13 次重复、预算≈40 次调用无感知。
 判定项：
   - 首次观测全文保留、is_new=True；相同 digest 第二次起替换为省略标记（省上下文）；
