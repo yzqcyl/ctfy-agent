@@ -815,7 +815,9 @@ class Solver:
         # 逃生口：auto_start_skip_categories="" 可关掉这条优化；需要实例时模型仍可手动 start_instance。
         category = str(getattr(challenge, "category", "") or "").strip().lower()
         skip_raw = self.config.extra.get("auto_start_skip_categories")
-        skip_raw = "misc,crypto" if skip_raw is None else str(skip_raw)
+        # [fix 2026-11-13 P2-D] 追加 reverse：11-13 120 题跑批实测 25/25 道 REVERSE 纯附件题
+        # 各触发一对 get_environment→NOT_FOUND / start_instance→NOT_FOUND（平台对无容器题没有环境原语）。
+        skip_raw = "misc,crypto,reverse" if skip_raw is None else str(skip_raw)
         skip_cats = {c.strip().lower() for c in skip_raw.split(",") if c.strip()}
         # [P2-C 精修 2026-11-12] 平台已经明确本题有容器/提交需要靶标在跑时不能跳：
         # crypto/misc 题库里也有必须起实例的题（catalog 统计 60+），按 category 一律跳过会判死。
@@ -825,7 +827,7 @@ class Solver:
                 and not self.platform.try_resolve("list_instances")):
             self.store.append_transcript(challenge.id, {
                 "role": "instance",
-                "note": "[实例守卫] 纯附件题型（misc/crypto）跳过自动 start_instance：该平台无 list_instances，"
+                "note": "[实例守卫] 纯附件题型（misc/crypto/reverse）跳过自动 start_instance：该平台无 list_instances，"
                         "实测必回 NOT_FOUND、白耗每题 5 次配额。需要环境时模型可手动 start_instance。",
             })
             return False

@@ -344,6 +344,10 @@ def main() -> int:
     store4.require(cid).category = "pwn"
     check("pwn 题仍允许自动 start",
           solver4.auto_start_allowed(store4.require(cid)) is True)
+    # 8d-2) reverse 纯附件题同样跳过（120 题跑批实测 25/25 道 REVERSE 白烧 get_environment/start）
+    store4.require(cid).category = "reverse"
+    check("无 list_instances 平台 reverse 纯附件题跳过自动 start",
+          solver4.auto_start_allowed(store4.require(cid)) is False)
 
     # 8e) 平台明确本题有容器 / 提交需要靶标在跑 → misc/crypto 也不能跳过（大跑批 60+ 道容器题）
     store5 = _store(tmp / "r8e", cid)
