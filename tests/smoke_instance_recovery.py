@@ -345,6 +345,20 @@ def main() -> int:
     check("pwn 题仍允许自动 start",
           solver4.auto_start_allowed(store4.require(cid)) is True)
 
+    # 8e) 平台明确本题有容器 / 提交需要靶标在跑 → misc/crypto 也不能跳过（大跑批 60+ 道容器题）
+    store5 = _store(tmp / "r8e", cid)
+    item5 = store5.require(cid)
+    item5.category = "crypto"
+    item5.has_container = True
+    solver5, _ = _solver(store5, FakePlatform(), _config())
+    check("crypto 题平台标记 has_container 时不跳过 start",
+          solver5.auto_start_allowed(store5.require(cid)) is True)
+    item6 = store5.require(cid)
+    item6.has_container = False
+    item6.requires_running_target = True
+    check("requires_running_target=True 时也不跳过 start",
+          solver5.auto_start_allowed(store5.require(cid)) is True)
+
     print()
     if FAILS:
         print(f"smoke_instance_recovery 失败 {len(FAILS)} 项：" + "、".join(FAILS))

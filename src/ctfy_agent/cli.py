@@ -91,6 +91,11 @@ def normalize_challenge(item: dict) -> dict:
         # 知识问答题（MCQ/QA）：提交走 submit_qa_answer，且不需要实例。
         # 曾因不认这个字段，QA 题在提交时被「本题还没有实例」挡住，正确答案直接丢（实测 SECQA-0001）。
         "is_qa_only": bool(pick("is_qa_only")),
+        # 实例需求元数据：正例来自 ctf2_get_practice_challenge 的 has_container /
+        # requires_running_target_for_submit；其余平台没有这两个键时保持 False（按旧行为自启）。
+        "has_container": bool(pick("has_container", "has_instance", "need_instance")),
+        "requires_running_target": bool(pick("requires_running_target_for_submit",
+                                              "requires_running_target")),
     }
 
 

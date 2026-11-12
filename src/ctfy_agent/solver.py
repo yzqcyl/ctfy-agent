@@ -817,7 +817,12 @@ class Solver:
         skip_raw = self.config.extra.get("auto_start_skip_categories")
         skip_raw = "misc,crypto" if skip_raw is None else str(skip_raw)
         skip_cats = {c.strip().lower() for c in skip_raw.split(",") if c.strip()}
-        if (category in skip_cats and not self.platform.try_resolve("list_instances")):
+        # [P2-C 精修 2026-11-12] 平台已经明确本题有容器/提交需要靶标在跑时不能跳：
+        # crypto/misc 题库里也有必须起实例的题（catalog 统计 60+），按 category 一律跳过会判死。
+        needs_env = bool(getattr(challenge, "has_container", False)
+                         or getattr(challenge, "requires_running_target", False))
+        if (category in skip_cats and not needs_env
+                and not self.platform.try_resolve("list_instances")):
             self.store.append_transcript(challenge.id, {
                 "role": "instance",
                 "note": "[实例守卫] 纯附件题型（misc/crypto）跳过自动 start_instance：该平台无 list_instances，"

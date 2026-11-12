@@ -175,6 +175,12 @@ class Challenge:
     difficulty: str = ""                            # easy / medium / hard，也可能是数字
     solves_count: int | None = None                 # 已解队伍数（难度与方向的客观参照）
     is_qa_only: bool = False                        # 纯知识问答/MCQ：提交走 submit_qa_answer，不需要实例
+    # 平台免费给的「要不要环境」两个字段（ctf2_get_practice_challenge 实测有）：
+    # has_container=本题有容器靶标；requires_running_target=提交前必须靶标在跑。
+    # 之前 normalize_challenge 把它们丢了，auto_start 只能按 category 猜，把 crypto/misc
+    # 里 60+ 道容器题一并跳过 → 必然解不出（2026-11-12 大跑批选型时发现）。
+    has_container: bool = False
+    requires_running_target: bool = False
     status: str = "new"
     attempts: int = 0
     solve_attempts: list = field(default_factory=list)  # 集群-B 解题尝试记录（跨进程持久化，每项一次尝试的摘要）
