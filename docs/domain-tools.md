@@ -8,7 +8,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `src/ctfy_agent/tools_domain_ext.py` | 4 个工具：`tcp` / `tcp_batch` / `elfpeek` / `netcheck`（纯 stdlib） |
+| `src/ctfy_agent/tools_domain_ext.py` | 5 个工具：`tcp` / `tcp_batch` / `elfpeek` / `netcheck` / `listen`（纯 stdlib） |
 
 ## 工具说明
 
@@ -18,6 +18,17 @@
 | `tcp_batch(host, port, payloads, hex_mode, read_timeout, same_conn)` | 同连接顺序发 N 个 payload 并汇总每条响应（≤200/次） | padding oracle、盲爆破 |
 | `elfpeek(path, view, min_len, limit)` | 纯 stdlib ELF 解析：`info`（架构/入口/PIE/NX/canary/RELRO）/`sections`/`symbols`/`strings`/`gadgets` | pwn 偏移与缓解、reverse 静态 |
 | `netcheck(host, port)` | DNS 是否解析 + TCP 是否可连；`*.internal` 解析失败时明确提示「VPN 隧道未接入」 | pwn/crypto 连不上时先诊断，避免盲目重试烧预算 |
+| `listen(port, bind, proto, timeout, max_conns, reply, send_first, trigger_url, trigger_host, …)` | 本地起监听等靶场**主动回连**，取回它发来的数据；可选**先 bind 再触发**（`trigger_url` / `trigger_host`）后 accept，解决单线程 agent 做不了「后台监听」的顺序问题；返回里列出本机 IP | beacon 外带 / SSRF 回调 / reverse connection / 「把结果投递到你的 host:port」类题 |
+
+### `listen` 的由来（2026-11-12）
+
+SAMPLE-024 是「靶场回连我们」的题型（beacon 把 flag 投递到 `ctfy-callback:4444`），
+而此前 agent 只有主动查询工具（`tcp` / `http_request`），没有 bind+accept 能力——本地只能
+人手起 `nc -l` 才解出来。正式比赛容器在靶场网内、回调名会解析到本容器，但 agent 依旧需要
+能监听，否则这类题直接 0 分。工具内置「bind → 触发 → accept」顺序，单线程下也能覆盖
+「靶场要等回调完成才回包」的情形（TCP backlog 会先把连接接住）。
+回归：`python tests/smoke_listen.py` → **15/15 PASS**（TCP/UDP 收发、reply、send_first、
+内置触发顺序、超时提示、参数校验、`trigger_url` 白名单防 SSRF、角色接线）。
 
 ## 接线方式（零改动 crew.py）
 
@@ -26,8 +37,9 @@
 - 分发放行：`LocalTools.call()` 对 `DOMAIN_NAMES` 走 `_call_domain_tool()`（`tools_local.py`），
   先做**沙盒路径锚定**与**实例端点白名单校验**（复用 `allowed_hosts/allowed_endpoints`，与 `http_request` 同一套合规），
   再交给 `tools_domain_ext.call_domain()`。
-- 角色授权（`config/agent.json`）：`rev.local += [elfpeek, tcp, tcp_batch, netcheck]`；`crypto.local += [tcp, tcp_batch, netcheck]`。
-  web/misc/ai/coordinator 不可见（门禁断言已覆盖）。
+- 角色授权（`config/agent.json`）：`rev.local += [elfpeek, tcp, tcp_batch, netcheck, listen]`；`crypto.local += [tcp, tcp_batch, netcheck, listen]`；
+  `pwn.local += [pwngen, pwnfind, tcp, tcp_batch, netcheck, listen]`；`misc.local += [tcp, tcp_batch, netcheck, listen]`；
+  `web.local += [listen]`（SSRF 回调）。ai/coordinator 不可见（门禁断言已覆盖）。
 
 ## 验收
 
@@ -45,7 +57,8 @@
 1. ~~pwn 角色~~ → ✅ 已新增（config-only，`delegate` enum 自动含 `pwn`，已验证）。
 2. ~~crypto `oracle_limit: 50`~~ → ✅ 提到 **300**；`crypto.max_steps` 10→12。
 3. ~~实测验证~~ → ✅ SAMPLE-010 **已解出**（111,552 tok）；SAMPLE-011 为环境性假阴性（本地不能执行 Linux ELF）；003/004/012 需 VPN；014 待平台限流解除。
-4. **misc 授权**：014「TCP 连通性测试」属 misc，需要给 misc 角色 `tcp/netcheck`，会触碰 `roles/misc.json` 防漂移断言 → 需与 P 系列同步（唯一未闭环项）。
+4. ~~misc 授权~~ → ✅ 已给 misc 角色 `tcp/tcp_batch/netcheck/listen`，`roles/misc.json` 经 `tools/sync_roles.py --write` 同步（三源一致）。
+5. **回调监听**：✅ 2026-11-12 新增 `listen`（见上），补上「靶场回连我们」题型的能力缺口。
 
 ## 阶段 0：可达性探针（`runs/probe-010-014.json`，零 LLM 成本）
 

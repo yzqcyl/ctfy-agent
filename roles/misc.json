@@ -19,7 +19,8 @@
         "hexpeek",
         "tcp",
         "tcp_batch",
-        "netcheck"
+        "netcheck",
+        "listen"
       ]
     }
   }

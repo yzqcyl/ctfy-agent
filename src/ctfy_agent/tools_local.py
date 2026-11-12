@@ -1114,9 +1114,22 @@ class LocalTools:
     # ---------- 领域扩展工具（pwn / crypto / reverse 共用地基） ----------
 
     def _call_domain_tool(self, name: str, arguments: dict) -> str:
-        """tcp / tcp_batch / elfpeek / netcheck：先做沙盒路径锚定与实例端点合规校验。"""
+        """tcp / tcp_batch / elfpeek / netcheck / listen：先做沙盒路径锚定与实例端点合规校验。"""
         if arguments.get("path") is not None:
             arguments["path"] = self._resolve_path(str(arguments["path"]))
+        if name == "listen":
+            # [listen 2026-11-12] 监听本身是本地 bind，不需要白名单；但它的「触发」
+            # （trigger_url / trigger_host）仍是主动对外请求，必须与 tcp/http_request
+            # 共用同一套实例白名单，否则新工具会变成任意 SSRF/扫描出口。
+            url = str(arguments.get("trigger_url") or "").strip()
+            if url:
+                self._check_target(url)
+            trigger_host = str(arguments.get("trigger_host") or "").strip()
+            if trigger_host:
+                trigger_port = arguments.get("trigger_port")
+                numeric = str(trigger_port if trigger_port is not None else "").strip().isdigit()
+                self._check_endpoint(trigger_host, int(trigger_port) if numeric else None)
+            return _call_domain(name, arguments)
         host = arguments.get("host")
         if host is not None:
             port = arguments.get("port")

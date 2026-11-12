@@ -1390,6 +1390,18 @@ def _to_int(value, default: int, what: str) -> int:  # [toolbox-fix 2026-10-30] 
         raise DomainToolError("参数 %s 需要整数（支持 0x 前缀），收到 %r" % (what, value))
 
 
+def _to_float(value, default: float, what: str) -> float:
+    """浮点参数统一入口：None/空→默认值，垃圾→DomainToolError（0x 不支持，超时/秒数用）。"""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        raise DomainToolError("参数 %s 需要数字，收到 %r" % (what, value)) from None
+
+
 def _hexbytes(text, what: str) -> bytes:  # [toolbox-fix 2026-10-30] hex 参数统一入口，防 ValueError 裸崩
     try:
         return bytes.fromhex(str(text or "").replace(" ", ""))
@@ -2043,6 +2055,246 @@ def netcheck(host: str, port: int | None = None, tls: bool = False) -> str:
     return _clip("\n".join(lines))
 
 
+# ---------------------------------------------------------------- 回调监听
+#
+# 为什么需要这个工具（2026-11-12 实测）：SAMPLE-024 是「靶场回连我们」的题型
+# （beacon 把 flag 投递到 ctfy-callback:4444）。当时 agent 的工具面只有主动查询
+# （tcp/http_request），没有「起监听等回连」，本地只能靠人手起 wc -l/nc 才解出来。
+# 正式比赛容器在靶场网内、回调名字会解析到本容器，但 agent 依旧需要能 bind+accept，
+# 否则这类题（exfil beacon / SSRF 回调 / reverse connection）直接 0 分。
+#
+# 单线程 agent 的关键顺序问题：必须先监听、再触发靶场回连。所以本工具允许把
+# 「一次触发动作」内置进来（trigger_url / trigger_host），绑好端口后先触发再 accept，
+# 这样即使靶场要等回调完成才回包也不会死锁（TCP backlog 会先把连接接住）。
+
+
+def _local_ipv4s() -> list[str]:
+    """本机 IPv4 地址：题面要我们给出回调地址时，模型需要知道该报哪个 IP。"""
+    ips: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = str(info[4][0])
+            if ip not in ips:
+                ips.append(ip)
+    except OSError:
+        pass
+    if not [ip for ip in ips if not ip.startswith("127.")]:
+        # 容器里 gethostname() 常只解析到 127.0.1.1；用一次「选路」拿出口地址（不真的发包）。
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect(("192.0.2.1", 9))  # TEST-NET-1：只让内核选路由，不产生通信
+                ip = str(probe.getsockname()[0])
+            finally:
+                probe.close()
+            if ip and ip not in ips:
+                ips.append(ip)
+        except OSError:
+            pass
+    return ips
+
+
+def _run_trigger(trigger_url: str = "", trigger_headers=None, trigger_body: str = "",
+                 trigger_host: str = "", trigger_port: int = 0, trigger_payload: str = "",
+                 trigger_hex: bool = False, timeout: float = 6.0) -> str:
+    """监听就绪后自动触发一次外部动作（http / raw tcp），返回一句话结果（失败不阻塞监听）。"""
+    url = (trigger_url or "").strip()
+    if url:
+        import urllib.error
+        import urllib.request
+
+        headers = {str(k): str(v) for k, v in (trigger_headers or {}).items()}
+        data = None
+        if trigger_body:
+            data = trigger_body.encode("utf-8", "surrogateescape")
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        req = urllib.request.Request(url, data=data, headers=headers,
+                                     method=("POST" if data is not None else "GET"))
+        try:
+            # 目标白名单已在 LocalTools 侧校验（与 http_request 同一套），此处只做网络请求。
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                body = resp.read(1024)
+                status = getattr(resp, "status", None) or resp.getcode()
+                return "触发 HTTP %s → %s，回包 %d 字节" % (url, status, len(body))
+        except Exception as exc:  # noqa: BLE001 - 触发失败不阻断监听
+            return "触发 HTTP %s 失败：%s: %s（监听继续等回连）" % (url, type(exc).__name__, exc)
+    host = (trigger_host or "").strip()
+    if host:
+        port = _to_int(trigger_port, 0, "trigger_port")
+        if not (0 < port < 65536):
+            return "trigger_port 非法（%r），跳过触发" % (trigger_port,)
+        payload = _hexbytes(trigger_payload, "trigger_payload") if trigger_hex else \
+            trigger_payload.encode("utf-8", "surrogateescape")
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout)
+            try:
+                if payload:
+                    sock.sendall(payload)
+                try:
+                    sock.settimeout(0.5)
+                    sock.recv(1024)  # 顺手收一下回显（很多服务会先回一段）
+                except (socket.timeout, OSError):
+                    pass
+            finally:
+                sock.close()
+            return "触发 TCP %s:%d 已发送 %d 字节" % (host, port, len(payload))
+        except OSError as exc:
+            return "触发 TCP %s:%d 失败：%s: %s（监听继续等回连）" % (host, port, type(exc).__name__, exc)
+    return ""
+
+
+def listen(port: int, bind: str = "", proto: str = "tcp", timeout: float = 30.0,
+           max_conns: int = 1, read_timeout: float = 3.0, max_recv: int = 8192,
+           reply: str = "", hex_mode: bool = False, send_first: bool = False,
+           trigger_url: str = "", trigger_headers=None, trigger_body: str = "",
+           trigger_host: str = "", trigger_port: int = 0, trigger_payload: str = "",
+           trigger_hex: bool = False) -> str:
+    """起本地监听等回连（TCP/UDP），可选先自动触发一次请求/发包。"""
+    port = _to_int(port, 0, "port")
+    if not (0 < port < 65536):
+        raise DomainToolError("端口非法：%r" % (port,))
+    if port < 1024:
+        raise DomainToolError(
+            "端口 %d < 1024：容器内是非 root 用户（uid 10001），绑不上特权端口。"
+            "回调端口一般由题面/实例 services 给定（如 4444/1337/8080），换一个 ≥1024 的。" % port)
+
+    bind = (bind or "").strip()
+    local_ips = _local_ipv4s()
+    if bind in ("", "0.0.0.0", "*", "all"):
+        bind_host = ""            # 所有网卡
+    elif bind in ("localhost", "127.0.0.1"):
+        bind_host = "127.0.0.1"
+    elif bind in local_ips:
+        bind_host = bind
+    else:
+        raise DomainToolError(
+            "bind=%r 不是本机地址。留空=所有网卡；或填本机 IP（%s）。" % (bind, ", ".join(local_ips) or "未识别到"))
+
+    proto = (proto or "tcp").strip().lower()
+    if proto not in ("tcp", "udp"):
+        raise DomainToolError("proto 只支持 tcp / udp，收到 %r" % (proto,))
+    timeout = max(1.0, min(_to_float(timeout, 30.0, "timeout"), 120.0))
+    read_timeout = max(0.2, min(_to_float(read_timeout, 3.0, "read_timeout"), timeout))
+    max_conns = max(1, min(_to_int(max_conns, 1, "max_conns"), 8))
+    max_recv = max(1, min(_to_int(max_recv, 8192, "max_recv"), MAX_READ))
+    reply_bytes = _hexbytes(reply, "reply") if (hex_mode and reply) else \
+        (reply or "").encode("utf-8", "surrogateescape")
+
+    head = ["[监听] %s %s:%d 已就绪（等待最多 %.0fs，最多 %d 个%s）" % (
+        proto.upper(), bind_host or "0.0.0.0", port, timeout, max_conns,
+        "连接" if proto == "tcp" else "数据报")]
+    if local_ips:
+        head.append("本机地址（题面要你提供回调地址时用这些）：%s" % ", ".join(local_ips))
+
+    if proto == "tcp":
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((bind_host, port))
+            srv.listen(max_conns)
+        except OSError as exc:
+            srv.close()
+            raise DomainToolError("监听 %s:%d 失败：%s: %s（端口被占用就换一个；回调端口以题面为准）"
+                                  % (bind_host or "0.0.0.0", port, type(exc).__name__, exc)) from None
+    else:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            srv.bind((bind_host, port))
+        except OSError as exc:
+            srv.close()
+            raise DomainToolError("UDP 绑定 %s:%d 失败：%s: %s"
+                                  % (bind_host or "0.0.0.0", port, type(exc).__name__, exc)) from None
+
+    triggered = _run_trigger(
+        trigger_url=trigger_url, trigger_headers=trigger_headers, trigger_body=trigger_body,
+        trigger_host=trigger_host, trigger_port=trigger_port, trigger_payload=trigger_payload,
+        trigger_hex=trigger_hex,
+    )
+    if triggered:
+        head.append("[触发] " + triggered)
+
+    results: list[str] = []
+    got = 0
+    deadline = time.time() + timeout
+    try:
+        while got < max_conns:
+            remain = deadline - time.time()
+            if remain <= 0:
+                break
+            srv.settimeout(max(0.05, remain))
+            if proto == "tcp":
+                try:
+                    conn, peer = srv.accept()
+                except socket.timeout:
+                    break
+                except OSError as exc:
+                    results.append("accept 失败：%s: %s" % (type(exc).__name__, exc))
+                    break
+                got += 1
+                data = b""
+                sent = 0
+                note = ""
+                with conn:
+                    try:
+                        conn.settimeout(max(0.2, min(read_timeout, max(0.2, deadline - time.time()))))
+                        if send_first and reply_bytes:
+                            conn.sendall(reply_bytes)
+                            sent = len(reply_bytes)
+                        while len(data) < max_recv:
+                            chunk = conn.recv(min(4096, max_recv - len(data)))
+                            if not chunk:
+                                break
+                            data += chunk
+                            # request/response 型对端（SSRF 回调、curl 等）在等我们回包，
+                            # 「读满/读超时后再回」会让它先超时 —— 收到第一块就回。
+                            if reply_bytes and not sent:
+                                conn.sendall(reply_bytes)
+                                sent = len(reply_bytes)
+                    except socket.timeout:
+                        note = "（读超时，可能对端还在等我们）"
+                    except OSError as exc:
+                        note = "（连接异常：%s）" % type(exc).__name__
+                results.append("连接 #%d 来自 %s:%s：收到 %d 字节%s%s" % (
+                    got, peer[0], peer[1], len(data),
+                    ("，已回送 %d 字节" % sent) if sent else "", note))
+                if data:
+                    results.append("  hex:   " + _hex_preview(data))
+                    results.append("  ascii: " + _ascii_preview(data))
+            else:
+                try:
+                    data, peer = srv.recvfrom(max_recv)
+                except socket.timeout:
+                    break
+                except OSError as exc:
+                    results.append("recvfrom 失败：%s: %s" % (type(exc).__name__, exc))
+                    break
+                got += 1
+                sent = 0
+                if reply_bytes:
+                    try:
+                        srv.sendto(reply_bytes, peer)
+                        sent = len(reply_bytes)
+                    except OSError as exc:
+                        results.append("回送失败：%s: %s" % (type(exc).__name__, exc))
+                results.append("数据报 #%d 来自 %s:%s：收到 %d 字节%s" % (
+                    got, peer[0], peer[1], len(data), ("，已回送 %d 字节" % sent) if sent else ""))
+                results.append("  hex:   " + _hex_preview(data))
+                results.append("  ascii: " + _ascii_preview(data))
+    finally:
+        try:
+            srv.close()
+        except OSError:
+            pass
+
+    if got == 0:
+        results.append("（%.0fs 内没有任何%s到达）" % (timeout, "连接" if proto == "tcp" else "数据报"))
+        results.append(
+            "排查顺序：① 题面/start_instance 的 services 里回调地址与端口是否一致；"
+            "② 是不是要先触发一次（用 trigger_url 或 trigger_host 让它回连，本工具会把触发放在监听之后）；"
+            "③ 多网卡时 bind 选错（试 bind=<上面的本机地址>）；④ 端口 <1024 或已被占用。")
+    return _clip("\n".join([*head, *results]))
+
+
 # ---------------------------------------------------------------- 规格与分发
 
 
@@ -2293,8 +2545,48 @@ PRNG_SPEC = {
 }
 # <<< [crypto-toolbox 2026-10-30]
 
+LISTEN_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "listen",
+        "description": (
+            "在本地起监听端口等靶场主动回连，取回它发来的数据（回调类题专用）。"
+            "典型场景：beacon/靶场把 flag 外带回来、SSRF 回调、reverse connection、"
+            "题面说「把结果投递到你的 host:port」而那个 host 就是本容器。"
+            "关键顺序：本工具先 bind 再执行一次可选触发（trigger_url 或 trigger_host），然后 accept，"
+            "所以「先触发再等回连」这种单线程做不了的顺序被内置解决了。"
+            "proto=tcp|udp；bind 留空=所有网卡；reply=收到后回送（如 HTTP 200 响应），"
+            "send_first=true 则连上立刻发；阻塞最多 timeout 秒（默认 30、上限 120）。"
+            "返回里会列出本机地址——题面要你给回调地址时用它；端口 <1024 绑不上（容器非 root）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "port": {"type": "integer", "description": "回调端口（题面/实例 services 给定，如 4444）"},
+                "bind": {"type": "string", "description": "绑定地址，默认留空=所有网卡（多网卡/非 root 场景可填本机 IP）"},
+                "proto": {"type": "string", "enum": ["tcp", "udp"], "description": "协议，默认 tcp"},
+                "timeout": {"type": "number", "description": "总共等多少秒（默认 30，上限 120）"},
+                "max_conns": {"type": "integer", "description": "最多收几个连接/数据报（默认 1，上限 8）"},
+                "read_timeout": {"type": "number", "description": "单连接读空闲超时秒（默认 3）"},
+                "max_recv": {"type": "integer", "description": "每个连接最多读多少字节（默认 8192）"},
+                "reply": {"type": "string", "description": "收到数据后回送的内容（hex_mode=true 时按 hex 解析）"},
+                "hex_mode": {"type": "boolean", "description": "reply 是否 hex 编码"},
+                "send_first": {"type": "boolean", "description": "true=连上立刻发 reply（服务端先要 banner/命令时用）"},
+                "trigger_url": {"type": "string", "description": "监听就绪后自动请求一次该 URL（触发靶场回连；只允许平台实例地址）"},
+                "trigger_body": {"type": "string", "description": "trigger_url 的 POST body（给了就发 POST）"},
+                "trigger_headers": {"type": "object", "description": "trigger_url 的额外请求头（字符串键值）"},
+                "trigger_host": {"type": "string", "description": "监听就绪后自动向该 host 发一次 TCP（与 trigger_url 二选一）"},
+                "trigger_port": {"type": "integer", "description": "trigger_host 的端口"},
+                "trigger_payload": {"type": "string", "description": "发往 trigger_host 的内容"},
+                "trigger_hex": {"type": "boolean", "description": "trigger_payload 是否 hex 编码"},
+            },
+            "required": ["port"],
+        },
+    },
+}
+
 DOMAIN_SPECS = [TCP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC, PWNGEN_SPEC, PWNFIND_SPEC,
-                RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC]
+                RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC, LISTEN_SPEC]
 
 DOMAIN_NAMES = {s["function"]["name"] for s in DOMAIN_SPECS}
 
@@ -2388,6 +2680,27 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
             port = args.get("port")
             return netcheck(str(args.get("host", "")), int(port) if port else None,
                             tls=bool(args.get("tls", False)))
+        if name == "listen":
+            headers = args.get("trigger_headers")
+            return listen(
+                port=_to_int(args.get("port"), 0, "port"),
+                bind=str(args.get("bind") or ""),
+                proto=str(args.get("proto") or "tcp"),
+                timeout=_to_float(args.get("timeout"), 30.0, "timeout"),
+                max_conns=_to_int(args.get("max_conns"), 1, "max_conns"),
+                read_timeout=_to_float(args.get("read_timeout"), 3.0, "read_timeout"),
+                max_recv=_to_int(args.get("max_recv"), 8192, "max_recv"),
+                reply=str(args.get("reply") or ""),
+                hex_mode=bool(args.get("hex_mode", False)),
+                send_first=bool(args.get("send_first", False)),
+                trigger_url=str(args.get("trigger_url") or ""),
+                trigger_headers=headers if isinstance(headers, dict) else None,
+                trigger_body=str(args.get("trigger_body") or ""),
+                trigger_host=str(args.get("trigger_host") or ""),
+                trigger_port=_to_int(args.get("trigger_port"), 0, "trigger_port"),
+                trigger_payload=str(args.get("trigger_payload") or ""),
+                trigger_hex=bool(args.get("trigger_hex", False)),
+            )
     except DomainToolError as exc:
         _fail(str(exc))
     except (ValueError, TypeError, struct.error, OverflowError) as exc:
