@@ -19,11 +19,75 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse, urlunparse
+
+# ---------- 敏感信息脱敏（审计 S1，2026-11-12） ----------
+# 为什么：流量库把请求/响应头原样落盘（runs/traffic/<id>.sqlite，gitignored 但明文留本地磁盘）。
+# http_request 会把模型给的 Authorization/Cookie 原样转发，于是靶机凭据、会话令牌、甚至 flag
+# 会以明文留在 sqlite + blob 里，复盘/交接/误打包时是实质泄露面。
+# 处置：落库前把「认证类头」与「URL query 里的凭据类参数」替换成
+# `<redacted sha256:xxxxxxxx len=N>` —— 保留 SHA256 前 8 位指纹（可对账"是不是同一个令牌"）
+# 与长度，丢掉明文。正文 body 不动（正文是解题证据，且 flag 常需原文回溯）；这一点在审计里
+# 记为已知取舍。
+_SENSITIVE_HEADER = re.compile(
+    r"(?i)^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|"
+    r"x-auth-token|x-access-token|x-csrf-token|token|secret|password)$"
+)
+_SENSITIVE_QUERY = re.compile(
+    r"(?i)(token|api[_-]?key|secret|passw(or)?d|pwd|auth|session|sid|sig|signature|credential)"
+)
+
+
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def redact_headers(headers: dict | None) -> dict | None:
+    """把敏感头值替换为指纹；其余头原样保留（保持 dict 顺序与类型）。"""
+    if not headers:
+        return headers
+    out = {}
+    for key, value in headers.items():
+        if _SENSITIVE_HEADER.match(str(key).strip()):
+            text = "" if value is None else str(value)
+            out[key] = f"<redacted sha256:{_fingerprint(text)} len={len(text)}>"
+        else:
+            out[key] = value
+    return out
+
+
+def redact_query(query: str) -> str:
+    """URL query 中凭据类参数的值替换为指纹（参数名与顺序保留）。"""
+    if not query:
+        return query
+    parts = []
+    for item in query.split("&"):
+        if not item:
+            parts.append(item)
+            continue
+        name, sep, value = item.partition("=")
+        if sep and _SENSITIVE_QUERY.search(unquote(name)):
+            parts.append(f"{name}=<redacted sha256:{_fingerprint(unquote(value))}>")
+        else:
+            parts.append(item)
+    return "&".join(parts)
+
+
+def _redact_url(url: str) -> tuple[str, str]:
+    """返回 (脱敏后的 url, 脱敏后的 query)。"""
+    if not url:
+        return url, ""
+    parsed = urlparse(url)
+    safe_query = redact_query(parsed.query)
+    if safe_query == parsed.query:
+        return url, parsed.query
+    safe = urlunparse(parsed._replace(query=safe_query))
+    return safe, safe_query
 
 # ---------- 容量护栏 ----------
 TRAFFIC_MAX_ROWS = 5000                    # 每题最多保留多少条交换
@@ -188,12 +252,14 @@ class TrafficStore:
             with self._lock:
                 netloc = path = query = ""
                 if url:
+                    url, query = _redact_url(url)   # 审计 S1：query 里的 token/api_key 落盘前脱敏
                     p = urlparse(url)
                     netloc = p.netloc
                     path = p.path or "/"
-                    query = p.query
                 req_blob = self._put_blob(req_body) if req_body else None
                 resp_blob = self._put_blob(resp_body) if resp_body else None
+                safe_req_headers = redact_headers(req_headers)
+                safe_resp_headers = redact_headers(resp_headers)
                 cur = self._conn.execute(
                     "INSERT INTO exchanges(ts, source, method, url, netloc, path, query, "
                     "status, mime, ms, req_headers, req_body_blob, req_bytes, resp_headers, "
@@ -202,9 +268,9 @@ class TrafficStore:
                     (
                         time.time(), source, method, url, netloc, path, query,
                         status, mime, ms,
-                        json.dumps(req_headers, ensure_ascii=False) if req_headers else None,
+                        json.dumps(safe_req_headers, ensure_ascii=False) if safe_req_headers else None,
                         req_blob, len(req_body.encode("utf-8", "replace")) if req_body else 0,
-                        json.dumps(resp_headers, ensure_ascii=False) if resp_headers else None,
+                        json.dumps(safe_resp_headers, ensure_ascii=False) if safe_resp_headers else None,
                         resp_blob, len(resp_body.encode("utf-8", "replace")) if resp_body else 0,
                         truncated, cache_hit, error,
                     ),

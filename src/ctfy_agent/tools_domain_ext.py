@@ -931,6 +931,12 @@ def _strings_utf16(data, min_len=4, limit=60):
 
 
 # ---------- [rev-toolbox] bytecode：.pyc / PyInstaller ----------
+#
+# ⚠️ 硬规约（代码审计 S2，2026-11-12）：本段用 `marshal.loads` 解析**不可信**的题目字节码
+# （.pyc / PyInstaller CArchive / PYZ），这是 rev 能力本体、不可回避。但加载出来的
+# `code object` 与常量**永远只用于静态展示**（co_names/co_consts/dis 反汇编），
+# **绝不 exec/eval/compile 回来、绝不 import、绝不以任何方式执行**。
+# 将来若有人要加"跑一下看看"的功能，必须离开这条路径单独评审——那是完全不同的威胁模型。
 
 _PYI_COOKIE = b"MEI\x0c\x0b\x0a\x0b\x0e"
 

@@ -669,6 +669,8 @@ TRAFFIC_SPEC = {
             "op=get：按 id 取某次交换的请求头+响应头+正文窗口（offset/limit 切片，响应窗 5000 字符）；"
             "op=diff：对 id=a 与 id=b 两条响应正文做行级差异（added_lines/removed_lines）。"
             "用于回答「哪些请求带过某个 cookie/参数」「某端点两种身份返回差在哪」这类跨请求问题。"
+            "注意：认证类头（Authorization/Cookie/Set-Cookie/token…）与 URL 里的凭据参数落盘时已脱敏成 "
+            "<redacted sha256:xxxxxxxx len=N>（前 8 位指纹可对账），所以搜不到这些令牌的明文；正文不受影响。"
         ),
         "parameters": {
             "type": "object",

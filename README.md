@@ -18,7 +18,7 @@ E:\ctfy_project\
 ├─ config\agent.json           # 7 角色、预算、工具面（与 roles\*.json 零漂移由 smoke 守卫）
 ├─ roles\                      # 6 个角色卡（json + system.txt）
 ├─ src\ctfy_agent\             # 框架本体（53 个模块：编排/平台/状态预算/工具/方法卡/GUI）
-├─ tests\                      # 总入口 smoke.py（180 断言）+ 56 个独立套件
+├─ tests\                      # 总入口 smoke.py（180 断言）+ 59 个独立套件
 ├─ tools\                      # container_check / publish_image / verify_image / secret_scan 等
 ├─ Dockerfile                  # 镜像构建（内置 ffuf/SecLists/sqlmap/capstone/pwntools/pycryptodome/gmpy2/sympy/z3）
 ├─ docs\                       # 14 篇当前文档 + docs\archive\（历史）
@@ -121,7 +121,7 @@ MCP 工具（`list_instances`/`stop_instance`/`submit_answer` 等只给 host 侧
 ## 自测
 
 ```powershell
-# 全量（56 个套件，约 4 分钟）
+# 全量（59 个套件，约 4 分钟）
 $env:PYTHONPATH='src;tools/pylibs'; $env:PYTHONIOENCODING='utf-8'
 & "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" -u runs\_mon\run_all_tests.py
 

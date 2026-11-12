@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -63,8 +65,31 @@ def load() -> dict:
     return {"active": DEFAULT_NAME, "profiles": {DEFAULT_NAME: default}}
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """同目录临时文件 + os.replace 的原子写（审计 S7）。
+
+    对比 state.py 的同类实现：不共享 pid/tid 唯一名也没关系，mkstemp 已保证唯一。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def save(data: dict) -> None:
-    PROFILES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    """原子写档案表（审计 S7）：先写同目录临时文件再 os.replace，写一半崩溃不会毁档。"""
+    _atomic_write_text(PROFILES_PATH, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 def _read_env() -> dict:
@@ -163,8 +188,8 @@ def _load_trash() -> list[dict]:
 
 
 def _save_trash(items: list[dict]) -> None:
-    TRASH_PATH.write_text(
-        json.dumps(items[-50:], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        TRASH_PATH, json.dumps(items[-50:], ensure_ascii=False, indent=2) + "\n")
 
 
 def _archive(name: str, profile: dict) -> None:
@@ -237,6 +262,6 @@ def sync_active_to_agent_json(data: dict) -> None:
         raw["mcp_url"] = prof["mcp_url"]
     if "tool_map" in prof:
         raw["tool_map"] = dict(prof.get("tool_map") or {})
-    DEFAULT_CONFIG_PATH.write_text(
-        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    _atomic_write_text(
+        DEFAULT_CONFIG_PATH, json.dumps(raw, ensure_ascii=False, indent=2) + "\n"
     )
