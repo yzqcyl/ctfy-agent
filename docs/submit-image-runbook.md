@@ -14,6 +14,13 @@
 | 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app`（非 root）/ `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` / `LLM_ENABLE_THINKING=0` |
 | 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v7.2`） |
 
+> ### 🚫 范围红线（用户 2026-11-12 定，之后每次重建都必须遵守）
+> 提交镜像**不得打包**两类内容：
+> 1. **可视化界面**：`src/ctfy_agent/gui/` 下的 `app.py / worker.py / settings.py / limits.py / onboard.py`；
+> 2. **跨平台连接**：多平台档案与适配器 `gui/platform_adapter.py`、`gui/platform_worker.py`、`gui/profiles.py`、`gui/toolmap.py`，以及本机 Windows↔WSL 的开发脚手架 `tools/fetch_pylibs.py`、`tests/_libs_linux_probe.py`（这些本就不随 `COPY src/` 进入镜像）。
+>
+> 当前 v7.2 **已满足**：`.dockerignore` L18–22 整包排除 `src/ctfy_agent/gui/`，`Dockerfile` L251–259 有构建期断言（`find_spec('ctfy_agent.gui') is None`，误加回即构建失败）。`pylibs.py` 里的「WSL/跨平台」只出现在*用户提示文案*里，无 subprocess/外连，可随 src/ 入镜像。
+
 ---
 
 ## 历史：v6.3 已构建、匿名可拉取、平台 admission=admitted（2026-11-04）——已被 v7.2 取代
