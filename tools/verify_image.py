@@ -71,6 +71,27 @@ def main(argv: list[str]) -> int:
         print("    ✗ manifest 读不到")
         return 1
     manifest = json.loads(body.decode())
+    # buildx 推的是 OCI image index（manifest list），层与 config 在下面那层 amd64 manifest 里。
+    # v7.2 及更早是单 arch manifest，所以旧版脚本直接读 layers 恰好能用；v7.3 起必须下钻。
+    if manifest.get("manifests"):
+        entries = manifest["manifests"]
+        print(f"    OCI index：{len(entries)} 个平台条目")
+        chosen = None
+        for entry in entries:
+            plat = entry.get("platform") or {}
+            if plat.get("os") == "linux" and plat.get("architecture") == "amd64":
+                chosen = entry
+                break
+        if chosen is None:
+            chosen = entries[0]
+        plat = chosen.get("platform") or {}
+        print(f"    选用平台 {plat.get('os')}/{plat.get('architecture')} → manifest {chosen['digest']}")
+        status, body = raw(f"{base}/v2/{repo}/manifests/{chosen['digest']}",
+                           {"Authorization": f"Bearer {token}", "Accept": ACCEPT})
+        if status != 200:
+            print(f"    ✗ 平台子 manifest 读不到（HTTP {status}）")
+            return 1
+        manifest = json.loads(body.decode())
     layers = manifest.get("layers") or []
     size_mb = sum((layer.get("size") or 0) for layer in layers) / 1048576
     print(f"    {len(layers)} 层，传输体积 {size_mb:.1f} MB")

@@ -1,25 +1,25 @@
 # 提交 agent 镜像 — 最终状态与操作单
 
-## ✅ v7.2 已构建、匿名可拉取（2026-11-11）——**提交用这个**
+## ✅ v7.3 已构建、匿名可拉取（2026-11-12）——**提交用这个**
 
 | 项 | 值 |
 |---|---|
-| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v7.2` |
-| digest（index） | `sha256:060a8fdefbe85d70a35f95f77a9075d3da6f5019a35f4b2085032baa04d0317d` |
-| digest（amd64） | `sha256:a8ca4635a0ebcb38df21a1fb9316ec5192414c9a6ffd65aa8318e0cc42fe5f99` |
-| 构建 | GitHub Actions run `42982226027`（branch `ctfarena/fix`、sha `a39f3e9`）→ 14 步全绿 |
-| 本次变更 | ① **A4 换值重交**（对齐 v3 §3.3 per-question wrong-attempt cap）：`state.wrong_by_qid` 按题号记错交，`reserve_submit`/`can_submit` 额度闸 per-question 化，换题号不再被别的题号锁死；同值仍幂等去重。② **G9 无 task.json 兜底**：缺 task.json 短轮询等待（`AGENT_TASK_WAIT_TIMEOUT`，默认 30s）而非立即 halted，对冲「常驻形态题稍后才放」的尾部风险。③ container_check schema_version 断言 2→3（A1 遗留） |
-| 单测 | `tests/smoke.py` **180 passed / 0 failed**（新增 A4 2 条 + G9 3 条）；独立套件全绿；密钥扫描干净 |
-| 体积/层数 | 19 层，197.7 MB（平台上限 400 MB） |
-| 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app`（非 root）/ `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` / `LLM_ENABLE_THINKING=0` |
-| 匿名拉取 | ✅ token / manifest / config 三层全 200（`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v7.2`） |
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v7.3` |
+| digest（index） | `sha256:7afd38ed80170196c78be563072447a10f25aa21a4fbf0364716b8f2a6c14bde` |
+| digest（amd64） | `sha256:c356c0f7fc7280b6ed99a71f4b77c1a8df6203ef893760db4c47e5e2d8aaac36` |
+| 构建 | GitHub Actions run `43215294520`（branch `ctfarena/fix`、sha `e454453`）→ 12 步全绿 |
+| 本次变更（相对 v7.2） | ① 补装 **z3-solver 5.4.1**（v7.2 漏装 → 官方镜像里 `z3solve` 必失败）；② apt 装 **gdb 16.3 + patchelf 0.18**（PWN 调试短板）；③ 新增 **`lattice_math.py`**（LLL + Coppersmith 单变量小根）并接线 `rsatool op=lll/coppersmith`（CRYPTO 短板）；④ 修 `smoke_libs` 在无 `tools/pylibs` 的干净检出里误判失败（CI 专属坑） |
+| 单测 | `tests/smoke.py` 180 passed / 0 failed；独立套件（含 `smoke_lattice` 30 项、`smoke_libs`、`smoke_secret_scan` 9 项）全绿；`secret_scan --all` 扫 211 文件干净 |
+| 体积/层数 | 19 层，251.7 MB（平台上限 400 MB） |
+| 运行契约 | Entrypoint `python -m ctfy_agent agent` / `User=app`（非 root）/ `PYTHONPATH=/ctfy/src` / `WorkingDir=/ctfy` |
+| 匿名拉取 | ✅ token / manifest / config 全 200；`python tools/verify_image.py ghcr.io/yzqcyl/ctfy-agent-pub:v7.3` → "平台可匿名拉取，且运行契约符合 CTFY-0001 v2" |
 
-> ### ⚠️ v7.3 重建必带（2026-11-12 发现并已改 Dockerfile，待下次构建生效）
-> **v7.2 漏装 z3-solver**：`z3solve` 工具自 2026-11-12 上线并被 rev/crypto/pwn/misc 四个角色派发，
-> 但 v7.2 镜像只装了 pwntools/pycryptodome/gmpy2/sympy/capstone → 官方镜像里 `import z3` 必失败、
-> `z3solve` 恒报缺库（本机靠 `tools/pylibs` 外挂所以一直没暴露）。
-> 已修：`Dockerfile` 增加 `Z3_VERSION=5.4.1.0` + sha256 锁安装 + 求解式 selftest（x>3∧x<5→4），
-> 镜像约 +21MB（~220MB，仍低于 400MB 门禁）。**重建后必须确认构建日志出现 `z3 selftest ok`。**
+> ### ✅ v7.3 构建必带清单（全部已在 run `43215294520` 日志中核验）
+> 1. **z3-solver**：日志 `z3 selftest ok 5.4.1`；
+> 2. **gdb + patchelf**：日志 `GNU gdb (Debian 16.3-1) 16.3` / `patchelf 0.18.0`；
+> 3. **格攻击**：`smoke_lattice.py` 在 CI 独立套件步骤 PASS（LLL+Coppersmith 真跑过，不只是 import）；
+> 4. **外挂库**：日志 `ext-libs selftest ok: Crypto 4.4.0 | gmpy2 2.3.2 | sympy 1.14.0 | pwntools 4.15.0`；
+> 5. **体积**：实测 **251.7 MB**（原估 230~240，gdb 调试符号比预估大），门禁 400 MB 仍有余量。
 
 > ### 🚫 范围红线（用户 2026-11-12 定，之后每次重建都必须遵守）
 > 提交镜像**不得打包**两类内容：
@@ -28,7 +28,20 @@
 >
 > ✅ **允许进镜像**：本机 Windows↔WSL 的**跨平台库连接能力**（`pylibs.py` 的 `CTFY_PYLIBS`/`CTFY_PYLIBS_STRICT` 路径搜索、`tools/fetch_pylibs.py` 取库脚本、Linux 侧库目录约定）。镜像本身是 Linux，这些能力不外连、不依赖 host，属于允许保留的通用能力（用户 2026-11-12 确认「2 可以进」）。
 >
-> 当前 v7.2 **已满足**：`.dockerignore` L18–22 整包排除 `src/ctfy_agent/gui/`，`Dockerfile` L251–259 有构建期断言（`find_spec('ctfy_agent.gui') is None`，误加回即构建失败）。`tools/` 与 `tests/` 本就不随 `COPY src/` 进入镜像，无需额外处理。
+> 当前 v7.3 **已满足**：`.dockerignore` L22 整包排除 `src/ctfy_agent/gui/`，`Dockerfile` L277 有构建期断言（`find_spec('ctfy_agent.gui') is None`，误加回即构建失败）。`tools/` 与 `tests/` 本就不随 `COPY src/` 进入镜像，无需额外处理。v7.3 沿用同一红线（未改 `.dockerignore` 与断言）。
+
+---
+
+## 历史：v7.2 已构建、匿名可拉取（2026-11-11）——已被 v7.3 取代
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/yzqcyl/ctfy-agent-pub:v7.2` |
+| digest（index） | `sha256:060a8fdefbe85d70a35f95f77a9075d3da6f5019a35f4b2085032baa04d0317d` |
+| digest（amd64） | `sha256:a8ca4635a0ebcb38df21a1fb9316ec5192414c9a6ffd65aa8318e0cc42fe5f99` |
+| 构建 | GitHub Actions run `42982226027`（branch `ctfarena/fix`、sha `a39f3e9`）→ 14 步全绿 |
+| 已知缺口（v7.3 修） | 未装 z3-solver（`z3solve` 恒报缺库）；无 gdb/patchelf；无格攻击工具 |
+| 体积/层数 | 19 层，197.7 MB |
 
 ---
 

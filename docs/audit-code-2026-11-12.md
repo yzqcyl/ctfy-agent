@@ -85,11 +85,11 @@
 **可优化（优先级从高到低）**：
 1. **C1 超大文件拆分**——可维护性/协作冲突收益最大（未做，纯重构、风险收益比不划算）
 2. ~~**S1 流量库脱敏**~~——✅ 已修（2026-11-12）
-3. ~~S7 profiles.json 改原子写~~——✅ 已修（顺带 platforms.deleted.json 与 agent.json）；S6 secret_scan 补 base64 形态规则——**决定不改**（误报率高，改为登记"是网不是盾"）
-4. C2 吞异常补日志——低优先级未做；~~docs 归档~~——✅ 已做（79 篇进 `docs/archive/`，见 `docs/README.md`）
+3. ~~S7 profiles.json 改原子写~~——✅ 已修（顺带 platforms.deleted.json 与 agent.json）；~~S6 secret_scan 补 base64 形态规则~~——✅ **已补（2026-11-12 修订判断，见 §六）**：先判断"不改（误报率高）"，实测加了低噪音规则后仓库 `--all` 仍干净，故改为采纳
+4. ~~C2 吞异常补日志~~——✅ **已局部补（2026-11-12，见 §六）**：traffic 落盘失败改为计数 + 首错一条 stderr；其余清理路径保持静默（注释已声明）；~~docs 归档~~——✅ 已做（79 篇进 `docs/archive/`，见 `docs/README.md`）
 
-> 处置进度（2026-11-12 收尾会话）：S1 / S2 / S7 已修或已立规约；C1 / C2 / S6 明确不做（理由如上）。
-> 新增回归：`tests/smoke_traffic_redact.py`、`tests/smoke_profiles_atomic.py`。
+> 处置进度（2026-11-12 收尾会话）：S1 / S2 / S7 已修或已立规约；S6 / C2 在第二轮（§六）补强；C1 / C4 / C5 明确不做（理由见 §六）。
+> 新增回归：`tests/smoke_traffic_redact.py`、`tests/smoke_profiles_atomic.py`、`tests/smoke_secret_scan.py`。
 
 ---
 
@@ -101,4 +101,29 @@
 
 ---
 
-*本报告基于两轮静态审计与只读验证（约 60 个模块/文件）。原审计未执行任何修改操作；S1/S2/S7 的修复由后续收尾会话完成，回归见文内引用。*
+## 六、外部审计（另一 agent，2026-11-12）对照与处置
+
+来源：用户转交的外部审计报告，已归档为 [`docs/audit-external-2026-11-12.md`](audit-external-2026-11-12.md)（原文件 `审计报告.md`，两轮只读审计）。其结论与本报告高度一致，逐条核对后的处置：
+
+| 项 | 外部结论 | 处置 | 依据 |
+|---|---|---|---|
+| S1 流量明文 | 唯一建议近期处理 | ✅ 本报告先已修 | 认证头/query 落盘前指纹化，`tests/smoke_traffic_redact.py` |
+| S2 pyc marshal | 建议立硬规约 | ✅ 已立 | 段头注释"只静态展示，绝不 exec/eval/compile/import" |
+| S3 .env 明文 | 登记风险 | 接受 | 不进 git/镜像；建议本轮把 `DEEPSEEK_API_KEY` / `CTFY_TOKEN` 轮换一次 |
+| S4 CERT_NONE | 靶机信道取舍 | 接受 | 仅靶机；LLM/MCP 主链路强制校验 |
+| S5 shell=True | 功能本体 | 接受 | 隔离靠容器；宿主机直跑=任意命令面，已在 `docs/capability-report-2026-11-12.md` §5 写明 |
+| S6 扫描盲区 | 建议补 base64 | ✅ **本轮采纳**（修正原"不做"判断） | `tools/secret_scan.py` 新增 `_scan_base64_tokens`：只报解码后命中已知前缀/赋值形态的候选；`--all` 扫 211 个跟踪文件仍干净；回归 `tests/smoke_secret_scan.py`（9 项） |
+| S7 profiles 非原子 | 建议 tmp+replace | ✅ 本报告先已修 | `tests/smoke_profiles_atomic.py` |
+| S8 prompt 注入 | 已有缓解 | 接受 | system prompt 多处声明不可信数据 + 提交幂等/限额兜底 |
+| C1 超大文件 | 建议拆分 | ❌ 不做 | 纯重构、无功能收益，赛前回归面大；记入技术债 |
+| C2 静默吞异常 | 建议补日志 | ✅ **局部采纳** | `traffic.py` `record()` 落盘失败改计数 `write_failures` + 首错一条 stderr（调用方语义不变，仍返回 0）；回归并入 `smoke_traffic_redact.py` |
+| C3 state.save() 全量写 | 性能取舍 | 接受 | 原子写 + 锁内 merge 正确，题量百级无感 |
+| C4 私有方法泄漏 | 风格问题 | ❌ 不改名 | `_as_json` 被 crew/solver/instance_guard/attachments 当准公开调用；改名前需同步 12 处测试替身，净收益为零 → 在 `platform.py` docstring 写明"准公开 API"约定 |
+| C5 自动补交单层防线 | 建议自身校验余额 | ❌ 不再加一层 | `_submit` 内已有幂等/去重/`submit_limit` 三道；外面复制一份限额口径反而会漂移 |
+| 本地卫生 | pycache / git gc | ✅ 顺手做 | 清 `__pycache__`（本就不进 git）、`git gc` 压缩松散对象 |
+
+**结论**：外部报告可采纳的只有 S6（补强）与 C2（局部），其余是"合理取舍"而非缺陷。这条对照同时修正了本报告先前对 S6 的保守判断（原判断"误报率高不做"）——先落一版最小噪音实现再评估，比凭直觉否掉更可靠。
+
+---
+
+*本报告基于两轮静态审计与只读验证（约 60 个模块/文件）。原审计未执行任何修改操作；S1/S2/S7 的修复由后续收尾会话完成，S6/C2 由第二轮外部审计对照后补强，回归见文内引用。*

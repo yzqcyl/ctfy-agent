@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import subprocess
@@ -52,6 +53,48 @@ _ASSIGN = re.compile(
     r"\s*[:=]\s*"
     r"([\"'])([^\"'\n]{8,})\2"
 )
+
+# 2b) base64 包裹的密钥（2026-11-12 审计 S6 的补强）：
+#     "base64 编码的 key / 无前缀随机串" 是旧规则盲区。但不能见 base64 就报——
+#     仓库里大量合法 base64（测试夹具、PNG 块、签名），误报会淹没真信号。
+#     只报「解码后命中已知前缀 _HARD_PATTERNS 或赋值形态 _ASSIGN」的候选。
+_B64_CANDIDATE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def _decode_b64(chunk: str) -> str | None:
+    pad = "=" * (-len(chunk) % 4)
+    try:
+        raw = base64.b64decode(chunk + pad, validate=True)
+    except Exception:  # noqa: BLE001 - 不是合法 base64 就跳过，不报错
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _scan_base64_tokens(line: str) -> list[tuple[str, str]]:
+    """返回 [(type, masked_preview)]；命中即止（控制大文件里的解码成本）。"""
+    hits: list[tuple[str, str]] = []
+    for match in _B64_CANDIDATE.finditer(line):
+        decoded = _decode_b64(match.group(0))
+        if not decoded or len(decoded) < 8:
+            continue
+        for name, pattern in _HARD_PATTERNS:
+            hit = pattern.search(decoded)
+            if hit:
+                hits.append((f"base64:{name}", "b64→" + mask(hit.group(0))))
+                break
+        else:
+            for match2 in _ASSIGN.finditer(decoded):
+                key, value = match2.group(1), match2.group(3)
+                if _PLACEHOLDER.search(value) or value in _KNOWN_FAKE:
+                    continue
+                hits.append((f"base64:literal_assignment:{key}", "b64→" + mask(value)))
+                break
+        if hits:
+            break
+    return hits
 
 # 值像"占位/引用/测试桩"就不算泄漏
 _PLACEHOLDER = re.compile(
@@ -143,6 +186,9 @@ def scan_file(path: Path) -> list[dict]:
                 continue  # key = key 这种自赋值
             findings.append({"file": rel(path), "line": lineno,
                              "type": f"literal_assignment:{key}", "preview": mask(value)})
+        if _B64_CANDIDATE.search(line):
+            for kind, preview in _scan_base64_tokens(line):
+                findings.append({"file": rel(path), "line": lineno, "type": kind, "preview": preview})
     return findings
 
 

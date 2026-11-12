@@ -147,16 +147,20 @@ CLI 开放，**不给模型**（防误操作烧配额）。已核对接线无孤
   ffuf 构建期烤入。
 - 明确不含：Sage、Ghidra/IDA、volatility、浏览器内核、pwndbg（只用 gdb 批处理）、ROPgadget（用 `pwnrop`）；
   GUI 与多平台适配器（见 runbook 红线）。
-- 体积：v7.2 实测 197.7 MB；补 z3 后约 220 MB；v7.3 再补 gdb/patchelf 约 **230~240 MB**（门禁 400 MB）。
+- 体积：v7.2 实测 197.7 MB；**v7.3 实测 251.7 MB / 19 层**（门禁 400 MB 有余量；gdb 调试符号比预估的 25 MB 大）。
+  构建证据：run `43215294520`（sha `e454453`）12 步全绿，index digest `sha256:7afd38ed…f2a6c14bde`、
+  amd64 `sha256:c356c0f7…e2d8aaac36`，`tools/verify_image.py` 匿名核验通过。
+- 镜像内自检（构建日志原文）：`z3 selftest ok 5.4.1`、`ext-libs selftest ok: Crypto 4.4.0 | gmpy2 2.3.2 |
+  sympy 1.14.0 | pwntools 4.15.0`、`GNU gdb (Debian 16.3-1) 16.3`、`patchelf 0.18.0`。
 
 ## 7. 缺口优先级与处理状态
 
 | # | 缺口 | 影响 | 状态 | 建议 |
 |---|---|---|---|---|
 | 1 | PWN/CRYPTO 真实题 0 分**未复验** | 最大不确定性：不知道 libs 接入是否真提升 | ⏳ 待批（烧配额） | 各 1 题复验，见 §8 |
-| 2 | v7.2 漏装 z3-solver | `z3solve` 在官方镜像恒失败 | ✅ **已修**（Dockerfile，待 v7.3 重建） | 重建时看构建日志 `z3 selftest ok` |
+| 2 | v7.2 漏装 z3-solver | `z3solve` 在官方镜像恒失败 | ✅ **已修并在 v7.3 镜像验证**（日志 `z3 selftest ok 5.4.1`） | 重建时看构建日志 |
 | 3 | 实例可达性（access_ready=false） | 配额烧光、整题作废 | 🟡 部分（负缓存已做） | 开题前置探测 + 早退 |
-| 4 | 格攻击（LLL/Coppersmith） | CRYPTO 高难度题天花板 | ✅ **已修**（`lattice_math.py` + `rsatool` op=lll/coppersmith，v7.3 待重建验证） | 见 §9；二元/ECC 仍靠 shell 手写 |
+| 4 | 格攻击（LLL/Coppersmith） | CRYPTO 高难度题天花板 | ✅ **已修并在 v7.3 镜像验证**（CI 独立套件跑 `smoke_lattice.py`）；仅一元小根，二元/ECC 仍靠 shell 手写 | 见 §9 |
 | 5 | 磁盘镜像 / 内存取证 | FORENSICS 中高难度题做不了 | ❌ 未做 | 加只读解析小工具（纯 stdlib） |
 | 6 | 无 gdb / 无 libc 版本库 | PWN 调试与偏移推断 | 🟡 **gdb/patchelf 已装**（v7.3）；libc 版本库仍无 | gdb 走 `-batch` 批处理；libc 小表待做 |
 | 7 | 无浏览器 JS 引擎 | 纯前端题受限 | ❌ 未做（有意取舍） | 不加 |
@@ -203,7 +207,7 @@ CLI 开放，**不给模型**（防误操作烧配额）。已核对接线无孤
 | 改动 | `Dockerfile` apt 行加 `gdb patchelf`，并在同一层做 `gdb --version` / `patchelf --version` 断言（风格同 as/objdump/readelf 断言） |
 | 用法 | 方法卡写明批处理式：`gdb -batch -q -ex run -ex 'info registers' -ex 'x/8gx $rsp' -ex bt ./poc < payload.bin`——容器里不需要 pwndbg/交互式 |
 | patchelf | ret2libc 题把题目自带 libc 的 interpreter/rpath 改成本机 loader 才能本地复现 |
-| 体积 | apt 层约 +25 MB，估算总镜像 230~240 MB（门禁 400 MB），构建日志会打实际大小 |
+| 体积 | **v7.2 197.7 MB → v7.3 251.7 MB，共 +54 MB**（z3 库 + gdb/patchelf + 本轮源码；gdb 带调试符号比预估的 25 MB 大）；19 层，门禁 400 MB 仍有余量 |
 
 ### 9.3 本篇报告的自我更正（复核 2026-11-12）
 

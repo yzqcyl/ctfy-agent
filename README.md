@@ -2,7 +2,7 @@
 
 纯 Python 标准库的多智能体 CTF 解题框架：1 个协调者 + 6 个方向专家
 （web / pwn / rev / crypto / misc / ai），通过平台 MCP 工具解题并当场提交。
-交付形态为**容器镜像** `ghcr.io/yzqcyl/ctfy-agent-pub:v7.2`（197.7 MB / 19 层，digest 见
+交付形态为**容器镜像** `ghcr.io/yzqcyl/ctfy-agent-pub:v7.3`（251.7 MB / 19 层，digest 见
 [docs/submit-image-runbook.md](docs/submit-image-runbook.md)）。
 
 > 文档地图：[docs/README.md](docs/README.md)（当前有效文档）｜能力现状：
@@ -134,10 +134,10 @@ $env:PYTHONPATH='src;tools/pylibs'; $env:PYTHONIOENCODING='utf-8'
 
 ## 现状（2026-11-12）
 
-- **代码线**：`ctfarena/fix` 分支；HEAD 含 v7.2 镜像对应代码 + libs 接入（pwntools/pycryptodome/z3 等）
-  + P2 三修（无环境负缓存 / 平台 attempt 回写 / ctf2 墓碑按题自愈）。
-- **镜像**：v7.2 已构建并通过匿名拉取；**v7.3 待建**——v7.2 漏装 z3-solver（`z3solve` 工具在镜像内会缺库），
-  已在 Dockerfile 补齐，重建后需确认构建日志有 `z3 selftest ok`。
-- **题库实测**（`runs/plat/state.json`，2026-11-10 数据）：SAMPLE 自建题 17/17；外部真实题 13/26
-  （REVERSE 8/8、FORENSICS 2/4、MISC 3/5、**PWN 0/4、CRYPTO 0/5**）。归因与下一步见能力评估报告 §3/§8。
-- **待办**：PWN/CRYPTO 真实题复验（烧平台配额，需用户批准）；格攻击/磁盘镜像取证工具缺口（未做）。
+- **代码线**：`ctfarena/fix` 分支；HEAD 含 v7.3 镜像对应代码（z3 / gdb / patchelf / LLL+Coppersmith
+  / 流量脱敏 / 原子写 / 密钥扫描 base64 补强）。
+- **镜像**：**v7.3 已构建并通过匿名拉取**（run `43215294520`，sha `e454453`，251.7 MB / 19 层）。
+  v7.2 的两个缺口（漏装 z3-solver → `z3solve` 恒缺库；无 gdb/patchelf → PWN 只能盲打）已在 v7.3 补齐。
+- **题库实测**（`runs/plat/state.json`，2026-11-10 数据，早于 v7 库/image 能力）：SAMPLE 自建题 17/17；
+  外部真实题 13/26（REVERSE 8/8、FORENSICS 2/4、MISC 3/5、**PWN 0/4、CRYPTO 0/5**）。归因与下一步见能力评估报告 §3/§8。
+- **待办**：PWN/CRYPTO 真实题复验（烧平台配额，需用户批准）；剩余缺口见能力评估报告 §8。

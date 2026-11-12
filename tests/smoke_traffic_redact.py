@@ -121,6 +121,22 @@ def main() -> int:
         check("redact_query 空串", tmod.redact_query("") == "")
         check("非凭据参数不动", tmod.redact_query("a=1&b=2") == "a=1&b=2")
         check("SQL 注入式 query 不误伤", tmod.redact_query("q=1%27+OR+1%3D1") == "q=1%27+OR+1%3D1")
+
+        # 7) 审计 C2（2026-11-12）：落盘失败不再静默——计数 + 首错一条 stderr，返回值仍是 0
+        store.write_failures = 0
+        store._fail_warned = False
+        real_conn = store._conn
+        store._conn = object()  # 模拟连接被关/磁盘不可写：execute 会抛 AttributeError
+        try:
+            rc = store.record(source="http_request", url="http://127.0.0.1:1/x", req_body="a=1")
+            check("C2 落盘失败返回 0（best-effort 语义不变）", rc == 0, repr(rc))
+            check("C2 落盘失败被计数", store.write_failures == 1, str(store.write_failures))
+            store._conn = object()
+            rc2 = store.record(source="http_request", url="http://127.0.0.1:1/y")
+            check("C2 连续失败继续计数（不刷屏）", store.write_failures == 2 and rc2 == 0,
+                  str(store.write_failures))
+        finally:
+            store._conn = real_conn
         store.close()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -174,6 +175,10 @@ class TrafficStore:
         self._conn: sqlite3.Connection | None = None
         self._disabled = False
         self._writes_since_prune = 0
+        # 落盘失败计数（2026-11-12 审计 C2）：旧实现 except 里直接 return 0，落盘失败
+        # 完全无感知，复盘时「为什么这题没有流量记录」查不出来。现在计数 + 首错一条 stderr。
+        self.write_failures = 0
+        self._fail_warned = False
         try:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self.blobs_dir.mkdir(parents=True, exist_ok=True)
@@ -281,7 +286,13 @@ class TrafficStore:
                     self._writes_since_prune = 0
                     self._maybe_prune()
                 return cur.lastrowid or 0
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - 落盘是 best-effort，绝不能击穿解题主流程
+            # C2：不再静默。计数 + 首错一条 stderr（只打一次，避免刷屏）；调用方仍拿到 0=没记上。
+            self.write_failures += 1
+            if not self._fail_warned:
+                self._fail_warned = True
+                print(f"[traffic] 流量落盘失败（后续同类错误只计数不再打印）：{type(exc).__name__}: {exc}",
+                      file=sys.stderr)
             return 0
 
     def _delete_oldest(self, n: int) -> None:

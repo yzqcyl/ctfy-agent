@@ -441,6 +441,11 @@ class CtfyPlatform:
 
         平台返回常是「content 文本 + structuredContent 美化 JSON」两段拼接，
         所以用 raw_decode 只取开头那个 JSON，忽略后面的重复美化段。
+
+        [审计 C4 2026-11-12] 名字带下划线是历史原因，实际被 crew/solver/instance_guard/
+        attachments 当作**准公开**方法调用（都不在本类内）。刻意不重命名：测试替身
+        （smoke_*.py 的 FakePlatform）只实现这一个名字，改名会牵连 12 处替身且净收益为零。
+        语义上视同公开 API —— 改行为前先 grep `_as_json`。
         """
         raw = text or ""
         if raw.startswith("-----"):

@@ -13,7 +13,8 @@
 | [submit-image-runbook.md](submit-image-runbook.md) | 镜像构建/提交/验收操作单 + **范围红线**（不带 GUI/多平台适配器）+ v7.3 待带项 | 出镜像、验镜像 |
 | [audit-rules-v2.5-2026-11-10.md](audit-rules-v2.5-2026-11-10.md) | 比赛规则 v2.5 逐条审计（15 处风险点 + 已修状态） | 正赛前合规复核 |
 | [audit-qa-2026-11-11.md](audit-qa-2026-11-11.md) | 问答/规则类审计（A1–A7 等，含状态） | 查"这条到底修了没" |
-| [audit-code-2026-11-12.md](audit-code-2026-11-12.md) | **全项目代码审计**（安全/质量/冗余/算法，两轮只读）：S1–S8、C1–C5，含处置建议 | 安全复核、准备改动前 |
+| [audit-code-2026-11-12.md](audit-code-2026-11-12.md) | **全项目代码审计**（安全/质量/冗余/算法，两轮只读）：S1–S8、C1–C5，含处置建议；§六 是对外部审计的逐条对照 | 安全复核、准备改动前 |
+| [audit-external-2026-11-12.md](audit-external-2026-11-12.md) | 外部（另一 agent）审计报告原文，两轮只读；处置结论见 `audit-code-2026-11-12.md` §六 | 想看外部视角的原始表述 |
 | [domain-tools.md](domain-tools.md) | 本地域工具参考（参数/输出/陷阱） | 改工具或调提示词时 |
 | [pylibs-bridge.md](pylibs-bridge.md) | 第三方库接入（镜像内置清单 + 本机外挂 + Windows 限制矩阵） | 动库/z3/pwntools 时 |
 | [ui-design-2026-11-10.md](ui-design-2026-11-10.md) | GUI 设计规范（本地开发用，**不进提交镜像**） | 改 GUI 时 |
