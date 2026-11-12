@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 
 from .config import Config, load
 from .crew import Crew
+from .gledger import build_global_ledger
 from .llm import DeepSeekLLM
 from .platform import CtfyPlatform
 from .state import Store
@@ -802,6 +803,8 @@ def run_agent(
                 # 不传就会退回 llm 默认值，偶发 raw TimeoutError 直接击穿整题（实测 3.3min 崩两次）。
                 timeout=config.timeout,
                 key_pool=key_pool,
+                # 全局 1B 总量总账（跨题/跨进程重启连续）；max_total_tokens=0 时为 None
+                gledger=build_global_ledger(config, run_id=os.environ.get("CTFY_RUN_ID", "")),
             )
 
     # 9) 跑 Crew

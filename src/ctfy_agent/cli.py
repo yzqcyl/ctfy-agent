@@ -52,6 +52,8 @@ def make_platform(config: Config, *, verbose: bool = False) -> CtfyPlatform:
 
 
 def make_llm(config: Config, model: str | None = None, budget=None) -> DeepSeekLLM:
+    from .gledger import build_global_ledger
+
     return DeepSeekLLM(
         api_key=config.llm_api_key,
         model=model or config.model,
@@ -62,6 +64,8 @@ def make_llm(config: Config, model: str | None = None, budget=None) -> DeepSeekL
         budget=budget,
         # 读超时跟题级 timeout 走（默认 120s；本机实测长输出会超过 120s → raw TimeoutError）
         timeout=config.timeout,
+        # 全局 1B 总量总账（跨题/跨进程）；max_total_tokens=0 时为 None（零开销）
+        gledger=build_global_ledger(config),
     )
 
 

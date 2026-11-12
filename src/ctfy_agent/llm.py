@@ -56,6 +56,7 @@ class DeepSeekLLM:
         debug: bool = False,
         budget=None,
         key_pool: KeyPool | None = None,
+        gledger=None,
     ):
         # [2026-11-10 加固-需求1] key_pool 存在时以 pool.current() 为准（api_key 参数仅兜底）；
         # pool 为单 key 时行为与现状逐字节一致。
@@ -69,6 +70,8 @@ class DeepSeekLLM:
         self.debug = debug
         # 费用刹车：budget 有余额才允许发下一次请求（见 budget.py）
         self.budget = budget
+        # 全局总账（跨题 1B 总量，见 gledger.py）：None = 未启用（零开销）
+        self.gledger = gledger
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.calls = 0
         # 同源重定向护栏：跨源重定向直接报错，防止 API Key 外送
@@ -169,6 +172,9 @@ class DeepSeekLLM:
         # 硬刹车：预算耗尽就直接拒绝发请求，不会产生费用
         if self.budget is not None:
             self.budget.check()
+        # 全局总账（跨题 1B 总量）：题级预算之外的第二道总量闸，同样在发请求前拦
+        if self.gledger is not None:
+            self.gledger.check()
 
         payload = {
             "model": self.model,
@@ -197,6 +203,9 @@ class DeepSeekLLM:
             self.usage[key] += int(usage.get(key) or 0)
         if self.budget is not None:
             self.budget.record(usage)
+        # 总账按「平台计费口径的原始 token」记（不减缓存折扣），跨题/跨进程累加
+        if self.gledger is not None:
+            self.gledger.record(usage)
 
         choices = data.get("choices") or []
         if not choices:

@@ -43,6 +43,10 @@ DEFAULTS = {
     "debug": False,
     # 费用/用量上限（硬刹车，防止跑飞烧钱）
     "max_tokens_per_challenge": 800000,   # 单题累计 token 上限（跨进程继承，重跑接着算）；与 agent.json 对齐
+    # 全局（跨题/跨进程）token 总账：正式赛智谱 1B 总量（规则 v2.5 §二(五)）。
+    # 0 = 不设上限（本地调试）；1B 对本地练习跑不构成约束。
+    "max_total_tokens": 1_000_000_000,
+    "global_ledger_path": "",             # 总账落盘路径；空=按 work 目录/runs 上一级自动解析
     "max_llm_calls": 20,                  # 单题累计模型调用次数上限
     "max_context_tokens": 16000,          # 单次请求上下文滑窗（估算 token），超窗丢最旧步骤
     "max_cost": 0.0,                      # 单题金额上限（0=不限；需同时配单价才生效）
@@ -72,6 +76,11 @@ ENV_MAP = {
     "AGENT_MAX_LLM_CALLS": "max_llm_calls",
     "AGENT_MAX_CONTEXT_TOKENS": "max_context_tokens",
     "AGENT_MAX_COST": "max_cost",
+    # 全局总账（跨题 1B 总量）：AGENT_* 与 CTFY_* 双前缀都认，容器里平台两种都可能注入
+    "AGENT_MAX_TOTAL_TOKENS": "max_total_tokens",
+    "CTFY_MAX_TOTAL_TOKENS": "max_total_tokens",
+    "AGENT_GLOBAL_LEDGER": "global_ledger_path",
+    "CTFY_GLOBAL_LEDGER": "global_ledger_path",
     "AGENT_PRICE_INPUT_PER_MTOK": "price_input_per_mtok",
     "AGENT_PRICE_OUTPUT_PER_MTOK": "price_output_per_mtok",
     "AGENT_RUNS_DIR": "runs_dir",
@@ -126,6 +135,8 @@ class Config:
     debug: bool = DEFAULTS["debug"]
 
     max_tokens_per_challenge: int = DEFAULTS["max_tokens_per_challenge"]
+    max_total_tokens: int = DEFAULTS["max_total_tokens"]
+    global_ledger_path: str = DEFAULTS["global_ledger_path"]
     max_llm_calls: int = DEFAULTS["max_llm_calls"]
     max_context_tokens: int = DEFAULTS["max_context_tokens"]
     max_cost: float = DEFAULTS["max_cost"]
@@ -185,6 +196,8 @@ class Config:
             "oracle_limit": self.oracle_limit,
             "allow_shell": self.allow_shell,
             "max_tokens_per_challenge": self.max_tokens_per_challenge,
+            "max_total_tokens": self.max_total_tokens,
+            "global_ledger_path": self.global_ledger_path,
             "max_llm_calls": self.max_llm_calls,
             "max_context_tokens": self.max_context_tokens,
             "max_cost": self.max_cost,
@@ -264,6 +277,8 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
         allow_shell=bool(raw["allow_shell"]),
         debug=bool(raw["debug"]),
         max_tokens_per_challenge=int(raw["max_tokens_per_challenge"]),
+        max_total_tokens=int(raw["max_total_tokens"]),
+        global_ledger_path=str(raw["global_ledger_path"] or ""),
         max_llm_calls=int(raw["max_llm_calls"]),
         max_context_tokens=int(raw["max_context_tokens"]),
         max_cost=float(raw["max_cost"]),

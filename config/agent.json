@@ -16,6 +16,8 @@
   "allow_shell": false,
   "debug": false,
   "max_tokens_per_challenge": 800000,
+  "max_total_tokens": 1000000000,
+  "global_ledger_path": "",
   "budget_cache_discount": true,
   "max_llm_calls": 240,
   "max_context_tokens": 32000,

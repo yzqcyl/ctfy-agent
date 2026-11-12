@@ -12,6 +12,10 @@ runs/
 logs/
 *.log
 
+# 全局 token 总账（跨题/跨进程的本机状态，含用量；不进 git）
+.ctfy-global-ledger.json
+.ctfy-ledger.*.tmp
+
 # Python
 __pycache__/
 *.py[cod]

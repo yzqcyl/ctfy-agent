@@ -12,7 +12,7 @@
 | # | 级别 | 不一致点 | 规则依据（页） | 现状 | 状态 |
 |---|---|---|---|---|---|
 | 1 | **P0** | 完全没有出题（authoring）能力 | §二(二)(四)(六)（P2/P3） | 代码 0 实现；`run_mode` 未知值已降级不再弃权 | **待做**（11/15 后窗口） |
-| 2 | **P0** | 正式赛智谱 1B token 总量，无全局账本 | §二(五)（P3） | 只有单题 `max_tokens_per_challenge=800k` | **待做** |
+| 2 | **P0** | 正式赛智谱 1B token 总量，无全局账本 | §二(五)（P3） | 只有单题 `max_tokens_per_challenge=800k` | **已修**（2026-11-12 `gledger.py`，见 §3 状态更新） |
 | 3 | P1 | 晋级口径（**30** 支）与首关 **11/14** 记错 | §二(一)（P2） | `PROGRESS.md` 时间线已改对 | **已修**（`241c845`） |
 | 4 | P1 | 切智谱时 `enable_thinking` 字段外发可能 400 | §二(五)（P3） | 只对 `*.aliyuncs.com` 端点发送 | **已修**（`241c845`） |
 | 5 | P1 | 双赛道报名冲突未核实 | §二(二)/§五(一)（P1/P6） | 仓库无记录 | **需人工**（今晚 5 分钟） |
@@ -114,6 +114,16 @@
 2. `max_tokens_per_challenge` 视 11/14 实测吞吐从 800k 调到 400k 左右（现有中位数远低于 800k）。
 3. **11-21 开跑前人工核查平台注入的 `LLM_*` 指向 bigmodel**（「状态查看」是规则允许的人工动作）；低成本代码兜底：rollup 里加一条「LLM_BASE_URL 不在正式赛白名单」的告警字段。
 4. 智谱切换不改代码：`.env`/平台注入换 `LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4` + GLM 模型名即可；`enable_thinking` 的 400 风险已修（#4）。
+
+> **2026-11-12 状态更新（P0-2 全局账本已落地）**：新增 `src/ctfy_agent/gledger.py`，在
+> `DeepSeekLLM.chat()` **发请求前** `check()`、收到响应后 `record(usage)`；按平台计费口径的
+> **原始 token**（prompt+completion，不减缓存折扣）跨题/跨进程累加，落盘
+> `<CTFY_WORK_DIR 或 runs 上一级>/.ctfy-global-ledger.json`；上限 `config.max_total_tokens`
+> 默认 **1B**（`AGENT_MAX_TOTAL_TOKENS` / `CTFY_MAX_TOTAL_TOKENS` 可覆盖，0=关闭）。
+> 到顶抛 `BudgetExceeded(kind="budget_exhausted")`，现有 retry/报告链条无需改动即正确收口
+> （不会继续白烧额度）。开跑时 transcript 落一行 `[全局总账] 已用/上限` 供事后核对；
+> 回归 `tests/smoke_gledger.py` **19/19**。设计说明见 `docs/global-token-ledger.md`。
+> 原先「建议 1：全局累加器先不做」作废——平台虽无额度查询接口，但本地记账足以在到顶时停手。
 
 > ✅ 同一条里做对的：入围/初选我们用的 `dashscope.aliyuncs.com/compatible-mode` **精确命中白名单**（§1.3 第 3 家）；`config.py` 默认回落 `api.deepseek.com` 也在白名单内。
 

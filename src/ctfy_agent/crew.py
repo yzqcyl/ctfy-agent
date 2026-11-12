@@ -949,6 +949,19 @@ class Crew:
             })
         except Exception:  # noqa: BLE001 - 诊断标记不拦解题
             pass
+        # 全局 1B 总量总账（跨题/跨进程；规则 v2.5 §二(五)）：开跑时把当前用量落成确定性事实。
+        # 题级 800k 只保护单题，多题/重跑/重启叠加的总量由 gledger 在每次 LLM 调用前拦。
+        try:
+            from .gledger import build_global_ledger
+
+            _gl = build_global_ledger(self.config, run_id=str(self.config.extra.get("run_id") or ""))
+            if _gl is not None:
+                self.store.append_transcript(challenge_id, {
+                    "role": "budget",
+                    "note": f"[全局总账] {_gl.describe()}（账本 {_gl.path}）",
+                })
+        except Exception:  # noqa: BLE001 - 总账展示失败不拦解题
+            pass
         # P2-2：按域编排档位（只动编排参数；未识别题型 → {} 即旧行为）
         self._profile = domain_profile(
             self.config.extra, challenge,
