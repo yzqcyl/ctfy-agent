@@ -2779,16 +2779,57 @@ class LocalTools:
                 out.append(part)
         return "".join(out) if changed else command
 
+    # [fix 2026-11-12 P1-B] run 级元数据文件名：沙盒是 runs/<run>/sandbox/<cid>，
+    # 这些文件在沙盒的上一层或同层，含全部题目的笔记、候选 flag、转录。
+    _RUN_META_TOKENS = ("state.json", "transcripts", "results.json", "events.jsonl",
+                        ".current.json", ".finished.json")
+
     def _cross_run_guard(self, command: str) -> str:
-        """拦住「读到别的 run 的残留沙盒」——实测污染，不是假想。
+        """拦住「读到别的 run 的残留沙盒」与「同 run 但跳出本题沙盒」——两条都实测污染过。
 
         2026-11-11 真实批量：`satisfied` 这题的 misc 专家在
         `runs/plat/sandbox/<旧 cid>/src/flag.txt` 找到 11-10 那次运行留下的 44 字节
         `dice{...}`（其实是**官方仓库自带的 flag**），当成平台下发的 flag 提交 → 又被判错，
         白烧一次提交（平台 attempt 直接变成 2，它按用户+题全局计数）。
         每个 run 的沙盒是隔离的临时目录，跨 run 读到的只可能是历史残留，一律拒绝。
+
+        2026-11-12 2h 实测（P1-B）：同一 run 内也会串。pwn 专家为找实例信息执行
+        `cd /d "...\\runs\\buuctf2h-...\\" & findstr state.json`，把上一题 rot 的候选
+        `flag{www_shiyanbar_com_is_very_good_????}` 带进自己的账本，随后 done 闸门拿
+        **别的题**的候选拦本题。所以「出本题沙盒」本身也要拦，而不只是跨 run。
         """
         low = str(command or "").replace("/", "\\").lower()
+        try:
+            sandbox = self._sandbox_dir().resolve()
+            run_dir = sandbox.parents[1]                       # runs/<run>
+        except (OSError, IndexError):
+            sandbox, run_dir = None, None
+        if sandbox is not None and run_dir is not None:
+            for token in self._RUN_META_TOKENS:
+                if token in low:
+                    return (
+                        f"[拒绝] 沙盒边界：`{token}` 是本次运行的全局元数据（含其它题的笔记与候选 flag），"
+                        "不属于本题沙盒。只用本题沙盒根目录下的附件与你自己写的文件。"
+                    )
+            run_name = run_dir.name.lower()
+            if run_name and run_name in low and "\\sandbox" not in low:
+                return (
+                    "[拒绝] 沙盒边界：命令引用了本次运行目录（含其它题状态/候选）。只在本题沙盒内操作。"
+                )
+            if re.search(r"\.\.\\+sandbox\\", low) or re.search(r"\\sandbox\\\.\.", low):
+                return (
+                    "[拒绝] 沙盒边界：命令要跳进/跳出本题沙盒（`..\\sandbox`）。"
+                    "其它题沙盒里是本轮历史残留，不是本题附件。"
+                )
+            own_cid = str(sandbox.name).lower()
+            for uuid_like in re.findall(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", low
+            ):
+                if uuid_like != own_cid:
+                    return (
+                        "[拒绝] 沙盒边界：命令引用了**其它题目**的沙盒目录（同 run 内跨题污染，"
+                        "11-12 实测会把别题的候选 flag 带进本题账本）。只用本题沙盒。"
+                    )
         if "sandbox" not in low:
             return ""
         try:

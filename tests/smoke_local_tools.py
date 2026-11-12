@@ -143,6 +143,15 @@ def _run(tmp: pathlib.Path) -> int:
           "其它运行目录" in guard("cat ../plat/sandbox/old-cid/src/flag.txt"))
     check("本 run 内正常命令放行", guard("type work\\exp.py") == "" and guard("python s1.py") == "")
     check("不含 sandbox 的命令不受影响", guard("cd .. && dir") == "")
+    # [fix 2026-11-12 P1-B] 同 run 越界：run 级元数据 / 别的题沙盒都要拒（实测跨题候选泄漏）
+    check("同 run state.json 被拒", "全局元数据" in guard("type ..\\state.json"))
+    check("同 run results.json 被拒", "全局元数据" in guard("findstr /i flag ..\\..\\results.json"))
+    check("同 run transcripts 被拒", "全局元数据" in guard("type transcripts\\web-01.jsonl"))
+    other_uuid = "11111111-2222-3333-4444-555555555555"
+    check("同 run 别的题沙盒被拒",
+          "其它题目" in guard("dir " + str(runs_root / "store" / "sandbox" / other_uuid)))
+    check("本题沙盒绝对路径不误伤",
+          guard("cd /d " + str(own) + " && python s1.py") == "")
     # [回归 2026-11-11 二次实测] runs/ 下有个历史误建目录就**叫 `runs`**；只按名字裸匹配会把
     # 合法命令也拒掉（本地 plat 测试真实误伤 5 次：`cd E:\...\runs\plat\sandbox\SAMPLE-003 && ...`
     # 与 `wsl.exe -e bash /mnt/e/.../runs/plat/sandbox/...` 都被拦，模型只好绕路浪费步数）。

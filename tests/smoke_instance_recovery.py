@@ -297,6 +297,54 @@ def main() -> int:
     check("无 list_instances 时提示跳过清扫", "list_instances" in note and "跳过" in note, note)
     check("提示里说明由 solver 按题自愈", "按题" in note or "自愈" in note, note)
 
+    # ---- 8) P1-A 回归（2026-11-12 实测）：environment_id 入库 + 配额被前题占住时按记录回收 ----
+    # 8a) ctf2 练习场回执只有 environment_id：必须存成 instance_id，否则 crew 释放被跳过
+    plat = FakePlatform()
+    store = _store(tmp / "r8a", cid)
+    solver, events = _solver(store, plat, _config())
+    solver._register_instance(cid, {"environment_id": "env-abc-123", "access_url": "h:1",
+                                    "access_ready": True, "status": "running"})
+    item = store.require(cid)
+    check("回执只有 environment_id 时也登记实例 id", item.instance_id == "env-abc-123", item.instance_id)
+    check("登记实例时记下 last_instance 供配额回收",
+          str((store.meta or {}).get("last_instance", {}).get("challenge_id") or "") == cid,
+          str(store.meta.get("last_instance")))
+
+    # 8b) 本题环境为空 + 配额被上一题占住 → 先按记录回收上一题，再重试 start
+    prev_cid = "chall-prev-9"
+    store2 = _store(tmp / "r8b", cid)
+    store2.upsert({"id": prev_cid, "name": "prev", "category": "pwn", "description": "d"})
+    store2.meta["last_instance"] = {"challenge_id": prev_cid, "competition_id": "ground-1"}
+    store2.save()
+    plat2 = FakePlatform(env={"status": "none"},
+                         start_results=[{"environment_id": "env-new-1", "access_ready": True,
+                                         "status": "running", "access_url": "h:2"}])
+    solver2, events2 = _solver(store2, plat2, _config())
+    info = solver2._recover_instance_slot(cid, "start_instance", LIMIT_FAIL)
+    deleted_ids = [a.get("challenge_id") for n, a in plat2.calls if n.startswith("ctf2_user_delete")]
+    check("配额被占时先回收上一题的环境", prev_cid in deleted_ids, str(plat2.calls))
+    check("回收成功后重试 start 并拿到新实例",
+          isinstance(info, dict) and str(info.get("environment_id")) == "env-new-1", str(info))
+    check("回收成功后清掉 last_instance 记录",
+          not (store2.meta or {}).get("last_instance"), str(store2.meta.get("last_instance")))
+
+    # 8c) 没有上一题记录时不乱删
+    store3 = _store(tmp / "r8c", cid)
+    plat3 = FakePlatform(env={"status": "none"})
+    solver3, _ = _solver(store3, plat3, _config())
+    got3 = solver3._release_previous_instance(cid, "ground-1")
+    check("无 last_instance 时不乱删", got3.get("ok") is False, str(got3))
+
+    # 8d) misc/crypto 纯附件题在「无 list_instances」平台跳过自动 start（P2-C）
+    store4 = _store(tmp / "r8d", cid)
+    store4.require(cid).category = "crypto"
+    solver4, _ = _solver(store4, FakePlatform(), _config())
+    check("无 list_instances 平台 misc/crypto 跳过自动 start",
+          solver4.auto_start_allowed(store4.require(cid)) is False)
+    store4.require(cid).category = "pwn"
+    check("pwn 题仍允许自动 start",
+          solver4.auto_start_allowed(store4.require(cid)) is True)
+
     print()
     if FAILS:
         print(f"smoke_instance_recovery 失败 {len(FAILS)} 项：" + "、".join(FAILS))

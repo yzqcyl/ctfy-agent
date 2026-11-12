@@ -104,10 +104,13 @@ def case_p6c_autosubmit(tmp: Path) -> None:
     # 源码顺序：补交必须发生在 stop_instance 之前（finally 内）
     src = inspect.getsource(Crew.solve)
     idx_call = src.find("self._auto_submit_verified(challenge_id, solver, submitted, reason)")
-    idx_stop = src.find("self.platform.stop_instance(challenge.instance_id)")
+    # [fix 2026-11-12 P1-A] 释放动作收敛进 _release_instance（先 stop(instance_id)，
+    # 软失败再按题删除：ctf2 练习场回收原语要 challenge_id+practice_ground_id）；
+    # 顺序断言改为「补交必须在该释放调用之前」。
+    idx_stop = src.find("self._release_instance(challenge_id, challenge)")
     assert idx_call != -1, "solve() 中缺少 _auto_submit_verified 调用"
-    assert idx_stop != -1, "solve() 中缺少 stop_instance"
-    assert idx_call < idx_stop, f"补交位置错误：call@{idx_call} 必须在 stop_instance@{idx_stop} 之前"
+    assert idx_stop != -1, "solve() 中缺少实例释放调用"
+    assert idx_call < idx_stop, f"补交位置错误：call@{idx_call} 必须在释放@{idx_stop} 之前"
 
 
 def main() -> int:

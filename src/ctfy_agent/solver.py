@@ -681,7 +681,20 @@ class Solver:
         challenge = self.store.require(challenge_id)
         challenge.instance = info if isinstance(info, dict) else {"raw": info}
         if isinstance(info, dict):
-            challenge.instance_id = str(info.get("id") or info.get("instance_id") or "")
+            # [fix 2026-11-12 P1-A] ctf2 练习场的实例回执给的是 environment_id（没有 id/instance_id）。
+            # 旧代码只认后两者 → instance_id 恒空 → crew 的释放分支被 `if challenge.instance_id`
+            # 短路 → 上一题实例占满唯一配额，下一题 start 直接 agent_environment_limit（实测）。
+            challenge.instance_id = str(
+                info.get("id") or info.get("instance_id") or info.get("environment_id") or ""
+            )
+            # 记下「最近一次真起过实例的题」：平台没有 list_instances，配额被占时只能按记录回收。
+            try:
+                self.store.meta["last_instance"] = {
+                    "challenge_id": challenge_id,
+                    "competition_id": str(self._competition_id(challenge_id) or ""),
+                }
+            except Exception:  # noqa: BLE001 - 记账失败不影响起实例
+                pass
         # 真的起来了实例 → 反转「本题没有环境」的负缓存（之前可能是平台误报/瞬态）
         challenge.instance_absent = False
         if challenge.status in ("new", "parsed"):
@@ -797,6 +810,20 @@ class Solver:
             return False
         if getattr(challenge, "instance_absent", False) and not self.config.extra.get("instance_absent_retry"):
             return False
+        # [fix 2026-11-12 P2-C] 纯附件题（misc/crypto）在「没有 list_instances 的练习场平台」上
+        # start_instance 必回 NOT_FOUND：11-12 实测 8 题里 5 题各白烧 1 次（每题硬上限 5 次）。
+        # 逃生口：auto_start_skip_categories="" 可关掉这条优化；需要实例时模型仍可手动 start_instance。
+        category = str(getattr(challenge, "category", "") or "").strip().lower()
+        skip_raw = self.config.extra.get("auto_start_skip_categories")
+        skip_raw = "misc,crypto" if skip_raw is None else str(skip_raw)
+        skip_cats = {c.strip().lower() for c in skip_raw.split(",") if c.strip()}
+        if (category in skip_cats and not self.platform.try_resolve("list_instances")):
+            self.store.append_transcript(challenge.id, {
+                "role": "instance",
+                "note": "[实例守卫] 纯附件题型（misc/crypto）跳过自动 start_instance：该平台无 list_instances，"
+                        "实测必回 NOT_FOUND、白耗每题 5 次配额。需要环境时模型可手动 start_instance。",
+            })
+            return False
         return bool(self.config.extra.get("auto_start_instance", True))
 
     def _store_rebuilt_instance(self, challenge_id: str, rebuilt) -> dict | None:
@@ -806,7 +833,10 @@ class Solver:
             return None
         item = self.store.require(challenge_id)
         item.instance = parsed
-        item.instance_id = str(parsed.get("id") or parsed.get("instance_id") or "")
+        # [fix 2026-11-12 P1-A] 同 _register_instance：ctf2 练习场只有 environment_id。
+        item.instance_id = str(
+            parsed.get("id") or parsed.get("instance_id") or parsed.get("environment_id") or ""
+        )
         item.instance_absent = False
         if item.status in ("new", "parsed"):
             self.store.set_status(challenge_id, "instance_up")
@@ -1001,6 +1031,41 @@ class Solver:
             return True
         return any(mark in low for mark in cls._RECYCLE_WORTHY)
 
+    @staticmethod
+    def _looks_environment_limit(text: str) -> bool:
+        """是否是「团队环境配额被占」类失败（ctf2 单配额平台的典型报错）。"""
+        low = str(text or "").lower()
+        return any(mark in low for mark in (
+            "agent_environment_limit", "share one quota", "share a single quota",
+            "environment limit", "environment_limit", "too many environments",
+        ))
+
+    def _release_previous_instance(self, challenge_id: str, comp: str = "") -> dict:
+        """回收「上一题」的残留实例（平台无 list_instances，只能靠 meta 里的一条记录）。
+
+        [fix 2026-11-12 P1-A] 实测：ctf2 全队 1 个环境配额，上一题解完后实例没被释放
+        （回执只有 environment_id，旧代码存不进 instance_id → crew 释放被跳过），
+        下一题 start 只会回 agent_environment_limit；而按本题 challenge_id 删什么也删不到。
+        这里按 _register_instance 记下的 last_instance 精确回收一次。
+        """
+        from .instance_guard import delete_environment  # noqa: PLC0415 - 只在配额失败路径需要
+
+        meta = self.store.meta or {}
+        last = meta.get("last_instance") or {}
+        last_cid = str(last.get("challenge_id") or "")
+        last_comp = str(last.get("competition_id") or "")
+        if not last_cid or last_cid == challenge_id:
+            return {"ok": False, "error": "没有其它题的实例记录可回收"}
+        removed = delete_environment(self.platform, last_cid, last_comp or comp)
+        if removed.get("ok"):
+            meta.pop("last_instance", None)
+            self.store.save()
+            self.on_event(
+                "instance_released_stale",
+                {"challenge_id": last_cid, "competition_id": last_comp or comp, "detail": removed},
+            )
+        return removed
+
     def _recover_instance_slot(self, challenge_id: str, start_name: str,
                                failure: str = "") -> dict | None:
         """start 失败后的自愈：先清掉「不属于本题」的残留实例，再重试一次。
@@ -1071,6 +1136,16 @@ class Solver:
                          "detail": {"failure": str(failure)[:300]}},
                     )
                     return None
+                # [fix 2026-11-12 P1-A] 单配额平台（ctf2）最常见的是「上一题的实例没释放」：
+                # 本题环境当然是空的，删本题什么也删不到。先按记录回收上一次真起过实例的题。
+                if self._looks_environment_limit(failure):
+                    cleared = self._release_previous_instance(challenge_id, comp or "")
+                    self.on_event(
+                        "instance_guard",
+                        {"note": f"配额被占，先回收上一题残留环境：{cleared}", "detail": cleared},
+                    )
+                    if cleared.get("ok"):
+                        return self._start_with_backoff(challenge_id, start_name)
                 removed = delete_environment(self.platform, challenge_id, comp or "")
                 self.on_event("instance_guard", {"note": f"按 challenge_id 回收残留环境：{removed}", "detail": removed})
                 if removed.get("ok"):

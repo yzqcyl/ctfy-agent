@@ -384,6 +384,15 @@ _REPEAT_LOOP_STOP = (
     "已省下的预算留给其它题；复现稿里按「需要新证据/换思路」记录。"
 )
 
+# [fix 2026-11-12 P2-D] 同参同结果空转：写文件后重跑同一脚本是合法动作（结果会变），
+# 但同一 (tool,args) 连续返回**完全相同的结果**就是在空转。11-12 实测 clockin 同一命令 14 次、
+# b64 9 次，纯烧预算；只按「结果字节相同」判，不会误伤「改脚本再跑」。
+DUP_RESULT_LIMIT = 3
+_DUP_RESULT_STOP = (
+    "[空转断路器] `{name}` 同一调用已连续 {n} 次返回**完全相同的结果**，判定为空转，本题收口"
+    "（reason=action_loop）。改脚本/换参数/换思路都算新动作；原样重跑不会产生新信息。"
+)
+
 
 def _looks_blocked(text: str) -> bool:
     """工具返回是否属于「被守卫拦下、重试无意义」的那一类。"""
@@ -722,6 +731,69 @@ class Crew:
         self._profile: dict = {}
 
     # ---------- 工具面 ----------
+
+    def _release_instance(self, challenge_id: str, challenge) -> dict:
+        """按平台真正认得的原语释放本题实例，返回 {ok, via} / {ok: False, error}。
+
+        [fix 2026-11-12 P1-A] 旧实现只调 `platform.stop_instance(instance_id)`，在 ctf2 练习场
+        上必然失效：① 回执给的是 `environment_id`（solver 旧代码不认 → instance_id 恒空 →
+        crew 的 `if challenge.instance_id` 直接跳过释放）；② 即使抠到 id，该平台的回收原语
+        要 `challenge_id + practice_ground_id`，传 instance_id 也不认。结果：全队唯一的实例
+        配额被上一题占死，下一题 start 只回 agent_environment_limit（11-12 实测 PWN/RE Medium
+        两题因此完全拿不到靶标）。这里按工具 schema 选路，不再硬编码 instance_id 形状。
+        """
+        from .instance_guard import delete_environment  # noqa: PLC0415 - 只在收尾路径需要
+
+        iid = str(getattr(challenge, "instance_id", "") or "")
+        comp = ""
+        try:
+            comp = str((self.store.meta or {}).get("competition_id") or "")
+        except Exception:  # noqa: BLE001 - 取不到场次 id 就让删除原语自己兜底
+            comp = ""
+        err = ""
+        if iid:
+            # 先按旧口径 stop(instance_id)（多数平台/单测桩都认这个形状），
+            # 只有真失败（抛错或软失败回执）才回退到按题删除。
+            try:
+                result = self.platform.stop_instance(iid)
+                if self._release_receipt_ok(result):
+                    self._forget_last_instance(challenge_id)
+                    return {"ok": True, "via": "stop_instance"}
+                err = f"stop_instance 软失败：{str(result)[:200]}"
+            except Exception as exc:  # noqa: BLE001
+                err = f"stop_instance 失败：{type(exc).__name__}: {exc}"
+        else:
+            err = "回执没有实例 id"
+        try:
+            removed = delete_environment(self.platform, challenge_id, comp)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{err}; 按题删除异常 {type(exc).__name__}: {exc}"}
+        if not removed.get("ok"):
+            return {"ok": False, "error": f"{err}; 按题删除失败：{str(removed.get('error') or '')[:200]}"}
+        self._forget_last_instance(challenge_id)
+        return {"ok": True, "via": "delete_environment", "detail": removed}
+
+    @staticmethod
+    def _release_receipt_ok(result) -> bool:
+        """stop/delete 回执是否真成功（MCP 软失败不会抛异常，只能看内容）。"""
+        if isinstance(result, dict):
+            if result.get("code") or result.get("error"):
+                return False
+            if result.get("accepted") is False:
+                return False
+            return True
+        text = str(result or "")
+        return not any(mark in text for mark in (
+            "[工具报错]", "缺少必填参数", "NOT_FOUND", "isError", "not found",
+        ))
+
+    def _forget_last_instance(self, challenge_id: str) -> None:
+        try:
+            last = (self.store.meta or {}).get("last_instance") or {}
+            if str(last.get("challenge_id") or "") == challenge_id:
+                self.store.meta.pop("last_instance", None)
+        except Exception:  # noqa: BLE001 - 记账清理失败不影响收尾
+            pass
 
     def _role_platform_names(self, role: str) -> set[str]:
         groups = (self.roles.get(role) or {}).get("platform") or []
@@ -1118,6 +1190,8 @@ class Crew:
         blocked_sig: tuple[str, str] | None = None
         blocked_streak = 0
         suppressed_tools: set[str] = set()
+        # 同参同结果空转计数（P2-D 2026-11-12）：sig → (最近一次结果文本, 连续相同次数)
+        dup_results: dict[tuple[str, str], tuple[str, int]] = {}
 
         # 断点续跑（P0-1）：协调者上下文是本 run 最贵的状态，崩溃即清零（003 实测烧掉 135k token）。
         # 每轮开跑前把 messages/reports/ledger/plan 快照到 run_dir/checkpoints/；正常收尾删除，
@@ -1537,6 +1611,28 @@ class Crew:
                     else:
                         blocked_sig, blocked_streak = None, 0
 
+                    # [fix 2026-11-12 P2-D] 同参同结果空转断路器（与上面的「被拦」断路器互补）：
+                    # 正常动作重复不拦（改脚本再跑结果是会变的），只有「同一调用连续返回完全相同
+                    # 结果」才是真空转。实测 clockin 同一命令 14 次、b64 9 次。
+                    if name in ("shell", "http_request"):
+                        _prev = dup_results.get(sig)
+                        if _prev is not None and _prev[0] == text:
+                            dup_results[sig] = (text, _prev[1] + 1)
+                            if _prev[1] + 1 >= DUP_RESULT_LIMIT:
+                                stop = True
+                                reason = "action_loop"
+                                messages.append({
+                                    "role": "user",
+                                    "content": _DUP_RESULT_STOP.format(name=name, n=_prev[1] + 1),
+                                })
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "gate", "step": rnd,
+                                     "note": f"空转断路器：{name} 同参同结果连续 {_prev[1] + 1} 次，收口 action_loop"},
+                                )
+                        else:
+                            dup_results[sig] = (text, 1)
+
                     if name == "delegate" and ledger.drain_new_refutations():
                         rotate = ledger.rotate()
                         messages.append({"role": "user", "content": rotate})
@@ -1627,12 +1723,24 @@ class Crew:
                     if submitted
                     else self.config.extra.get("keep_instance_on_fail")
                 )
-            if challenge.instance_id and not keep:
+            if (challenge.instance_id or challenge.instance) and not keep:
                 try:
-                    self.platform.stop_instance(challenge.instance_id)
-                    self.on_event("instance_stopped", {"challenge_id": challenge_id, "instance_id": challenge.instance_id})
-                except Exception as exc:
-                    self.on_event("instance_stop_failed", {"error": str(exc)})
+                    released = self._release_instance(challenge_id, challenge)
+                except Exception as exc:  # noqa: BLE001 - 释放失败只记事件，绝不拦收尾
+                    released = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                if released.get("ok"):
+                    self.on_event("instance_stopped", {
+                        "challenge_id": challenge_id,
+                        "instance_id": challenge.instance_id,
+                        "via": released.get("via"),
+                    })
+                else:
+                    # [fix 2026-11-12 P1-A] 旧代码这里静默失败：单配额平台上一次释放失败
+                    # 会让下一题的实例题直接不可解，必须留可见事件。
+                    self.on_event("instance_stop_failed", {
+                        "challenge_id": challenge_id,
+                        "error": str(released.get("error") or "")[:400],
+                    })
                 challenge.instance_id = ""
                 challenge.instance = {}
                 self.store.save()
