@@ -253,7 +253,8 @@ AI_CARDS: list[tuple[tuple[str, ...], str]] = [
 
 # 方向方法卡（rev/pwn/crypto/misc）：与 web 卡分表，避免泛键（python/tcp）污染 web 打法块。
 # 键取自平台真实 tag 词表（`runs/_nonweb_inventory.py`）；卡面只讲「用现有工具怎么走」，
-# 不写镜像里没有的东西（无 gdb/ROPgadget；反汇编走 capstone，v5 起镜像内置；
+# 不写镜像里没有的东西（v7.3 起镜像内置 gdb/patchelf——gcov 之外唯一能看崩溃现场的路径；
+# ROPgadget 仍无，找 gadget 走 pwnrop/elfpeek view=gadgets；反汇编走 capstone，v5 起内置；
 # crypto 的 pycrypt / pwn 的 pwnrop 自 v7 镜像起可用）。
 DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
     (("reverse", "stripped", "per_team_artifact", "per-team-artifact"),
@@ -269,15 +270,20 @@ DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
      "PWN 栈溢出四步：elfpeek info 看 PIE/NX/canary → symbols/strings 找 gets/read/system/win → "
      "pwngen op=cyclic 生成模式串、tcp 发超长触发崩溃 → pwnfind 反查精确偏移。"
      "有附件 libc 就 elfpeek view=lookup 拿 system、/bin/sh 偏移走 ret2libc；"
-     "payload 一律 pwngen op=build 组装后 tcp(hex_mode=true) 发，别手搓转义串。"),
+     "payload 一律 pwngen op=build 组装后 tcp(hex_mode=true) 发，别手搓转义串。"
+     "崩溃看不懂就用 shell 跑批处理 gdb 看现场：`gdb -batch -q -ex run -ex 'info registers' -ex 'x/8gx $rsp' "
+     "-ex bt ./poc < payload.bin`（镜像 v7.3 起内置 gdb；不用交互式，拿寄存器/RIP 覆盖值就够）。"
+     "题目自带 libc 本地跑不起来时：`patchelf --set-interpreter <本机 ld.so> --set-rpath <libc 目录> ./bin` 后复现。"),
     (("format_string", "heap", "rop", "seccomp"),
      "PWN 进阶：格式化串先 %p 泄栈找自己输入的位置（tcp_batch 批量试 %1$p..%20$p 一次收敛）；"
      "没有 win 函数走 ROP，elfpeek view=gadgets filter=rdi|rsi|rdx|syscall；堆题先看 malloc/free 顺序"
      "与 tcache 是否 double-free，别急着一次打通；远程先泄漏 libc 基址再算偏移。"),
     (("rsa", "small_e", "wiener", "common_modulus"),
      "CRYPTO RSA 先自动试：rsatool op=small_e（c 开 e 次根）/ wiener（d 小）/ common_modulus（同 n 两组）/ "
-     "fermat（p、q 相邻）。都不中就找 n 的分解线索（题面给的 factor 提示、共享因子、p=q 情形），"
-     "拿到 d 后用 hexpeek 拼明文再 decode_blob。"),
+     "fermat（p、q 相邻）。有「明文结构」线索就走格攻击：message=m0+x 且 x 小、或 f(x)≡0 (mod N) 有小根 → "
+     "rsatool op=coppersmith（poly 给升幂系数 [常数项,…,最高次(必须 1)]；X 缺省按 N^(1/2δ)，512bit N 可靠到 2^120 量级）；"
+     "题目直接给矩阵/线性组合求小向量 → rsatool op=lll（basis 整数矩阵，v0 是最短向量）。"
+     "都不中就找 n 的分解线索（题面 factor 提示、共享因子、p=q），拿到 d 后用 hexpeek 拼明文再 decode_blob。"),
     (("aes", "ecb", "oracle", "cbc"),
      "CRYPTO 分组密码：先判模式——16 字节对齐后出现相同块 = ECB；ECB 打块剪切/字节翻转移位取目标块；"
      "CBC 打 IV 与前一密文块的位翻转；padding oracle 用 tcp_batch 一次批量试末字节（≤200/轮）。"

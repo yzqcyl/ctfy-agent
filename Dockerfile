@@ -14,12 +14,23 @@ FROM python:3.12-slim
 # 少任何一个都抛 PwnlibException——实测 v7 构建 run 31 缺 as、run 32 缺 cpp 连续挂两次。
 # 顺带 gcc/libc6-dev 让模型能在容器里本地编译 C 漏洞利用（pwn 常见打法：写 poc.c 编译跑通
 # 再打远程）。disasm()/ROP 还要 binutils 的 objdump/readelf。
-# 体积：合计约 +85MB，基线 126.5 + 扩展库 ~60 后约 280MB，仍在 400MB 门禁内（tools/container_check.py）。
+#
+# gdb + patchelf（v7.3，2026-11-12）：PWN 短板里最硬的一条是「崩了看不见」——模型只能猜偏移。
+#   * gdb：给 pwn/rev 用 `gdb -batch -q -ex run -ex 'info registers' -ex bt ./poc` 这种批处理
+#     方式看崩溃现场（无需 pwndbg，交互式用不上，批处理就够拿寄存器/栈/回溯）；
+#   * patchelf：ret2libc 题把题目自带 libc 的 interpreter/rpath 改成本机 loader，才能本地复现。
+#   体积约 +25MB（gdb 带 libpython/pretty-printer 依赖），总计约 230~240MB，仍低于 400MB 门禁。
+#
+# 体积：合计约 +110MB（gcc/libc6-dev/binutils 约 85 + gdb/patchelf 约 25），
+# 基线 126.5 + 扩展库 ~85 + 工具链 ~110 仍在 400MB 门禁内（tools/container_check.py）。
 # 注意 libc6-dev 必须显式列出：gcc 只 Recommend 它，本行是 --no-install-recommends，不写就没有 stdio.h。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl grep coreutils ca-certificates bash passwd binutils gcc libc6-dev \
-    && rm -rf /var/lib/apt/lists/*
+        gdb patchelf \
+    && rm -rf /var/lib/apt/lists/* \
+    && gdb --version | head -1 \
+    && patchelf --version
 
 # ---------- P2：web 工具链（构建期安装；运行期无网络，所以必须烤进镜像） ----------
 # ffuf：目录/参数发现，web 角色的 fuzz 工具调用它（模型不直接跑命令行）。

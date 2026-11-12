@@ -37,15 +37,19 @@
 
 ## 3. 角色与工具面（当前 `config/agent.json`）
 
-| 角色 | 本地工具（12 上限） | 平台工具 | max_steps | 备注 |
+| 角色 | 本地工具（实际派发清单） | 平台工具 | max_steps | 备注 |
 |---|---|---|---|---|
 | coordinator | —（只有 note/report 特殊工具） | read / instance / oracle / submit | 40 | 只做路由与提交，不自己解题 |
-| web | http_request http_map http_burst fuzz authdiff jsrecon sqli jwt_forge decode_blob shell write_file (+traffic 默认) | get_challenge 及附件/提示/实例/verify 共 10 个 | 40 | 工具面最全 |
+| web | http_request http_map http_burst fuzz authdiff jsrecon sqli jwt_forge decode_blob shell write_file listen (+traffic 默认) | get_challenge 及附件/提示/实例/verify 共 10 个 | 40 | 工具面最全 |
 | ai | http_request http_map chat shell write_file decode_blob | 同 web 10 个 | 40 | `chat` 专治 LLM 应用题 |
-| rev | shell write_file elfpeek hexpeek tcp tcp_batch netcheck listen z3solve | read / instance / oracle | 40 | 无 gdb；反汇编走 capstone/objdump |
-| crypto | shell write_file hexpeek rsatool aesblock prng tcp tcp_batch netcheck listen z3solve pycrypt | read / instance / oracle | 40 | 大整数走 gmpy2（镜像已装） |
+| rev | shell write_file elfpeek hexpeek tcp tcp_batch netcheck listen z3solve | read / instance / oracle | 40 | 反汇编走 capstone/objdump；gdb 见 §9 |
+| crypto | shell write_file hexpeek rsatool aesblock prng tcp tcp_batch netcheck listen z3solve pycrypt | read / instance / oracle | 40 | 大整数走 gmpy2；格攻击走 rsatool 的 lll/coppersmith（§9） |
 | pwn | shell write_file elfpeek hexpeek pwngen pwnfind tcp tcp_batch netcheck listen z3solve pwnrop | read / instance / oracle | 40 | pwntools 走 pwnrop + shell 里的 `import pwn` |
 | misc | http_request http_map shell write_file decode_blob unpack_archive hexpeek tcp tcp_batch netcheck listen z3solve | read / instance | 40 | 无 oracle/submit 权（结论交协调者） |
+
+> 更正（2026-11-12 复核）：本表此前写「12 上限」——**代码里没有硬校验**，12 只是历史上各角色
+> 派发数的经验值（crypto/pwn/misc 当前恰好 12 个，web 12 个）。真正影响成本的是「每步工具调用 ≤8」
+> 与模型自身的选择面，加工具时不需要改任何门禁代码。
 
 平台侧另有全局工具（`list_instances`/`stop_instance`/`renew_instance`/`get_scoreboard`…）只对 host 侧
 CLI 开放，**不给模型**（防误操作烧配额）。已核对接线无孤岛：实现了的 30 个本地工具里 27 个按角色派发，
@@ -130,17 +134,20 @@ CLI 开放，**不给模型**（防误操作烧配额）。已核对接线无孤
 | 提交 | 本地 `submit_limit=3`/题号 + 平台 `platform_submit_limit=5` 轮，attempt 上限 `limit*16` | 试错空间有限 |
 | 实例 | 每题 `instance_ops_limit=5` 次 start；团队 1 槽位；ctf2 无 `list_instances` | 实例泄漏/不可达直接毁题 |
 | 连接 | `connect_timeout=40s`，`connect_deadline=5400s` | 平台故障窗要熬 60–90 min |
-| shell | 单次 120s 超时，白名单命令 | 长跑脚本要拆 |
+| shell | 单次 120s 超时；**命令无白名单**（角色 `allow_shell=true` 即任意命令，隔离靠容器） | 长跑脚本要拆；别拿 shell 干网络扫描 |
 | 网络 | 运行期无外网（只能打本题实例） | 不能上网抄题解/取附件（除非平台给） |
 | 平台契约 | v3：预下发实例、单题 token、每轮重写 result.json、最多 5 轮 | 见 `HANDOFF-2026-11-10-r2 §3~§5` |
 
-## 6. 当前镜像能力（v7.2 + 2026-11-12 补丁）
+## 6. 当前镜像能力（v7.3：v7.2 + 2026-11-12 补丁 + PWN/CRYPTO 短板补齐）
 
-- 基础：`python:3.12-slim` + bash/curl/grep/coreutils + gcc/libc6-dev/binutils（`as/objdump/readelf` 构建期断言）。
+- 基础：`python:3.12-slim` + bash/curl/grep/coreutils + gcc/libc6-dev/binutils（`as/objdump/readelf` 构建期断言）
+  + **gdb / patchelf（v7.3 补，构建期 `gdb --version` / `patchelf --version` 断言）**。
 - 内置库：capstone 5.0.3、pwntools 4.15.0、pycryptodome 4.4.0、gmpy2 2.3.2、sympy 1.14.0、
-  **z3-solver 5.4.1.0（11-12 补，v7.2 漏装）**。ffuf 构建期烤入。
-- 明确不含：gdb、Sage、Ghidra/IDA、volatility、浏览器内核；GUI 与多平台适配器（见 runbook 红线）。
-- 体积：v7.2 实测 197.7 MB；补 z3 后约 220 MB（门禁 400 MB）。
+  **z3-solver 5.4.1.0**、**格攻击（LLL + 一元 Coppersmith）为项目内纯 stdlib 模块 `lattice_math.py`（v7.3 新增）**。
+  ffuf 构建期烤入。
+- 明确不含：Sage、Ghidra/IDA、volatility、浏览器内核、pwndbg（只用 gdb 批处理）、ROPgadget（用 `pwnrop`）；
+  GUI 与多平台适配器（见 runbook 红线）。
+- 体积：v7.2 实测 197.7 MB；补 z3 后约 220 MB；v7.3 再补 gdb/patchelf 约 **230~240 MB**（门禁 400 MB）。
 
 ## 7. 缺口优先级与处理状态
 
@@ -149,9 +156,9 @@ CLI 开放，**不给模型**（防误操作烧配额）。已核对接线无孤
 | 1 | PWN/CRYPTO 真实题 0 分**未复验** | 最大不确定性：不知道 libs 接入是否真提升 | ⏳ 待批（烧配额） | 各 1 题复验，见 §8 |
 | 2 | v7.2 漏装 z3-solver | `z3solve` 在官方镜像恒失败 | ✅ **已修**（Dockerfile，待 v7.3 重建） | 重建时看构建日志 `z3 selftest ok` |
 | 3 | 实例可达性（access_ready=false） | 配额烧光、整题作废 | 🟡 部分（负缓存已做） | 开题前置探测 + 早退 |
-| 4 | 格攻击（LLL/Coppersmith） | CRYPTO 高难度题天花板 | ❌ 未做 | 复验后再决定是否手写小整数版 |
+| 4 | 格攻击（LLL/Coppersmith） | CRYPTO 高难度题天花板 | ✅ **已修**（`lattice_math.py` + `rsatool` op=lll/coppersmith，v7.3 待重建验证） | 见 §9；二元/ECC 仍靠 shell 手写 |
 | 5 | 磁盘镜像 / 内存取证 | FORENSICS 中高难度题做不了 | ❌ 未做 | 加只读解析小工具（纯 stdlib） |
-| 6 | 无 gdb / 无 libc 版本库 | PWN 调试与偏移推断 | ❌ 未做 | gdb 可装（apt），libc 库可加小表；优先级中 |
+| 6 | 无 gdb / 无 libc 版本库 | PWN 调试与偏移推断 | 🟡 **gdb/patchelf 已装**（v7.3）；libc 版本库仍无 | gdb 走 `-batch` 批处理；libc 小表待做 |
 | 7 | 无浏览器 JS 引擎 | 纯前端题受限 | ❌ 未做（有意取舍） | 不加 |
 | 8 | Sage | 格/ECC 终极解 | ❌ 明确不做 | 体积 500MB+ |
 
@@ -172,3 +179,40 @@ CLI 开放，**不给模型**（防误操作烧配额）。已核对接线无孤
 
 **风险提示**：外部公开题的 flag 在练习场会被判错，因此判据必须包含「平台是否重签发 flag」这一前置确认；
 否则 0 分结论不可用。若两题都是环境/flag 机制问题，复验无意义，需改用 SAMPLE 银行加难度的自建题。
+## 9. v7.3 增补：PWN/CRYPTO 短板补齐（2026-11-12 晚）
+
+用户在复验前拍板「先补能力短板再重建」，本节记录这一轮实际做了什么、边界在哪、怎么验证。
+
+### 9.1 CRYPTO：格攻击（LLL + 一元 Coppersmith）
+
+| 项 | 内容 |
+|---|---|
+| 位置 | `src/ctfy_agent/lattice_math.py`（纯 stdlib，无第三方依赖）；接线在 `tools_domain_ext.rsatool` 的 `op=lll` / `op=coppersmith` |
+| 为什么塞进 rsatool | crypto 角色本地工具已是 12 个（crypto=12/pwn=12/misc=12），加第 13 个就要动 config 与派发；格攻击本质是 RSA 攻击的延伸，做成 op 最省 |
+| LLL | δ-LLL（默认 3/4），Decimal 80 位有效数字做 Gram-Schmidt（第一版 Fraction 精确版在 11 维/2000 位元素上要 5 分钟，不可用）；维数 ≤24、单元素位长 ≤2^17 的护栏 |
+| Coppersmith | Howgrave-Graham 一元构造（N^{m-i}·x^j·f(x)^i + x^k·f(x)^m），自动在 (精度, m, t) 小阶梯上试，命中即停，总预算 12 s |
+| 实测可靠区间 | deg=2、N 511 bit 时根位长 58 bit 稳定命中（0.2~1 s）；根上界取到 2^120 可解、2^200 不可解。**默认 X=N^(1/2δ)** 是保守值 |
+| 明确不支持 | ① **beta<1**（根模 N 的未知因子，如「已知 p 高位」）——该场景需 m≈25+ 维才到理论界，秒级工具跑不动，直接报错并给出替代打法；② 二元 Coppersmith（boneh-durfee/部分密钥）；③ ECC/离散对数 |
+| 求根 | 先用短向量两两 gcd 榨线性因子（纯 stdlib）；有 sympy（镜像内置）时用 `ground_roots` 兜底高次 gcd 情形 |
+| 回归 | `tests/smoke_lattice.py`（30 项）：LLL 行列式/整数组合/Lovász/范数上界/非法输入 + Coppersmith 正例/负例/非首一/beta 拒绝 + 工具层接线 |
+
+### 9.2 PWN：gdb + patchelf
+
+| 项 | 内容 |
+|---|---|
+| 改动 | `Dockerfile` apt 行加 `gdb patchelf`，并在同一层做 `gdb --version` / `patchelf --version` 断言（风格同 as/objdump/readelf 断言） |
+| 用法 | 方法卡写明批处理式：`gdb -batch -q -ex run -ex 'info registers' -ex 'x/8gx $rsp' -ex bt ./poc < payload.bin`——容器里不需要 pwndbg/交互式 |
+| patchelf | ret2libc 题把题目自带 libc 的 interpreter/rpath 改成本机 loader 才能本地复现 |
+| 体积 | apt 层约 +25 MB，估算总镜像 230~240 MB（门禁 400 MB），构建日志会打实际大小 |
+
+### 9.3 本篇报告的自我更正（复核 2026-11-12）
+
+1. §3 工具表：web 角色漏了 `listen`；「12 上限」实际**无代码校验**，只是经验值（已加注）。
+2. §5：「shell 白名单命令」**错误**——shell 是 `shell=True` 任意命令，隔离靠容器；已更正。
+3. §4.3 缺口③④「无 libc 版本库/无 patchelf」：patchelf 已在 v7.3 装上，libc 版本库仍未做。
+4. §6 镜像清单：v7.2 曾漏 z3、v7.3 补 gdb/patchelf，均已按「构建期断言」方式固化，避免再次静默漏装。
+
+### 9.4 仍未验证的部分（等用户批测试）
+
+格攻击与 gdb 都只是**工具可用**，没有任何真实题目的效果数据；PWN/CRYPTO 仍停在外部题 0/4 与 0/5 的旧口径。
+按 §8 的方案各挑 1 题复验（40–45 min/题、需用户批配额），并优先确认「平台是否重签发 flag」这一前置问题。

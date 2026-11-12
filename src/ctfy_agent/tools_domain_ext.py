@@ -30,6 +30,7 @@ import zlib  # [rev-toolbox] bytecode 视图：PyInstaller/PYZ 的 zlib 载荷
 from pathlib import Path
 
 from . import pylibs as _pylibs  # [libs 2026-11-12] 进程内外挂库（z3/pycryptodome/pwntools）接入
+from . import lattice_math as _lattice  # [crypto-lattice 2026-11-12] 格攻击：LLL + 一元 Coppersmith
 
 TOOL_TEXT_MAX = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
 # O-C：工具输出的硬上限（字符），env AGENT_TOOL_TEXT_MAX 可覆盖（默认 6000 = 原行为）。
@@ -1575,8 +1576,10 @@ def _wiener(n: int, e: int):
 
 def rsatool(op: str = "factor", n: str = "", e: str = "", c: str = "",
             e1: str = "", e2: str = "", c1: str = "", c2: str = "",
-            ns=None, cs=None, B: int = 10000, limit: int = 200000) -> str:
-    """[crypto-toolbox] RSA 攻击集（纯 stdlib）：small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor。"""
+            ns=None, cs=None, B: int = 10000, limit: int = 200000,
+            basis=None, poly=None, X: str = "", m: int = 0, t: int = 0) -> str:
+    """[crypto-toolbox] RSA 攻击集（纯 stdlib）：small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor
+    + 格攻击（2026-11-12）：lll（任意整数格的 LLL 归约）/ coppersmith（一元小根，根模 N）。"""
     op = (op or "factor").strip().lower()
     B = _to_int(B, 10000, "B")        # [toolbox-fix 2026-10-30] 防非整数裸崩
     limit = _to_int(limit, 200000, "limit")  # [toolbox-fix 2026-10-30]
@@ -1658,8 +1661,72 @@ def rsatool(op: str = "factor", n: str = "", e: str = "", c: str = "",
             got = fn(nn, arg)
             if got:
                 return _clip("分解成功（%s）：\np = %d\nq = %d" % (fn.__name__, got[0], got[1]))
-        raise DomainToolError("常规弱点均未分解；考虑格攻击/Coppersmith（本工具不做）")
-    raise DomainToolError("op 只支持 small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor")
+        raise DomainToolError("常规弱点均未分解；换 op=coppersmith（已知小根/已知明文结构）或 op=lll（格攻击）")
+    # ---------- [crypto-lattice 2026-11-12] 格攻击 ----------
+    if op == "lll":
+        if not isinstance(basis, list) or not basis:
+            raise DomainToolError("lll 需要 basis：整数矩阵（数组的数组，每行一个基向量，等长）")
+        try:
+            rows = [[_int_of(x) for x in row] for row in basis if isinstance(row, list)]
+            reduced = _lattice.lll_reduce(rows)
+        except _lattice.LatticeError as exc:
+            raise DomainToolError("lll 失败：%s" % exc) from None
+        except (TypeError, ValueError) as exc:
+            raise DomainToolError("basis 格式不对（要二维整数数组）：%s" % exc) from None
+        lines = ["LLL 归约完成：%d 条 %d 维向量（delta=3/4）" % (len(reduced), len(reduced[0]) if reduced else 0)]
+        for idx, row in enumerate(reduced[:12]):
+            lines.append("  v%d = %s" % (idx, _fmt_vec(row)))
+        lines.append("提示：v0 是归约后最短向量；解出目标向量后，用原基解线性组合求系数（格题常见下一步）。")
+        return _clip("\n".join(lines))
+    if op == "coppersmith":
+        nn = _int_of(n)
+        coeffs = [_int_of(x) for x in (poly or [])]
+        if len(coeffs) < 2:
+            raise DomainToolError("coppersmith 需要 poly：升幂系数数组（如 [常数项, 一次项, …, 最高次]，最高次必须为 1）")
+        bound = _to_int(X, 0, "X") if str(X or "").strip() else 0
+        try:
+            res = _lattice.coppersmith_auto(
+                coeffs, nn, X=bound or None, root_finder=_sympy_root_finder(),
+                budget_s=12.0,
+            )
+        except _lattice.LatticeError as exc:
+            raise DomainToolError("coppersmith 失败：%s" % exc) from None
+        head = ("命中：小根 root = %d（X 上界 2^%d，m=%s t=%s dim=%s，用时 %.1fs）"
+                % (res["root"], res["X"].bit_length(), res["m"], res["t"], res["dim"], res["elapsed_s"]))
+        return _clip("\n".join([head, _render_int_result("root", res["root"]), "校验：" + res["note"]]))
+    raise DomainToolError("op 只支持 small_e/common_modulus/wiener/fermat/pollard_pm1/pollard_rho/hastad/crt/factor/lll/coppersmith")
+
+
+def _fmt_vec(row, max_items: int = 6) -> str:
+    """基向量格式化：大整数不整条打印（6000 字符预算）。"""
+    parts = []
+    for value in row[:max_items]:
+        s = str(value)
+        parts.append(s if len(s) <= 40 else s[:18] + "…" + s[-8:])
+    if len(row) > max_items:
+        parts.append("…(%d 维)" % len(row))
+    return "[" + ", ".join(parts) + "]"
+
+
+def _sympy_root_finder():
+    """用 sympy 的 ground_roots 从短多项式里精确求整数根（镜像内置 sympy；本机在 tools/pylibs）。
+
+    纯 stdlib 时返回 None —— lattice_math 会退回 gcd 路线（对小参数足够，大参数会明确报"没找到"）。
+    """
+    sp = _pylibs.import_or_none("sympy")
+    if sp is None:
+        return None
+
+    def finder(coeffs):
+        x = sp.Symbol("x")
+        poly = sp.Poly([sp.Rational(int(c.numerator), int(c.denominator)) for c in coeffs], x)
+        out = []
+        for root in poly.ground_roots():
+            if sp.denominator(root) == 1:
+                out.append(int(sp.numer(root)))
+        return out
+
+    return finder
 
 
 # ---------- [crypto-toolbox] AES（纯 stdlib，块/模式原语） ----------
@@ -2818,17 +2885,20 @@ RSATOOL_SPEC = {
     "function": {
         "name": "rsatool",
         "description": (
-            "纯 stdlib 的 RSA 攻击集。op=small_e（c 开 e 次根）、common_modulus（同 n 两组 e1/c1/e2/c2）、"
+            "纯 stdlib 的 RSA/格攻击集。op=small_e（c 开 e 次根）、common_modulus（同 n 两组 e1/c1/e2/c2）、"
             "wiener（d 小，连分数）、fermat（p,q 接近）、pollard_pm1（p-1 平滑，B 给上界）、"
             "pollard_rho（通用分解，limit 次）、hastad（低指数广播：ns/cs 数组 + e）、crt（模方程）、"
-            "factor（小因子/fermat/p-1/rho 自动轮试）。大整数支持 0x 前缀。命中给明文 hex/ascii。"
+            "factor（小因子/fermat/p-1/rho 自动轮试）、lll（任意整数格归约，给 basis）、"
+            "coppersmith（一元小根：给 poly 升幂系数 + 模数 n，根模 N，回 root）。大整数支持 0x 前缀。"
+            "coppersmith 适用「已知明文结构/message = m0 + x 且 x 小」「f(x) ≡ 0 (mod N) 有小根」；"
+            "根的上界 X 默认按 N^(1/2δ) 取，实测 δ=2 的 512bit N 可靠到 2^120 量级。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "op": {"type": "string",
                        "enum": ["small_e", "common_modulus", "wiener", "fermat", "pollard_pm1",
-                                "pollard_rho", "hastad", "crt", "factor"]},
+                                "pollard_rho", "hastad", "crt", "factor", "lll", "coppersmith"]},
                 "n": {"type": "string", "description": "RSA 模数"},
                 "e": {"type": "string", "description": "公钥指数"},
                 "c": {"type": "string", "description": "密文"},
@@ -2840,6 +2910,13 @@ RSATOOL_SPEC = {
                 "cs": {"type": "array", "items": {"type": "string"}, "description": "hastad/crt：密文/余数数组"},
                 "B": {"type": "integer", "description": "p-1 平滑界（默认 10000）"},
                 "limit": {"type": "integer", "description": "fermat/rho 迭代上限（默认 200000）"},
+                "basis": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}},
+                          "description": "lll：整数基矩阵（行向量，等长；维数 ≤24）"},
+                "poly": {"type": "array", "items": {"type": "string"},
+                         "description": "coppersmith：升幂系数（[常数项, 一次, …, 最高次]，最高次必须为 1）"},
+                "X": {"type": "string", "description": "coppersmith：根上界（缺省按 N^(1/2δ) 取）"},
+                "m": {"type": "integer", "description": "coppersmith：格参数 m（缺省自动阶梯）"},
+                "t": {"type": "integer", "description": "coppersmith：格参数 t（缺省按 δ·m/2）"},
             },
             "required": ["op"],
         },
@@ -3096,6 +3173,11 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
                 cs=args.get("cs") if isinstance(args.get("cs"), list) else None,
                 B=args.get("B") if args.get("B") is not None else 10000,
                 limit=args.get("limit") if args.get("limit") is not None else 200000,
+                basis=args.get("basis") if isinstance(args.get("basis"), list) else None,
+                poly=args.get("poly") if isinstance(args.get("poly"), list) else None,
+                X=str(args.get("X") or ""),
+                m=args.get("m") if args.get("m") is not None else 0,
+                t=args.get("t") if args.get("t") is not None else 0,
             )
         if name == "aesblock":  # [crypto-toolbox]
             return aesblock(

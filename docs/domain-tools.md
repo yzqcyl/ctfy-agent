@@ -285,3 +285,33 @@ SAMPLE-024 是「靶场回连我们」的题型（beacon 把 flag 投递到 `ctf
   `structuredContent.result`，此前按 `instances` / `items` 解析，所以误判为「无孤儿实例」。
 - 处理：停掉孤儿实例后，看门狗第 7 次探测即通过，SAMPLE 全量基准顺利开跑。
 - 教训：`start_instance` 报「Rate limited」时，**先列实例清孤儿**，再怀疑平台限流。
+
+## v7.3 增补（2026-11-12 晚）：格攻击 + gdb/patchelf
+
+这一节只写「当前可用状态」，上面的历史记录保持原样（历史里说的「容器没有 gdb/capstone」是当时的事实）。
+
+### rsatool 新增两个 op（纯 stdlib）
+
+| op | 参数 | 说明 |
+|---|---|---|
+| `lll` | `basis`（二维整数数组，行向量等长，维数 ≤24） | δ-LLL 归约。输出 `v0…v11`（每条向量 >40 位会缩略），末尾提示「用原基解线性组合求系数」。适合把「小向量/线性组合」类题直接喂进来 |
+| `coppersmith` | `n`（模数）、`poly`（升幂系数 `[常数项, …, 最高次]`，最高次必须为 1）、可选 `X` | 一元小根：找 `|root| < X` 且 `f(root) ≡ 0 (mod N)`。命中回 root + hex/ascii + 校验行；X 缺省按 `N^(1/2δ)` 保守取 |
+
+用法要点（写进方法卡那里也有一份）：
+
+- `coppersmith` 适用「message = m0 + x 且 x 小」「已知固定填充的高位/低位」「f(x) ≡ 0 (mod N) 有小根」。
+  **根模 N 的未知因子（beta<1，如已知 p 高位）不支持**：那个场景要 m≈25+ 维，秒级工具跑不动，
+  工具会直接报错并提示改用「低位枚举 + gcd」或 z3。
+- 实测可靠区间：δ=2、N 512 bit，根 58 bit 稳定命中（0.2~1 s）；X 给到 2^120 可解，2^200 不可解。
+- 不用手搓多项式数学：`poly` 直接抄题面方程（`x^2 + A x + B` → `[B, A, 1]`）。
+- 实现/边界/回归细节见 `docs/capability-report-2026-11-12.md §9` 与 `tests/smoke_lattice.py`。
+
+### 镜像里的调试工具（v7.3 起）
+
+| 工具 | 用法 | 说明 |
+|---|---|---|
+| `gdb` | `shell` 里跑 `gdb -batch -q -ex run -ex 'info registers' -ex 'x/8gx $rsp' -ex bt ./poc < payload.bin` | 只用批处理，不需要 pwndbg/交互式；拿 RIP 覆盖值与栈内容足够算偏移 |
+| `patchelf` | `patchelf --set-interpreter <本机 ld.so> --set-rpath <libc 目录> ./bin` | 题目自带 libc 版本不匹配时改 ELF，之后才能本地复现 ret2libc |
+
+两者都在 `Dockerfile` 的 apt 层装了构建期断言（`gdb --version` / `patchelf --version`），
+漏装会当场构建失败，不会像 z3 那样「工具在、库没装」再静默半年。
