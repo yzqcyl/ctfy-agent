@@ -13,6 +13,8 @@
   "instance_ops_limit": 5,
   "oracle_limit": 100,
   "auto_start_instance": true,
+  "instance_absent_retry": false,
+  "platform_submit_limit": 5,
   "allow_shell": false,
   "debug": false,
   "max_tokens_per_challenge": 800000,

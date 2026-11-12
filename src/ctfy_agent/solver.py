@@ -682,6 +682,8 @@ class Solver:
         challenge.instance = info if isinstance(info, dict) else {"raw": info}
         if isinstance(info, dict):
             challenge.instance_id = str(info.get("id") or info.get("instance_id") or "")
+        # 真的起来了实例 → 反转「本题没有环境」的负缓存（之前可能是平台误报/瞬态）
+        challenge.instance_absent = False
         if challenge.status in ("new", "parsed"):
             self.store.set_status(challenge_id, "instance_up")
         self.store.save()
@@ -702,6 +704,14 @@ class Solver:
         "instance_gone",
         "instance_expired",
         "实例不存在",
+    )
+
+    # 平台明确回答「本题压根没有环境」的标记（DASCTF ctf2 实测：crypto/misc 这类纯附件题
+    # 调 start_instance 会回 `NOT_FOUND` / `is not visible`，与「槽位被占」不是一回事）。
+    # 判定刻意保守：`challenge_not_found` 是**比赛上下文陈旧**（可反查修复）、
+    # `instance_not_found` 是**旧实例没了**（该重建实例），两者都不算「本题没有环境」。
+    _NO_INSTANCE_STRONG = (
+        "not visible", "no environment", "environment_not_found", "环境不存在", "无环境",
     )
 
     _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -741,17 +751,158 @@ class Solver:
         challenge.instance = {}
         self.store.save()
 
+    @classmethod
+    def _looks_no_instance(cls, text: str) -> bool:
+        """平台回执是否明确表示「本题没有环境」（不是槽位/限流，也不是比赛上下文不符）。"""
+        low = str(text or "").lower()
+        if not low:
+            return False
+        # 比赛上下文不符（可反查修复）/ 旧实例没了（该重建，不是没有环境）→ 都不算
+        if "challenge_not_found" in low or "instance_not_found" in low or "instance not found" in low:
+            return False
+        if any(mark in low for mark in cls._NO_INSTANCE_STRONG):
+            return True
+        # 裸 NOT_FOUND（平台用 code 表达）也算，但只在不涉及「instance」时
+        return ("not_found" in low or "not found" in low) and "instance" not in low
+
+    def _mark_instance_absent(self, challenge_id: str, reason: str) -> None:
+        """记住「平台明确说本题没有环境」：后续重跑跳过自启、模型手动 start 也被拦回。"""
+        try:
+            newly = self.store.mark_instance_absent(challenge_id)
+        except Exception:  # noqa: BLE001 - 负缓存是省钱项，落盘失败不能影响主流程
+            return
+        if not newly:
+            return
+        note = str(reason or "").strip().replace("\n", " ")[:160]
+        self.on_event("instance_absent", {"challenge_id": challenge_id, "reason": note})
+        self.store.append_transcript(challenge_id, {
+            "role": "instance",
+            "note": f"[实例守卫] 平台明确本题没有环境（{note or 'NOT_FOUND / is not visible'}）"
+                    "→ 之后不再自动 start_instance；按无环境题解（附件/静态/算法/编码）。",
+        })
+
+    def auto_start_allowed(self, challenge) -> bool:
+        """自动起实例的前置判定（solver 与 crew 共用，避免两处条件各写一份而漂移）。
+
+        禁止自启的四种情形：
+          1. 平台预下发实例（token 无权 start，调了只是 403）；
+          2. 已登记实例/实例 id；
+          3. 平台已明确本题没有环境（`instance_absent` 负缓存，见 `_mark_instance_absent`）；
+          4. 配置关掉自动自启（`auto_start_instance=false`）。
+        逃生口：`instance_absent_retry=true` 时无视负缓存再试一次（平台偶发误报时人工开）。
+        """
+        if self.config.extra.get("instance_preissued"):
+            return False
+        if getattr(challenge, "instance_id", "") or getattr(challenge, "instance", None):
+            return False
+        if getattr(challenge, "instance_absent", False) and not self.config.extra.get("instance_absent_retry"):
+            return False
+        return bool(self.config.extra.get("auto_start_instance", True))
+
+    def _store_rebuilt_instance(self, challenge_id: str, rebuilt) -> dict | None:
+        """把重建回执落成实例信息；回执不是 dict 时返回 None（调用方保留原回执）。"""
+        parsed = self.platform._as_json(rebuilt)
+        if not isinstance(parsed, dict):
+            return None
+        item = self.store.require(challenge_id)
+        item.instance = parsed
+        item.instance_id = str(parsed.get("id") or parsed.get("instance_id") or "")
+        item.instance_absent = False
+        if item.status in ("new", "parsed"):
+            self.store.set_status(challenge_id, "instance_up")
+        self.store.save()
+        return parsed
+
+    def _rebuild_tombstone_by_challenge(self, challenge_id: str, name: str, args: dict, raw: str) -> str:
+        """没有实例 id 的平台（DASCTF ctf2：回执只有 access_url / environment_id）的墓碑自愈。
+
+        平台回「已在运行」但本地没有可用端点时，旧逻辑 `_instance_id_in_text()` 抠不到 UUID →
+        直接原样返回，自愈永远不触发（HANDOFF P2）。这里改用平台唯一可用的**按题原语**：
+        `ctf2_get_environment(challenge_id)` 探活 → 明确不存在才 `按题删一次` → 再 start 一次。
+        环境仍可用则不删不重启（删了等于白扔一次 start 配额）；状态不明则什么都不做。
+        """
+        get_name = self.platform.try_resolve("get_instance")
+        props = self.platform.prop_names(get_name) if get_name else set()
+        if "challenge_id" not in props:
+            # 平台的 get_instance 只认 instance_id → 这条兜底路径不适用，维持旧行为
+            return raw
+        from .instance_guard import (  # noqa: PLC0415 - 只在自愈失败路径需要
+            delete_environment,
+            environment_absent,
+            environment_live,
+            query_environment,
+        )
+
+        comp = self._competition_id(challenge_id) or ""
+        env = query_environment(self.platform, challenge_id, comp)
+        if environment_live(env):
+            # 环境其实还活着：不删、不重启，把按题查到的端点补进本地，让模型换新端点重试
+            info = dict(env)
+            iid = str(env.get("instance_id") or "")
+            if iid:
+                info.setdefault("id", iid)
+            else:
+                info.pop("id", None)
+            item = self.store.require(challenge_id)
+            item.instance = info
+            item.instance_absent = False
+            self.store.save()
+            self.store.append_transcript(challenge_id, {
+                "role": "instance",
+                "note": "[实例守卫] 平台按题查到环境仍可用（回执没有实例 id），不删不重启，直接复用该端点",
+            })
+            return raw + (
+                "\n[实例守卫] 平台按 challenge_id 查到本题环境**仍可用**（本平台回执不给实例 id）："
+                f"端点={str(info.get('access_url') or info.get('access_urls') or '见回执')[:200]}。"
+                "不要 stop/重建，直接用该端点继续；若连接全失败再 report 收口。"
+            )
+        if not environment_absent(env):
+            return raw  # 状态不明：不乱删（删一次就少一次 start 配额）
+        removed = delete_environment(self.platform, challenge_id, comp)
+        if not removed.get("ok"):
+            return raw + (
+                "\n[实例守卫] 平台回执说实例已在运行，但按题探活既查不到、回收也失败"
+                f"（{str(removed.get('error') or '')[:140]}）。别再反复 start，直接 report/done 收口。"
+            )
+        if not self.store.record_call(challenge_id, name, self.config.instance_ops_limit):
+            return raw + (
+                "\n[实例守卫] 旧环境已按题回收，但本次尝试的实例操作配额用尽，无法自动重建；"
+                "不要再重试同一参数，直接 report/done 收口。"
+            )
+        self._forget_instance(challenge_id)
+        try:
+            rebuilt = self.platform.call_text(name, args)
+        except Exception as exc:  # noqa: BLE001 - 重建失败就保留原回执 + 说明
+            return raw + f"\n[实例守卫] 自动重建实例失败（{type(exc).__name__}: {exc}），请直接收口。"
+        self.store.append_transcript(challenge_id, {
+            "role": "tool",
+            "note": "[实例守卫] 平台回「已在运行」但按题探活报环境不存在（回执无实例 id），"
+                    "已按 challenge_id 回收旧环境并重新 start_instance",
+        })
+        new_id = self._store_rebuilt_instance(challenge_id, rebuilt)
+        if new_id is not None:
+            shown = str(new_id.get("id") or new_id.get("instance_id") or "(新端点)")
+            return str(rebuilt) + (
+                "\n[实例守卫] 旧环境已按 challenge_id 回收（回执本就没有实例 id），"
+                f"已自动重建为 {shown}，请用新端点："
+                f"{str(new_id.get('access_url') or '')[:200]}"
+            )
+        return str(rebuilt) + "\n[实例守卫] 已自动重新 start 一次；若回执仍无端点，直接收口，不要反复重试。"
+
     def _maybe_rebuild_tombstone(self, challenge_id: str, name: str, args: dict, text) -> str:
         """start 回「已在运行」但探活说实例不存在 → stop 旧 id（尽力）→ 真 start 一次。
 
         只在 get_instance 明确报 not found 时执行（平台自己说没有），并且额外那次 start 也计入
         instance_ops_limit（烧不出配额）。任何一步失败都保持原回执，只追加说明，不影响主流程。
+        回执里没有实例 id 的平台（ctf2）走 `_rebuild_tombstone_by_challenge` 的按题原语。
         """
         raw = str(text or "")
         if not any(mark in raw for mark in self._ALREADY_RUNNING_MARKS):
             return raw
         old_id = self._instance_id_in_text(raw) or str(self.store.require(challenge_id).instance_id or "")
-        if not old_id or self._instance_liveness(old_id) != "absent":
+        if not old_id:
+            return self._rebuild_tombstone_by_challenge(challenge_id, name, args, raw)
+        if self._instance_liveness(old_id) != "absent":
             return raw
         stop_name = self.platform.try_resolve("stop_instance")
         if stop_name:
@@ -774,17 +925,11 @@ class Solver:
             "note": f"[实例守卫] 平台登记的实例 {old_id} 已被回收（get_instance 报不存在），"
                     "已 stop 旧 id 并重新 start_instance",
         })
-        parsed = self.platform._as_json(rebuilt)
-        if isinstance(parsed, dict):
-            item = self.store.require(challenge_id)
-            item.instance = parsed
-            item.instance_id = str(parsed.get("id") or parsed.get("instance_id") or "")
-            if item.status in ("new", "parsed"):
-                self.store.set_status(challenge_id, "instance_up")
-            self.store.save()
+        new_id = self._store_rebuilt_instance(challenge_id, rebuilt)
+        if new_id is not None:
             return str(rebuilt) + (
                 f"\n[实例守卫] 旧实例 {old_id} 已失效（平台报 instance_not_found），"
-                f"已自动重建为 {item.instance_id or '(新实例)'}，请用新端点。"
+                f"已自动重建为 {str(new_id.get('id') or new_id.get('instance_id') or '(新实例)')}，请用新端点。"
             )
         return str(rebuilt) + "\n[实例守卫] 已自动重新 start 一次；若回执仍无端点，直接收口，不要反复重试。"
 
@@ -952,8 +1097,11 @@ class Solver:
             # 避免此处只记 1 次而重试 5 次打穿平台硬上限（审计 B-2）。
             info = self._start_with_backoff(challenge_id, start_name)
             if not info:
-                info = self._recover_instance_slot(
-                    challenge_id, start_name, getattr(self, "_last_start_error", ""))
+                reason = str(getattr(self, "_last_start_error", "") or "")
+                # 「平台明确说没有环境」→ 记负缓存：之后重跑不再自启，也不再让模型手动烧配额
+                if self._looks_no_instance(reason):
+                    self._mark_instance_absent(challenge_id, reason)
+                info = self._recover_instance_slot(challenge_id, start_name, reason)
         if not info:
             return None
         return self._register_instance(challenge_id, info)
@@ -988,6 +1136,17 @@ class Solver:
             # 时不能短路——否则本地登记的死 id 永远挡住重建（SAMPLE-019/016 实测）。
             if name == self.platform.try_resolve("start_instance"):
                 existing = self.store.require(challenge_id)
+                # 负缓存：平台已明确本题没有环境（此前 start_instance 回 NOT_FOUND / not visible）。
+                # 直接确定性拦回，不再白烧一次写操作配额与步数；模型照提示按无环境题解。
+                if (getattr(existing, "instance_absent", False) and not existing.instance
+                        and not existing.instance_id
+                        and not self.config.extra.get("instance_absent_retry")):
+                    return (
+                        "[实例守卫] 平台此前已明确本题没有环境（start_instance 回 NOT_FOUND / "
+                        "is not visible），本次不再发起启动。这类题按**无环境**解：纯附件/静态分析/"
+                        "算法复现/编码剥壳；题面若写了连接方式再 get_challenge 核对，别反复 start。",
+                        False,
+                    )
                 if existing.instance_id:
                     if self._instance_liveness(existing.instance_id) != "absent":
                         extra = (
@@ -1350,6 +1509,23 @@ class Solver:
         challenge = self.store.require(challenge_id)
         # 知识问答/MCQ 题没有实例，提交必须走 submit_qa_answer(challenge_id, …)。
         # 否则会落进 instance 分支，被「本题还没有实例」拦死（实测 SECQA-0001 答对 D 却提交不了）。
+        # [P2 平台计数同步] 平台按「用户+题」全局累计提交次数（最多 5 轮，跨 run 不重置）。
+        # 本地 per-question 闸只看自己的 state；换 run 目录重跑时平台额度可能已用满，继续交只是白送。
+        # 只做「读回执 + 硬停」：不把平台 attempt 写进 challenge.attempts（那是本地解题轮次口径）。
+        # 0（或缺省=5 时配 0）表示关闭这个硬停，退回老行为。
+        try:
+            platform_cap = int(self.config.extra.get("platform_submit_limit", 5))
+        except (TypeError, ValueError):
+            platform_cap = 5
+        platform_cap = max(0, platform_cap)
+        used_platform = int(getattr(challenge, "platform_attempts", 0) or 0)
+        if platform_cap > 0 and used_platform >= platform_cap:
+            return (
+                f"[提交被拦截] 平台已累计本题 {used_platform} 次提交（上限 {platform_cap} 次，"
+                "按「用户+题」全局计数、跨 run 不重置）。再交不会被受理——换新值也没额度了，"
+                "直接复盘收口（把 flag 候选与依据写进 report）。",
+                False,
+            )
         qa_only = bool(getattr(challenge, "is_qa_only", False)) or any(
             str(t).lower() in ("qa", "mcq", "single_select") for t in (challenge.tags or [])
         )
@@ -1451,6 +1627,14 @@ class Solver:
             accepted = False
         else:
             accepted = looks_accepted(text)
+        # [P2 平台计数同步] 回执里 attempt = 平台按「用户+题」全局累计的提交次数（跨 run）。
+        # 记进 platform_attempts（单调取 max）供下次开跑直接硬停，同时回显给模型看还剩几次。
+        attempt_seen = self._platform_attempt_from(result, text)
+        if attempt_seen:
+            used_platform = self.store.note_platform_attempt(challenge_id, attempt_seen)
+            if platform_cap > 0:
+                text += (f"\n[平台计数] 平台已累计第 {used_platform}/{platform_cap} 次提交"
+                         "（用户+题全局计数，跨 run 不重置）。")
 
         if accepted is True:
             # [fix 2026-11-03 B-3] 解析平台回执的 challenge_fully_solved：多问题题只过当前题号时
@@ -1472,6 +1656,43 @@ class Solver:
             # [v7.2 A4] 按题号记错交次数，供 per-question 额度闸用（v3 多轮换题号重交不被锁死）
             self.store.mark_submitted(challenge_id, answer, accepted=False, question_id=question_id)
         return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
+
+    def _platform_attempt_from(self, result, text: str) -> int:
+        """从提交回执里取平台的 attempt（用户+题全局累计）。取不到返回 0（绝不猜）。
+
+        平台回执形状不统一：`{"accepted":false,"attempt":2,…}` 可能落在返回值顶层、
+        `structuredContent` 里，或 content 文本里的 JSON（`_as_json` 那条路径）。
+        """
+        def _pick(obj, depth: int = 0) -> int:
+            if not isinstance(obj, dict) or depth > 2:
+                return 0
+            for key in ("attempt", "submit_attempt", "attempts"):
+                value = obj.get(key)
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    return number
+            inner = obj.get("structuredContent")
+            if isinstance(inner, dict):
+                return _pick(inner, depth + 1)
+            return 0
+
+        found = _pick(result)
+        if found:
+            return found
+        if isinstance(result, str) and result.strip():
+            # 极少数路径 call_raw 直接回文本：先按文本里的 JSON 试一次
+            try:
+                return _pick(json.loads(result.strip()))
+            except (ValueError, TypeError):
+                pass
+        try:
+            parsed = self.platform._as_json(text)
+        except Exception:  # noqa: BLE001 - 解析失败按「没读到」处理
+            parsed = None
+        return _pick(parsed)
 
     def _fully_solved_from(self, result, text: str) -> bool:
         """从提交回执里解析 challenge_fully_solved，判断多问题题是否已全解。
@@ -1715,12 +1936,8 @@ class Solver:
 
         # 实例能自动起就自动起，省掉模型一次摸索（真实平台一次只允许一个实例）
         # 平台预下发实例时禁止自启：token 无权 start_instance，调了只会 403（实测 SAMPLE-004）。
-        if (
-            not self.config.extra.get("instance_preissued")
-            and not challenge.instance
-            and not challenge.instance_id
-            and self.config.extra.get("auto_start_instance", True)
-        ):
+        # 无环境题（平台曾明确回 NOT_FOUND）也跳过：见 auto_start_allowed 的负缓存说明。
+        if self.auto_start_allowed(challenge):
             try:
                 info = self._ensure_instance(challenge_id)
                 if info:

@@ -202,6 +202,14 @@ class Challenge:
     next_question_id: str = ""    # 多问题题：下一道待提交的 question_id（per-challenge 隔离，不写 config.extra）
     notes: list[str] = field(default_factory=list)
     tool_counts: dict = field(default_factory=dict)  # 写操作频控计数（start/stop 实例等）
+    # 平台明确回答「本题没有环境」（start_instance 回 NOT_FOUND / is not visible）后置位：
+    # 后续重跑不再自动自启实例（省一次写操作配额 + 一步步数），模型手动 start 也被确定性拦回。
+    # 与 instance/instance_id 的分工：那两个是「有实例时的登记」，这个是「确定没有实例」的负缓存。
+    instance_absent: bool = False
+    # 平台回执里的 attempt（平台按「用户+题」全局累计，跨 run；最多 5 轮）。
+    # 与 attempts 的分工：attempts 是本地解题轮次，platform_attempts 只用于「平台还剩几次提交」
+    # 与回显，绝不拿它当 solve 轮次（否则重试/预算策略会被平台计数污染）。
+    platform_attempts: int = 0
     steps: int = 0
     updated_at: str = field(default_factory=now)
 
@@ -433,6 +441,7 @@ class Store:
                     continue
         # 单调取 max
         item.attempts = max(item.attempts, int(disk.get("attempts") or 0))
+        item.platform_attempts = max(item.platform_attempts, int(disk.get("platform_attempts") or 0))
         item.oracle_calls = max(item.oracle_calls, int(disk.get("oracle_calls") or 0))
         # tool_counts：每 key 取 max（不同 lane 各自计数，不该互相覆盖）
         disk_tc = disk.get("tool_counts") or {}
@@ -462,6 +471,9 @@ class Store:
         # 布尔/单值：磁盘有真值则采纳（全解标志、已解出的 flag、下一题号不回退）
         if disk.get("submitted_ok"):
             item.submitted_ok = True
+        # 负缓存只增不减：别的 lane 已判定「本题没有环境」时，本 lane 的 save 不能把它抹掉
+        if disk.get("instance_absent"):
+            item.instance_absent = True
         if disk.get("flag_value") and not item.flag_value:
             item.flag_value = disk.get("flag_value")
         # answers_by_qid：按题号并集（每个题号的答案单调，先到先得，跨 lane 不回退）
@@ -625,6 +637,55 @@ class Store:
         if count > 0:
             item.tool_counts[str(name)] = count - 1
             item.touch()
+
+    # ---------- 实例负缓存 / 平台提交计数 ----------
+
+    def mark_instance_absent(self, challenge_id: str, reason: str = "") -> bool:
+        """平台明确回答「本题没有环境」后置位负缓存（幂等）。返回是否**本次新置位**。
+
+        用途：无环境题（纯附件/静态/算法）只在第一次尝试时被自启浪费一次 start 配额与一步；
+        之后重跑直接跳过自启，模型手动 start 也被确定性拦回（见 solver._execute）。
+        """
+        with _lock_exclusive(self._lock_path()):
+            self._refresh_flags(challenge_id)
+            item = self.require(challenge_id)
+            if item.instance_absent:
+                return False
+            item.instance_absent = True
+            item.touch()
+            self.save()
+            return True
+
+    def clear_instance_absent(self, challenge_id: str) -> None:
+        """反转负缓存（真的起来了实例，或人工要求重试自启时）。"""
+        item = self.require(challenge_id)
+        if not item.instance_absent:
+            return
+        item.instance_absent = False
+        item.touch()
+        self.save()
+
+    def note_platform_attempt(self, challenge_id: str, attempt: int) -> int:
+        """把平台提交回执里的 attempt 单调并入本地（跨 run 全局计数，只增不减）。
+
+        为什么不塞进 `attempts`：那是本地**解题轮次**（重试策略/预算切片按它算），平台 attempt 是
+        **提交次数**（用户+题全局、最多 5 轮），两个口径混用会把重试策略带偏（HANDOFF P2 的原始顾虑）。
+        返回合并后的本地值（调用方拿来回显「平台累计第 N/5 次提交」）。
+        """
+        try:
+            value = int(attempt)
+        except (TypeError, ValueError):
+            return 0
+        if value <= 0:
+            return 0
+        with _lock_exclusive(self._lock_path()):
+            self._refresh_flags(challenge_id)
+            item = self.require(challenge_id)
+            if value > int(item.platform_attempts or 0):
+                item.platform_attempts = value
+                item.touch()
+                self.save()
+            return int(item.platform_attempts or 0)
 
     def bump_oracle(self, challenge_id: str, limit: int) -> bool:
         """登记一次 oracle 探针；返回 False 表示已达上限。"""

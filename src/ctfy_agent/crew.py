@@ -1071,13 +1071,8 @@ class Crew:
 
         # 自动起实例（协调者统筹环境，专家直接干活）
         # 平台预下发实例时禁止自启：token 无权 start_instance，调了只会拿 403 白烧一轮（实测 SAMPLE-004）。
-        _preissued = bool(self.config.extra.get("instance_preissued"))
-        if (
-            not _preissued
-            and not challenge.instance_id
-            and not challenge.instance
-            and self.config.extra.get("auto_start_instance", True)
-        ):
+        # 「平台明确本题没有环境」的负缓存也在这里生效（判定统一走 solver.auto_start_allowed）。
+        if solver.auto_start_allowed(challenge):
             try:
                 solver._ensure_instance(challenge_id)
             except Exception as exc:
