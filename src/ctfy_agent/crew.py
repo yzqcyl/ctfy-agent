@@ -419,7 +419,7 @@ _REPEAT_BLOCK_HINT = (
 )
 # [fix 2026-11-13 P6] submit 的按值摘除提示：工具还在，只是这个值不许再交。
 _REPEAT_VALUE_HINT = (
-    "[重复动作断路器] `submit` 的这个答案已经是第 {n} 次被拦（同值重复零信息），这个**值**已移出工具面。\n"
+    "[重复动作断路器] `submit` 的这个答案已经是第 {n} 次被拦（同值重复零信息）。\n"
     "submit 工具本身仍可用：换一个**不同的候选值**或题号再提交；没有新候选就 delegate 去拿新证据。\n"
     "注意：平台对同值判错不会因改大小写/包裹而改变，除非有新证据，否则别在旧值上打转。"
 )
@@ -427,6 +427,13 @@ _REPEAT_LOOP_STOP = (
     "连续 {n} 次重复同一被拦动作，判定为卡死循环，本题收口（reason=action_loop）。"
     "已省下的预算留给其它题；复现稿里按「需要新证据/换思路」记录。"
 )
+# [fix 2026-11-13 P13] submit 的同值重复：只提示、不摘工具；但连续到 SUBMIT_STOP_LIMIT 次
+# 仍要收口（实测 SAMPLE-015/016 把同一个答案各交 34/37 次，纯靠提示拦不住）。
+_REPEAT_VALUE_STOP_HINT = (
+    "[重复动作断路器] submit 已经连续 {n} 次交同一个被拦的答案。再交同一个值就直接收口本题"
+    "（reason=action_loop）。现在只剩两条路：换一个**真正不同**的候选值，或 delegate 去拿新证据。"
+)
+SUBMIT_STOP_LIMIT = REPEAT_BLOCK_LIMIT * 2
 
 # [fix 2026-11-12 P2-D] 同参同结果空转：写文件后重跑同一脚本是合法动作（结果会变），
 # 但同一 (tool,args) 连续返回**完全相同的结果**就是在空转。11-12 实测 clockin 同一命令 14 次、
@@ -1300,6 +1307,9 @@ class Crew:
         # 旧逻辑同值被拦 2 次就把 submit 从工具面拿走，判错的候选又逼着提交 → 死锁到收口
         # （实测 vigenere：判错 1 次后 submit 被摘、done 被候选闸门拦，100s/900s 就结束）。
         suppressed_sigs: set[tuple[str, str]] = set()
+        # submit 同值重复只提示「换值」，不摘工具；连续到 SUBMIT_STOP_LIMIT 才收口（见 P6/P13）。
+        submit_hinted = False
+        submit_strong_hinted = False
         # 已被平台判错的候选值：done 闸门不再拿它们逼提交（见 _REFUTED_DONE_GATE）。
         refuted_values: set[str] = set()
         # 裸 token 自动补 flag{} 只做一次（见 _WRAP_RETRY_HINT）。
@@ -1516,7 +1526,7 @@ class Crew:
                     # [fix 2026-11-13 P6] 按「工具+参数」摘除的动作在派发前直接拦下（不执行、不烧平台额度）。
                     # submit 被摘的只是那个**已判错的值**，换候选值仍可提交；其它工具行为与旧版一致。
                     sig_now = _action_signature(name, args)
-                    if sig_now in suppressed_sigs:
+                    if sig_now in suppressed_sigs and name != "submit":
                         text = (
                             "[重复动作断路器] 这个「工具+参数」组合已经被摘除，同样调用不会再产生新信息。\n"
                             "submit 请换一个**不同的候选值/题号**（submit 工具本身仍可用）；"
@@ -1771,33 +1781,54 @@ class Crew:
                             blocked_streak += 1
                         else:
                             blocked_sig, blocked_streak = sig, 1
-                        # [fix 2026-11-13 P6] submit 只摘「这个值」，不摘整个工具：
-                        # 判错候选 + submit 被摘 + done 被候选闸门拦 = 死锁（vigenere 实证）。
-                        if blocked_streak >= REPEAT_BLOCK_STREAK and name not in suppressed_tools:
-                            if name == "submit":
-                                if sig not in suppressed_sigs:
-                                    suppressed_sigs.add(sig)
-                                    messages.append({
-                                        "role": "user",
-                                        "content": _REPEAT_VALUE_HINT.format(n=blocked_streak),
-                                    })
-                                    self.store.append_transcript(
-                                        challenge_id,
-                                        {"role": "gate", "step": rnd,
-                                         "note": f"重复动作断路器：submit 该值已移出工具面"
-                                                 f"（连续 {blocked_streak} 次被拦，换值仍可交）"},
-                                    )
-                            else:
-                                suppressed_tools.add(name)
+                        # [fix 2026-11-13 P6/P13] submit 只给一次性「换值」提示，不摘工具、不收口：
+                        # 摘工具会造成死锁（判错候选 + done 被候选闸门拦）；而把 submit 计入
+                        # action_loop 又会让它 77s 就收口（vigenere 17:56 实证）。同值重复的硬拦截
+                        # 由 solver._submit 的去重负责（不烧平台次数），这里只做软提示。
+                        if blocked_streak >= REPEAT_BLOCK_STREAK and name == "submit":
+                            if not submit_hinted:
+                                submit_hinted = True
                                 messages.append({
                                     "role": "user",
-                                    "content": _REPEAT_BLOCK_HINT.format(name=name, n=blocked_streak),
+                                    "content": _REPEAT_VALUE_HINT.format(n=blocked_streak),
                                 })
                                 self.store.append_transcript(
                                     challenge_id,
                                     {"role": "gate", "step": rnd,
-                                     "note": f"重复动作断路器：{name} 连续 {blocked_streak} 次被拦，已移出工具面"},
+                                     "note": f"submit 同值连续 {blocked_streak} 次被拦：只提示换值，"
+                                             f"不摘工具、不收口"},
                                 )
+                            if blocked_streak >= REPEAT_BLOCK_LIMIT and not submit_strong_hinted:
+                                submit_strong_hinted = True
+                                messages.append({
+                                    "role": "user",
+                                    "content": _REPEAT_VALUE_STOP_HINT.format(n=blocked_streak),
+                                })
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "gate", "step": rnd,
+                                     "note": f"submit 同值连续 {blocked_streak} 次被拦：已警告将收口"},
+                                )
+                            if blocked_streak >= SUBMIT_STOP_LIMIT:
+                                stop = True
+                                reason = "action_loop"
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "gate", "step": rnd,
+                                     "note": f"重复动作断路器：submit 同值连续 {blocked_streak} 次，"
+                                             f"收口 action_loop"},
+                                )
+                        elif blocked_streak >= REPEAT_BLOCK_STREAK and name not in suppressed_tools:
+                            suppressed_tools.add(name)
+                            messages.append({
+                                "role": "user",
+                                "content": _REPEAT_BLOCK_HINT.format(name=name, n=blocked_streak),
+                            })
+                            self.store.append_transcript(
+                                challenge_id,
+                                {"role": "gate", "step": rnd,
+                                 "note": f"重复动作断路器：{name} 连续 {blocked_streak} 次被拦，已移出工具面"},
+                            )
                         if blocked_streak >= REPEAT_BLOCK_LIMIT and name != "submit":
                             stop = True
                             reason = "action_loop"
@@ -1812,6 +1843,8 @@ class Crew:
                             )
                     else:
                         blocked_sig, blocked_streak = None, 0
+                        submit_hinted = False
+                        submit_strong_hinted = False
 
                     # [fix 2026-11-12 P2-D] 同参同结果空转断路器（与上面的「被拦」断路器互补）：
                     # 正常动作重复不拦（改脚本再跑结果是会变的），只有「同一调用连续返回完全相同

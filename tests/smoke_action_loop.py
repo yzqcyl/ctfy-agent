@@ -195,21 +195,26 @@ def main() -> int:
     check("正常结果不算拦截", not crew_mod._looks_blocked('{"accepted": true}'))
     check("平台判错不算拦截", not crew_mod._looks_blocked("----- 工具返回 -----\n{\"accepted\":false}"))
 
-    # ---------- 2) 端到端：同一答案连交 → 断路器收口 ----------
+    # ---------- 2) 端到端：同一答案连交 → 提示换值，连续到上限才收口 ----------
     plat = StubPlatform()
     llm = ScriptedLLM([{"name": "submit", "args": {"answer": "L3AK{same_guess}"}}] * 20)
     events: list = []
     store, crew = _fresh(cfg, plat, llm, "loop1", events)
     summary = crew.solve(CID)
 
-    check("收口原因是 action_loop", summary.get("reason") == "action_loop", str(summary.get("reason")))
+    # [fix 2026-11-13 P13] submit 同值重复不再 4 次就收口（会 77s 结束，实测 vigenere），
+    # 改为：第 2 次提示换值、第 4 次强警告、第 8 次才 action_loop；submit 工具全程不摘。
+    check("同值重复最终仍以 action_loop 收口", summary.get("reason") == "action_loop",
+          str(summary.get("reason")))
     check("未误报解出", summary.get("submitted") is False)
-    check("只真提交了 1 次（其余被闸门拦下）", len(plat.submitted) == 1, f"实际 {len(plat.submitted)} 次")
-    check("LLM 调用远少于 40 轮上限", llm.calls <= crew_mod.REPEAT_BLOCK_LIMIT + 1, f"实际 {llm.calls} 次")
+    check("只真提交了 1 次（其余被去重/闸门拦下）", len(plat.submitted) == 1,
+          f"实际 {len(plat.submitted)} 次")
+    check("submit 连续上限=2×REPEAT_BLOCK_LIMIT",
+          llm.calls <= crew_mod.SUBMIT_STOP_LIMIT + 1, f"实际 {llm.calls} 次")
     check("submitted 参数正确", plat.submitted and plat.submitted[0].get("answer") == "L3AK{same_guess}",
           str(plat.submitted))
     tr = _transcript_notes(store)
-    check("转录记了移出工具面", "已移出工具面" in tr)
+    check("转录记了换值提示（不摘工具）", "只提示换值" in tr)
     check("转录记了 action_loop 收口", "action_loop" in tr)
     check("状态记为 stalled", store.require(CID).status == "stalled", store.require(CID).status)
     # [接手 2026-11-11] 生效预算必须落成确定性一行（来源可辨，避免"改了配置没用"的误判）
@@ -223,13 +228,13 @@ def main() -> int:
     names_all = crew._coordinator_tools()
     check("不传 suppressed 时工具面不变",
           any((t.get("function") or {}).get("name") == "submit" for t in names_all))
-    # [fix 2026-11-13 P6] submit 改为「按值摘除」：判错的候选不许重交，但换一个候选值仍必须能提交。
+    # [fix 2026-11-13 P6/P13] submit 不再整工具摘除：判错的候选不许重交，但换值仍必须能提交。
     # 旧行为（整个 submit 从工具面消失）在「候选判错 + done 被候选闸门拦」时会死锁（vigenere 实证）。
     seen = [names for names in llm.tools_history]
     check("首轮还能看见 submit", any("submit" in n for n in seen[:1]))
-    check("按值摘除后 submit 仍在工具面（换值可继续）", all("submit" in n for n in seen[1:]),
+    check("同值重复后 submit 仍在工具面（换值可继续）", all("submit" in n for n in seen[1:]),
           str(seen))
-    check("转录记了该值被摘除", "该值已移出工具面" in tr, tr[-400:])
+    check("转录记了换值提示", "只提示换值" in tr, tr[-400:])
 
     # ---------- 4) 透明性：动作不重复时不介入 ----------
     # 每次都是不同答案：即使平台都判错，也不该被当成「重复动作」拦（判错 ≠ 被守卫拦下）。
@@ -262,9 +267,9 @@ def main() -> int:
     llm3 = ScriptedLLM([{"name": "submit", "args": {"answer": "FLAG{same}"}}] * 20)
     store3, crew3 = _fresh(cfg, plat3, llm3, "loop3")
     summary3 = crew3.solve(CID)
-    check("无实例重复提交 → action_loop 收口", summary3.get("reason") == "action_loop",
+    check("无实例重复提交 → 连续到上限才 action_loop", summary3.get("reason") == "action_loop",
           str(summary3.get("reason")))
-    check("无实例重复提交被断路器截断（<=4 次）", llm3.calls <= crew_mod.REPEAT_BLOCK_LIMIT + 1,
+    check("无实例重复提交被截断（<=2×上限）", llm3.calls <= crew_mod.SUBMIT_STOP_LIMIT + 1,
           f"实际 {llm3.calls} 次")
     check("无实例重复提交有确定性说明",
           "提交失败" in _transcript_notes(store3), _transcript_notes(store3)[-300:])
