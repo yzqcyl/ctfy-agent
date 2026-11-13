@@ -276,12 +276,37 @@ class CtfyPlatform:
     # ---------- 参数校验 ----------
 
     def _clean_args(self, name: str, arguments: dict | None) -> dict:
-        """轻量校验：required 缺失报错，integer 自动纠正类型。"""
+        """轻量校验：required 缺失报错，integer 自动纠正类型，未知字段剔除。
+
+        [fix 2026-11-13 P12] DASCTF 平台 2026-11-13 起对工具参数做严格校验
+        （`additionalProperties: false`，多传一个字段就回 INVALID_REQUEST）。而练习场
+        `ctf2_get_practice_challenge` 与比赛版 `ctf2_get_competition_challenge` 是**同一个语义
+        动作的两套 schema**：前者要 `practice_ground_id`、后者要 `competition_id + stage_id`。
+        旧调用方（attachments/_read_challenge_detail、crew 的 get_challenge 封装）为「桥接两种口径」
+        会同时传 competition_id 与 practice_ground_id → 直接被拒 → 附件/题面全拿不到，
+        专家只能空转（本轮 17:20 起的批次就是这么白跑的）。
+        这里在调用前做一次 schema 归一：
+          1) 工具有 `practice_ground_id` 而没给 → 用 `competition_id` 顶上（练习场语义）；
+          2) 剔除 schema 里不存在的字段（含桥接残留），避免 strict 校验拒绝。
+        只改实际要发给平台的参数，不动模型侧 transcript。
+        """
         cleaned = dict(arguments or {})
         schema = self.schema_of(name)
         if not schema:
             return cleaned
         properties = schema.get("properties") or {}
+        if properties:
+            # 1) 练习场：competition_id 在语义上就是 practice_ground_id
+            if (
+                "practice_ground_id" in properties
+                and cleaned.get("practice_ground_id") in (None, "")
+                and cleaned.get("competition_id")
+            ):
+                cleaned["practice_ground_id"] = cleaned["competition_id"]
+            # 2) 剔除未声明字段（strict schema 会整单拒绝）
+            for field in list(cleaned):
+                if field not in properties:
+                    cleaned.pop(field, None)
         for field in schema.get("required") or []:
             if cleaned.get(field) in (None, ""):
                 raise PlatformError(f"{name}: 缺少必填参数 {field}")
