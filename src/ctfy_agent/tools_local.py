@@ -2706,10 +2706,15 @@ class LocalTools:
         # [fix 2026-11-13 P16] find 加进来：cmd 里确实有 find.exe（按文本搜文件），
         # 于是 `find . -maxdepth 4 -name '*.zip'` 会执行成「找不到路径」的诡异回执（exit 0、空 stdout），
         # 模型拿不到信息还以为是路径问题。实测 round2 6 道题里 21 次 shell 调用烧在这上面。
-        unix_only = ("grep", "head", "tail", "wc", "sed", "awk", "xxd", "sh", "bash", "find")
+        # [fix 2026-11-13 P19] 再补 cut/tr/uniq/xargs/tee/basename/dirname/env：都是「模型按 Linux 习惯写、
+        # cmd 里没有对应命令」的高频词（round3 实测 `... | cut -c1-200` 直接 'cut' is not recognized，
+        # 白丢一步）。cmd 自带 sort/findstr，但语义不同，不放进白名单。
+        unix_only = ("grep", "head", "tail", "wc", "sed", "awk", "xxd", "sh", "bash", "find",
+                     "cut", "tr", "uniq", "xargs", "tee", "basename", "dirname", "env")
         if _shims_available():
             # 前五个由 tools/shims 提供 Windows 实现，不再拦截；sed/awk 太复杂不做 shim
-            unix_only = ("sed", "awk", "sh", "bash", "find")
+            unix_only = ("sed", "awk", "sh", "bash", "find",
+                         "cut", "tr", "uniq", "xargs", "tee", "basename", "dirname", "env")
         cmds = cls._windows_command_words(command)
         outside = cls._outside_dquotes(command)
         notes: list[str] = []
@@ -2719,6 +2724,11 @@ class LocalTools:
             if "find" in missing:
                 hint += ("；列文件用 `dir /s /b *关键字*`，复杂检索/解包用 write_file 写 Python 脚本"
                          "（pathlib/zipfile）再 `python x.py`")
+            if any(c in missing for c in ("cut", "tr", "uniq", "xargs", "tee", "basename", "dirname")):
+                hint += ("；列切片/去重/字段提取统一写 Python 脚本（str.split/os.path.basename），"
+                         "别在 cmd 里拼管道")
+            if "env" in missing:
+                hint += "；列环境变量用 `set`（cmd 内置）"
             notes.append(hint)
         if "python3" in cmds:
             notes.append("Windows 上解释器叫 `python`（不是 python3）")

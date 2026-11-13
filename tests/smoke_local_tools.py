@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import sys
@@ -178,6 +179,15 @@ def _run(tmp: pathlib.Path) -> int:
 
     desc = BURST_SPEC["function"]["parameters"]["properties"]["values"]["description"]
     check("http_burst 上限文案含分批指引", "拆成多批" in desc)
+
+    # ---- P19: Windows shell 守卫覆盖「Linux 习惯、cmd 没有」的高频命令 ----
+    if os.name == "nt":
+        hint = LocalTools._windows_shell_guard("cat a.txt | cut -c1-200")
+        check("shell 守卫拦 cut", bool(hint) and "cut" in hint and "Python" in hint, str(hint))
+        hint = LocalTools._windows_shell_guard("env | sort")
+        check("shell 守卫拦 env", bool(hint) and "set" in hint, str(hint))
+        hint = LocalTools._windows_shell_guard("find . -name '*.zip'")
+        check("shell 守卫拦 find", bool(hint) and "dir /s /b" in hint, str(hint))
 
     print()
     if FAILS:

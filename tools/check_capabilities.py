@@ -294,6 +294,28 @@ def probe_john() -> str:
     return _version_probe("john", ["--help"], "")
 
 
+def probe_upx() -> str:
+    """P19：UPX 真往返（压缩一个 ELF → 解压 → 能跑），不只看 --version。"""
+    path = shutil.which("upx")
+    if not path:
+        raise RuntimeError("upx 不在 PATH 里")
+    src = next((p for p in ("/bin/true", "/usr/bin/true", "/bin/echo") if os.path.isfile(p)), "")
+    if not src:
+        raise RuntimeError("找不到可用于 UPX 往返的 ELF 样本（/bin/true 等）")
+    with _scratch() as tmp:
+        target = os.path.join(tmp, "sample")
+        shutil.copy2(src, target)
+        original = Path(target).read_bytes()
+        proc = _run([path, "-q", "-f", target])
+        assert proc.returncode == 0, f"upx 压缩失败: {(proc.stderr or proc.stdout)[:160]}"
+        packed = Path(target).read_bytes()
+        assert packed != original, "upx 压缩后文件没变化"
+        proc = _run([path, "-q", "-d", "-f", target])
+        assert proc.returncode == 0, f"upx 解压失败: {(proc.stderr or proc.stdout)[:160]}"
+        assert Path(target).read_bytes() == original, "upx 解压后与原始文件不一致"
+    return "upx 压缩→解压往返一致"
+
+
 PY_PROBES = {
     "qr": probe_qr,
     "pcap": probe_pcap,
@@ -313,6 +335,7 @@ BIN_PROBES = {
     "7z": probe_7z,
     "poppler": probe_poppler,
     "john": probe_john,
+    "upx": probe_upx,
 }
 
 

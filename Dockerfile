@@ -286,15 +286,18 @@ RUN set -eux; \
 #   * 不装 tesseract：OCR 题在本题库里占比极低，但 tesseract+libtesseract+eng 语料约 +18MB；
 #   * binwalk 会带进系统 python3（Debian 包 python3-binwalk 依赖 python3，约 +25MB），
 #     换来固件/嵌套压缩包雕刻能力，保留；`file`/`foremost`/`7z` 是它的轻量替代。
+#   * upx-ucl（P19，约 +1MB）：REVERSE 常见 UPX 加壳题，本地实测专家写 `upx -d` 直接
+#     'upx' is not recognized（round3 的 b8c599c2 就卡在脱壳）；apt 包自带 linux 二进制。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        binwalk foremost steghide libimage-exiftool-perl p7zip-full poppler-utils john \
+        binwalk foremost steghide libimage-exiftool-perl p7zip-full poppler-utils john upx-ucl \
     && rm -rf /var/lib/apt/lists/* \
-    && for b in binwalk foremost steghide exiftool 7z 7za pdftotext pdftoppm john; do \
+    && for b in binwalk foremost steghide exiftool 7z 7za pdftotext pdftoppm john upx; do \
         command -v "$b" >/dev/null || { echo "缺能力工具 $b" >&2; exit 1; }; \
     done \
     && (7z i >/dev/null 2>&1 || 7za i >/dev/null 2>&1) \
-    && echo "capability binaries ok: $(binwalk --help 2>&1 | head -1 || true) / $(steghide --version 2>&1 | head -1)"
+    && (upx --version >/dev/null 2>&1) \
+    && echo "capability binaries ok: $(binwalk --help 2>&1 | head -1 || true) / $(steghide --version 2>&1 | head -1) / $(upx --version 2>&1 | head -1 || true)"
 
 # 能力自检（功能级，不只是 import）：二维码生成→解码、pcap 写→读、AES zip 往返、
 # steghide/7z 真实往返…… 构建期跑 3 轮（同一套探针重复三轮，避免「一次碰巧过」）。
