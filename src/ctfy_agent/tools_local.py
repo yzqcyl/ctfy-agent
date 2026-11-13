@@ -2703,16 +2703,23 @@ class LocalTools:
     def _windows_shell_guard(cls, command: str) -> str | None:
         # 已被 _windows_rewrite 换成等价物的命令不再列入（ls/cat/pwd/which/cp/mv），
         # 只保留「有叫法差异但无语义等价物」或「改写不安全」的命令。
-        unix_only = ("grep", "head", "tail", "wc", "sed", "awk", "xxd", "sh", "bash")
+        # [fix 2026-11-13 P16] find 加进来：cmd 里确实有 find.exe（按文本搜文件），
+        # 于是 `find . -maxdepth 4 -name '*.zip'` 会执行成「找不到路径」的诡异回执（exit 0、空 stdout），
+        # 模型拿不到信息还以为是路径问题。实测 round2 6 道题里 21 次 shell 调用烧在这上面。
+        unix_only = ("grep", "head", "tail", "wc", "sed", "awk", "xxd", "sh", "bash", "find")
         if _shims_available():
             # 前五个由 tools/shims 提供 Windows 实现，不再拦截；sed/awk 太复杂不做 shim
-            unix_only = ("sed", "awk", "sh", "bash")
+            unix_only = ("sed", "awk", "sh", "bash", "find")
         cmds = cls._windows_command_words(command)
         outside = cls._outside_dquotes(command)
         notes: list[str] = []
         missing = sorted({c for c in cmds if c in unix_only})
         if missing:
-            notes.append(f"Windows shell 无 {'/'.join(missing)}；文本处理改用 http_request 的 grep/offset")
+            hint = f"Windows shell 无 {'/'.join(missing)}；文本处理改用 http_request 的 grep/offset"
+            if "find" in missing:
+                hint += ("；列文件用 `dir /s /b *关键字*`，复杂检索/解包用 write_file 写 Python 脚本"
+                         "（pathlib/zipfile）再 `python x.py`")
+            notes.append(hint)
         if "python3" in cmds:
             notes.append("Windows 上解释器叫 `python`（不是 python3）")
         if "<<" in outside:
