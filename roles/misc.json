@@ -21,7 +21,8 @@
         "tcp_batch",
         "netcheck",
         "listen",
-        "z3solve"
+        "z3solve",
+        "udp"
       ]
     }
   }

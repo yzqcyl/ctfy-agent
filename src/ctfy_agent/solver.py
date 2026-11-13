@@ -707,7 +707,48 @@ class Solver:
             self._wait_instance_ready(challenge_id, info)
         except Exception:  # noqa: BLE001 - 就绪等待是增强项
             pass
+        # [2026-11-13 CTFY 数据面] 本机没有 WireGuard 客户端（Windows 非管理员）时，用用户态
+        # wireproxy 把实例的 VPN 服务映射到本地端口并装 socket 改写（见 netbridge/portmap）。
+        # 失败只留痕，绝不拦解题：正式比赛容器里隧道由平台注入，本来就不需要这层。
+        try:
+            self._ensure_local_bridge(challenge_id, info)
+        except Exception as exc:  # noqa: BLE001 - 本地桥是开发辅助
+            try:
+                self.store.append_transcript(
+                    challenge_id,
+                    {"role": "note", "content": f"[本地桥] 未启用/失败：{type(exc).__name__}: {exc}"},
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return info
+
+    def _ensure_local_bridge(self, challenge_id: str, info) -> list[str]:
+        """给当前实例建本地端口桥（无 TUN 环境），返回给模型的提示行（失败抛异常由调用方兜）。
+
+        幂等：同一实例已有桥时直接复用，不重启 wireproxy。
+        """
+        from .netbridge import active_bridge, start_bridge  # noqa: PLC0415 - 只在实例就绪路径需要
+
+        if not isinstance(info, dict):
+            return []
+        instance_id = str(info.get("id") or info.get("instance_id") or "")
+        current = active_bridge()
+        if current is not None and instance_id and current.instance_id == instance_id and current.tunnels:
+            return []
+        description = ""
+        try:
+            description = str(self.store.require(challenge_id).description or "")
+        except Exception:  # noqa: BLE001
+            description = ""
+        competition_id = str(self._competition_id(challenge_id) or "")
+        lines = start_bridge(self.config, info, competition_id, description=description)
+        if lines:
+            note = "[本地桥] " + "；".join(lines[:4])
+            try:
+                self.store.append_transcript(challenge_id, {"role": "instance", "note": note})
+            except Exception:  # noqa: BLE001
+                pass
+        return lines
 
     _DEAD_INSTANCE_MARKERS = (
         "instance_not_found",
@@ -1376,6 +1417,15 @@ class Solver:
                 # localhost 当回调地址（SAMPLE-016/024 类型的坑）。这里翻成可照做的短提示。
                 if isinstance(parsed, dict):
                     hints = instance_access_lines(parsed)
+                    try:
+                        # 同一份提示里附上「本机已建好本地桥」的端口清单：没有 VPN 客户端的
+                        # 本机环境下模型不用知道隧道细节，照 host:port 连即可（已透明改写）。
+                        hints += self._ensure_local_bridge(challenge_id, parsed)
+                    except Exception as exc:  # noqa: BLE001 - 本地桥是开发辅助，不拦主流程
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "note", "content": f"[本地桥] 未启用/失败：{type(exc).__name__}: {exc}"},
+                        )
                     if hints:
                         text += "\n\n[接入提示]\n" + "\n".join(f"- {line}" for line in hints)
                         self.store.append_transcript(

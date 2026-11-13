@@ -154,16 +154,16 @@ ROLE_MAX_STEPS = 40
 # 默认角色。config/agent.json 的 roles 键可覆盖（会进 extra）。
 DEFAULT_ROLES: dict[str, dict] = {
     "coordinator": {"max_steps": ROLE_MAX_STEPS, "platform": ["read", "instance", "oracle", "submit"], "local": []},
-    "web": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request"], "keep_tail": 5, "facts_max": 12, "facts_chars": 780},
-    "rev": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell"], "keep_tail": 4},
-    "crypto": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance", "oracle"], "local": ["shell"]},
-    "misc": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["read", "instance"], "local": ["http_request"]},
+    "web": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request", "udp"], "keep_tail": 5, "facts_max": 12, "facts_chars": 780},
+    "rev": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell", "udp"], "keep_tail": 4},
+    "crypto": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance", "oracle"], "local": ["shell", "udp"]},
+    "misc": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["read", "instance"], "local": ["http_request", "udp"]},
     # pwn/ai 与 config/agent.json 的 roles 键对齐：DEFAULT_ROLES 是「角色丢失时的兜底」，
     # 缺了这两条，agent.json 一旦裁剪/丢失 pwn/ai，这两类题会无人可派（审计发现：
     # agent.json 之外没有任何兜底来源）。工具面按 agent.json 的同名角色抄全，避免兜底退化。
     "pwn": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True,
             "platform": ["read", "instance"],
-            "local": ["shell", "elfpeek", "tcp", "tcp_batch", "netcheck"]},
+            "local": ["shell", "elfpeek", "tcp", "tcp_batch", "netcheck", "udp"]},
     # [web-ai-gap 2026-10-30] ai 兜底按 agent.json 抄全（开 shell、local 补 shell/decode_blob），
     # 避免 config 丢失时退化成「无载荷构造」的旧面。
     # platform 用组名：oracle 组 = verify_answer + verify_exploit，校验通道无需单列。
@@ -799,6 +799,14 @@ class Crew:
             if str(last.get("challenge_id") or "") == challenge_id:
                 self.store.meta.pop("last_instance", None)
         except Exception:  # noqa: BLE001 - 记账清理失败不影响收尾
+            pass
+        # [2026-11-13 CTFY 数据面] 实例释放后本地端口桥没有意义了：顺手停掉 wireproxy
+        # 并撤掉 socket 改写，避免下一题拿到旧映射（同一进程串行跑全量时尤其重要）。
+        try:
+            from .netbridge import stop_bridge  # noqa: PLC0415 - 只有收尾路径需要
+
+            stop_bridge()
+        except Exception:  # noqa: BLE001 - 清理尽力而为
             pass
 
     def _role_platform_names(self, role: str) -> set[str]:

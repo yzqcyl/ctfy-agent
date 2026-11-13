@@ -22,7 +22,8 @@
       "chat",
       "shell",
       "write_file",
-      "decode_blob"
+      "decode_blob",
+      "udp"
     ]
   }
 }

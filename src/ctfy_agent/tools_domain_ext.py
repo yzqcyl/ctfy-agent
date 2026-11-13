@@ -266,6 +266,82 @@ def tcp_batch(host: str, port: int, payloads: list[str], hex_mode: bool = True,
     return _clip("\n".join([head] + rows))
 
 
+# >>> [udp-tool 2026-11-13] UDP 往返：CTFY SAMPLE-015 这类「hello → challenge token → flag token」
+#     的题要求**同一个源端口**连发两个数据报（换源端口 token 即失效，实测回 "bad token"）。
+#     本工具按 host:port 复用同一个 socket，报出本地源端口，reset=true 显式收尾。
+_UDP_SESSIONS: dict[tuple[str, int], socket.socket] = {}
+
+
+def _udp_socket(host: str, port: int, timeout: float) -> tuple[socket.socket, bool]:
+    key = (str(host), int(port))
+    sock = _UDP_SESSIONS.get(key)
+    fresh = sock is None
+    if sock is not None and sock.fileno() < 0:  # 被对端/系统关掉了：重建
+        fresh = True
+        sock = None
+    if sock is None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _UDP_SESSIONS[key] = sock
+    sock.settimeout(float(timeout))
+    return sock, fresh
+
+
+def udp(host: str, port: int, payload: str = "", hex_mode: bool = False,
+        timeout: float = 5.0, max_recv: int = 4096, replies: int = 1,
+        reset: bool = False) -> str:
+    """UDP 一问一答（同一 host:port 复用源端口）。"""
+    if reset:
+        sock = _UDP_SESSIONS.pop((str(host), int(port)), None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return "已关闭 %s:%s 的 UDP 会话（下次调用会用新源端口）" % (host, port)
+    if not host or not int(port):
+        raise DomainToolError("udp 需要 host 与 port")
+    try:
+        raw = bytes.fromhex(payload.strip()) if hex_mode else payload.encode("utf-8", "surrogateescape")
+    except ValueError as exc:
+        raise DomainToolError("hex_mode 下 payload 不是合法 hex：%s" % exc) from None
+    t0 = time.time()
+    sock, fresh = _udp_socket(host, int(port), float(timeout))
+    try:
+        local = sock.getsockname()
+    except OSError:
+        local = ("?", "?")
+    got: list[bytes] = []
+    errors: list[str] = []
+    try:
+        sock.sendto(raw, (host, int(port)))
+        deadline = time.time() + float(timeout)
+        while len(got) < max(1, int(replies)) and time.time() < deadline:
+            try:
+                body, _addr = sock.recvfrom(int(max_recv))
+            except socket.timeout:
+                break
+            except ConnectionResetError as exc:
+                # Windows 上 UDP 收到 ICMP 不可达会抛 10054：隧道刚握手时偶发，重试一次即可
+                errors.append("reset(%s)" % (getattr(exc, "winerror", "") or ""))
+                continue
+            got.append(body)
+    except OSError as exc:
+        raise DomainToolError("UDP 发送失败：%s" % exc) from None
+    parts = ["UDP 往返 %s:%s（本地源端口 %s，%s会话，耗时 %.0f ms，发送 %d 字节）" % (
+        host, port, local[1], "新" if fresh else "复用同一", (time.time() - t0) * 1000, len(raw))]
+    if errors:
+        parts.append("收到 %d 次 ICMP 重置（%s）；隧道刚就绪时可能出现，重发即恢复" % (len(errors), ",".join(errors)))
+    for index, body in enumerate(got):
+        parts.append("回复#%d（%d 字节）" % (index + 1, len(body)))
+        parts.append(_fmt_stream(body, "udp"))
+    if not got:
+        parts.append(
+            "未收到回复。UDP 无连接，常见原因：①服务端要特定首个报文（如 hello）；"
+            "②源端口/令牌绑定——保持同一会话重试，别 reset；③隧道刚起时前 1-2 个报文可能丢，重发一次。"
+        )
+    return _clip("\n".join(parts))
+
+
 # ---------------------------------------------------------------- ELF
 
 # >>> [rev-toolbox 2026-11-02] 重定位 / 动态段：纯 stdlib 自研，不引入 pyelftools
@@ -2771,6 +2847,34 @@ TCP_BATCH_SPEC = {
     },
 }
 
+# >>> [udp-tool 2026-11-13] UDP 规格（经 DOMAIN_SPECS 自动注册）。CTFY SAMPLE-015 实测：
+#     平台 UDP 服务对源端口敏感，必须同一 socket 连发 hello / flag。
+UDP_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "udp",
+        "description": (
+            "对平台实例的 UDP 服务做一问一答；同一 host:port 会自动复用同一个 socket（**源端口不变**）。"
+            "很多 UDP 题把 token 绑在源端口上：「hello → challenge <token> → flag <token>」必须同一个会话连发。"
+            "只能连本题实例的 host:port（白名单外拒绝）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "实例主机（surface.services[].host）"},
+                "port": {"type": "integer", "description": "实例 UDP 端口"},
+                "payload": {"type": "string", "description": "要发送的内容（文本；hex_mode=true 时按 hex 解析）"},
+                "hex_mode": {"type": "boolean", "description": "payload 是否 hex 编码（二进制协议用 true）"},
+                "timeout": {"type": "number", "description": "等回复的秒数（默认 5.0）"},
+                "max_recv": {"type": "integer", "description": "单条回复最多读多少字节（默认 4096）"},
+                "replies": {"type": "integer", "description": "期望收几条回复（默认 1）"},
+                "reset": {"type": "boolean", "description": "发送前丢弃旧会话（换新源端口收尾用）"},
+            },
+            "required": ["host", "port"],
+        },
+    },
+}
+
 # >>> [rev-toolbox 2026-10-30] elfpeek 规格升级：disasm / bytecode / gadgets v2 / utf16
 ELFPEEK_SPEC = {
     "type": "function",
@@ -3098,7 +3202,7 @@ LISTEN_SPEC = {
     },
 }
 
-DOMAIN_SPECS = [TCP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC, PWNGEN_SPEC, PWNFIND_SPEC,
+DOMAIN_SPECS = [TCP_SPEC, UDP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC, PWNGEN_SPEC, PWNFIND_SPEC,
                 RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC, LISTEN_SPEC,
                 Z3SOLVE_SPEC, PYCRYPT_SPEC, PWNROP_SPEC]
 
@@ -3119,6 +3223,16 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
                 max_recv=int(args.get("max_recv", 4096)),
                 tls=bool(args.get("tls", False)),
                 sni=str(args.get("sni") or ""),
+            )
+        if name == "udp":
+            return udp(
+                str(args.get("host", "")), int(args.get("port") or 0),
+                payload=str(args.get("payload") or ""),
+                hex_mode=bool(args.get("hex_mode", False)),
+                timeout=float(args.get("timeout", 5.0)),
+                max_recv=int(args.get("max_recv", 4096)),
+                replies=int(args.get("replies", 1)),
+                reset=bool(args.get("reset", False)),
             )
         if name == "tcp_batch":
             return tcp_batch(
