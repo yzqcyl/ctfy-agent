@@ -124,3 +124,29 @@ python -m ctfy_agent --run-id playground auto --order id --status new instance_u
 - `2dc31d9` fix(solver): verify_exploit 退避重试（judge 侧车就绪窗口）
 - `ef2637d` docs(playground): 练习场 16/17 结果与证据
 - `5d8cf77` fix(netbridge): WireGuard 配置补 PersistentKeepalive=25
+- `27570ee` docs(playground): 收尾报告 16/17（证据链）
+
+## 7. 时间线观察（平台侧）
+
+| 时间（本地） | 现象 |
+|---|---|
+| 01:50 前后 | SAMPLE-023 estate 成功一次：portal:80 在 t+120s 返回 200 |
+| 02:20 | SAMPLE-023 estate 成功一次：files:80 在 t+36s 返回 200（`file host online; request /flag`） |
+| 04:00 之后 | 同一策略起 40+ 个实例（节点 .3/.4/.5/.6/.7/.8/.9/.10/.11/.12，覆盖两个比赛），`services` 恒为 0、estate 端口恒 `connection refused` |
+| 07:0x（同一会话内，第 18 轮，node 10.90.0.11） | **portal:80 在 t+56s 起**并稳定返回 `DocuVault portal…`；但 files 在该轮 150s 窗口内仍未起 —— 证明 estate 是「能起来但很慢/很不稳定」，而脚本到窗口就停实例是当时的短板（已改为 portal 起来后保活再等 files 300s，见 `runs/_mon/case_023_catch.py`） |
+| 07:3x | 6 轮 portal-first 收割未再命中 portal |
+| 05:45 | 补充 `PersistentKeepalive`、放宽 `AllowedIPs`、`renew_instance`、单实例串行（cap=1）均无效 |
+
+推测：凌晨某个时间点后，练习场/ SAMPLE 比赛的 engagement（estate）部署整体降级；这与「其他队伍计数仍在涨」并不矛盾
+（计数是累计值，且他们可能落在缓存已热的节点上）。
+
+## 8. 全量核对命令（一次跑完 17 题）
+
+```powershell
+$env:PYTHONPATH='src'
+python runs/_mon/final_verify.py --both
+# 输出：runs/_mon/final_verify.md（表格）+ runs/_mon/final_verify.json（机读）
+```
+
+2026-11-14 05:45 快照结果：练习场看板 **14/17**、`get_my_solves` **16/17**；
+SAMPLE 比赛看板 **15/17**（含 SAMPLE-023），QA 两题同为 0 计数。
