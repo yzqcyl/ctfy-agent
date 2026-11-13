@@ -35,3 +35,8 @@ tools/pylibs/
 
 # 收进来的第三方模块（可能内嵌凭据，且不属于镜像源码）
 inbox/
+
+# 本地能力自检 / pip 临时目录（Windows 上 mkdtemp 建出的目录可能 ACL 异常、删不掉，忽略即可）
+.capcheck-tmp/
+pip-build-tracker-*/
+pip-download-_*/

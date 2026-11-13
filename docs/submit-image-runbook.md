@@ -32,6 +32,23 @@
 
 ---
 
+## 🚧 v8 候选（未构建，2026-11-13）：能力补齐段
+
+**状态：待构建**。120 题 BUUCTF 跑批暴露的「缺工具」缺口已补进 `Dockerfile`（v8 能力段）+
+`tools/check_capabilities.py` 功能级自检，详见 `docs/capability-pack-v8-2026-11-13.md`。
+
+| 项 | 值 |
+|---|---|
+| 变更 | ① pip 补 pillow/zxing-cpp/qrcode/scapy/dpkt/pyzipper/pycryptodomex/uncompyle6；② apt 补 binwalk/foremost/steghide/exiftool/p7zip-full/poppler-utils/john；③ 构建期 `RUN python /ctfy/tools/check_capabilities.py --binaries --rounds 3`（功能往返，任一失败即构建失败） |
+| 红线核对 | 未改 `.dockerignore`；`COPY tools/check_capabilities.py` 只拷这**一个**工具脚本（不是整个 `tools/`），`tests/`/`runs/`/`docs/` 仍不进镜像；构建期 gui 断言保持 |
+| 体积预估 | v7.3 实测 251.7MB + 约 80MB ≈ **330MB**（门禁 400MB）；binwalk 会带入系统 python3，已在文档里记录 |
+| 本机验证 | `check_capabilities --rounds 3 --local` → **18 通过 / 0 失败**（3 轮一致；本机跳过 3 项被 Smart App Control 拦未签名 `.pyd` 的探针） |
+| 镜像可装性 | `runs/_big/verify_cap_wheels.py` 按钉死 sha256 下载 Linux cp312/abi3 wheel → **9/9 校验通过**；apt 包在 Debian bookworm 查证存在 |
+| 本机限制 | 本机 WSL 不可用（`E_ACCESS_DENIED`）→ Docker Desktop Linux engine 起不来，无法本地 `docker build`；靠 CI 构建 + 构建期自检兜底 |
+| 提交前待办 | CI 构建 v8（workflow_dispatch）→ `tools/container_check.py` 校验体积/非 root/五条契约 → 匿名拉取校验 → 更新本文件 v8 段 |
+
+---
+
 ## 历史：v7.2 已构建、匿名可拉取（2026-11-11）——已被 v7.3 取代
 
 | 项 | 值 |

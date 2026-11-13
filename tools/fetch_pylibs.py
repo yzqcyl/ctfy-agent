@@ -47,7 +47,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 TARGET = ROOT / "tools" / "pylibs"
 TMPROOT = ROOT / "runs" / "_tmp" / "pylibs-install"
 
-DEFAULT_PACKAGES = ["pycryptodome", "sympy", "gmpy2", "pwntools", "z3-solver"]
+DEFAULT_PACKAGES = [
+    "pycryptodome", "sympy", "gmpy2", "pwntools", "z3-solver",
+    # v8 能力补齐（2026-11-13，与 Dockerfile 的 cap-req 段一致，便于本机复现）
+    "pillow", "zxing-cpp", "qrcode", "scapy", "dpkt", "pyzipper", "pycryptodomex",
+    "uncompyle6",
+]
 
 
 def _patch_tempfile() -> None:

@@ -243,6 +243,64 @@ RUN set -eux; \
     python -c "import z3; x=z3.Int('x'); s=z3.Solver(); s.add(x>3, x<5); assert s.check()==z3.sat and s.model()[x].as_long()==4, 'z3 求解异常'; print('z3 selftest ok', z3.get_version_string())"; \
     python -c "import Crypto, gmpy2, sympy, pwnlib; from pwn import remote, process, cyclic, p64, p32, context, ELF, asm, cyclic_find; assert len(cyclic(128))==128, 'cyclic 异常'; assert cyclic_find(p32(0x61616162))==4, 'cyclic_find 异常'; assert p64(0x41424344)==b'DCBA\x00\x00\x00\x00', 'p64 异常'; assert asm('nop')==b'\x90', 'asm 异常'; print('ext-libs selftest ok: Crypto', Crypto.__version__, '| gmpy2', gmpy2.version(), '| sympy', sympy.__version__, '| pwntools', pwnlib.__version__)"
 
+# ---------- v8 能力补齐：misc/rev 专项库 + 常用命令行工具（2026-11-13，120 题跑批驱动） ----------
+# 缺口证据（runs/_big/notes.md B 段 / runs/_big/analysis2.md 未解清单）：
+#   * 二维码：沙盒里连 Pillow 都没有，更没有解码库 → qr 题只能靠 strings 猜；
+#   * 流量分析：webshell/pcap 题没有 scapy/dpkt，专家只能手写 pcap 解析，多道题 wall_clock；
+#   * zip：stdlib zipfile 不支持 AES（pyzipper 补；ZipCrypto 已知明文攻击仍缺 bkcrack，见 notes B2）；
+#   * .pyc 逆向：uncompyle6/xdis 覆盖旧版 pyc 反编译（REVERSE 类 pyc 题）；
+#   * 隐写/文件雕刻/PDF/OCR：binwalk、foremost、steghide、exiftool、7z、poppler、tesseract；
+#   * 口令爆破：john（hash 类 MISC/CRYPTO 题）。
+# 体积口径：v7.3 实测 251.7MB + 本段约 +65MB，仍低于 400MB 门禁（tools/container_check.py）。
+#
+# 为什么带 sha256：带二进制 wheel 的 C 扩展（pillow/zxing-cpp/pycryptodomex）按 capstone 同口径
+# 版本+sha256 双钉死；纯 Python 包（qrcode/scapy/dpkt/pyzipper/uncompyle6）只锁版本。
+# 为什么 pycryptodomex 而不是 pycryptodome：pyzipper 只认 Cryptodome 命名空间，而镜像已有
+# pycryptodome（Crypto 命名空间）给 crypto 角色用，两者可共存。
+ARG PILLOW_VERSION=12.3.0
+ARG PILLOW_SHA256=78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91
+ARG ZXING_VERSION=3.1.1
+ARG ZXING_SHA256=9cf67341949946307d086b302cefd453fb47bc6d6ddc7d088839e9481982757b
+ARG PYCRYPTODOMEX_VERSION=3.24.2
+ARG PYCRYPTODOMEX_SHA256=e340408a601003f235b50117cd16f87b2a5b4760765aafe93340eeaadeb0414d
+ARG QRCODE_VERSION=8.2
+ARG SCAPY_VERSION=2.8.0
+ARG DPKT_VERSION=1.9.8
+ARG PYZIPPER_VERSION=0.4.0
+ARG UNCOMPYLE6_VERSION=3.9.3
+RUN set -eux; \
+    printf 'pillow==%s --hash=sha256:%s\n' "${PILLOW_VERSION}" "${PILLOW_SHA256}" > /tmp/cap-req.txt; \
+    printf 'zxing-cpp==%s --hash=sha256:%s\n' "${ZXING_VERSION}" "${ZXING_SHA256}" >> /tmp/cap-req.txt; \
+    printf 'pycryptodomex==%s --hash=sha256:%s\n' "${PYCRYPTODOMEX_VERSION}" "${PYCRYPTODOMEX_SHA256}" >> /tmp/cap-req.txt; \
+    python -m pip install --no-cache-dir --require-hashes -r /tmp/cap-req.txt; \
+    python -m pip install --no-cache-dir \
+        "qrcode==${QRCODE_VERSION}" "scapy==${SCAPY_VERSION}" "dpkt==${DPKT_VERSION}" \
+        "pyzipper==${PYZIPPER_VERSION}" "uncompyle6==${UNCOMPYLE6_VERSION}"; \
+    rm -f /tmp/cap-req.txt
+
+# 命令行工具（apt）：MISC 的「先看文件、再雕刻、再隐写」三板斧 + PDF/口令爆破。
+# 构建期立刻校验可执行文件都在，缺一个就让构建失败（而不是等运行期模型踩空）。
+#
+# 取舍（体积门禁 400MB，v7.3 实测 251.7MB）：
+#   * 不装 7zip：它与 p7zip-full 都提供 /usr/bin/7z，同时装会有文件覆盖风险；p7zip-full 足够；
+#   * 不装 tesseract：OCR 题在本题库里占比极低，但 tesseract+libtesseract+eng 语料约 +18MB；
+#   * binwalk 会带进系统 python3（Debian 包 python3-binwalk 依赖 python3，约 +25MB），
+#     换来固件/嵌套压缩包雕刻能力，保留；`file`/`foremost`/`7z` 是它的轻量替代。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binwalk foremost steghide libimage-exiftool-perl p7zip-full poppler-utils john \
+    && rm -rf /var/lib/apt/lists/* \
+    && for b in binwalk foremost steghide exiftool 7z 7za pdftotext pdftoppm john; do \
+        command -v "$b" >/dev/null || { echo "缺能力工具 $b" >&2; exit 1; }; \
+    done \
+    && (7z i >/dev/null 2>&1 || 7za i >/dev/null 2>&1) \
+    && echo "capability binaries ok: $(binwalk --help 2>&1 | head -1 || true) / $(steghide --version 2>&1 | head -1)"
+
+# 能力自检（功能级，不只是 import）：二维码生成→解码、pcap 写→读、AES zip 往返、
+# steghide/7z 真实往返…… 构建期跑 3 轮（同一套探针重复三轮，避免「一次碰巧过」）。
+COPY tools/check_capabilities.py /ctfy/tools/check_capabilities.py
+RUN python /ctfy/tools/check_capabilities.py --binaries --rounds 3
+
 # 瘦身（主办方：镜像太大传不上去）。运行时只用 stdlib，下列都是死重量（约 20MB）：
 #   pip/setuptools/wheel/ensurepip（不安装依赖）、test 模块、idlelib/lib2to3/pydoc_data/turtledemo。
 # 另：.dockerignore 已排除 tests/docs/runs/__pycache__，ENV 里禁了运行时写 .pyc。
