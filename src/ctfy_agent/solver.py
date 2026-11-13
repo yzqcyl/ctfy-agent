@@ -802,6 +802,45 @@ class Solver:
             start = raw.find("{", start + 1)
         return None
 
+    def _retry_verify_exploit(self, challenge_id: str, args: dict, verify_name: str):
+        """verify_exploit 失败后按退避自动重试；通过返回提示文本，始终不过返回 None。
+
+        SAMPLE-019 实证：实例 state=ready 之后 judge 侧车还要几十秒才可用，期间
+        ``verify_exploit`` 稳定回 ``exit_code=1``（且不消耗尝试次数）。这里重试 3 次、
+        间隔 20/25/30s，正好覆盖就绪窗口；仍不过就原样交回模型判断（不谎报通过）。
+        """
+        instance_id = str(args.get("instance_id") or "")
+        question_id = str(args.get("question_id") or "flag")
+        if not instance_id:
+            return None
+        for attempt, delay in enumerate((20, 25, 30), start=1):
+            try:
+                time.sleep(delay)
+                text = self.platform.call_text(
+                    verify_name, {"instance_id": instance_id, "question_id": question_id}
+                )
+            except Exception as exc:  # noqa: BLE001 - 重试是增强项
+                try:
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "note",
+                         "content": f"[verify 重试#{attempt}] 调用异常：{type(exc).__name__}: {exc}"},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            if challenge_id in self.platform.my_solved_ids(self._competition_id(challenge_id)):
+                try:
+                    item = self.store.require(challenge_id)
+                    item.answers_by_qid[question_id] = f"verified:{question_id}"
+                    self.store.set_status(challenge_id, "submitted")
+                    self.store.save()
+                except ValueError:
+                    pass
+                return (f"{text}\n[判定通过] verify_exploit 第 {attempt} 次重试通过"
+                        f"（间隔 {delay}s：judge 侧车就绪需要时间），本题在平台记为解出。")
+        return None
+
     def _instance_liveness(self, instance_id: str) -> str:
         """用 get_instance 确定性探活：absent=平台明确说没有这个实例；live=查得到；unknown=没工具/探活失败。
 
@@ -1501,6 +1540,13 @@ class Solver:
                     except ValueError:
                         pass
                     return f"{text}\n[判定通过] verify_exploit 已验证，本题在平台记为解出，无需再找 flag。", True
+                # [fix 2026-11-13 SAMPLE-019] 实例「ready」不等于 judge 侧车就绪：起实例后
+                # 5-10s 内 verify 一律 exit_code=1；等到 ~40s 后同一次验证直接通过（solve_rank 19）。
+                # verify 不消耗尝试次数、平台侧会重跑 judge，所以这里自动退避重试，别让模型
+                # 把「时机未到」误判成「利用没生效」然后推倒重来。
+                retried = self._retry_verify_exploit(challenge_id, args, verify_name)
+                if retried is not None:
+                    return retried, True
                 return text, False
             # [fix 2026-11-05 CTFARENA-001] verify_answer 通过是「平台已记该题号解出」的硬事实。
             # 旧代码只看 verify_exploit，verify_answer 成功不落库 → 协调者把已通过题号当未通过，
