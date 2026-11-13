@@ -5234,6 +5234,13 @@ def main() -> int:
     # ，于是 case_fuzz_functional / case_sqli_functional / case_misc_ext 在 CI 必红（实测 11-05）。
     tmp = Path(tempfile.gettempdir()) / "ctfy_agent_smoke"
     tmp.mkdir(parents=True, exist_ok=True)
+    # [P17] 跨 run 提交账本落在 run_dir 的父目录（真实跑批期望的行为）；smoke 复用同一个 tmp，
+    # 上一轮残留的 submit_ledger.json 会把下一轮用例整段拦掉（实测 submit_limit/v66 变红）。
+    for stale in tmp.rglob("submit_ledger.json"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
     cases = [
         ("protocol", case_protocol),

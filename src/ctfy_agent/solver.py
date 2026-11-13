@@ -35,6 +35,7 @@ from .method_cards import domain_cards, is_asi_tag, method_cards
 from .platform import CtfyPlatform, PlatformError, looks_like_instance_uuid
 from .progress import BudgetPhase, EnvFailureTracker, ObservationTracker
 from .state import Store
+from . import submit_ledger
 from .tools_local import LocalTools, ToolError, as_bool
 
 MAX_TOOL_TEXT = int(os.environ.get("AGENT_TOOL_TEXT_MAX") or 6000)
@@ -1816,6 +1817,15 @@ class Solver:
             platform_cap = 5
         platform_cap = max(0, platform_cap)
         used_platform = int(getattr(challenge, "platform_attempts", 0) or 0)
+        # [P17] 跨 run 账本：state.json 是 per-run 的，换 run/快照就清零，
+        # 实测 cuteRE 被交到平台 attempt=6、菜刀流量把已判错的 NPF_{...} 在下一个 run 又交一次。
+        # 这里把账本里的已用次数并进来，并直接拦「平台已判错的值」。
+        _ledger_path = submit_ledger.ledger_path(getattr(self.store, "run_dir", None))
+        _ledger = submit_ledger.load(_ledger_path)
+        used_platform = max(used_platform, submit_ledger.attempts(_ledger, challenge_id))
+        _blocked = submit_ledger.blocked_reason(_ledger, challenge_id, answer, platform_cap)
+        if _blocked:
+            return _blocked, False
         if platform_cap > 0 and used_platform >= platform_cap:
             return (
                 f"[提交被拦截] 平台已累计本题 {used_platform} 次提交（上限 {platform_cap} 次，"
@@ -1929,11 +1939,13 @@ class Solver:
         attempt_seen = self._platform_attempt_from(result, text)
         if attempt_seen:
             used_platform = self.store.note_platform_attempt(challenge_id, attempt_seen)
+            submit_ledger.note_attempt(_ledger_path, challenge_id, attempt_seen)
             if platform_cap > 0:
                 text += (f"\n[平台计数] 平台已累计第 {used_platform}/{platform_cap} 次提交"
                          "（用户+题全局计数，跨 run 不重置）。")
 
         if accepted is True:
+            submit_ledger.note_accepted(_ledger_path, challenge_id, answer)
             # [fix 2026-11-03 B-3] 解析平台回执的 challenge_fully_solved：多问题题只过当前题号时
             # 传 fully_solved=False，让 mark_submitted 不置 status="submitted"，避免 precheck_fn 短路。
             fully_solved = self._fully_solved_from(result, text)
@@ -1950,6 +1962,8 @@ class Solver:
         if accepted is False:
             # P2-4：记下这次错交，并回显全部已判错值——提交次数只有 3 次，错交一次就少 1/3
             self.store.note_rejected(challenge_id, answer)
+            # [P17] 跨 run 记住判错值：下个 run/快照里同一个值不再白交一次
+            submit_ledger.note_rejected(_ledger_path, challenge_id, answer)
             # [v7.2 A4] 按题号记错交次数，供 per-question 额度闸用（v3 多轮换题号重交不被锁死）
             self.store.mark_submitted(challenge_id, answer, accepted=False, question_id=question_id)
         return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
