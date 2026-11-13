@@ -90,6 +90,19 @@ def main() -> int:
           and any("UDP 服务" in line for line in lines)
           and any("TCP 服务" in line for line in lines))
 
+    # ---- 1b) 只有题面名字（无 surface.services）也要建隧道；OOB 回调端口要错开本地端口 ----
+    names = netbridge.estate_names_from_text('Two names resolve inside the tunnel: `portal.sample023.internal` and `files.sample023.internal`.')
+    check('从题面提取 estate 域名', names == ['portal.sample023.internal', 'files.sample023.internal'], str(names))
+    text2, tunnels2 = netbridge.build_plan(VPN_CONF, [], inbound_ports=[4444],
+                                           estate_names=['portal.sample023.internal'])
+    targets2 = {(item['target'], item['kind']) for item in tunnels2}
+    check('无服务清单时为 estate 域名建 80/443 隧道',
+          ('portal.sample023.internal:80', 'tcp') in targets2
+          and ('portal.sample023.internal:443', 'tcp') in targets2, str(sorted(targets2)))
+    inbound2 = [item for item in tunnels2 if item['kind'] == 'inbound']
+    check('OOB 回调本地端口与 ListenPort 错开',
+          bool(inbound2) and inbound2[0]['local'] != '127.0.0.1:4444', str(inbound2))
+
     # ---- 2) OOB 端口提取 ----
     ports = netbridge.inbound_ports_from_text(
         "The beacon connects to ``ctfy-callback:4444`` and sends the stored document.",
@@ -236,7 +249,7 @@ def main() -> int:
         # build_plan 会随机分配端口；这里改为固定端口以对齐 holder
         local_port = holder.getsockname()[1]
         original_build = netbridge.build_plan
-        netbridge.build_plan = lambda vpn, svcs, inbound_ports=None, claimed=None: (  # type: ignore[assignment]
+        netbridge.build_plan = lambda vpn, svcs, inbound_ports=None, claimed=None, estate_names=None, **kw: (  # type: ignore[assignment]
             "\n".join([vpn, ""]),
             [{"kind": "tcp", "target": "abc.internal:1337", "local": f"127.0.0.1:{local_port}"},
              {"kind": "udp", "target": "ghi.internal:5353", "local": "127.0.0.1:9"}],
@@ -260,7 +273,7 @@ def main() -> int:
     # 5c) 端口不通 → BridgeError（就绪等待有界）
     bridge3 = netbridge.LocalBridge(str(work / "wireproxy-not-needed.exe"), work)
     original_build = netbridge.build_plan
-    netbridge.build_plan = lambda vpn, svcs, inbound_ports=None, claimed=None: (  # type: ignore[assignment]
+    netbridge.build_plan = lambda vpn, svcs, inbound_ports=None, claimed=None, estate_names=None, **kw: (  # type: ignore[assignment]
         "\n".join([vpn, ""]),
         [{"kind": "tcp", "target": "dead.internal:1", "local": "127.0.0.1:9"}],
     )

@@ -153,6 +153,25 @@ def inbound_ports_from_text(*texts: str) -> list[int]:
     return ports
 
 
+_NAME_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]*\.internal)\b", re.I)
+
+
+def estate_names_from_text(*texts: str) -> list[str]:
+    """从题面里抠 estate 内网主机名（``portal.sample023.internal`` 这类）。
+
+    有些题目（如 SAMPLE-023）平台不下发 ``surface.services``，只给 VPN + 一句「estate 自己的
+    edge-dns 会解析这两个名字」。没有服务清单就没法预建隧道，但它们一定走标准 HTTP 端口，
+    所以在 80/443 上各建一条隧道即可（域名由隧道内 DNS 解析）。
+    """
+    names: list[str] = []
+    for text in texts:
+        for match in _NAME_RE.finditer(str(text or "")):
+            name = match.group(1).lower().rstrip(".")
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def _free_port(kind: str = "tcp") -> int:
     socktype = socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM
     with socket.socket(socket.AF_INET, socktype) as sock:
@@ -179,7 +198,8 @@ def dns_servers(vpn_conf: str) -> list[str]:
 
 
 def build_plan(vpn_conf: str, services: list[dict], *, inbound_ports: list[int] | None = None,
-               claimed: set[int] | None = None, include_dns: bool = True) -> tuple[str, list[dict]]:
+               claimed: set[int] | None = None, include_dns: bool = True,
+               estate_names: list[str] | None = None) -> tuple[str, list[dict]]:
     """生成 wireproxy 配置文本 + 隧道清单（不含端口分配副作用：可反复调用做单测）。
 
     返回 (config_text, tunnels)，tunnels 元素：
@@ -207,6 +227,19 @@ def build_plan(vpn_conf: str, services: list[dict], *, inbound_ports: list[int] 
             lines += ["[TCPClientTunnel]", f"BindAddress = 127.0.0.1:{local_port}",
                       f"Target = {target}", ""]
         tunnels.append({"kind": svc["kind"], "target": target, "local": f"127.0.0.1:{local_port}"})
+    # 没有 surface.services 的 VPN 题：按题面里点名的 estate 域名 + 标准 HTTP 端口补隧道
+    known = {f"{item['target'].rsplit(':', 1)[0]}:{item['target'].rsplit(':', 1)[1]}".lower()
+             for item in tunnels}
+    for name in (estate_names or [])[:4]:
+        for port in (80, 443):
+            key = f"{name}:{port}"
+            if key in known:
+                continue
+            local_port = take_port("tcp")
+            lines += ["[TCPClientTunnel]", f"BindAddress = 127.0.0.1:{local_port}",
+                      f"Target = {key}", ""]
+            tunnels.append({"kind": "tcp", "target": key, "local": f"127.0.0.1:{local_port}"})
+            known.add(key)
     for port in inbound_ports or []:
         if not (1 <= int(port) <= 65535):
             continue
@@ -270,7 +303,8 @@ class LocalBridge:
         self.stop()
         self.instance_id = str(instance_id or "")
         inbound = inbound_ports_from_text(description)
-        config_text, tunnels = build_plan(vpn_conf, services, inbound_ports=inbound)
+        config_text, tunnels = build_plan(vpn_conf, services, inbound_ports=inbound,
+                                          estate_names=estate_names_from_text(description))
         self.config_path.write_text(config_text, encoding="utf-8")
         try:
             os.chmod(self.config_path, 0o600)
@@ -405,8 +439,9 @@ def start_bridge(config, instance: dict, competition_id: str, *, description: st
                 if isinstance(svc, dict)]
     wants_vpn = any(str(svc.get("access") or "").lower() == "vpn"
                     or str(svc.get("host") or "").lower().endswith(".internal") for svc in services)
-    if not wants_vpn and not inbound_ports_from_text(description):
-        return []  # 本题既没有过隧道的服务，也没有 OOB 回连端口
+    if not wants_vpn and not inbound_ports_from_text(description) \
+            and not estate_names_from_text(description):
+        return []  # 既没有过隧道的服务，也没有 OOB 回连端口/estate 域名
     instance_id = str(instance.get("id") or instance.get("instance_id") or "")
     vpn_conf = fetch_vpn_config(str(mcp_url or getattr(config, "mcp_url", "") or ""),
                                 str(token or getattr(config, "token", "") or ""),

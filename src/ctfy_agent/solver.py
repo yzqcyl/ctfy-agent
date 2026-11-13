@@ -775,6 +775,33 @@ class Solver:
         match = self._UUID_RE.search(str(text or ""))
         return match.group(0) if match else ""
 
+    @staticmethod
+    def _json_blob_in_text(text: str):
+        """从「[已在运行] … 实例信息：{…}」这类带前缀的回执里抠出 JSON 对象。
+
+        [2026-11-13 SAMPLE-023] 平台对「实例已存在」不是回纯 JSON，而是
+        ``[已在运行] 本题实例已存在（instance_id=…），无需重复启动。 实例信息：{...}``。
+        旧逻辑 `_as_json` 解析失败 → 视为「没拿到实例」→ 既不登记端点白名单，也不建本地桥，
+        `*.internal` 自然全不可达，最终误判成「VPN 不可达」收口。
+        """
+        raw = str(text or "")
+        start = raw.find("{")
+        while start >= 0:
+            depth = 0
+            for index in range(start, len(raw)):
+                char = raw[index]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(raw[start:index + 1])
+                        except (ValueError, TypeError):
+                            break
+            start = raw.find("{", start + 1)
+        return None
+
     def _instance_liveness(self, instance_id: str) -> str:
         """用 get_instance 确定性探活：absent=平台明确说没有这个实例；live=查得到；unknown=没工具/探活失败。
 
@@ -1401,6 +1428,9 @@ class Solver:
                 # 靠 get_instance 探活确认后 stop 旧 id + 重新 start（详见 _maybe_rebuild_tombstone）。
                 text = self._maybe_rebuild_tombstone(challenge_id, name, args, text)
                 parsed = self.platform._as_json(text)
+                if parsed is None:
+                    # 平台对「实例已存在」回的是带前缀的文本 + 内嵌 JSON，单独抠一次
+                    parsed = self._json_blob_in_text(text)
                 local.allow_many(parsed if parsed is not None else text)
                 if parsed is not None:
                     item = self.store.require(challenge_id)

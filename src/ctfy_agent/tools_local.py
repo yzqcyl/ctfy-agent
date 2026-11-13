@@ -921,6 +921,26 @@ class LocalTools:
         roots.discard("")
         return root in roots
 
+    def _bridge_estate_host(self, host: str) -> bool:
+        """本地桥已就绪时，放行平台 VPN estate 内的名字（``*.internal`` / ``*.ctfy.run``）。
+
+        [2026-11-13 SAMPLE-023] 平台对部分题不下发 ``surface.services``，只给 VPN + 「estate 的
+        edge-dns 会解析这几个名字」。这些名字不在实例端点白名单里，旧逻辑直接合规拦截，
+        模型只能判「不可达」。它们只能经我们建的隧道解析/连通，放行不会变成任意 SSRF。
+        """
+        name = (host or "").rstrip(".").lower()
+        if not (name.endswith(".internal") or name.endswith(".ctfy.run")):
+            return False
+        try:
+            from . import netbridge, portmap  # noqa: PLC0415 - 只有需要判定时导入
+
+            bridge = netbridge.active_bridge()
+            if bridge is not None and bridge.tunnels:
+                return True
+            return portmap.dns_port() != 0
+        except Exception:  # noqa: BLE001 - 判定失败就按旧规则拦
+            return False
+
     def _check_target(self, url: str) -> None:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -945,6 +965,8 @@ class LocalTools:
         if f"{host}:{port}" in self.allowed_endpoints:
             return
         if self._same_platform_host(host):
+            return
+        if self._bridge_estate_host(host):
             return
         raise ToolError(
             f"合规拦截：{host} 不是平台为本题下发的实例地址。"
@@ -973,6 +995,8 @@ class LocalTools:
         if port is not None and f"{host}:{int(port)}" in self.allowed_endpoints:
             return
         if self._same_platform_host(host):
+            return
+        if self._bridge_estate_host(host):
             return
         raise ToolError(
             f"合规拦截：{host}{':' + str(port) if port else ''} 不是平台为本题下发的实例端点。"
