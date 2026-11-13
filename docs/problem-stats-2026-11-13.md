@@ -12,10 +12,12 @@
 | 结果 | 内容 |
 |---|---|
 | 主套 `tests/smoke.py` | **180 passed / 0 failed**（P6/P7/P8/P9/P12/P13 改动后各跑一遍） |
-| 独立套件 | **32 个中 31 个首轮通过**；唯一失败 `smoke_http_cache.py` 是并发跑批时本地端口 WinError 10053 抖动，单独复跑 **通过** |
+| 独立套件第一轮（32 个） | **31 个通过**；唯一失败 `smoke_http_cache.py` 是并发跑批时本地端口 WinError 10053 抖动，单独复跑 **通过** |
+| 独立套件第二轮（剩余 34 个） | **34/34 全部通过**（`smoke_gui_theme`、`smoke_libs`、`smoke_ai_*`、`smoke_webmap` 等） |
+| 合计 | **66 个独立套件全绿 + 主套 180 例**，无产品缺陷级失败 |
 | 覆盖命中 | `smoke_attachments`（平台参数归一 P12）、`smoke_platform_attempt`、`smoke_solved_scope`、`smoke_gate`、`smoke_action_loop`（P6/P13 语义）、`smoke_instance_*` 6 个、`smoke_netbridge`、`smoke_crypto/rev/pwn`（70 例）全部通过 |
 
-结论：功能回归面全绿；唯一的「失败」是测试环境并发抖动，不是产品缺陷。
+结论：功能回归面全绿；唯一的「失败」是测试环境并发抖动，复测即过，不是产品缺陷。
 
 ## 2. 批次问题统计
 
