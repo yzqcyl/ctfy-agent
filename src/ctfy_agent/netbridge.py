@@ -231,7 +231,7 @@ def build_plan(vpn_conf: str, services: list[dict], *, inbound_ports: list[int] 
     known = {f"{item['target'].rsplit(':', 1)[0]}:{item['target'].rsplit(':', 1)[1]}".lower()
              for item in tunnels}
     for name in (estate_names or [])[:4]:
-        for port in (80, 443):
+        for port in (80, 443, 8080, 8000, 3000):
             key = f"{name}:{port}"
             if key in known:
                 continue
