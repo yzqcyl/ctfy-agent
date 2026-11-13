@@ -38,10 +38,11 @@ from .state import Store
 
 SCHEMA_VERSION = 3  # v3（2026-11-05）：平台预启实例、token 单题作用域；见 runs/site/standards-live/CTFY-0001.md
 DEFAULT_WORK_DIR = "/ctfy/work"
-DEFAULT_MAX_TURNS = 160         # task.json.max_turns 为 null（无预算）时的保守上限（80→160：配合协调者 24 轮）
+DEFAULT_MAX_TURNS = 240         # task.json.max_turns 为 null（无预算）时的上限；统一口径=config/agent.json 的 max_llm_calls
 DEFAULT_MAX_TOKENS = 8192       # 4096 会在 thinking 块截断、一步即「无动作结束」
 DEFAULT_MAX_CONTEXT = 32000  # 对齐 agent.json 与各角色提示词的「上下文 32k」承诺（原 16000 导致 16k 就丢旧步骤，模型按 32k 规划却提前失忆）
 DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
+DEFAULT_INSTANCE_READY_TIMEOUT = 180  # 统一口径：.env 与本地实测都用 180s（solver 默认 45s，仅兜底）
 ATTACH_COPY_LIMIT_MIB = 4  # v3：平台单次把附件预放进 /ctfy/work/attachments/ 的上限；超过则 path=null
 # [v7.2 G9] task.json 缺失时的短轮询等待（秒）。平台托管形态（v3 管辖，11-14/15 主流）下
 # task.json 在容器启动前就位，缺失通常是环境错误；但万一 11-14/15 实际是「常驻形态、题稍后才放」，
@@ -323,7 +324,8 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     if _tok_cap is None:
         _tok_cap = DEFAULT_MAX_TOKENS_PER_CHALLENGE
     config.max_tokens_per_challenge = _as_int(env.get("AGENT_MAX_TOKENS_PER_CHALLENGE"), _tok_cap)
-    config.submit_limit = max(3, (len(questions) + gated) * 2)
+    # 统一口径：本地 submit_limit=5（与平台侧「用户+题最多 5 次」对齐），多问题再按题号数放大
+    config.submit_limit = max(5, (len(questions) + gated) * 2)
     config.runs_dir = str(work_dir / "runs")
     # 读超时：长上下文+长输出的单次生成实测能挂满 300s（120s 默认太紧）。容器侧抬到 240s；
     # 配合 llm._post 把 TimeoutError 归一成可重试 LLMError，单次超时不再击穿整题。
@@ -856,6 +858,10 @@ def main(argv=None) -> int:
         help="task.json 路径（默认 $CTFY_WORK_DIR/task.json，本地测试用绝对路径覆盖）",
     )
     args = parser.parse_args(argv)
+
+    # 统一口径：实例就绪等待默认 180s（与 .env 一致）。solver 侧只在 env 缺失时回落到 45s，
+    # 容器里平台通常不注入这个 env，所以在这里补默认值，避免容器内比本地更早放弃。
+    os.environ.setdefault("AGENT_INSTANCE_READY_TIMEOUT", str(DEFAULT_INSTANCE_READY_TIMEOUT))
 
     work_dir = Path(os.environ.get("CTFY_WORK_DIR") or DEFAULT_WORK_DIR)
     task_path = Path(args.task) if args.task else work_dir / "task.json"

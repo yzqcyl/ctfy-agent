@@ -21,10 +21,11 @@ ENV_FILE = PROJECT_ROOT / ".env"
 DEFAULTS = {
     # 平台侧
     "mcp_url": "https://ctfy.tsinghua.edu.cn/api/v1/mcp/",
-    "timeout": 120.0,
+    # [统一口径 2026-11-13] 全项目限制值一律取「并行存在的最高值」：此处 DEFAULTS 必须与
+    # config/agent.json 完全一致（tests/smoke_limits_consistency.py 守卫），不再保留更小的兜底值。
+    "timeout": 240.0,
     # 握手（initialize / tools/list / notify）专用超时：容器连 ctfy.io 会 TLS/SSE 挂死，
-    # 用短超时让「平台恢复后被 1 分钟内重连」；tools/call 与 LLM 仍走 timeout（长）。实测 submit 单次 242s，
-    # 故 timeout 在容器侧抬到 240s。参见 docs/archive/pending-fixes-2026-11-09.md P1。
+    # 用短超时让「平台恢复后被 1 分钟内重连」；tools/call 与 LLM 仍走 timeout（240s）。
     "connect_timeout": 40.0,
     # MCP 建连总等待窗口（秒）：平台整机故障时能兜 60–90 分钟（SAMPLE-001/002 靠熬过去才解出）。
     "connect_deadline": 5400.0,
@@ -32,13 +33,13 @@ DEFAULTS = {
     "model": "deepseek-v4.1-flash",
     "llm_base_url": "https://api.deepseek.com/v1",
     "temperature": 0.2,
-    "max_tokens": 4096,
+    "max_tokens": 8192,
     # 智能体行为
-    "max_steps": 12,
-    "submit_limit": 3,
+    "max_steps": 40,
+    "submit_limit": 5,
     "max_calls_per_step": 8,
     "instance_ops_limit": 5,
-    "oracle_limit": 50,
+    "oracle_limit": 100,
     "allow_shell": False,
     "debug": False,
     # 费用/用量上限（硬刹车，防止跑飞烧钱）
@@ -47,8 +48,8 @@ DEFAULTS = {
     # 0 = 不设上限（本地调试）；1B 对本地练习跑不构成约束。
     "max_total_tokens": 1_000_000_000,
     "global_ledger_path": "",             # 总账落盘路径；空=按 work 目录/runs 上一级自动解析
-    "max_llm_calls": 20,                  # 单题累计模型调用次数上限
-    "max_context_tokens": 16000,          # 单次请求上下文滑窗（估算 token），超窗丢最旧步骤
+    "max_llm_calls": 240,                 # 单题累计模型调用次数上限（与 agent.json 一致）
+    "max_context_tokens": 32000,          # 单次请求上下文滑窗（估算 token），超窗丢最旧步骤
     "max_cost": 0.0,                      # 单题金额上限（0=不限；需同时配单价才生效）
     "price_input_per_mtok": 0.0,          # 输入 token 单价（每百万 token）
     "price_output_per_mtok": 0.0,         # 输出 token 单价（每百万 token）

@@ -3,7 +3,7 @@
     "model": "deepseek-v4.1-flash-1017",
     "max_steps": 40,
     "allow_shell": true,
-    "max_tokens": 4096,
+    "max_tokens": 8192,
     "platform": [
       "get_challenge",
       "list_challenge_attachments",

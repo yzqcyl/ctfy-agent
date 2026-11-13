@@ -57,7 +57,7 @@ Windows 坑：先设 `PYTHONIOENCODING=utf-8`；本机有代理时必须 `NO_PRO
 | 模型 | `deepseek-v4.1-flash-1017` | `config/agent.json` 的 `model` 或 `DEEPSEEK_MODEL` |
 | 端点 | OpenAI 兼容 `/chat/completions`（本地填哪家网关都行，当前用阿里云百炼） | `DEEPSEEK_BASE_URL` |
 | 温度 | `0.2` | `temperature` |
-| 单轮上限 | `4096` tokens（reasoning 烧穿时自适应放大） | `max_tokens` |
+| 单轮上限 | `8192` tokens（reasoning 烧穿时自适应放大） | `max_tokens` |
 
 **比赛容器例外**：平台契约为一次运行一个 provider 的一个模型，角色级 `model` 会被入口剥掉；
 `LLM_API_KEY` 为空必须 refused，绝不回退自有 key。
@@ -67,14 +67,17 @@ Windows 坑：先设 `PYTHONIOENCODING=utf-8`；本机有代理时必须 `NO_PRO
 | 项 | 当前值 | 说明 |
 | --- | --- | --- |
 | `max_tokens_per_challenge` | `800000` | 单题累计 token 上限（跨角色/跨轮累计，重跑接着算） |
-| `max_llm_calls` | `240`（代码兜底 160） | 单题累计模型调用次数上限；平台 `task.max_turns` 优先 |
-| `max_steps` | `40` / 角色 | 每角色每轮步数 |
+| `max_llm_calls` | `240`（代码兜底也是 240） | 单题累计模型调用次数上限；平台 `task.max_turns` 优先 |
+| `max_steps` | `40` / 角色 | 每角色每轮步数（顶层 `max_steps` 同为 40，不再有 12 的小兜底） |
 | `max_calls_per_step` | `8` | 一步内最多并行工具调用 |
-| `oracle_limit` | `100` | judge/oracle 类调用上限 |
-| `submit_limit` | `3` / 题号（平台 5 轮） | 本地幂等闸 + 平台提交轮次 |
+| `oracle_limit` | `100` | ⚠️ 仅配置未接线（代码里没有使用点），不等于实际生效 |
+| `submit_limit` | `5` / 题号（平台 5 轮） | 本地幂等闸 + 平台提交轮次（容器内按题号数放大） |
 
-另有墙钟刹车（`AGENT_DEADLINE_*`）、连接窗口（`connect_timeout=40s` / `connect_deadline=5400s`）
-与缓存折价开关（`budget_cache_discount`）。
+墙钟**默认不限**，需要时用 `AGENT_DEADLINE_AT`（绝对时刻，全批共享）或 `AGENT_DEADLINE_MINUTES`
+（每题各自起算）；连接窗口 `connect_timeout=40s` / `connect_deadline=5400s`；缓存折价 `budget_cache_discount`。
+
+> 全项目限制值已统一到「并行存在的最高值」，唯一权威表见 [docs/limits-2026-11-13.md](docs/limits-2026-11-13.md)，
+> 由 `tests/smoke_limits_consistency.py` 守卫（DEFAULTS / agent.json / agent_main 三处必须一致）。
 
 ## 多智能体协作（crew）
 

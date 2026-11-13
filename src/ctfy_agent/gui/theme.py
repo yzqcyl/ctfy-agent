@@ -841,8 +841,15 @@ class Skeleton(tk.Frame):
             self._job = None
 
     def _tick(self) -> None:
-        self._phase = (self._phase + 0.06) % 2.0
-        self._draw()
+        try:
+            if not self.winfo_exists():
+                self._job = None
+                return
+            self._phase = (self._phase + 0.06) % 2.0
+            self._draw()
+        except tk.TclError:  # 窗口正在销毁：停掉动画，别把异常抛进 Tk 回调
+            self._job = None
+            return
         self._job = self.after(50, self._tick)
 
     def _draw(self) -> None:
@@ -894,8 +901,15 @@ class Spinner(tk.Canvas):
             pass
 
     def _tick(self) -> None:
-        self._angle = (self._angle + 24) % 360
-        self._draw()
+        try:
+            if not self.winfo_exists():
+                self._job = None
+                return
+            self._angle = (self._angle + 24) % 360
+            self._draw()
+        except tk.TclError:  # 窗口正在销毁：停掉动画，别把异常抛进 Tk 回调
+            self._job = None
+            return
         self._job = self.after(40, self._tick)
 
     def _draw(self) -> None:
