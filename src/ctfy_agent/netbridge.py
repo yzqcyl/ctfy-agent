@@ -197,6 +197,34 @@ def dns_servers(vpn_conf: str) -> list[str]:
     return servers
 
 
+def keepalive_conf(vpn_conf: str, seconds: int = 25) -> str:
+    """给 WireGuard 配置补 ``PersistentKeepalive``（缺省没有时）。
+
+    [fix 2026-11-14 SAMPLE-023] 用户态隧道（wireproxy）默认不保持 NAT 会话，
+    estate 类题目（多一跳 node 侧 wireguard → DMZ）在会话空闲几十秒后会出现
+    「TCP 连接被拒/无响应」的假故障；25s 保活可让 node 侧的映射一直有效。
+    已有该键的配置原样返回（不覆盖平台下发的值）。
+    """
+    if "persistentkeepalive" in vpn_conf.lower():
+        return vpn_conf
+    out: list[str] = []
+    in_peer = False
+    inserted = False
+    for line in vpn_conf.splitlines():
+        stripped = line.strip().lower()
+        if stripped == "[peer]":
+            in_peer = True
+        out.append(line)
+        if in_peer and not inserted and (
+            stripped.startswith("allowedips") or stripped.startswith("endpoint")
+        ):
+            out.append(f"PersistentKeepalive = {int(seconds)}")
+            inserted = True
+    if not inserted:
+        out.append(f"PersistentKeepalive = {int(seconds)}")
+    return "\n".join(out)
+
+
 def build_plan(vpn_conf: str, services: list[dict], *, inbound_ports: list[int] | None = None,
                claimed: set[int] | None = None, include_dns: bool = True,
                estate_names: list[str] | None = None) -> tuple[str, list[dict]]:
@@ -206,7 +234,7 @@ def build_plan(vpn_conf: str, services: list[dict], *, inbound_ports: list[int] 
       {"kind": "tcp"|"udp"|"inbound"|"dns", "target": "host:port", "local": "127.0.0.1:port"}
     """
     tunnels: list[dict] = []
-    lines: list[str] = [vpn_conf.strip(), ""]
+    lines: list[str] = [keepalive_conf(vpn_conf).strip(), ""]
     used_ports: set[int] = set(claimed or set())
 
     def take_port(kind: str = "tcp") -> int:
