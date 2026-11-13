@@ -23,6 +23,29 @@ from ctfy_agent.crew import (  # noqa: E402
 )
 
 
+def case_flag_fidelity_rule(tmp: Path) -> None:
+    """[fix 2026-11-13 P14] flag 交付保真纪律必须出现在所有专家提示词（含自定义）里。
+
+    实证：ezRSA / 菜刀流量 的专家都声称「已解出」但平台判错（疑似少字符 / 诱饵 flag），
+    白烧提交额度并把协调者拖进同值重试。这条规则必须无条件追加，不能只写在工单里。
+    """
+    from ctfy_agent.crew import FLAG_FIDELITY_RULE, Crew
+
+    assert "可复现证据" in FLAG_FIDELITY_RULE
+    for role in ("web", "rev", "crypto", "misc", "pwn", "ai"):
+        text = Crew._role_system(role)
+        assert "flag 交付纪律" in text, f"{role} 提示词缺 flag 保真纪律"
+    custom = Crew._role_system("rev", override="你是专家，随便看看。PLAN / report / evidence 都写")
+    assert "flag 交付纪律" in custom, "自定义提示词未追加 flag 保真纪律"
+    main = sys.modules.get("__main__")
+    label = "flag 交付保真纪律：所有专家角色（含自定义提示词）都追加"
+    reporter = getattr(main, "ok", None)
+    if callable(reporter):
+        reporter(label)
+    else:
+        print(f"PASS {label}")
+
+
 def case_done_gate(tmp: Path) -> None:
     main = sys.modules.get("__main__")
     reporter = getattr(main, "ok", None)
@@ -124,6 +147,7 @@ if __name__ == "__main__":
 
     try:
         case_done_gate(Path("."))
+        case_flag_fidelity_rule(Path("."))
         case_convergence_stalled(Path("."))
         print("OK")
     except Exception:
