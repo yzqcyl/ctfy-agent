@@ -40,14 +40,25 @@ _TIME_KEYS = ("created_at", "createdAt", "started_at", "startedAt", "created")
 
 
 def _items(listed) -> list[dict]:
-    """把 list_instances 的返回（list / {instances|items|data: [...]} / 其它）归一成列表。"""
+    """把 list_instances 的返回归一成列表。
+
+    支持 ``list`` / ``{instances|items|data|results|result: [...]}`` / ``{"result": {...}}``。
+
+    [2026-11-13 CTFY 接入测试实测] CTFY 3.4.6 的 ``list_instances`` 回的是
+    ``{"result": [ ... ]}``（单数键）。旧版只认 instances/items/data/results，
+    于是「有实例」被归一成空列表：``reap()`` 以为没有残留实例 → 团队实例配额泄漏
+    （正是 P1 配额泄漏的一个 CTFY 触发器）。这里补上 ``result`` 并兼容再包一层。
+    """
     if isinstance(listed, list):
         return [x for x in listed if isinstance(x, dict)]
     if isinstance(listed, dict):
-        for key in ("instances", "items", "data", "results"):
+        for key in ("instances", "items", "data", "results", "result"):
             value = listed.get(key)
             if isinstance(value, list):
                 return [x for x in value if isinstance(x, dict)]
+        result = listed.get("result")
+        if isinstance(result, dict):
+            return _items(result)
     return []
 
 

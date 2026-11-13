@@ -22,6 +22,7 @@ import time
 from json import JSONDecodeError
 
 from .budget import Budget, BudgetExceeded, apply_deadline, stop_reason_of
+from .access_facts import competition_access_lines, instance_access_lines
 from .progress import BudgetPhase
 from .checkpoint import (
     discard as _ckpt_discard,
@@ -725,6 +726,11 @@ class Crew:
         self._specialists: dict[str, object] = {}
         # 多问题/门控题的只读快照（run 开始时拉一次，供简报与提交后判定复用）
         self._question_info: dict = {}
+        # 比赛级接入约束（2026-11-12 CTFY 接入测试新增）：tcp_access / agent_internet /
+        # 实例并发 / TTL 这些平台事实，旧版完全没采集，导致模型在「必须先用 VPN」的场次里
+        # 盲试直连。run 开始时只读拉一次，拼进协调者简报。
+        self._access_lines: list[str] = []
+        self._access_cache: dict[str, list[str]] = {}
         # 集群-B：本次尝试的决策温度（None=不改各角色自带温度，行为同旧）；由 _delegate 盖到专家上
         self._attempt_temperature: float | None = None
         # P2-2：当前题目的按域编排档位（solve() 每轮开始时重算；{} = 旧行为）
@@ -1152,6 +1158,8 @@ class Crew:
 
         # 多问题/门控题：CLI/MCP 路径没有容器的 task.json，这里补一次只读 get_challenge
         self._question_info = self._fetch_challenge(challenge_id, solver)
+        # 比赛级接入约束（tcp_access=vpn / 实例并发 / TTL…）：只读一次，进简报
+        self._access_lines = self._fetch_access_lines(challenge_id, solver)
         brief = self._brief(challenge)
         if prior_text:
             # 集群-B 黑板继承：只把「结论事实 + 判错死路」前置到首发 brief，
@@ -2227,6 +2235,35 @@ class Crew:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def _fetch_access_lines(self, challenge_id: str, solver) -> list[str]:
+        """只读拉一次比赛级接入约束（tcp_access / agent_internet / 实例并发 / TTL）→ 提示行。
+
+        2026-11-12 CTFY「Platform Playground」接入测试的证据：`tcp_access=vpn` 的场次里，
+        agent 不知道要先连 VPN，会把「隧道没连」误判成「靶场卡住」反复换端口；`practice_instance_cap=1`
+        也不知道，容易并行开实例互相抢。这里把平台事实前置到简报，失败静默返回 []（不击穿主流程）。
+        同一比赛只拉一次（self._access_cache 按 competition_id 缓存）。
+        """
+        try:
+            comp_id = str(solver._competition_id(challenge_id) or "")
+        except Exception:  # noqa: BLE001 - 反查失败只是少一条增强信息
+            return []
+        if not comp_id:
+            return []
+        cached = self._access_cache.get(comp_id)
+        if cached is not None:
+            return list(cached)
+        lines: list[str] = []
+        name = self.platform.try_resolve("get_competition")
+        if name:
+            try:
+                data = self.platform._as_json(self.platform.call_text(name, {"competition_id": comp_id}))
+                if isinstance(data, dict):
+                    lines = competition_access_lines(data)
+            except Exception:  # noqa: BLE001 - 只读增强，失败就当没有
+                lines = []
+        self._access_cache[comp_id] = list(lines)
+        return lines
+
     @staticmethod
     def _question_ids(info: dict) -> list[str]:
         """本题全部题号（平台 flag_solves 的键就是题号全集，含门控题）。"""
@@ -2294,6 +2331,13 @@ class Crew:
         facets = challenge.facets()
         if facets:
             parts.append(facets)
+        # 接入约束（比赛级 + 实例级）：先于题面给出，让模型第一轮就知道「要不要 VPN / 怎么连 /
+        # 回调地址是什么 / per-team 附件怎么拿」，避免拿着 http:// 去打 tcp 端口这种硬亏。
+        access = list(getattr(self, "_access_lines", []) or [])
+        if challenge.instance:
+            access += instance_access_lines(challenge.instance)
+        if access:
+            parts.append("## 本场接入约束（平台事实，照做）\n" + "\n".join(f"- {line}" for line in access[:12]))
         if challenge.description:
             parts.append(_untrusted("题面：\n" + challenge.description[:3000]))
         if challenge.instance:

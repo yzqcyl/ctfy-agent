@@ -15,11 +15,13 @@ import os
 import hashlib
 import json
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
 from json import JSONDecodeError
 
+from .access_facts import instance_access_lines, readiness_probes
 from .artifacts import DOWNLOAD_TOOLS, persist_download
 from .budget import Budget, BudgetExceeded, apply_deadline, stop_reason_of
 from .companion import PlanTrack, parse_companion
@@ -581,6 +583,7 @@ class Solver:
         P2b 修复：优先用 schema 里的 `challenge_id` 精确过滤（比 `q` 模糊匹配更稳），
         命中字段改用 instance_guard.instance_challenge_id（兼容 challenge 是 dict 的情况）。
         """
+        from .instance_guard import _items as _instance_items  # noqa: PLC0415 - 与 reap 同款延迟导入
         from .instance_guard import instance_challenge_id  # noqa: PLC0415 - 与 reap 同款延迟导入
 
         list_name = self.platform.try_resolve("list_instances")
@@ -592,13 +595,9 @@ class Solver:
             except Exception:  # noqa: BLE001 - 读列表失败绝不能毁掉本流程
                 continue
             data = self.platform._as_json(text)
-            items: list = []
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("instances") or data.get("items") or data.get("data") or []
-            if not isinstance(items, list):
-                continue
+            # [2026-11-13 CTFY 接入测试] CTFY 的 list_instances 回 {"result": [...]}；
+            # 归一化统一走 instance_guard._items，避免每个调用点各写一套键名表而漏平台。
+            items = _instance_items(data)
             for it in items:
                 if isinstance(it, dict) and instance_challenge_id(it) == challenge_id:
                     return it
@@ -823,7 +822,12 @@ class Solver:
         # crypto/misc 题库里也有必须起实例的题（catalog 统计 60+），按 category 一律跳过会判死。
         needs_env = bool(getattr(challenge, "has_container", False)
                          or getattr(challenge, "requires_running_target", False))
+        # [fix 2026-11-13 回归] 类别跳过是「省配额」的启发式，不能盖掉人工逃生口：
+        # 负缓存命中的题恰恰最需要 instance_absent_retry 再试一次（平台误报时会一直判死），
+        # 而 misc/crypto/reverse 正是负缓存最常见的一类。smoke_instance_absent 的
+        # 「逃生口：auto_start_allowed 放行」就是钉这条；两者同时成立时以人工逃生口为准。
         if (category in skip_cats and not needs_env
+                and not self.config.extra.get("instance_absent_retry")
                 and not self.platform.try_resolve("list_instances")):
             self.store.append_transcript(challenge.id, {
                 "role": "instance",
@@ -1349,6 +1353,18 @@ class Solver:
                         )
                     if item.status in ("new", "parsed"):
                         self.store.set_status(challenge_id, "instance_up")
+                # [2026-11-12 CTFY 接入测试] 回执里的 surface 是唯一可靠的「怎么连」事实：
+                # 服务清单（tcp/udp/http、access=vpn）、VPN 隧道端点、OOB 回调身份、per-team 附件。
+                # 旧版把这些原样丢给模型看原始 JSON，模型常按 http:// 去打 tcp 端口、或把
+                # localhost 当回调地址（SAMPLE-016/024 类型的坑）。这里翻成可照做的短提示。
+                if isinstance(parsed, dict):
+                    hints = instance_access_lines(parsed)
+                    if hints:
+                        text += "\n\n[接入提示]\n" + "\n".join(f"- {line}" for line in hints)
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "instance", "note": "[接入提示] " + "；".join(hints[:6])},
+                        )
                 self.store.save()
             # [接手 2026-11-11 本地 plat 测试] instance_id 填错（host/前缀/旧 id）时平台只回
             # 「instance_not_found」——模型看不出该填什么，就接着换着花样 404（SAMPLE-008 实测 3 次，
@@ -1508,6 +1524,11 @@ class Solver:
         except Exception:  # noqa: BLE001 - 守卫失败不拦主流程
             return 0
         items = (data.get("items") if isinstance(data, dict) else data) or []
+        # [2026-11-13 CTFY 接入测试] CTFY 回 {"result": [...]}：旧的 data["items"] 取值拿到
+        # 空列表，配额 1 的场次里「清残留」永远清不到东西 → 配额泄漏。统一走 _items。
+        if isinstance(data, dict):
+            from .instance_guard import _items as _instance_items  # noqa: PLC0415
+            items = _instance_items(data)
         stopped = 0
         for item in items:
             if not isinstance(item, dict):
@@ -1524,19 +1545,19 @@ class Solver:
         return stopped
 
     def _wait_instance_ready(self, challenge_id: str, info) -> None:
-        """有界等待实例应用就绪：Go 网关 404 / 连接失败视为未就绪，其它状态码视为就绪。"""
-        services = ((info or {}).get("surface") or {}).get("services") if isinstance(info, dict) else None
-        svc = None
-        for item in services or []:
-            if isinstance(item, dict) and item.get("host"):
-                svc = item
-                break
-        if not svc:
+        """有界等待实例应用就绪。
+
+        [2026-11-12 接入测试修正] 旧版一律 `GET http://<host>/` 探测**第一个**服务：
+        - tcp 实例（SAMPLE-016 的 tcp :1337）用 http 打必然失败 → 白等 45s 刷失败日志；
+        - udp 实例（SAMPLE-015）根本没有 HTTP 面 → 同样白等；
+        - 多服务（SAMPLE-022 两个端口）只看第一个。
+        现在按 service_type 生成探测计划（http/https → GET；tcp → socket connect；udp → 不探测），
+        逐个服务探一次，全部通过即就绪。
+        """
+        surface = ((info or {}).get("surface") or {}) if isinstance(info, dict) else {}
+        plan = readiness_probes(surface.get("services") if isinstance(surface, dict) else None)
+        if not plan:
             return
-        host = str(svc.get("host"))
-        port = svc.get("port") or (443 if str(svc.get("service_type")) == "https" else 80)
-        scheme = "https" if str(port) not in ("80", "8080") else "http"
-        url = f"{scheme}://{host}/"
         # [2026-11-10 加固-需求4] 上限可配：重 Docker 靶场（Java/Node + 初始化数据）常见
         # 60–120s 才可用，45s 就停等会让后续每个请求都被拒、进而被误判成「实例卡住」。
         # 默认仍 45s（= 旧行为）；比赛 .env 设 AGENT_INSTANCE_READY_TIMEOUT=180。
@@ -1547,41 +1568,78 @@ class Solver:
             wait_cap = 45.0
         wait_cap = max(5.0, min(wait_cap, 600.0))  # 下限防 0 秒死循环，上限防把 10h session 等没
         deadline = time.time() + wait_cap
-        attempt = 0
-        last = "（未探测）"
         # 退避间隔：重靶场前半段注定失败，固定 3s 连打大半是无效请求
         backoff = [3, 5, 8, 10]
+        last_by_probe: dict[str, str] = {}
+        attempt = 0
         while time.time() < deadline:
             attempt += 1
-            code = 0
-            body = b""
-            try:
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    code = resp.status
-                    body = resp.read(120)
-            except urllib.error.HTTPError as exc:
-                code = exc.code
-                try:
-                    body = exc.read(120)
-                except Exception:  # noqa: BLE001
-                    body = b""
-            except Exception as exc:  # noqa: BLE001
-                last = f"{type(exc).__name__}: {exc}"
-            if code:
-                last = f"HTTP {code}（{len(body)}B）"
-                gateway_404 = code == 404 and len(body) <= 60 and b"page not found" in body.lower()
-                if not gateway_404:
-                    self.store.append_transcript(
-                        challenge_id,
-                        {"role": "instance", "note": f"[就绪等待] {host} 第 {attempt} 次探测 {last}，视为就绪"},
-                    )
-                    return
+            pending: list[dict] = []
+            for probe in plan:
+                label = f"{probe['kind']} {probe['host']}:{probe['port']}"
+                if probe["kind"] == "http":
+                    ok, detail = self._probe_http(probe)
+                else:
+                    ok, detail = self._probe_tcp(probe)
+                last_by_probe[label] = detail
+                if not ok:
+                    pending.append(probe)
+            if not pending:
+                summary = "；".join(f"{k} → {v}" for k, v in list(last_by_probe.items())[:4])
+                self.store.append_transcript(
+                    challenge_id,
+                    {"role": "instance", "note": f"[就绪等待] 第 {attempt} 次探测全部可达（{summary}），视为就绪"},
+                )
+                return
             time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
-        self.store.append_transcript(
-            challenge_id,
-            {"role": "instance", "note": f"[就绪等待] {host} {wait_cap:.0f}s 内未见应用就绪（最后 {last}），继续按平台状态推进"},
+        summary = "；".join(f"{k} → {v}" for k, v in list(last_by_probe.items())[:4])
+        note = f"[就绪等待] {wait_cap:.0f}s 内未见全部服务就绪（{summary}），继续按平台状态推进"
+        # 实例标了 access=vpn / host 是 *.internal 时，连不上最常见的原因是本地没连 VPN 而不是
+        # 应用没起来——把这条写清楚，避免模型把「隧道没连」误判成「靶场卡住」去乱换端口。
+        services = surface.get("services") if isinstance(surface, dict) else None
+        vpn_needed = any(
+            isinstance(s, dict) and (str(s.get("access") or "").lower() == "vpn"
+                                     or str(s.get("host") or "").endswith(".internal"))
+            for s in (services or [])
         )
+        if vpn_needed:
+            vpn = surface.get("vpn") if isinstance(surface, dict) else None
+            target = ""
+            if isinstance(vpn, dict) and vpn.get("host"):
+                target = f"（VPN 端点 {vpn.get('proto') or 'udp'}://{vpn.get('host')}:{vpn.get('port')}）"
+            note += f"\n[接入提示] 该实例是 access=vpn / *.internal{target}：直连失败通常是**隧道没连**，" \
+                    "不是靶场没起来。先确认 VPN 已连（比赛容器内由平台注入），再决定是否按「接入层不可达」收口。"
+        self.store.append_transcript(challenge_id, {"role": "instance", "note": note})
+
+    @staticmethod
+    def _probe_http(probe: dict) -> tuple[bool, str]:
+        """HTTP 就绪探测：Go 网关 404（page not found）算未就绪，其它有响应就算就绪。"""
+        url = f"{probe.get('scheme') or 'http'}://{probe['host']}:{probe['port']}/"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read(120)
+                code = resp.status
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            try:
+                body = exc.read(120)
+            except Exception:  # noqa: BLE001
+                body = b""
+        except Exception as exc:  # noqa: BLE001 - DNS/连接失败都算未就绪
+            return False, f"{type(exc).__name__}: {exc}"
+        detail = f"HTTP {code}（{len(body)}B）"
+        gateway_404 = code == 404 and len(body) <= 60 and b"page not found" in body.lower()
+        return (not gateway_404), detail
+
+    @staticmethod
+    def _probe_tcp(probe: dict) -> tuple[bool, str]:
+        """TCP 就绪探测：能建连就算就绪（不看应用层协议）。"""
+        try:
+            with socket.create_connection((probe["host"], int(probe["port"])), timeout=5):
+                return True, "TCP connect 成功"
+        except Exception as exc:  # noqa: BLE001 - DNS/拒绝/超时都算未就绪
+            return False, f"{type(exc).__name__}: {exc}"
 
     def _submit(self, args: dict, challenge_id: str) -> tuple[str, bool]:
         answer = str(args.get("answer") or args.get("flag") or args.get("value") or "").strip()

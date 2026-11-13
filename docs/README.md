@@ -8,6 +8,7 @@
 | 文档 | 用途 | 什么时候看 |
 |---|---|---|
 | [capability-report-2026-11-12.md](capability-report-2026-11-12.md) | **能力评估**：各题型能力范围、真实题库成绩、缺口清单、验证方案 | 想知道"agent 现在能干什么/差什么" |
+| [ctfy-playground-access-2026-11-13.md](ctfy-playground-access-2026-11-13.md) | **CTFY 平台接入测试**：练习场实测约束（tcp_access=vpn/实例配额 1/TTL）、实例回执形状、本次补的 4 处功能与 VPN 阻塞点 | 接平台、调实例/回调/附件链路时 |
 | [HANDOFF-2026-11-10-r2.md](HANDOFF-2026-11-10-r2.md) | 主交接文档（持续更新）：当前状态、机制、踩坑、未完项 | 接手/续接第一份 |
 | [HANDOFF-2026-11-10.md](HANDOFF-2026-11-10.md) | 上一版交接（r2 的 §3–§5 仍以它为准：容器契约、预算、5 轮口径） | 查契约/预算细节 |
 | [submit-image-runbook.md](submit-image-runbook.md) | 镜像构建/提交/验收操作单 + **范围红线**（不带 GUI/多平台适配器）+ v7.3 待带项 | 出镜像、验镜像 |
