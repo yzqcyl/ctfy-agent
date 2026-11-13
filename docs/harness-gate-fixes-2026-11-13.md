@@ -73,3 +73,41 @@ git revert --no-edit 3a3fdd4     # 或 git checkout 3a3fdd4^ -- src/ctfy_agent/c
 ```
 
 回滚后跑 `python tests/smoke.py`（应仍 180/0）并重建快照再跑批次即可。
+
+## 6. 验证轮又挖出两个「让所有批次静默白跑」的平台侧问题（17:20–17:50）
+
+### P11. 全局平台档案被切到 CTFY，批次跟着跑错平台
+- 现象：验证批次里专家查题一律 challenge_not_found（404）。根因：config/platforms.json 的
+  ctive 被并行会话从 ctf2（DASCTF 练习场 BUUCTF）改成 CTFY（清华竞赛场），
+un_big 跟随
+  ctive → 语义 get_challenge 映射成竞赛版工具 → 练习场题全部 404。
+- 修复：
+un_big.py 支持 BIG_PROFILE=ctf2 强制档案（只影响本进程，绝不改全局 active，避免干扰并行会话）。
+
+### P12. DASCTF 平台开始 strict 校验参数，练习场题面/附件全丢
+- 现象：ttachments._read_challenge_detail 为兼容两套 schema 同时传
+  competition_id + practice_ground_id，平台回 INVALID_REQUEST（additionalProperties:false）→
+  附件/题面全拿不到，专家只能空转。
+- 修复：platform._clean_args 调用前按真实 schema 归一：工具有 practice_ground_id 而没给时用
+  competition_id 顶上；剔除未声明字段。验证：vigenere 现在能读到题面 + ttachment.zip(3525B)。
+- 影响范围：本轮之前所有「0 解出」的验证批次都要按这个口径重跑，之前的结论作废。
+
+### P13. submit 同值重复改为「提示换值 + 双倍上限才收口」
+- 现象：P6 落地后 vigenere 反而在 **77s** 就 action_loop（基线 215s）——submit 不再摘工具后模型持续原样重试，
+  拦截计数到 4 就收口。
+- 修复：第 2 次提示换值、第 4 次强警告、第 8 次（2×REPEAT_BLOCK_LIMIT）才收口；submit 全程不摘工具。
+
+## 7. 最新一轮验证数据（fixval3，10 道真实未解近失题，ctf2 档案 + P12 修复）
+
+| 题目 | 旧代码（基线） | 修复后 | 说明 |
+|---|---|---|---|
+| bang | coordinator_done 257s | action_loop 758s（旧快照，无 P13） | 预算利用率 +195% |
+| vigenere | coordinator_done 215s | action_loop 77s（旧快照，无 P13） | P13 已修 |
+| powerPacked | coordinator_done 318s | coordinator_done 863s | 预算利用率 +171% |
+| LittleJunk | coordinator_done 227s | wall_clock 1018s | 用满预算 |
+| 书鱼的秘密 | coordinator_done 129s | coordinator_done 272s | 仍偏早收口 |
+
+- 提前收口（<70% 预算）：基线 9/10 → 修复后 1/5（已出结果部分）。
+- 附件/题面获取：fixval3 起 10 道全部 ttachments 事件成功（fixval2 时 0 道成功）。
+- 解出数仍为 0/5：说明「平台可达 + 预算用满」只是必要条件，题目本身仍需要更多解题能力/时间；
+  但此前所有批次的「0 解出」结论不成立，因为平台链路根本没通。
