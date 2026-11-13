@@ -69,6 +69,33 @@ def main() -> int:
     check("tcp_access=public 的说明不含 *.internal 警告", "*.internal" not in joined(
         competition_access_lines({"tcp_access": "public"})))
 
+    # ---------------- 1b) 局间暂停（CTFY competition_paused） ----------------
+    paused = competition_access_lines({
+        "play_open": False,
+        "next_session_starts_at": "2026-11-13T04:00:00Z",
+        "sessions": [
+            {"starts_at": "2026-11-13T00:00:00Z", "ends_at": "2026-11-13T03:45:00Z"},
+            {"starts_at": "2026-11-13T04:00:00Z", "ends_at": "2026-11-13T07:45:00Z"},
+        ],
+    })
+    ptext = joined(paused)
+    check("play_open=false + 下一局时间 → 明确「不可玩/重试无用」",
+          "play_open=false" in ptext and "2026-11-13T04:00:00Z" in ptext
+          and "competition_paused" in ptext, ptext)
+    check("分场次表被点出", "分场次" in ptext and "00:00:00Z→" in ptext, ptext)
+    check("没有 next_session 也能说清暂停语义",
+          "competition_paused" in joined(competition_access_lines({"play_open": False})))
+    check("play_open=true 不出暂停提示",
+          "competition_paused" not in joined(competition_access_lines({"play_open": True})))
+    real_pause = ("[工具报错] ----- 工具返回 (isError=true) ----- Error calling tool 'start_instance': "
+                  "competition_paused: This competition is paused between sessions — play resumes at "
+                  "2026-11-13T04:00:00+00:00. Wait; do not retry sooner.")
+    check("_is_competition_paused 认真实 403 文案", Solver._is_competition_paused(real_pause) is True)
+    check("_is_competition_paused 不误判配额/瞬时",
+          Solver._is_competition_paused("team_capacity_exceeded: Max 1 concurrent instances per team") is False
+          and Solver._is_competition_paused("Rate limited by upstream API, please retry later") is False
+          and Solver._is_competition_paused("") is False)
+
     # ---------------- 2) 实例 surface → 接入说明 ----------------
     inst = {
         "id": "782e6892-e55e-4d75-8136-85766877d6fb",

@@ -52,7 +52,7 @@ def _mk(tmp: Path, **extra):
         """只接 solve_clusterb 用到的两个查询面。"""
 
         @staticmethod
-        def my_solved_ids():
+        def my_solved_ids(competition_id=None):
             return []
 
         @staticmethod

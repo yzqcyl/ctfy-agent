@@ -76,6 +76,27 @@ def competition_access_lines(comp: dict | None) -> list[str]:
     install = str(comp.get("solve_env_mode") or "").strip().lower()
     if install and install != "normal":
         lines.append(f"环境模式：solve_env_mode={install}（平台在题目放题/关闭窗口上有宽限语义，遇到 403/404 先看阶段）")
+
+    # 分场次（session）的比赛：局间 start/submit 会被 403 competition_paused，重试无用。
+    # 2026-11-13 练习场实测（4h 一局）：局间文案 "This competition is paused between sessions
+    # — play resumes at 2026-11-13T04:00:00+00:00. Wait; do not retry sooner."
+    sessions = comp.get("sessions")
+    next_start = str(comp.get("next_session_starts_at") or "").strip()
+    play_open = comp.get("play_open")
+    if play_open is False and next_start:
+        lines.append(
+            f"当前不可玩（play_open=false）：下一局 {next_start}（UTC）开始。"
+            "局间 start_instance/submit 会被 403 competition_paused —— 重试无用，先做不依赖实例的事。"
+        )
+    elif play_open is False:
+        lines.append("当前不可玩（play_open=false）：局间 start/submit 会被 403 competition_paused，重试无用。")
+    if isinstance(sessions, list) and sessions:
+        spans = []
+        for item in sessions[:6]:
+            if isinstance(item, dict) and item.get("starts_at"):
+                spans.append(f"{item.get('starts_at')}→{item.get('ends_at') or '?'}")
+        if spans:
+            lines.append("分场次：" + "；".join(spans) + "（UTC）—— 局间暂停，实例会被停/删。")
     return lines
 
 

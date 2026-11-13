@@ -51,7 +51,7 @@ def _mk(tmp: Path, **extra):
 
     class StubPlatform:
         @staticmethod
-        def my_solved_ids():
+        def my_solved_ids(competition_id=None):
             return []
 
         @staticmethod

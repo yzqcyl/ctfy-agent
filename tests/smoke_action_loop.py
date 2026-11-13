@@ -101,7 +101,7 @@ class StubPlatform:
                              "text": json.dumps({"accepted": False, "is_solved": False})}],
                 "isError": False}
 
-    def my_solved_ids(self) -> set[str]:
+    def my_solved_ids(self, competition_id=None) -> set[str]:
         return set()
 
     def stop_instance(self, instance_id: str) -> None:  # pragma: no cover - 无实例场景不会调

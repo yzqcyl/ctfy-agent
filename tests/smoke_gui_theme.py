@@ -823,8 +823,14 @@ def case_force_rerun_really_reruns() -> None:
             "flag_value": "FLAG{a}", "status": "done",
         })
 
+        # [2026-11-13] 「已解出」事实源已改成按比赛收窄（题 id 跨比赛重复，全局查会误判）；
+        # 这里补上比赛上下文，保持本用例原来「平台说已解出」的语义。
+        store.meta["competition_id"] = "smoke-force"
+
         class FakePlatform:
-            def my_solved_ids(self):
+            active_competition_id = "smoke-force"
+
+            def my_solved_ids(self, competition_id=None):
                 return {"c1"}
 
         crew = Crew(cfg, FakePlatform(), store, lambda model=None: None)

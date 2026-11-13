@@ -1009,7 +1009,7 @@ class Crew:
             if challenge.status == "done" or getattr(challenge, "submitted_ok", False):
                 return self._presolved_summary(challenge_id, challenge)
             try:
-                if challenge_id in self.platform.my_solved_ids():
+                if challenge_id in self._platform_solved_ids():
                     challenge.status = "submitted"
                     return self._presolved_summary(challenge_id, challenge)
             except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不拦解题
@@ -1778,7 +1778,7 @@ class Crew:
         # 翻成 exploit_verified 会把 1/3 的完成度报成整题解出（实测 CTFARENA-048 复测踩到）。
         if not submitted and reason not in ("superseded", "partial_solve"):
             try:
-                if challenge_id in self.platform.my_solved_ids():
+                if challenge_id in self._platform_solved_ids():
                     submitted = True
                     reason = "exploit_verified"
                     challenge.status = "submitted"
@@ -1890,7 +1890,7 @@ class Crew:
             if ch.status == "done" or getattr(ch, "submitted_ok", False):
                 return True
             try:
-                return cid in self.platform.my_solved_ids()
+                return cid in self._platform_solved_ids()
             except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不该拦住解题
                 return False
 
@@ -2005,7 +2005,7 @@ class Crew:
         if ch.status == "done" or getattr(ch, "submitted_ok", False):
             return self._presolved_summary(challenge_id, ch)
         try:
-            if challenge_id in self.platform.my_solved_ids():
+            if challenge_id in self._platform_solved_ids():
                 ch.status = "submitted"  # 与 solve() 的 exploit_verified 兜底同口径
                 return self._presolved_summary(challenge_id, ch)
         except Exception:  # noqa: BLE001 - 预检是省钱项，平台失败不拦解题
@@ -2234,6 +2234,27 @@ class Crew:
         except Exception:  # noqa: BLE001 - 只读增强，失败退回单问题默认
             return {}
         return data if isinstance(data, dict) else {}
+
+    def _platform_solved_ids(self) -> set:
+        """平台「我已解出」集合，**按当前比赛收窄**；比赛上下文未知时返回空集合。
+
+        [2026-11-13 CTFY 接入测试] 题 id 会跨比赛重复（SAMPLE-016 同时在 SAMPLE 套题与练习场，
+        CTFARENA-xxx 又是另一套）。旧版直接问全局 `get_my_solves`：CTFY 实测全局 232 条、
+        练习场只有 1 条 —— 拿全局判断「本场已解出」，会把没做的题直接短路跳过（最坏情况：
+        直接把整场判成已解、一个 flag 都不交）。这里只信本场事实；拿不到比赛上下文时宁可不短路
+        （多花一次解题成本）也不误判已解。
+        """
+        scope = ""
+        try:
+            scope = str(self.config.extra.get("competition_id")
+                        or self.store.meta.get("competition_id")
+                        or getattr(self.platform, "active_competition_id", "")
+                        or "")
+        except Exception:  # noqa: BLE001 - 取不到上下文就当未知
+            scope = ""
+        if not scope:
+            return set()
+        return self.platform.my_solved_ids(scope)
 
     def _fetch_access_lines(self, challenge_id: str, solver) -> list[str]:
         """只读拉一次比赛级接入约束（tcp_access / agent_internet / 实例并发 / TTL）→ 提示行。

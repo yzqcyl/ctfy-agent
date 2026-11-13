@@ -109,7 +109,7 @@ class FakePlatform:
         except ValueError:
             return None
 
-    def my_solved_ids(self):
+    def my_solved_ids(self, competition_id=None):
         return set(self._solved)
 
 

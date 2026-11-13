@@ -157,6 +157,9 @@ class CtfyPlatform:
         self._question_ids: dict[str, set[str]] = {}
         # 最近一次 verify_* 判过 true 的 question_id；多问题题提交时优先用它当默认题号
         self._verified_qid: str = ""
+        # [2026-11-13 CTFY 接入测试] 最近一次平台调用里带过的比赛上下文。my_solved_ids() 这类
+        # 零参便捷方法据此按比赛收窄（题 id 跨比赛重复，全局查会误判「已解出」而跳过本题）。
+        self.active_competition_id: str = ""
 
     # ---------- 连接 ----------
 
@@ -429,6 +432,12 @@ class CtfyPlatform:
         return self.call(name, arguments, retries=retries)
 
     def call_text(self, name: str, arguments: dict | None = None, *, retries: int = 0) -> str:
+        # [2026-11-13 CTFY 接入测试] 记住最近一次调用里的比赛上下文：my_solved_ids() 这类
+        # 零参便捷方法必须按当前比赛收窄（详见 my_solved_ids 的注释）。
+        if isinstance(arguments, dict):
+            scope = arguments.get("competition_id")
+            if scope:
+                self.active_competition_id = str(scope)
         result = self.call(name, arguments, retries=retries)
         text = render_call_result(result)
         if isinstance(result, dict) and result.get("isError"):
@@ -461,14 +470,26 @@ class CtfyPlatform:
 
     # ---------- 便捷方法 ----------
 
-    def my_solved_ids(self) -> set:
+    def my_solved_ids(self, competition_id: str | None = None) -> set:
         """平台侧「我已解出」的题 id 集合（确定性事实源，供 proof-of-exploitation 判定回传）。
 
         `get_my_solves` 返回 [{"challenge_id": "...", "solved_at": ...}]；失败时返回空集合，
-        绝不让判定回传把主流程拖垮。带 10 s 缓存：同一轮里 solver 与 crew 都会问。
+        绝不让判定回传把主流程拖垮。带 10 s 缓存（按比赛分键）：同一轮里 solver 与 crew 都会问。
+
+        [2026-11-13 CTFY 接入测试] **必须按比赛收窄**：题 id 会在多个比赛里重复
+        （SAMPLE-016 同时存在于 SAMPLE 套题与练习场；CTFARENA-xxx 又是另一套）。
+        旧版只查全局 → 「在别的比赛解过」被当成「本场已解」，直接短路跳过没做的题。
+        CTFY 实测 `get_my_solves` 支持 competition_id：练习场 1 条 / TPCTF 0 条 / 不带 232 条。
+        competition_id 缺省时用最近一次平台调用里的比赛上下文（call_text 里记录），
+        这样 solver/crew 那些零参调用也按当前比赛收窄，不必逐处改调用点。
         """
+        scope = str(competition_id or getattr(self, "active_competition_id", "") or "").strip()
         now = time.time()
-        cached = getattr(self, "_solved_cache", None)
+        caches = getattr(self, "_solved_caches", None)
+        if not isinstance(caches, dict):
+            caches = {}
+            self._solved_caches = caches
+        cached = caches.get(scope)
         if cached and now - cached[0] < 10.0:
             return cached[1]
         solved: set = set()
@@ -477,24 +498,25 @@ class CtfyPlatform:
         if name not in self._by_name:
             name = ""
         if name:
+            payload = {"competition_id": scope} if scope else {}
             try:
-                text = self.call_text(name, {})
+                text = self.call_text(name, payload)
                 data = self._as_json(text)
                 if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            cid = item.get("challenge_id") or item.get("id")
-                            if cid:
-                                solved.add(str(cid))
+                    rows = data
                 elif isinstance(data, dict):
-                    for item in data.get("solves") or data.get("items") or data.get("result") or []:
-                        if isinstance(item, dict):
-                            cid = item.get("challenge_id") or item.get("id")
-                            if cid:
-                                solved.add(str(cid))
+                    rows = (data.get("solves") or data.get("items") or data.get("result")
+                            or data.get("results") or data.get("data") or [])
+                else:
+                    rows = []
+                for item in rows:
+                    if isinstance(item, dict):
+                        cid = item.get("challenge_id") or item.get("id")
+                        if cid:
+                            solved.add(str(cid))
             except Exception:  # noqa: BLE001 - 判定增强项，失败就当没解出
                 solved = set()
-        self._solved_cache = (now, solved)
+        caches[scope] = (now, solved)
         return solved
 
     def whoami(self):

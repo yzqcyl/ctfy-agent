@@ -1267,6 +1267,23 @@ class Solver:
                     args.pop("competition_id", None)
                     args = self._autofill(name, args, challenge_id)
                     text = self.platform.call_text(name, args)
+                # 局间暂停（CTFY competition_paused）：不是配额、也不是瞬时故障，等到下一局才有意义。
+                # 2026-11-13 练习场实测：局间 403，且提示 "resumes at … Wait; do not retry sooner"。
+                # 这里回滚本次写操作计数（失败调用不该吃配额），并把「等下一局」写成确定性结论，
+                # 免得模型连点 start 把 instance_ops_limit 烧光。
+                if self._is_competition_paused(text):
+                    if name in self._instance_op_names():
+                        try:
+                            self.store.refund_call(challenge_id, name)
+                        except Exception:  # noqa: BLE001 - 计数回滚是增强项
+                            pass
+                    text += (
+                        "\n[局间暂停] 比赛当前处于局间休息（competition_paused / play_open=false），"
+                        "现在 start 一定被 403 拒，**重试无用**、只会烧本地实例操作额度。"
+                        "先用 get_competition 看 next_session_starts_at（或 sessions）确认下一局开始时间，"
+                        "到点再 start；这段时间做不需要实例的事（读题面、下附件、整理结论/报告）。"
+                    )
+                    return text, False
                 # 限流/5xx 瞬时失败按 (5,15)s 等待重试（不含 timeout，避免「服务端已开实例但响应
                 # 没回来」时重复开实例）；重试最多 2 次，不烧模型 token。
                 for wait in (5, 15):
@@ -1391,7 +1408,7 @@ class Solver:
             if verify_name and name == verify_name:
                 # proof-of-exploitation 题没有 flag：平台侧 judge 判定通过后，本题记为解出。
                 # 判定不用回执文案猜，直接问 get_my_solves（确定性事实源）。
-                if challenge_id in self.platform.my_solved_ids():
+                if challenge_id in self.platform.my_solved_ids(self._competition_id(challenge_id)):
                     qid = str(args.get("question_id") or "")
                     try:
                         item = self.store.require(challenge_id)
@@ -1451,6 +1468,20 @@ class Solver:
             or "team_capacity_exceeded" in low
             or "concurrent instances" in low
         )
+
+    @staticmethod
+    def _is_competition_paused(text: str) -> bool:
+        """比赛处于「局间暂停」类拒绝（CTFY 文案：competition_paused / paused between sessions）。
+
+        2026-11-13 练习场实测：练习场按 4h 一局（00:00–03:45、04:00–07:45 …），局间调
+        start_instance 直接 403 ``competition_paused: This competition is paused between
+        sessions — play resumes at 2026-11-13T04:00:00+00:00. Wait; do not retry sooner.``。
+        这不是配额问题、也不是瞬时故障：等再久也不该在本局内重试，连点只会烧光 instance_ops_limit。
+        """
+        low = str(text or "").lower()
+        return ("competition_paused" in low
+                or "paused between sessions" in low
+                or "competition is paused" in low)
 
     def _evict_finished_instances(self, challenge_id: str) -> int:
         """回收「已解出/已结束」题的旧实例，腾团队并发名额；返回停掉的个数。
@@ -1950,7 +1981,7 @@ class Solver:
             ch = store.require(cid)
             if ch.status in ("submitted", "done") or ch.submitted_ok:
                 return True
-            return cid in self.platform.my_solved_ids()
+            return cid in self.platform.my_solved_ids(self._competition_id(cid))
 
         orch = Orchestrator(attempt_fn, attempts_max=k, caps_fn=caps_fn, precheck_fn=precheck_fn)
         report = orch.run_challenge(challenge_id)
