@@ -1822,7 +1822,12 @@ class Crew:
                                     {"role": "gate", "step": rnd,
                                      "note": f"submit 同值连续 {blocked_streak} 次被拦：已警告将收口"},
                                 )
-                            if blocked_streak >= SUBMIT_STOP_LIMIT:
+                            if (blocked_streak >= SUBMIT_STOP_LIMIT
+                                    # [fix 2026-11-13 P15] 平台已判错的同值重复是硬死路：
+                                    # 实测 ezRSA/菜刀流量 在同值上又空转 8 轮才收口（210s/810s），
+                                    # 早点收口让 worker 去跑下一题更划算（并发只有 3）。
+                                    or (blocked_streak >= REPEAT_BLOCK_LIMIT
+                                        and "已经提交过" in text)):
                                 stop = True
                                 reason = "action_loop"
                                 self.store.append_transcript(
