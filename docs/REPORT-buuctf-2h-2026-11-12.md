@@ -226,6 +226,46 @@ runs\_lab2h\monitor.md                    # 全程监视屏（含卡死/重复/�
 runs\_lab2h\summary.json / digest.txt     # 本报告 §1/§2/§3 的数据源
 ```
 
+## 8. 修复与复测（2026-11-12 晚，commit `a7fbede` + `80dbc2b`）
+
+> 本节数据来自隔离快照 `runs/_fix2/repo`（= 本报告 commit `4f60f87` 的 `git archive`，
+> 加了下面的修复），平台 ctf2 / BUUCTF ground `b9bbb32f`，2026-11-12 21:30–23:50 重跑。
+
+### 8.1 修复内容
+
+| commit | 修复 | 对应 §5 问题 |
+|---|---|---|
+| `a7fbede` | ctf2 回执只给 `environment_id` 时也登记实例；记 `meta.last_instance`；配额报错时先按记录回收**上一题**环境再重试 start；释放优先 `stop_instance` 并用回执白名单识别软失败，失败回落按题 `delete_environment` | P1-A 配额泄漏 |
+| `a7fbede` | 沙盒越界护栏扩展到 run 级元数据（`state.json`/`results.json`/`transcripts`/`events.jsonl`）、其它题目录、`\sandbox\..` | P1-B 同 run 跨题泄漏 |
+| `a7fbede` | 同一 (tool,args) 连续 3 次返回 byte-identical 结果 → `action_loop` 收口；无 `list_instances` 平台对纯附件题跳过自动 start | P2 重复动作 / 白 start |
+| `80dbc2b` | 接入 `has_container` / `requires_running_target_for_submit` 元数据，把上面那条「跳过 start」收窄到**平台明确没有容器**的 misc/crypto 题（题库里 crypto/misc 也有 60+ 道必须起容器的题，一律跳过会判死） | 修复自身引入的过宽条件 |
+
+回归：`tests/smoke.py` **180 passed / 0 failed**（基线 175），新增 6 条断言覆盖
+`environment_id` 入库、`last_instance` 回收、无记录不乱删、`has_container` 例外、同 run 越界。
+
+### 8.2 4 题重跑结果
+
+| 题 | 上轮 | 本轮 | 结论 |
+|---|---|---|---|
+| rot（CRYPTO/Easy） | ❌ wall_clock 924s | ✅ **`flag{www_shiyanbar_com_is_very_good_@8Mu}`** 283s / 3 步 / 1 次提交即中 | 上轮是被 15min 墙钟和错误的爆破方向耗死，非能力缺失 |
+| b64（MISC/Medium） | ❌ wall_clock 936s | ✅ **`DASCTF{YD_m0CTfBejoM2ZtGry_NQgk9sUAIP}`** 751s / 4 步 | 上轮 9 次同名命令空转被去重/断路器抑制；本机 `PIL` 可用（宿主 site-packages） |
+| easyROPtocol（PWN/Medium） | ❌ 连靶标都没拿到 | ❌ 拿到靶标但 3 轮 22min 未解 | 协议字段/校验已推进到「参数1 报文的读取格式/长度」；本机无 Linux/WSL/gdb，剩下靠黑盒试错，预算不足。**实例配额问题已不再出现** |
+| clockin（RE/Medium） | ❌ 配额 + 时间 | ❌ 平台侧 502 | **两次全新实例**（22:49、22:56）`GET /` 均 `502 Target unavailable`（openresty，30+ 次探测），APK 静态侧两 dex 常量扫描 + 方法链已穷尽，flag 须后端计算 → 确定性外部阻塞，非本项目缺陷 |
+
+### 8.3 修复生效的直接证据
+
+- 实例登记：`state.json` 里 `instance_id` 从 `""` 变为 `77a50140-…`/`a482f6f8-…`（`environment_id` 入库生效），`meta.last_instance` 正常记录
+- 换题不再报 `agent_environment_limit`；easyROPtocol 修复后**首次**成功拿到靶标（上轮全程没拿到）
+- 释放路径：`instance_stopped` 事件带 `via`，且后续题能正常 start（配额已归还）
+- 同 run 跨题泄漏：本轮 4 题 transcript 中无跨题候选串污染；越界命令被拦
+- 重复动作：clockin 上轮的 14 次同名命令、b64 的 9 次，本轮未再出现（`action_loop` 断路器/去重闸）
+
+### 8.4 仍未解决
+
+1. easyROPtocol：需要更长时间/更强本地能力（Linux 容器跑 gdb、pwntools 动态调试），或平台给足 start 配额重试；
+2. clockin：等 ctf2 平台该题容器恢复；重试脚本已备（`runs/_fix2/clear_clockin_env.py` 清场 + 全新实例）。
+3. 之后启动 120 题大跑批（crypto/misc/pwn/re 各 30，并发 3），用于在更大样本上统计问题并继续修。
+
 > 备注：本轮测试期间并行会话仍在改共享仓库（HEAD 已前进到 `2bcb94c` 并有未提交文件）；本报告全部数字来自**冻结快照 `fa8f877`**，与当前 HEAD 的差异需另行复核。共享 `config/agent.json` 当前被并行会话切到 CTFY 档案（`mcp_url` 指向 ctfy、`tool_map` 为空），复跑本测试请务必用快照或重新切回 ctf2。
 
 *报告生成时间：2026-11-12 21:30 左右；所有结论均来自当次运行的 results/events/transcripts 原始文件，未做推断性夸大。*
