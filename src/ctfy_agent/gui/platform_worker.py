@@ -8,6 +8,55 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
+
+# 「按难度动态分配时间预算」（能力评估 §4.1/§6-②）：122 题里 43 题因墙钟被打断，
+# 固定 15 分钟对 Easy 太松、对 Hard 太紧。默认 Easy 10 / Medium 25 / Hard 40 分钟；
+# 经 config.extra.{time_budget, time_budget_minutes, time_budget_fallback} 可关/可调。
+_BUDGET_MINUTES = {"easy": 10, "medium": 25, "hard": 40}
+
+
+def _budget_minutes(config, difficulty: str) -> int | None:
+    """返回某难度的时间预算（分钟）；返回 None 表示关闭（沿用旧的全局取消行为）。"""
+    if not config.extra.get("time_budget", True):
+        return None
+    diff = str(difficulty or "").strip().lower()
+    override = config.extra.get("time_budget_minutes")
+    if isinstance(override, dict) and diff in override:
+        try:
+            return int(override[diff])
+        except (TypeError, ValueError):
+            pass
+    if diff in _BUDGET_MINUTES:
+        return int(_BUDGET_MINUTES[diff])
+    try:
+        return int(config.extra.get("time_budget_fallback", 20))
+    except (TypeError, ValueError):
+        return None
+
+
+def _arm_budget(global_cancel: threading.Event, minutes: int | None) -> tuple[threading.Event, bool]:
+    """给单题装一个软停止信号：预算时间到或全局取消时置位；不影响其它题。
+
+    返回 (event, engaged)。engaged=False 表示没装计时器（请直接用全局 cancel，避免额外线程）。
+    """
+    ev = threading.Event()
+    if not minutes or minutes <= 0:
+        return ev, False
+
+    def watch() -> None:
+        deadline = time.monotonic() + minutes * 60
+        while not ev.is_set():
+            if global_cancel is not None and global_cancel.is_set():
+                ev.set()
+                return
+            if time.monotonic() >= deadline:
+                ev.set()
+                return
+            time.sleep(1.0)
+
+    threading.Thread(target=watch, name=f"budget-{minutes}m", daemon=True).start()
+    return ev, True
 
 
 def _platform(config, verbose: bool = False, cancel=None):
@@ -356,19 +405,31 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 )
                 _hydrate_attachments(platform, store, cid, competition_id or "", on_event)
 
+                # 按难度分配时间预算：软停止只作用于本题，不波及并发中的其它题。
+                ch0 = store.get(cid)
+                diff = str(getattr(ch0, "difficulty", "") or "")
+                budget_mins = _budget_minutes(config, diff)
+                ev, budget_engaged = _arm_budget(cancel, budget_mins)
+                task_cancel = ev if budget_engaged else cancel
+                if budget_engaged:
+                    q.put(("batch_note", f"[{cid}] 难度 {diff or '?'} → 时间预算 "
+                                         f"{budget_mins} 分钟"))
+
                 crew = Crew(config, platform, store,
                             lambda model=None: make_llm(config, model=model), on_event=on_event)
-                summary = crew.solve(cid, cancel_event=cancel, force_rerun=cid in forced)
+                summary = crew.solve(cid, cancel_event=task_cancel, force_rerun=cid in forced)
                 ch = store.get(cid)
                 flag = getattr(ch, "flag_value", "") if ch else ""
                 ok = bool((summary or {}).get("submitted")) or bool(flag)
                 # 「已解出」是平台/缓存给的现成结论（0 token、0 轮次），界面要能区分出「跳过」
                 presolved = str((summary or {}).get("reason") or "") == "already_solved"
                 note = ""
+                if budget_engaged and task_cancel.is_set() and not cancel.is_set():
+                    note = f"时间预算到（{budget_mins} 分钟，难度 {diff or '?'}）"
                 if ok and not flag:
                     # 平台说已解、本地没有 flag（常见于平台侧已解但本 agent 没记到 flag）：
                     # 不能既显示「已解出」又在详情写「未解出」，要说明真实原因。
-                    note = "平台已解出（本地无 flag 记录）"
+                    note = note or "平台已解出（本地无 flag 记录）"
                 return {"id": cid, "ok": ok, "flag": flag, "note": note,
                         "presolved": presolved}
             except Exception as exc:  # noqa: BLE001 - 单题失败不中断批量
