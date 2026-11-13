@@ -77,6 +77,8 @@ def main() -> int:
     check("OOB 生成 TCPServerTunnel", "[TCPServerTunnel]" in text and "ListenPort = 4444" in text)
     check("公网服务不建隧道", "ctf.example.com:8080" not in text)
     check("私钥原样保留（wireproxy 要用）", "PrivateKey = SUPER_SECRET_KEY=" in text)
+    check("补 PersistentKeepalive（用户态隧道长期空闲）",
+          "PersistentKeepalive = 25" in text, text)
     check("隧道计数（TCP+UDP+OOB+DNS）", len(tunnels) == 5, str(tunnels))
     check("隧道 local 都指向 127.0.0.1",
           all(str(item["local"]).startswith("127.0.0.1:") for item in tunnels), str(tunnels))
