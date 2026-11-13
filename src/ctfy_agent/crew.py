@@ -344,6 +344,43 @@ _FLAG_CANDIDATE_HINT = (
     "[候选出现] 账本已自动收录到工具输出里的逐字候选：{cand}\n"
     "不要继续侦察了：立即用 verify_answer 校验（不消耗提交次数），通过就 submit。"
 )
+# [fix 2026-11-13 P6] 候选被平台判错（wrong）后的收口：旧逻辑仍拿这份候选逼 submit，
+# 而 submit 同值已被去重闸门拦下/断路器摘除 → 僵住到预算烧完（实测 vigenere 100s/900s 就收口）。
+# 判错值一旦记账，done 闸门不再拿它逼提交，改用预算闸门逼「换证据」，不再原地打转。
+_REFUTED_DONE_GATE = (
+    "[done 被候选闸门拦下] 账本里的候选 flag 已经被平台判错：{cands}。现在收口等于把剩余预算白扔。\n"
+    "下一步必须 delegate 一个能产出**新证据**的增量目标：换数据源（别的附件/流/字段）、换解码或算法假设、"
+    "或换实例入口；拿到新候选后先 verify_answer 再 submit。\n"
+    "禁止再把已判错的值（或它的换大小写/换包裹）重新提交——平台对同值判错不会改变。"
+)
+# [fix 2026-11-13 P7] 裸值自动补一次 flag{} 包裹：实测 rsa15 把 md5 明文直交 3 次全判错，
+# 从没试过 flag{...} 形式。只对「无包裹、无空白、像 token」的值补一次，不批量猜。
+_WRAP_RETRY_HINT = (
+    "\n\n[提交格式] 这个值没有 flag{{}} 包裹，已被平台判错；已按平台惯例自动补 `flag{{值}}` 重试一次。"
+    "若仍判错，说明值本身不对——换候选，不要再改格式猜。"
+)
+
+
+def _needs_flag_wrapper(value: str) -> bool:
+    """候选值是否「像裸 token、缺 flag{} 包裹」（只用于一次性规范化重试，不做爆破）。
+
+    只认机器生成的 token 形态（hex 摘要 / UUID / base64），不认普通单词：
+    普通单词判错更可能是值本身错，补包裹只会白烧一次提交（实测 rsa15 的 md5 明文属于前者）。
+    """
+    text = str(value or "").strip()
+    if not 16 <= len(text) <= 120:
+        return False
+    if any(ch in text for ch in "{} \t\r\n\"'"):
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]{16,}", text):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", text):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9+/]{16,}={0,2}", text) and any(
+        ch.isupper() for ch in text
+    ) and any(ch.islower() for ch in text):
+        return True
+    return False
 
 # ---------------- 重复被拦动作断路器（2026-11-10 接手新增） ----------------
 # 实测（runs/plat 2026-11-10 02:28 收尾，26 题 13 解；转录逐条核对）：
@@ -380,6 +417,12 @@ _REPEAT_BLOCK_HINT = (
     "下一步只能二选一：① 用 delegate 派一个**与之前不同的增量目标**去拿新证据；"
     "② 改用其它候选值/其它题号再提交。禁止原样重试。"
 )
+# [fix 2026-11-13 P6] submit 的按值摘除提示：工具还在，只是这个值不许再交。
+_REPEAT_VALUE_HINT = (
+    "[重复动作断路器] `submit` 的这个答案已经是第 {n} 次被拦（同值重复零信息），这个**值**已移出工具面。\n"
+    "submit 工具本身仍可用：换一个**不同的候选值**或题号再提交；没有新候选就 delegate 去拿新证据。\n"
+    "注意：平台对同值判错不会因改大小写/包裹而改变，除非有新证据，否则别在旧值上打转。"
+)
 _REPEAT_LOOP_STOP = (
     "连续 {n} 次重复同一被拦动作，判定为卡死循环，本题收口（reason=action_loop）。"
     "已省下的预算留给其它题；复现稿里按「需要新证据/换思路」记录。"
@@ -413,8 +456,9 @@ def _action_signature(name: str, args: dict) -> tuple[str, str]:
 def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: int,
                max_blocks: int = MAX_DONE_BLOCKS, calls_left: int | None = None,
                tokens_left: int | None = None, open_count: int = 0,
-               candidates: list[str] | None = None) -> tuple[str, bool, bool]:
-    """候选/预算闸门：拦 done 至多 max_blocks 次。
+               candidates: list[str] | None = None,
+               refuted: list[str] | None = None) -> tuple[str, bool, bool]:
+    """候选/预算闸门：拦 done 至多 max_blocks 次（预算闸门可到 2×max_blocks）。
 
     返回 (text, stop, no_candidate)。stop=False 表示拦下（本轮不结束，把闸门文案回灌给协调者），
     stop=True 且 no_candidate=True 表示「多次拦截后放行，并记为 no_candidate」。
@@ -422,20 +466,42 @@ def _done_gate(submitted: bool, attempts: int, observations: list, done_blocks: 
     [fix 2026-11-05 P4] 新增预算闸门（仅当调用方传入预算快照时生效，旧调用行为不变）：预算充足
     （剩余调用 > 15 或剩余 token > 12 万）且未提交时，纵容「有观察就当解完」的 done 会直接把
     可解题白扔（Run1/Run2 多题实证：2~7 轮、预算剩 40%~90% 就 coordinator_done）。
+    [fix 2026-11-13 P6] 新增 refuted：已被平台判错的候选不再拿来逼提交（旧逻辑会让协调者
+    反复 submit 同值→被去重闸门拦→done 又被候选闸门拦，僵到预算烧完）。候选全判错时改走
+    预算闸门逼「换证据」；同时把预算闸门上限提到 2×max_blocks，压住「129s/900s 就收口」这类早停。
     """
+    refuted_set = {str(x).strip() for x in (refuted or []) if str(x).strip()}
+    live_candidates = [c for c in (candidates or []) if str(c).strip() not in refuted_set]
+    budget_left = calls_left is not None or tokens_left is not None
+    budget_rich = budget_left and (calls_left is None or calls_left > 15) and (
+        tokens_left is None or tokens_left > 120_000
+    )
     if not submitted and attempts == 0 and not observations:
         if done_blocks < max_blocks:
             return _NO_CANDIDATE_GATE, False, False
+        # [fix 2026-11-13 P8] 零候选但预算还很足时不再直接收口（实测 129s/900s 的 no_candidate），
+        # 改走预算闸门逼一轮新攻击面；有界 2×max_blocks，最多多拦 2 次，不会死循环。
+        if budget_rich and done_blocks < 2 * max_blocks:
+            return _BUDGET_DONE_GATE, False, False
         return "协调结束（无候选，候选闸门放行并记为 no_candidate）。", True, True
     # [fix 2026-11-05 P5] 有候选却 done：优先拦下逼它先 verify/submit（比预算闸门更具体）
-    if not submitted and candidates and done_blocks < max_blocks:
-        shown = "、".join(f"`{c}`" for c in candidates[:3])
+    if not submitted and live_candidates and done_blocks < max_blocks:
+        shown = "、".join(f"`{c}`" for c in live_candidates[:3])
         return _CANDIDATE_SUBMIT_GATE.format(cands=shown), False, False
-    budget_left = calls_left is not None or tokens_left is not None
+    # [fix 2026-11-13 P6] 候选全部被平台判错：不再逼提交（同值必然再判错），改为逼换证据。
+    if (
+        not submitted
+        and candidates
+        and not live_candidates
+        and budget_rich
+        and done_blocks < 2 * max_blocks
+    ):
+        shown = "、".join(f"`{c}`" for c in candidates[:3])
+        return _REFUTED_DONE_GATE.format(cands=shown), False, False
     if (
         not submitted
         and budget_left
-        and done_blocks < max_blocks
+        and done_blocks < 2 * max_blocks
         and (open_count >= 2 or (tokens_left or 0) > 120_000)
         and (calls_left is None or calls_left > 15)
     ):
@@ -501,11 +567,35 @@ def _ledger_candidates(ledger, limit: int = 6) -> list[str]:
     """集群-B 黑板：本次尝试里「看起来像 flag」但还没验过的候选值（花括号形态）。
 
     只做形态筛选，不判真——判真交给下一次尝试的 verify/submit。
+    [fix 2026-11-13 P9] 过滤明显占位/诱饵串：审计 207 次尝试里 flag{AAAA…}、DASCTF{fake…}、
+    FLAG{you_may_need_this} 这类值被反复当真候选提交，白烧平台提交次数（每题上限只有 5 次）。
     """
     from .retry import extract_candidates  # noqa: PLC0415 - 延迟导入，避免顶层循环依赖
 
     texts = [getattr(o, "text", "") for o in (getattr(ledger, "observations", None) or [])]
-    return extract_candidates(texts, limit=limit)
+    return [c for c in extract_candidates(texts, limit=limit) if not _is_placeholder_candidate(c)]
+
+
+# 明显不是真 flag 的占位/诱饵特征（全部小写后匹配括号内文本）。
+_PLACEHOLDER_MARKS = (
+    "fake", "placeholder", "example", "dummy", "not_real", "notreal", "sample",
+    "you_may_need", "youmayneed", "test_flag", "testflag", "test_test", "selftest",
+    "abcdefgh", "1234567890", "0123456789", "xxx", "tbd", "todo", "changeme",
+)
+
+
+def _is_placeholder_candidate(value: str) -> bool:
+    """候选值是否是明显的占位/诱饵（如 flag{AAAA…}、DASCTF{fake…}、FLAG{you_may_need_this}）。"""
+    low = str(value or "").strip().lower()
+    if not low:
+        return True
+    start, end = low.find("{"), low.rfind("}")
+    inner = low[start + 1:end] if start >= 0 and end > start else low
+    if not inner:
+        return True
+    if re.fullmatch(r"(.)\1+", inner):  # 全同字符，如 AAAAAAAA
+        return True
+    return any(mark in inner for mark in _PLACEHOLDER_MARKS)
 
 
 def _convergence_stalled(stats: dict, last_open: int, last_refuted: int,
@@ -1206,6 +1296,14 @@ class Crew:
         blocked_sig: tuple[str, str] | None = None
         blocked_streak = 0
         suppressed_tools: set[str] = set()
+        # [fix 2026-11-13 P6] submit 只按「工具+参数」摘除，不整工具摘除：
+        # 旧逻辑同值被拦 2 次就把 submit 从工具面拿走，判错的候选又逼着提交 → 死锁到收口
+        # （实测 vigenere：判错 1 次后 submit 被摘、done 被候选闸门拦，100s/900s 就结束）。
+        suppressed_sigs: set[tuple[str, str]] = set()
+        # 已被平台判错的候选值：done 闸门不再拿它们逼提交（见 _REFUTED_DONE_GATE）。
+        refuted_values: set[str] = set()
+        # 裸 token 自动补 flag{} 只做一次（见 _WRAP_RETRY_HINT）。
+        wrap_retried = False
         # 同参同结果空转计数（P2-D 2026-11-12）：sig → (最近一次结果文本, 连续相同次数)
         dup_results: dict[tuple[str, str], tuple[str, int]] = {}
 
@@ -1415,6 +1513,46 @@ class Crew:
                         args = {}
                     tool_id = call.get("id") or f"call_{rnd}_{name}"
 
+                    # [fix 2026-11-13 P6] 按「工具+参数」摘除的动作在派发前直接拦下（不执行、不烧平台额度）。
+                    # submit 被摘的只是那个**已判错的值**，换候选值仍可提交；其它工具行为与旧版一致。
+                    sig_now = _action_signature(name, args)
+                    if sig_now in suppressed_sigs:
+                        text = (
+                            "[重复动作断路器] 这个「工具+参数」组合已经被摘除，同样调用不会再产生新信息。\n"
+                            "submit 请换一个**不同的候选值/题号**（submit 工具本身仍可用）；"
+                            "其它动作请改实质参数或换目标。"
+                        )
+                        if sig_now == blocked_sig:
+                            blocked_streak += 1
+                        else:
+                            blocked_sig, blocked_streak = sig_now, 1
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "gate", "step": rnd,
+                             "note": f"重复动作断路器：已摘除组合仍被调用（{blocked_streak} 次）"},
+                        )
+                        self.store.append_transcript(
+                            challenge_id,
+                            {"role": "coordinator", "step": rnd, "tool": name,
+                             "args": args, "result": text[:2000]},
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tool_id,
+                             "content": _untrusted(text[:MAX_TOOL_TEXT])}
+                        )
+                        self.on_event("tool", {"name": name, "args": args, "result": text})
+                        if blocked_streak >= REPEAT_BLOCK_LIMIT:
+                            stop = True
+                            reason = "action_loop"
+                            self.store.append_transcript(
+                                challenge_id,
+                                {"role": "gate", "step": rnd,
+                                 "note": f"重复动作断路器：已摘除组合连续 {blocked_streak} 次被调用，"
+                                         f"收口 action_loop"},
+                            )
+                            break
+                        continue
+
                     if name == "delegate":
                         role_name = str(args.get("role") or "").strip()
                         # objective 为主；task 是旧格式兼容（模型偶发沿用旧字段名）
@@ -1498,6 +1636,35 @@ class Crew:
                             )
                         else:
                             text, accepted = solver._submit(args, challenge_id)
+                            answer_val = str(args.get("answer") or args.get("flag") or "").strip()
+                            # [fix 2026-11-13 P6] 平台判错/去重拦下的值记入 refuted：done 闸门
+                            # 不再拿它逼 submit（否则同值必再判错 + 被去重拦，僵住到预算烧完）。
+                            if not accepted and answer_val and "[提交失败]" not in text:
+                                refuted_values.add(answer_val)
+                            # [fix 2026-11-13 P7] 裸 token 自动补一次 flag{} 包裹再交：
+                            # 实测 rsa15 把 md5 明文直交 3 次全判错，从没试过包裹形式。
+                            if (
+                                not accepted
+                                and not wrap_retried
+                                and answer_val
+                                and "[提交失败]" not in text
+                                and _needs_flag_wrapper(answer_val)
+                            ):
+                                wrap_retried = True
+                                wrapped = "flag{" + answer_val + "}"
+                                refuted_values.add(wrapped)
+                                _text2, _acc2 = solver._submit(
+                                    {**args, "answer": wrapped}, challenge_id
+                                )
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "gate", "step": rnd,
+                                     "note": f"提交格式规范化：裸值自动补 flag{{}} 重试一次（accepted={_acc2}）"},
+                                )
+                                if _acc2:
+                                    text, accepted = _text2, True
+                                else:
+                                    text = text + _WRAP_RETRY_HINT
                             if accepted:
                                 submitted = True
                                 reason = "flag_accepted"
@@ -1573,6 +1740,7 @@ class Crew:
                                 calls_left=_left_calls, tokens_left=_left_tok,
                                 open_count=int(_lstat.get("open") or 0),
                                 candidates=_ledger_candidates(ledger),
+                                refuted=sorted(refuted_values),
                             )
                             if not stop:
                                 done_blocks += 1
@@ -1596,23 +1764,41 @@ class Crew:
                     # [接手 2026-11-10] 重复被拦动作断路器（实测同一错 flag 被连交 34~39 次）。
                     # 只对「被守卫拦下的动作」计数：正常动作即使重复也不在这里拦（账本另有去重）。
                     sig = _action_signature(name, args)
-                    if _looks_blocked(text):
+                    # [fix 2026-11-13 P8] done 被闸门拦下不交给断路器计数：闸门自身有界（最多
+                    # 2×MAX_DONE_BLOCKS 次），再把 done 摘掉只会让收口原因变成 action_loop，掩盖真实语义。
+                    if _looks_blocked(text) and name != "done":
                         if sig == blocked_sig:
                             blocked_streak += 1
                         else:
                             blocked_sig, blocked_streak = sig, 1
+                        # [fix 2026-11-13 P6] submit 只摘「这个值」，不摘整个工具：
+                        # 判错候选 + submit 被摘 + done 被候选闸门拦 = 死锁（vigenere 实证）。
                         if blocked_streak >= REPEAT_BLOCK_STREAK and name not in suppressed_tools:
-                            suppressed_tools.add(name)
-                            messages.append({
-                                "role": "user",
-                                "content": _REPEAT_BLOCK_HINT.format(name=name, n=blocked_streak),
-                            })
-                            self.store.append_transcript(
-                                challenge_id,
-                                {"role": "gate", "step": rnd,
-                                 "note": f"重复动作断路器：{name} 连续 {blocked_streak} 次被拦，已移出工具面"},
-                            )
-                        if blocked_streak >= REPEAT_BLOCK_LIMIT:
+                            if name == "submit":
+                                if sig not in suppressed_sigs:
+                                    suppressed_sigs.add(sig)
+                                    messages.append({
+                                        "role": "user",
+                                        "content": _REPEAT_VALUE_HINT.format(n=blocked_streak),
+                                    })
+                                    self.store.append_transcript(
+                                        challenge_id,
+                                        {"role": "gate", "step": rnd,
+                                         "note": f"重复动作断路器：submit 该值已移出工具面"
+                                                 f"（连续 {blocked_streak} 次被拦，换值仍可交）"},
+                                    )
+                            else:
+                                suppressed_tools.add(name)
+                                messages.append({
+                                    "role": "user",
+                                    "content": _REPEAT_BLOCK_HINT.format(name=name, n=blocked_streak),
+                                })
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "gate", "step": rnd,
+                                     "note": f"重复动作断路器：{name} 连续 {blocked_streak} 次被拦，已移出工具面"},
+                                )
+                        if blocked_streak >= REPEAT_BLOCK_LIMIT and name != "submit":
                             stop = True
                             reason = "action_loop"
                             messages.append({

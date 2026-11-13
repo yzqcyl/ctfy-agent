@@ -217,19 +217,19 @@ def main() -> int:
     check("预算事件已发出",
           any(k == "budget_plan" for k, _ in events), str([k for k, _ in events])[:200])
 
-    # ---------- 3) 工具面真的少了 submit ----------
+    # ---------- 3) 工具面：submit 仍可见（按「值」摘除而非按工具摘除）----------
     names_after = crew._coordinator_tools({"submit"})
     check("被摘工具不在工具面", all((t.get("function") or {}).get("name") != "submit" for t in names_after))
     names_all = crew._coordinator_tools()
     check("不传 suppressed 时工具面不变",
           any((t.get("function") or {}).get("name") == "submit" for t in names_all))
-    # 断言第 2 轮起模型确实看不到 submit（tools_history 由假 LLM 记录）
-    # 时序：第 1 轮真提交→平台判错（不算拦截）；第 2 次同值→闸门拦（streak=1）；
-    # 第 3 次同值→streak=2 触发摘除（该轮工具面已发出）；第 4 轮起工具面才真的没有 submit。
+    # [fix 2026-11-13 P6] submit 改为「按值摘除」：判错的候选不许重交，但换一个候选值仍必须能提交。
+    # 旧行为（整个 submit 从工具面消失）在「候选判错 + done 被候选闸门拦」时会死锁（vigenere 实证）。
     seen = [names for names in llm.tools_history]
     check("首轮还能看见 submit", any("submit" in n for n in seen[:1]))
-    check("触发摘除后轮次看不到 submit", all("submit" not in n for n in seen[3:]),
+    check("按值摘除后 submit 仍在工具面（换值可继续）", all("submit" in n for n in seen[1:]),
           str(seen))
+    check("转录记了该值被摘除", "该值已移出工具面" in tr, tr[-400:])
 
     # ---------- 4) 透明性：动作不重复时不介入 ----------
     # 每次都是不同答案：即使平台都判错，也不该被当成「重复动作」拦（判错 ≠ 被守卫拦下）。

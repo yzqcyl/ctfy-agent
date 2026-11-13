@@ -19,6 +19,7 @@ from ctfy_agent.crew import (  # noqa: E402
     MAX_DONE_BLOCKS,
     _convergence_stalled,
     _done_gate,
+    _needs_flag_wrapper,
 )
 
 
@@ -39,7 +40,44 @@ def case_done_gate(tmp: Path) -> None:
     assert _done_gate(False, 1, [], 0) == ("协调结束。", True, False)
     assert _done_gate(False, 0, ["FLAG{x}"], 0) == ("协调结束。", True, False)
 
-    label = "候选闸门：零候选拦 done 至多 2 次；有提交/有尝试/有证据则放行"
+    # [fix 2026-11-13 P6] 候选被平台判错（refuted）后不再逼提交，改逼「换证据」；
+    # 未判错的候选仍走候选闸门（逼先 verify/submit）。
+    text, stop, no_cand = _done_gate(
+        False, 1, ["FLAG{o}"], 0, calls_left=200, tokens_left=300_000,
+        candidates=["flag{A}"], refuted=["flag{A}"],
+    )
+    assert stop is False and no_cand is False and "判错" in text, (stop, no_cand, text)
+    text, stop, no_cand = _done_gate(
+        False, 1, [], 0, calls_left=200, tokens_left=300_000,
+        candidates=["flag{B}"], refuted=["flag{A}"],
+    )
+    assert stop is False and "候选 flag" in text, (stop, text)
+
+    # [fix 2026-11-13 P8] 零候选但预算充足：上限后仍要继续拦（最多 2×max_blocks），压住早停。
+    text, stop, _ = _done_gate(False, 0, [], MAX_DONE_BLOCKS, calls_left=200, tokens_left=300_000)
+    assert stop is False and "预算闸门" in text, (stop, text)
+    text, stop, no_cand = _done_gate(
+        False, 0, [], 2 * MAX_DONE_BLOCKS, calls_left=200, tokens_left=300_000
+    )
+    assert stop is True and no_cand is True, (stop, no_cand)
+
+    # [fix 2026-11-13 P7] 裸 token 一次性补 flag{} 的判定：只认机器 token，不认普通单词。
+    assert _needs_flag_wrapper("2f1d580c50468481f3082c6b5bfd869d") is True
+    assert _needs_flag_wrapper("AAAAAAAAAAAAAAAAAAAA") is True  # base64/大写 hex 形态
+    assert _needs_flag_wrapper("guess_one") is False
+    assert _needs_flag_wrapper("flag{abc}") is False
+    assert _needs_flag_wrapper("short") is False
+
+    # [fix 2026-11-13 P9] 占位/诱饵候选过滤：不再把假 flag 当真候选逼提交。
+    from ctfy_agent.crew import _is_placeholder_candidate  # noqa: PLC0415
+    for decoy in ("flag{AAAAAAAAAAAAAAAA}", "DASCTF{fakeFAKEfAkeFakeflag}",
+                  "FLAG{you_may_need_this}", "SCTF{fake...}", "flag{test_test_test}"):
+        assert _is_placeholder_candidate(decoy) is True, decoy
+    for real in ("flag{office_easy_cracked}", "DASCTF{Hello_glbONaSci!}",
+                 "flag{mrctf_vigenere_crypto_crack_man}", "CTF2{9f3a1c}"):
+        assert _is_placeholder_candidate(real) is False, real
+
+    label = "候选闸门：零候选拦 done 至多 2 次；判错候选改逼换证据；裸 token 补包裹判定；占位候选过滤"
     if callable(reporter):
         reporter(label)
     else:
