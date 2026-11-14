@@ -154,6 +154,11 @@ def test_generate(tmp: pathlib.Path) -> None:
     result = pwn_local.generate_repro(elf, tmp / "repro")
     names = {pathlib.Path(item).name for item in result["files"]}
     ok("生成 4 个文件", names == {"Dockerfile", "run.sh", "poc.py", "notes.md"}, names)
+    # Windows 上必须写 LF：run.sh 的 shebang 不能被翻成 "#!/usr/bin/env bash\r"
+    raw_run = (tmp / "repro" / "run.sh").read_bytes()
+    ok("run.sh 是 LF 换行（容器内可执行）",
+       b"\r\n" not in raw_run and raw_run.startswith(b"#!/usr/bin/env bash\n"),
+       raw_run[:40])
     dockerfile = (tmp / "repro" / "Dockerfile").read_text(encoding="utf-8")
     ok("Dockerfile 用满足最高 GLIBC 的镜像", "ubuntu:24.04" in dockerfile, dockerfile[:120])
     ok("Dockerfile 装 socat/libc6-dbg", "socat" in dockerfile and "libc6-dbg" in dockerfile)

@@ -426,12 +426,19 @@ def fetch_challenge_files(platform, store, challenge_id: str, *, competition_id:
             rec = {**entry, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
         # P2-19：主通道失败 → 本地缓存/镜像兜底；成功路径顺手写缓存
         name = _sanitize_filename(str(entry.get("name") or ""), "attachment.bin")
-        target = root / name
+        # 内容模式下实际落盘名可能来自响应 filename（rec["name"]），缓存必须指向真实文件，
+        # 否则 cache_put 读不到、OSError 被静默吞掉 → 缓存永远不会写（审计实测）
+        actual = _sanitize_filename(str(rec.get("name") or name), name)
+        target = root / actual
         if not rec.get("ok"):
             rec = fallback_fetch(entry, target, primary_error=str(rec.get("error") or ""),
                                  mirrors=mirrors, timeout=timeout, opener=opener)
         elif not rec.get("skipped"):
-            cache_put(entry, target)
+            cache_result = cache_put(entry, target)
+            if not cache_result.get("ok") and on_event:
+                on_event("attachments_cache_error",
+                         {"challenge_id": challenge_id, "name": actual,
+                          "error": str(cache_result.get("error"))[:160]})
         records.append(rec)
         if on_event:
             on_event("attachment", {"challenge_id": challenge_id, **rec})
@@ -463,8 +470,9 @@ def _cache_dir() -> Path:
 
 
 def _cache_key(entry: dict) -> str:
+    # competition 分区：同名/同 file_id 跨赛事不串缓存
     raw = "|".join(str(entry.get(key) or "") for key in
-                   ("challenge_id", "file_id", "name"))
+                   ("competition_id", "challenge_id", "file_id", "name"))
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
 
 
@@ -502,9 +510,13 @@ def cache_get(entry: dict, target: Path) -> dict:
         expected = meta.get("bytes")
         if expected is not None and data_path.stat().st_size != int(expected):
             return {"ok": False, "error": "缓存大小不符，视为未命中"}
+        data = data_path.read_bytes()
+        expected_sha = str(meta.get("sha256") or "")
+        if expected_sha and hashlib.sha256(data).hexdigest() != expected_sha:
+            return {"ok": False, "error": "缓存 sha256 不符，视为未命中"}
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data_path.read_bytes())
-        sha = hashlib.sha256(target.read_bytes()).hexdigest()
+        target.write_bytes(data)
+        sha = hashlib.sha256(data).hexdigest()
         return {**entry, "ok": True, "name": target.name, "path": target.name,
                 "bytes": target.stat().st_size, "sha256": sha,
                 "source": "cache", "url_origin": "cache"}

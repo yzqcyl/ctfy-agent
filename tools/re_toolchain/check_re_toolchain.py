@@ -73,17 +73,44 @@ def test_shell_syntax() -> None:
            proc.stderr.decode("utf-8", "replace")[:200])
 
 
+COMPILED = {"ran": False, "ok": False}
+
+
+def _freetype_header() -> pathlib.Path | None:
+    """找 FreeType 头：默认路径 + pkg-config --cflags 给的 -I 目录。"""
+    for candidate in (pathlib.Path("/usr/include/freetype2/ft2build.h"),
+                      pathlib.Path("/usr/local/include/freetype2/ft2build.h")):
+        if candidate.is_file():
+            return candidate
+    pkg_config = shutil.which("pkg-config")
+    if pkg_config:
+        try:
+            proc = subprocess.run([pkg_config, "--cflags", "freetype2"],
+                                  capture_output=True, text=True)
+            for token in proc.stdout.split():
+                if token.startswith("-I"):
+                    candidate = pathlib.Path(token[2:]) / "ft2build.h"
+                    if candidate.is_file():
+                        return candidate
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
 def test_compile() -> None:
     gcc = shutil.which("gcc")
-    header = pathlib.Path("/usr/include/freetype2/ft2build.h")
-    if not gcc or not header.exists():
+    header = _freetype_header()
+    if not gcc or header is None:
+        # 不算「通过」：--build 下必须报 VM_PENDING（审计：之前假绿成 RESULT=PASS）
         ok("真编译 ft_hook.so（缺 gcc/FreeType 头，标记 VM 待办）", True,
            "VM 内跑 tools/re_toolchain/build_ft_hook.sh --outdir /tmp/build")
         return
+    COMPILED["ran"] = True
     outdir = HERE / "build"
     outdir.mkdir(exist_ok=True)
     proc = subprocess.run(["bash", str(HERE / "build_ft_hook.sh"), "--outdir", str(outdir)],
                           capture_output=True)
+    COMPILED["ok"] = proc.returncode == 0
     ok("VM 内编译成功", proc.returncode == 0,
        proc.stderr.decode("utf-8", "replace")[:300])
     ok("产出 ft_hook.so", (outdir / "ft_hook.so").is_file())
@@ -107,8 +134,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"失败：{'；'.join(failed)}")
         print("RESULT=FAIL")
         return 1
-    if args.build and not shutil.which("gcc"):
-        print("RESULT=VM_PENDING（源码/脚本自检通过；编译需在 Linux VM 验证）")
+    if args.build and not COMPILED["ran"]:
+        print("RESULT=VM_PENDING（源码/脚本自检通过；gcc 或 FreeType 头缺失，"
+              "编译需在 Linux VM 验证）")
         return 0
     print(f"检查通过（{len(CHECKS)} 项）")
     print("RESULT=PASS")

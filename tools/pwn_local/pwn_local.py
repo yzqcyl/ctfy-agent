@@ -36,6 +36,8 @@ def inspect_elf(path: str | pathlib.Path) -> dict:
     data = _read(pathlib.Path(path))
     if data[:4] != b"\x7fELF":
         raise ValueError(f"不是 ELF：{path}")
+    if len(data) < 52:  # ELF64 头至少 64 字节，ELF32 52 字节；截断文件不能 struct.unpack
+        raise ValueError(f"ELF 文件被截断（{len(data)} 字节）：{path}")
     bits = 64 if data[4] == 2 else 32
     endian = "<" if data[5] == 1 else ">"
     machine = KNOWN_MACHINES.get(struct.unpack_from(endian + "H", data, 18)[0], "unknown")
@@ -227,7 +229,9 @@ def generate_repro(binary: str | pathlib.Path, out_dir: str | pathlib.Path) -> d
     written = []
     for name, content in files.items():
         target = out / name
-        target.write_text(content, encoding="utf-8")
+        # newline="\n"：Windows 默认把 \n 翻成 CRLF，run.sh 的 shebang 会变成
+        # "#!/usr/bin/env bash\r" → 容器里 bash run.sh 直接失败（审计实测）。
+        target.write_text(content, encoding="utf-8", newline="\n")
         written.append(str(target))
     return {"binary": str(path), "report": report, "image": image,
             "files": written, "out_dir": str(out)}
