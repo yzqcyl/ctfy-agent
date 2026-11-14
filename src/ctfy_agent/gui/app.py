@@ -520,7 +520,7 @@ class App:
         self.tv_solved.grid(row=0, column=0, sticky="nsew")
         self.vsb_solved.grid(row=0, column=1, sticky="ns")
         self.hsb_solved.grid(row=1, column=0, sticky="ew")
-        self.tv_solved.bind("<Double-Button-1>", lambda e: self._gen_writeup_selected())
+        self.tv_solved.bind("<Double-Button-1>", self._on_solved_double)
         # 一级只放日期；展开某个日期时才去读当天那些题的 transcript 算「解出/停止时间」
         self.tv_solved.bind("<<TreeviewOpen>>", self._on_solved_open)
         self.skel_solved = theme.Skeleton(lcard.body, rows=7, row_height=22, gap=9)
@@ -617,6 +617,9 @@ class App:
                              text=f"{day} · {len(runs)} 个运行（展开加载当天题目）",
                              open=False, tags=("date",))
             self._day_by_iid[node] = day
+            # 必须给一个占位子节点：Tk 只有「有子节点」才画 ▸ 箭头，否则用户根本点不开
+            tv.insert(node, "end", text="（展开加载当天题目…）",
+                      values=("", "", "", ""), tags=("stopped",))
         tv.tag_configure("date", font=theme.heading_font(10),
                          foreground=theme.TEXT_MUTED)
         tv.tag_configure("solved", foreground=theme.SUCCESS)
@@ -627,6 +630,19 @@ class App:
         else:
             self.lbl_solved.set("runs/ 下还没有可复现的记录（跑完一题后点「刷新已解出」）")
         self._solved_loading(False)
+
+    def _on_solved_double(self, _evt=None) -> None:
+        """双击：日期行 → 展开加载当天；题目行 → 生成/查看复现。"""
+        try:
+            iid = self.tv_solved.focus()
+        except tk.TclError:
+            return
+        day = self._day_by_iid.get(iid or "")
+        if day:
+            if day not in self._day_loaded:
+                self._load_day(iid, day)
+            return
+        self._gen_writeup_selected()
 
     def _on_solved_open(self, _evt=None) -> None:
         """用户展开某个日期：此时才去加载当天题目（解析 state.json + 读 transcript）。"""
@@ -646,18 +662,12 @@ class App:
         tv.insert(iid, "end", text="加载当天题目…", values=("", "读取中…", "", ""),
                   tags=("stopped",))
 
-        if not background:
-            self._fill_day(day, iid, self._load_day_rows(day))
-            return
-
-        def _bg() -> None:
-            items = self._load_day_rows(day)
-            try:
-                self.after(0, self._fill_day, day, iid, items)
-            except (tk.TclError, RuntimeError, AttributeError):  # 窗口已关 / selftest 桩对象
-                pass
-
-        threading.Thread(target=_bg, name="load-day", daemon=True).start()
+        # [抢修 2026-11-10] 原实现用「后台线程 + self.after(0, ...)」回主线程，
+        # 实测在真 mainloop 下 after 从子线程调用会抛 RuntimeError 被吞掉 →
+        # 界面永远停在「加载当天题目…」（用户看到的「展开不了」）。
+        # 一天通常 20~40ms，直接主线程加载；只解析当天那几个 run，仍然不是全量加载。
+        items = self._load_day_rows(day)
+        self._fill_day(day, iid, items)
 
     def _load_day_rows(self, day: str) -> list[dict]:
         """解析「这一天」涉及的 run：只留解出/已停止，并读 transcript 取精确时间。

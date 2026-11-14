@@ -268,7 +268,9 @@ def case_app_integration() -> None:
         assert app.tv_solved.item(tops[0], "text").startswith(rid_day), app.tv_solved.item(tops[0], "text")
         assert "展开加载当天题目" in app.tv_solved.item(tops[0], "text")
         # 一级只有日期：题目默认一个都不加载（这是「不要一次性载入全部已解题目」的关键）
-        assert app.tv_solved.get_children(tops[0]) == (), "日期节点初始不该有子节点"
+        kids0 = app.tv_solved.get_children(tops[0])
+        # 必须有 1 个占位子节点：Tk 只有「有子节点」才画 ▸ 展开箭头（否则点不开）
+        assert len(kids0) == 1 and "展开加载" in app.tv_solved.item(kids0[0], "text"), kids0
         assert app.tv_solved.item(tops[0], "open") in (0, "0", False)
         assert "个日期" in app.lbl_solved.get()
         # 展开当天 → 同步加载（测试里 background=False）→ 真读 state.json + transcript
