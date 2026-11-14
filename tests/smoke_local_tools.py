@@ -188,6 +188,11 @@ def _run(tmp: pathlib.Path) -> int:
         check("shell 守卫拦 env", bool(hint) and "set" in hint, str(hint))
         hint = LocalTools._windows_shell_guard("find . -name '*.zip'")
         check("shell 守卫拦 find", bool(hint) and "dir /s /b" in hint, str(hint))
+        # P20：本地没有 binutils，模型改道 elfpeek/hexpeek，而不是反复试 objdump/od
+        hint = LocalTools._windows_shell_guard("od -An -c attachment.md")
+        check("shell 守卫拦 od", bool(hint) and "elfpeek" in hint, str(hint))
+        hint = LocalTools._windows_shell_guard("objdump -d ./chall")
+        check("shell 守卫拦 objdump", bool(hint) and "elfpeek" in hint, str(hint))
 
     print()
     if FAILS:

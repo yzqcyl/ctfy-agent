@@ -2730,6 +2730,18 @@ class LocalTools:
             if "env" in missing:
                 hint += "；列环境变量用 `set`（cmd 内置）"
             notes.append(hint)
+        # [fix 2026-11-13 P20] 本机 Windows 没有的 Linux 二进制工具：模型按 Linux 习惯敲
+        # objdump/readelf/strings/od/gdb，cmd 直接报「is not recognized」，白丢一步。
+        # 镜像（CI 构建的 linux 容器）里 binutils/gdb 是有的，但本地跑批要能代表镜像行为，
+        # 所以这里把模型导向我们自己的等价工具（elfpeek / hexpeek / Python 读文件），
+        # 而不是让它反复试不存在的命令。实测 round3 出现 `od -An -c attachment.md` 直接失败。
+        nt_missing = ("objdump", "readelf", "nm", "strings", "od", "gdb", "ltrace", "strace")
+        gap = sorted({c for c in cmds if c in nt_missing})
+        if gap:
+            notes.append(
+                f"本机（Windows）没有 {'/'.join(gap)}；反汇编/节表/符号/字符串用 elfpeek"
+                "（sections/disasm/gadgets/strings），字节查看用 hexpeek 或 Python 读文件——"
+                "不要反复试这些 Linux 工具（镜像里有，但本机没有）")
         if "python3" in cmds:
             notes.append("Windows 上解释器叫 `python`（不是 python3）")
         if "<<" in outside:
