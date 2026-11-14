@@ -918,10 +918,16 @@ class Crew:
             pass
         # [2026-11-13 CTFY 数据面] 实例释放后本地端口桥没有意义了：顺手停掉 wireproxy
         # 并撤掉 socket 改写，避免下一题拿到旧映射（同一进程串行跑全量时尤其重要）。
+        # [2026-11-14 supervisor] 桥按实例 id 分键：只停本题那条，否则并发跑多题时
+        # 一题的收尾会把别的题的隧道一起杀掉（表现为「另一题突然连不上」）。
         try:
             from .netbridge import stop_bridge  # noqa: PLC0415 - 只有收尾路径需要
 
-            stop_bridge()
+            instance_id = str((last or {}).get("instance_id") or "")
+            if instance_id:
+                stop_bridge(instance_id)
+            else:
+                stop_bridge()  # 老状态没记实例 id：退回旧的全停语义
         except Exception:  # noqa: BLE001 - 清理尽力而为
             pass
 

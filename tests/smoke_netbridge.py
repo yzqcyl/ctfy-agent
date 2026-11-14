@@ -299,6 +299,116 @@ def main() -> int:
     except netbridge.BridgeError as exc:
         check("指定根目录下找不到 wireproxy → BridgeError", "wireproxy" in str(exc), str(exc))
 
+    # ---- 5e) 分属主映射：supervisor 并发多题时一条桥的 stop 不能清掉别人的映射 ----
+    portmap.restore()
+    portmap.install({("a.internal", 100): ("127.0.0.1", 19101)}, owner="inst-a")
+    portmap.install({("b.internal", 200): ("127.0.0.1", 19102)}, owner="inst-b")
+    merged = portmap.current()
+    check("两个属主映射并存", ("a.internal", 100) in merged and ("b.internal", 200) in merged, str(merged))
+    portmap.clear("inst-a")
+    merged = portmap.current()
+    check("clear(owner=a) 只撤 a", ("a.internal", 100) not in merged and ("b.internal", 200) in merged,
+          str(merged))
+    portmap.install({("b.internal", 200): ("127.0.0.1", 99102)}, owner="inst-b")
+    check("同属主 install 原地替换（不影响他人）",
+          portmap.current()[("b.internal", 200)] == ("127.0.0.1", 99102), str(portmap.current()))
+    portmap.clear()
+    check("clear() 老语义 = 全清", portmap.current() == {}, str(portmap.current()))
+
+    # ---- 5f) 多桥并存：supervisor 并发跑两道网络题，两条隧道都要在 ----
+    def start_one(host: str, key: str):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(4)
+            port = holder.getsockname()[1]
+            original = netbridge.build_plan
+            netbridge.build_plan = lambda vpn, svcs, inbound_ports=None, claimed=None, estate_names=None, **kw: (  # type: ignore[assignment]
+                "\n".join([vpn, ""]),
+                [{"kind": "tcp", "target": f"{host}:1337", "local": f"127.0.0.1:{port}"}],
+            )
+            try:
+                one = netbridge.LocalBridge(str(work / "wireproxy-not-needed.exe"), work, key=key)
+                one.start(VPN_CONF, [], launch=False)
+            finally:
+                netbridge.build_plan = original  # type: ignore[assignment]
+            return one, port
+
+    try:
+        bridge_a, port_a = start_one("multi-a.internal", "inst-a")
+        bridge_b, port_b = start_one("multi-b.internal", "inst-b")
+        both = portmap.current()
+        check("两桥映射同时存在（并发多题）",
+              ("multi-a.internal", 1337) in both and ("multi-b.internal", 1337) in both, str(both))
+        check("同实例重复 start 不会误清别人", both[("multi-a.internal", 1337)][1] == port_a,
+              str(both.get(("multi-a.internal", 1337))))
+        bridge_a.stop()
+        after = portmap.current()
+        check("停 A 只撤 A 的映射", ("multi-a.internal", 1337) not in after
+              and ("multi-b.internal", 1337) in after, str(after))
+        bridge_b.stop()
+        check("两桥都停后映射为空", portmap.current() == {}, str(portmap.current()))
+    finally:
+        portmap.restore()
+
+    # ---- 5g) 多桥隔离：每条桥的配置/日志在 work_dir/<key>/ 下（否则互相覆盖私钥配置） ----
+    try:
+        b1 = netbridge.LocalBridge(str(work / "wireproxy-not-needed.exe"), work, key="inst-a")
+        b2 = netbridge.LocalBridge(str(work / "wireproxy-not-needed.exe"), work, key="inst-b")
+        check("不同 key 的 bridge 工作目录隔离", b1.work_dir != b2.work_dir, str((b1.work_dir, b2.work_dir)))
+        check("bridge 目录名带 key", b1.work_dir.name == "inst-a" and b2.work_dir.name == "inst-b",
+              str((b1.work_dir.name, b2.work_dir.name)))
+        b3 = netbridge.LocalBridge(str(work / "wireproxy-not-needed.exe"), work, key="../../evil key")
+        check("key 里的路径字符被清洗", ".." not in b3.work_dir.name and "/" not in b3.work_dir.name,
+              b3.work_dir.name)
+    except Exception as exc:  # noqa: BLE001
+        check("work_dir 按 key 隔离", False, repr(exc))
+
+    # ---- 5h) 私钥脱敏：异常/日志尾巴不能把 WireGuard 私钥带进日志 ----
+    sample = ("[Interface]\nPrivateKey = SUPER_SECRET_KEY=\nAddress = 172.16.9.2/32\n"
+              "Endpoint = 1.2.3.4:51820\n[Peer]\nPresharedKey = ALSO_SECRET=\n")
+    masked = netbridge.redact_secrets(sample)
+    check("脱敏去掉 PrivateKey 值", "SUPER_SECRET_KEY" not in masked, masked)
+    check("脱敏去掉 PresharedKey 值", "ALSO_SECRET" not in masked, masked)
+    check("脱敏去掉 Endpoint 值", "1.2.3.4" not in masked, masked)
+    check("脱敏保留结构行（便于排障）",
+          "[Interface]" in masked and "Address = 172.16.9.2/32" in masked, masked)
+    try:
+        netbridge.fetch_vpn_config("https://127.0.0.1:9/api/v1/mcp/", "tok", "iid-1", "comp", timeout=1.0)
+        check("取 VPN 配置失败抛 BridgeError", False)
+    except netbridge.BridgeError as exc:
+        check("取 VPN 配置失败抛 BridgeError 且不含私钥", "PrivateKey" not in str(exc), str(exc))
+
+    # ---- 5i) 起桥失败 → 注册表不留半条桥（先登记后启动，失败要摘掉） ----
+    old_fetch = netbridge.fetch_vpn_config
+    netbridge.fetch_vpn_config = lambda *a, **kw: VPN_CONF  # type: ignore[assignment]
+    try:
+        cfg = Cfg({"local_bridge": True, "wireproxy_path": str(work / "definitely_missing.exe"),
+                   "local_bridge_dir": str(work)})
+        try:
+            netbridge.start_bridge(cfg, {"id": "inst-fail", "surface": {"services": [
+                {"service_type": "tcp", "host": "abc.internal", "port": 1337, "access": "vpn"}]}},
+                "comp", key="inst-fail")
+            check("起桥失败 → BridgeError", False)
+        except netbridge.BridgeError:
+            check("起桥失败 → BridgeError", True)
+        check("起桥失败后注册表不残留", netbridge.active_bridge("inst-fail") is None)
+    finally:
+        netbridge.fetch_vpn_config = old_fetch  # type: ignore[assignment]
+        netbridge.stop_bridge()
+
+    # ---- 5j) 跨属主同名服务冲突：不静默覆盖，保留先装者并可查询 ----
+    portmap.restore()
+    portmap.install({("dup.internal", 80): ("127.0.0.1", 19001)}, owner="inst-a")
+    portmap.install({("dup.internal", 80): ("127.0.0.1", 19002)}, owner="inst-b")
+    kept = portmap.current()[("dup.internal", 80)]
+    check("同名服务保留先装者的映射", kept == ("127.0.0.1", 19001), str(kept))
+    check("冲突可查询（供上层提示照抄本地端口）",
+          any(c["key"][0] == "dup.internal" for c in portmap.conflicts()), str(portmap.conflicts()))
+    portmap.clear()
+    check("冲突记录随清空复位", portmap.conflicts() == [], str(portmap.conflicts()))
+    portmap.restore()
+
     print()
     if FAILS:
         print(f"RESULT=FAIL ({len(FAILS)} 项): " + "; ".join(FAILS))

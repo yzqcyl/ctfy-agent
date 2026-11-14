@@ -21,6 +21,13 @@ import threading
 
 _LOCK = threading.RLock()  # patched socket 函数会被多线程调用（集群-A 并行路）
 _MAP: dict[tuple[str, int], tuple[str, int]] = {}
+# 分属主映射：supervisor 并发跑多道网络题时，每条隧道映射各自的实例服务，
+# 一个实例释放/换实例只能撤掉自己的映射，不能把别人的一起清掉（旧实现是全局单表）。
+_OWNERS: dict[str, dict[tuple[str, int], tuple[str, int]]] = {}
+_ORDER: list[str] = []            # 按 install 顺序合并（冲突时先到者保留）
+_DNS_OWNERS: dict[str, int] = {}  # 每个属主的内网 DNS 本地端口
+_DNS_PORTS: list[int] = []        # 所有在用 DNS 本地端口（按 owner 顺序，查询逐个试）
+_CONFLICTS: list[dict] = []       # 跨属主同 host:port 冲突记录（不静默覆盖）
 _ORIG: dict[str, object] = {}
 _INSTALLED = False
 _DNS_PORT = 0
@@ -94,28 +101,33 @@ def _parse_answers(data: bytes) -> tuple[int, list[str]]:
     return rcode, ips
 
 
-def _dns_resolve(name: str) -> list[str]:
-    """通过隧道里的平台 DNS 解析名字（无连接 UDP，失败返回空列表）。"""
-    port = _DNS_PORT
-    if not port:
+def _dns_resolve(name: str, ports: list[int] | None = None) -> list[str]:
+    """通过隧道里的平台 DNS 解析名字（无连接 UDP，失败返回空列表）。
+
+    并发多题时每实例各有一条 DNS 隧道，端口不同：按 owner 顺序**逐个试**，
+    不能只认最后一个（否则 A 题的 *.internal 可能走了 B 实例的解析器）。
+    """
+    candidates = list(ports or _DNS_PORTS)
+    if not candidates:
         return []
     txid = (int.from_bytes(name.encode("utf-8", "ignore")[:2], "big") ^ 0x5A5A) & 0xFFFF
     query = _build_query(name, txid)
-    for _attempt in range(2):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.settimeout(_DNS_TIMEOUT)
-            sock.sendto(query, ("127.0.0.1", port))
-            data, _addr = sock.recvfrom(2048)
-        except OSError:
-            continue
-        finally:
-            sock.close()
-        rcode, ips = _parse_answers(data)
-        if ips:
-            return ips
-        if rcode == 3:  # NXDOMAIN：确定不存在，不必重试
-            return []
+    for port in candidates:
+        for _attempt in range(2):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.settimeout(_DNS_TIMEOUT)
+                sock.sendto(query, ("127.0.0.1", int(port)))
+                data, _addr = sock.recvfrom(2048)
+            except OSError:
+                continue
+            finally:
+                sock.close()
+            rcode, ips = _parse_answers(data)
+            if ips:
+                return ips
+            if rcode == 3:  # NXDOMAIN：确定不存在，换下一个解析器（不同实例的解析域不同）
+                break
     return []
 
 
@@ -133,7 +145,7 @@ def _gai(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 - 对齐
         protocol = proto or (socket.IPPROTO_UDP if socktype == socket.SOCK_DGRAM else socket.IPPROTO_TCP)
         return [(socket.AF_INET, socktype, protocol, "", mapped)]
     # 未在「已下发服务」里：内网域名先问平台 DNS（比等系统解析器超时快，也不会误报不可达）
-    if host and not isinstance(host, (bytes, bytearray)) and _DNS_PORT and family in (0, socket.AF_INET):
+    if host and not isinstance(host, (bytes, bytearray)) and _DNS_PORTS and family in (0, socket.AF_INET):
         name = str(host)
         if not _is_ip_literal(name) and _norm_host(name).endswith(_DNS_SUFFIXES):
             ips = _dns_resolve(name)
@@ -142,7 +154,7 @@ def _gai(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 - 对齐
     try:
         return _ORIG["gai"](host, port, family, type, proto, flags)
     except socket.gaierror:
-        if host and not isinstance(host, (bytes, bytearray)) and _DNS_PORT and family in (0, socket.AF_INET):
+        if host and not isinstance(host, (bytes, bytearray)) and _DNS_PORTS and family in (0, socket.AF_INET):
             name = str(host)
             if not _is_ip_literal(name):
                 ips = _dns_resolve(name)
@@ -194,35 +206,108 @@ def _install_locked() -> None:
     _INSTALLED = True
 
 
-def set_dns_port(port: int | None) -> None:
-    """指定隧道 DNS 的本地 UDP 端口（0/None 表示关闭内网 DNS）。"""
-    global _DNS_PORT
+def _rebuild_locked() -> None:
+    """按属主顺序合并映射表与 DNS 端口（调用方持锁）。"""
+    global _MAP, _DNS_PORT, _DNS_PORTS, _CONFLICTS
+    merged: dict[tuple[str, int], tuple[str, int]] = {}
+    conflicts: list[dict] = []
+    for owner in _ORDER:
+        for key, local in (_OWNERS.get(owner) or {}).items():
+            old = merged.get(key)
+            if old is not None and old != local:
+                # 跨实例同名服务：保留先装的，记下来让上层提示「请照抄 _tunnel.json 本地端口」
+                conflicts.append({"key": key, "kept": old, "ignored": local, "owner": owner})
+                continue
+            merged[key] = local
+    _MAP = merged                     # 整体换引用：读者要么看到旧表要么看到新表，不会撞见半表
+    ports: list[int] = []
+    for owner in _ORDER:
+        port = int(_DNS_OWNERS.get(owner) or 0)
+        if port and port not in ports:
+            ports.append(port)
+    _DNS_PORTS = ports
+    _DNS_PORT = ports[0] if ports else 0
+    _CONFLICTS = conflicts
+    if merged or ports:
+        _install_locked()
+
+
+def conflicts() -> list[dict]:
+    """最近一次重建时的跨属主同名服务冲突（供 netbridge 给模型提示）。"""
     with _LOCK:
-        _DNS_PORT = int(port or 0)
-        if _DNS_PORT:
-            _install_locked()
+        return list(_CONFLICTS)
+
+
+def dns_ports() -> list[int]:
+    with _LOCK:
+        return list(_DNS_PORTS)
+
+
+def _touch_locked(owner: str) -> None:
+    if owner not in _ORDER:
+        _ORDER.append(owner)
+
+
+def set_dns_port(port: int | None, owner: str = "") -> None:
+    """指定隧道 DNS 的本地 UDP 端口（0/None 表示该属主关闭内网 DNS）。
+
+    `owner` 区分不同实例/进程内隧道：supervisor 并发跑多题时各桥各自登记，
+    撤掉一个不会误关别人的 DNS（旧调用方不传 owner，行为与从前一致）。
+    """
+    owner = str(owner or "")
+    with _LOCK:
+        if int(port or 0):
+            _DNS_OWNERS[owner] = int(port or 0)
+            _touch_locked(owner)
+        else:
+            _DNS_OWNERS.pop(owner, None)
+        _rebuild_locked()
 
 
 def dns_port() -> int:
     return _DNS_PORT
 
 
-def install(mapping: dict[tuple[str, int], tuple[str, int]] | None) -> dict:
-    """安装/更新映射表（原地替换）。返回规范化后的映射，便于调用方记日志。"""
-    global _INSTALLED
+def _owner_dropped_locked(owner: str) -> None:
+    if owner in _ORDER:
+        _ORDER.remove(owner)
+
+
+def install(mapping: dict[tuple[str, int], tuple[str, int]] | None,
+            owner: str = "") -> dict:
+    """安装/更新某个属主的映射表（同一属主原地替换；不同属主取并集）。
+
+    返回**合并后**的全量映射（便于调用方记日志）。不传 owner 的老调用方
+    （solver / 单题脚本）语义不变：每次 install 覆盖自己那一份。
+    """
+    owner = str(owner or "")
     normalized: dict[tuple[str, int], tuple[str, int]] = {}
     for (host, port), (local_host, local_port) in (mapping or {}).items():
         normalized[(_norm_host(host), int(port))] = (str(local_host), int(local_port))
     with _LOCK:
-        _MAP.clear()
-        _MAP.update(normalized)
-        _install_locked()
-    return dict(normalized)
+        if normalized:
+            _OWNERS[owner] = normalized
+            _touch_locked(owner)
+        else:
+            _OWNERS.pop(owner, None)
+            _owner_dropped_locked(owner)   # 空映射不留空属主，避免顺序表无限增长
+        _rebuild_locked()
+        return dict(_MAP)
 
 
-def clear() -> None:
+def clear(owner: str | None = None) -> None:
+    """撤映射：不传 owner = 全清（老语义）；传 owner = 只撤该属主。"""
     with _LOCK:
-        _MAP.clear()
+        if owner is None:
+            _OWNERS.clear()
+            _DNS_OWNERS.clear()
+            _ORDER.clear()
+        else:
+            key = str(owner or "")
+            _OWNERS.pop(key, None)
+            _DNS_OWNERS.pop(key, None)
+            _owner_dropped_locked(key)
+        _rebuild_locked()
 
 
 def current() -> dict[tuple[str, int], tuple[str, int]]:
@@ -234,7 +319,12 @@ def restore() -> None:
     """测试用：恢复原始 socket 实现。"""
     global _INSTALLED
     with _LOCK:
-        _MAP.clear()
+        _MAP = {}
+        _OWNERS.clear()
+        _DNS_OWNERS.clear()
+        _ORDER.clear()
+        _DNS_PORTS.clear()
+        _CONFLICTS.clear()
         if _INSTALLED:
             socket.getaddrinfo = _ORIG["gai"]  # type: ignore[assignment]
             socket.socket.connect = _ORIG["connect"]  # type: ignore[assignment]

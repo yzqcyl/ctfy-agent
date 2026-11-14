@@ -692,6 +692,8 @@ class Solver:
                 self.store.meta["last_instance"] = {
                     "challenge_id": challenge_id,
                     "competition_id": str(self._competition_id(challenge_id) or ""),
+                    # 实例 id：收尾时按它只停本题的本地桥（supervisor 并发多题不能全停）
+                    "instance_id": str(challenge.instance_id or ""),
                 }
             except Exception:  # noqa: BLE001 - 记账失败不影响起实例
                 pass
@@ -733,7 +735,8 @@ class Solver:
         if not isinstance(info, dict):
             return []
         instance_id = str(info.get("id") or info.get("instance_id") or "")
-        current = active_bridge()
+        # 按实例 id 取桥：supervisor 并发多题时全局「最近一棵」可能是别人的
+        current = active_bridge(instance_id or None)
         if current is not None and instance_id and current.instance_id == instance_id and current.tunnels:
             return []
         description = ""
@@ -742,7 +745,8 @@ class Solver:
         except Exception:  # noqa: BLE001
             description = ""
         competition_id = str(self._competition_id(challenge_id) or "")
-        lines = start_bridge(self.config, info, competition_id, description=description)
+        lines = start_bridge(self.config, info, competition_id, description=description,
+                             key=instance_id or None)
         if lines:
             note = "[本地桥] " + "；".join(lines[:4])
             try:

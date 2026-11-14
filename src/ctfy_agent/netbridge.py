@@ -12,7 +12,7 @@
     一行都不用改。
 
 用法（由 solver 在实例就绪后自动调用）：
-    start_bridge(config, instance, competition_id, description=...) -> list[str] 提示行
+    start_bridge(config, instance, competition_id, description=..., key=...) -> list[str] 提示行
     stop_bridge()   # 释放实例/进程退出时清理
 
 安全：WireGuard 配置含实例私钥，只写在 ``CTFY_BRIDGE_DIR``/用户目录下（权限 0600），
@@ -29,6 +29,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -41,6 +42,24 @@ _ATEXIT_HOOKED = False
 
 class BridgeError(RuntimeError):
     """本地桥起不来（wireproxy 缺失/配置无效/端口不通）。"""
+
+
+# WireGuard 配置里有实例私钥；它可能出现在异常文本/wireproxy 日志里，
+# 而这些文本会进 supervisor 日志、事件流与模型 prompt —— 一律先脱敏再外露。
+_SECRET_LINE_MARKERS = ("privatekey", "presharedkey", "endpoint")
+
+
+def redact_secrets(text: str) -> str:
+    """把 WG 配置/日志里的私钥、预共享密钥、Endpoint 行替换成 <redacted>。"""
+    out: list[str] = []
+    for line in str(text or "").splitlines():
+        low = line.strip().lower()
+        if any(low.startswith(marker) or f"{marker} " in low[:24] for marker in _SECRET_LINE_MARKERS):
+            key = line.split("=", 1)[0].strip() if "=" in line else line.strip()[:16]
+            out.append(f"{key} = <redacted>")
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 # ---------- 配置读取 ----------
@@ -112,7 +131,9 @@ def fetch_vpn_config(mcp_url: str, token: str, instance_id: str, competition_id:
     except Exception as exc:  # noqa: BLE001 - 统一包成 BridgeError，让调用方只处理一种错
         raise BridgeError(f"取 VPN 配置失败（{instance_id}）：{type(exc).__name__}: {exc}") from exc
     if "[Interface]" not in text or "PrivateKey" not in text:
-        raise BridgeError(f"VPN 配置格式不符（没有 [Interface]/PrivateKey）：{text[:120]}")
+        # 只报长度/首行特征，不回显正文（正文含私钥，会经日志/prompt 泄露）
+        head = redact_secrets(text[:80].splitlines()[0] if text else "")
+        raise BridgeError(f"VPN 配置格式不符（没有 [Interface]/PrivateKey，长度 {len(text)}）：{head[:40]}")
     return text
 
 
@@ -308,12 +329,23 @@ def tunnel_lines(tunnels: list[dict]) -> list[str]:
 
 # ---------- 桥的生命周期 ----------
 
+def _safe_key(key: str) -> str:
+    """实例 id → 安全目录名（去掉路径分隔符/奇怪字符，限长）。"""
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key or "")).strip("._")[:64]
+    return cleaned or "default"
+
+
 class LocalBridge:
     """一个实例一个桥：起 wireproxy 子进程 + 装 portmap；停止时清进程/映射/私钥文件。"""
 
-    def __init__(self, binary: str, work_dir: str | pathlib.Path):
+    def __init__(self, binary: str, work_dir: str | pathlib.Path, key: str = ""):
         self.binary = str(binary)
-        self.work_dir = pathlib.Path(work_dir)
+        # 桥的属主 key（supervisor 用实例 id）：端口映射/DNS 按 key 登记，互不覆盖
+        self.key = str(key or "")
+        # 每条桥一个独立子目录：配置/日志都是固定文件名（wireproxy.conf/-log），
+        # 共用目录会让桥 B 覆盖桥 A 的私钥配置、A.stop 删掉 B 的 conf（并发多题必坏的坑）
+        base = pathlib.Path(work_dir)
+        self.work_dir = (base / _safe_key(self.key)) if self.key else base
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.proc: subprocess.Popen | None = None
         self.config_path = self.work_dir / "wireproxy.conf"
@@ -346,9 +378,10 @@ class LocalBridge:
             mapping = {(item["target"].rsplit(":", 1)[0], int(item["target"].rsplit(":", 1)[1])):
                        (item["local"].rsplit(":", 1)[0], int(item["local"].rsplit(":", 1)[1]))
                        for item in tunnels if item["kind"] in ("tcp", "udp")}
-            portmap.install(mapping)
+            portmap.install(mapping, owner=self.key)
             dns = [item for item in tunnels if item["kind"] == "dns"]
-            portmap.set_dns_port(int(dns[0]["local"].rsplit(":", 1)[1]) if dns else 0)
+            portmap.set_dns_port(int(dns[0]["local"].rsplit(":", 1)[1]) if dns else 0,
+                                 owner=self.key)
         except Exception:
             self.stop()
             raise
@@ -418,14 +451,15 @@ class LocalBridge:
 
     def _log_tail(self, limit: int = 600) -> str:
         try:
-            return self.log_path.read_text(encoding="utf-8", errors="replace")[-limit:]
+            raw = self.log_path.read_text(encoding="utf-8", errors="replace")[-limit:]
         except OSError:
             return ""
+        return redact_secrets(raw)   # wireproxy 日志可能带配置/端点，外露前先脱敏
 
     # -- 停 --
     def stop(self) -> None:
-        portmap.clear()
-        portmap.set_dns_port(0)
+        portmap.clear(self.key)          # 只撤自己的映射，别误伤并发跑的其他题
+        portmap.set_dns_port(0, owner=self.key)
         proc, self.proc = self.proc, None
         if proc is not None and proc.poll() is None:
             try:
@@ -446,19 +480,40 @@ class LocalBridge:
 
 
 def _atexit_stop() -> None:
-    global _ACTIVE
-    if _ACTIVE is not None:
+    for key in list(_BRIDGES):
+        _stop_one(key)
+
+
+# 多桥注册表：key（=实例 id）→ LocalBridge。
+# 并发跑多道网络题时，一条实例一棵桥；之前只有一个全局 _ACTIVE，第二条桥一起
+# 就把第一条停掉（supervisor 并发下会出现「第一题隧道突然不通」）。
+_BRIDGES: dict[str, LocalBridge] = {}
+_DEFAULT_KEY = ""
+
+
+# 桥注册表锁：并发 solver 线程可能同时给不同实例起桥（端口分配/注册表都必须串行）
+_BRIDGE_LOCK = threading.RLock()
+
+
+def _stop_one(key: str) -> None:
+    with _BRIDGE_LOCK:
+        bridge = _BRIDGES.pop(key, None)
+    if bridge is not None:
         try:
-            _ACTIVE.stop()
+            bridge.stop()
         except Exception:  # noqa: BLE001
             pass
-        _ACTIVE = None
 
 
 def start_bridge(config, instance: dict, competition_id: str, *, description: str = "",
-                 mcp_url: str | None = None, token: str | None = None) -> list[str]:
-    """起（或替换）当前实例的本地桥；返回给模型的提示行。失败抛 BridgeError。"""
-    global _ACTIVE, _ATEXIT_HOOKED
+                 mcp_url: str | None = None, token: str | None = None,
+                 key: str | None = None, launch: bool = True) -> list[str]:
+    """起（或替换）某实例的本地桥；返回给模型的提示行。失败抛 BridgeError。
+
+    `key` 默认取实例 id：同实例的桥幂等替换，不同实例的桥并存（并发多题必需）。
+    `launch=False` 只做配置/端口/映射（离线单测用，不启 wireproxy）。
+    """
+    global _ATEXIT_HOOKED
     settings = bridge_settings(config)
     if settings is None:
         return []
@@ -471,28 +526,46 @@ def start_bridge(config, instance: dict, competition_id: str, *, description: st
             and not estate_names_from_text(description):
         return []  # 既没有过隧道的服务，也没有 OOB 回连端口/estate 域名
     instance_id = str(instance.get("id") or instance.get("instance_id") or "")
+    bridge_key = key if key is not None else (instance_id or _DEFAULT_KEY)
     vpn_conf = fetch_vpn_config(str(mcp_url or getattr(config, "mcp_url", "") or ""),
                                 str(token or getattr(config, "token", "") or ""),
                                 instance_id, competition_id)
-    if _ACTIVE is not None:
-        _ACTIVE.stop()
-    bridge = LocalBridge(settings["binary"], settings["work_dir"])
-    lines = bridge.start(vpn_conf, services, instance_id=instance_id, description=description)
-    _ACTIVE = bridge
-    if not _ATEXIT_HOOKED:
-        atexit.register(_atexit_stop)
-        _ATEXIT_HOOKED = True
-    return ["本机没有 VPN 客户端，已自动建好用户态隧道（效果等同已连平台 VPN）", *lines]
-
-
-def stop_bridge() -> None:
-    global _ACTIVE
-    if _ACTIVE is not None:
+    with _BRIDGE_LOCK:
+        _stop_one(bridge_key)
+        bridge = LocalBridge(settings["binary"], settings["work_dir"], key=bridge_key)
+        # 先登记再启动：启动失败时能确定地把自己摘掉（反过来会出现「表里没有但进程还在」）
+        _BRIDGES[bridge_key] = bridge
         try:
-            _ACTIVE.stop()
-        finally:
-            _ACTIVE = None
+            lines = bridge.start(vpn_conf, services, instance_id=instance_id,
+                                 description=description, launch=launch)
+        except BaseException:
+            _BRIDGES.pop(bridge_key, None)
+            raise
+        if not _ATEXIT_HOOKED:
+            atexit.register(_atexit_stop)
+            _ATEXIT_HOOKED = True
+    out = ["本机没有 VPN 客户端，已自动建好用户态隧道（效果等同已连平台 VPN）", *lines]
+    # 跨实例同名服务：portmap 保留先装者，这里明确提示模型照抄本地端口（不静默串线）
+    clashes = portmap.conflicts()
+    if clashes:
+        out.append("注意：有同名内网服务已被其他实例占用，连接请一律照抄 _tunnel.json "
+                   "里的本地端口（不要用 *.internal 名字），否则可能连到别的题实例")
+    return out
 
 
-def active_bridge() -> LocalBridge | None:
-    return _ACTIVE
+def stop_bridge(key: str | None = None) -> None:
+    """停桥：不传 key = 全停（老语义）；传 key = 只停该实例的桥。"""
+    if key is None:
+        for item in list(_BRIDGES):
+            _stop_one(item)
+        return
+    _stop_one(str(key))
+
+
+def active_bridge(key: str | None = None) -> LocalBridge | None:
+    """取桥：传 key 取指定实例的桥；不传返回**最近创建**的一棵（老语义）。"""
+    if key is not None:
+        return _BRIDGES.get(str(key))
+    if not _BRIDGES:
+        return None
+    return list(_BRIDGES.values())[-1]
