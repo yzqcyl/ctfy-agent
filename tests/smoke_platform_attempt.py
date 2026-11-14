@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from ctfy_agent.config import Config  # noqa: E402
 from ctfy_agent.solver import Solver  # noqa: E402
 from ctfy_agent.state import Store  # noqa: E402
+from ctfy_agent import submit_ledger  # noqa: E402
 
 FAILS: list[str] = []
 CID = "SAMPLE-ATTEMPT"
@@ -115,6 +116,15 @@ class DummyLLM:
     budget = None
 
 
+def _fresh_ledger(tmp: pathlib.Path, tag: str) -> None:
+    """每个子用例用独立账本（P17 跨 run 账本会永久记住「已判错的值」，
+    子用例复用同一 CID+answer 时必须隔离，否则前一个用例的判错会拦掉后一个）。"""
+    path = tmp / f"ledger_{tag}.json"
+    if path.exists():
+        path.unlink()
+    os.environ[submit_ledger.ENV_PATH] = str(path)
+
+
 def _submit(store, platform, cfg=None):
     solver = Solver(cfg or _config(), platform, DummyLLM(), store)
     return solver._submit({"flag": "flag{guess}"}, CID)
@@ -124,6 +134,7 @@ def main() -> int:
     tmp = ROOT / "runs" / f"_t_attempt_{os.getpid()}"
 
     # ---- 1) 顶层 attempt 解析 + 回显 ----
+    _fresh_ledger(tmp, "c1")
     store = _store(tmp / "r1")
     platform = FakePlatform([{"accepted": False, "attempt": 2, "submission_id": "s1"}])
     text, accepted = _submit(store, platform)
@@ -136,6 +147,7 @@ def main() -> int:
           f"attempts={store.require(CID).attempts} platform={store.require(CID).platform_attempts}")
 
     # ---- 2) 单调：旧回执（attempt 更小）不回退 ----
+    _fresh_ledger(tmp, "c2")
     platform = FakePlatform([{"accepted": False, "attempt": 1}])
     _submit(store, platform)
     check("attempt 单调不回退", store.require(CID).platform_attempts == 2,
@@ -147,6 +159,7 @@ def main() -> int:
           str(reloaded.require(CID).platform_attempts))
 
     # ---- 4) structuredContent 形态 ----
+    _fresh_ledger(tmp, "c4")
     store2 = _store(tmp / "r2")
     platform = FakePlatform([{"isError": False, "structuredContent": {"accepted": False, "attempt": 3}}])
     text, _ = _submit(store2, platform)
@@ -154,6 +167,7 @@ def main() -> int:
           str(store2.require(CID).platform_attempts))
 
     # ---- 5) content 文本里的 JSON（MCP 真实返回形态：dict + content[].text）----
+    _fresh_ledger(tmp, "c5")
     store3 = _store(tmp / "r3")
     platform = FakePlatform([{
         "content": [{"type": "text",
@@ -165,6 +179,7 @@ def main() -> int:
     check("文本 JSON 形态回显计数", "第 4/5 次提交" in text, text[-200:])
 
     # ---- 6) 平台额度用满 → 本地硬停，不再打平台 ----
+    _fresh_ledger(tmp, "c6")
     store4 = _store(tmp / "full", platform_attempts=5)
     platform = FakePlatform([{"accepted": True, "attempt": 6}])
     text, accepted = _submit(store4, platform)
@@ -173,6 +188,7 @@ def main() -> int:
     check("额度用满：一次都没打平台", platform.payloads == [], str(platform.payloads))
 
     # ---- 7) 逃生口：platform_submit_limit=0 关闭硬停 ----
+    _fresh_ledger(tmp, "c7")
     store5 = _store(tmp / "off", platform_attempts=9)
     platform = FakePlatform([{"accepted": False, "attempt": 10}])
     text, accepted = _submit(store5, platform, _config(platform_submit_limit=0))
@@ -181,6 +197,7 @@ def main() -> int:
           str(store5.require(CID).platform_attempts))
 
     # ---- 8) 判通过路径不受影响 ----
+    _fresh_ledger(tmp, "c8")
     store6 = _store(tmp / "accepted")
     platform = FakePlatform([{"accepted": True, "attempt": 1, "challenge_fully_solved": True}])
     text, accepted = _submit(store6, platform)
@@ -188,6 +205,7 @@ def main() -> int:
     check("判通过仍落 submitted", store6.require(CID).status == "submitted",
           str(store6.require(CID).status))
 
+    os.environ.pop(submit_ledger.ENV_PATH, None)
     shutil.rmtree(tmp, ignore_errors=True)
     print()
     if FAILS:

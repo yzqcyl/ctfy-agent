@@ -48,7 +48,7 @@ def case_attempts_and_rejected(tmp: Path) -> None:
     submit_ledger.note_rejected(path, cid, "NPF_{DECOY}")
     data = submit_ledger.load(path)
     assert submit_ledger.is_rejected(data, cid, "NPF_{DECOY}")
-    assert "已经判错过" in submit_ledger.blocked_reason(data, cid, "NPF_{DECOY}", 5)
+    assert "已判错过" in submit_ledger.blocked_reason(data, cid, "NPF_{DECOY}", 5)
     assert submit_ledger.blocked_reason(data, cid, "NPF_{OTHER}", 5) == ""
 
     # attempt 单调取 max（并发/乱序回执不会把次数写小）
