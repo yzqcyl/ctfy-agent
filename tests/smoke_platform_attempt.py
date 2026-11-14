@@ -94,6 +94,9 @@ class FakePlatform:
 def _config(**extra) -> Config:
     cfg = Config()
     cfg.submit_limit = 3
+    # 固定平台提交上限：config/agent.json 里的 platform_submit_limit 是运营可调项
+    # （2026-11-14 已从 5 调到 10），本套件断言的是「上限=5」时的回显/硬停语义。
+    cfg.extra["platform_submit_limit"] = 5
     cfg.extra.update(extra)
     return cfg
 
