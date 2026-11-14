@@ -14,7 +14,7 @@ from .solver import Solver
 from .state import Store
 from .tools_local import LocalTools, ToolError
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "PROJECT_ROOT",
