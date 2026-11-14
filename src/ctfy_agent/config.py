@@ -151,6 +151,7 @@ class Config:
     llm_api_key: str = ""
 
     extra: dict = field(default_factory=dict)
+    policy: dict = field(default_factory=dict)   # 自治调度配置（见 supervisor 方案 §7）
 
     # ---------- 派生路径 ----------
 
@@ -215,17 +216,66 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
     raw = dict(DEFAULTS)
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     extra: dict = {}
+    policy: dict = {}
     if path.is_file():
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         for key, value in data.items():
             if key in raw:
                 raw[key] = value
+            elif key == "policy" and isinstance(value, dict):
+                policy = dict(value)
             else:
                 extra[key] = value
+
+    # [2026-11-14 M4] 自治调度 policy：可用 AGENT_POLICY_JSON 整体注入 / 覆盖；标量用 AGENT_POLICY_*。
+    policy_json = os.environ.get("AGENT_POLICY_JSON", "").strip()
+    if policy_json:
+        try:
+            override = json.loads(policy_json)
+            if isinstance(override, dict):
+                policy.update(override)
+        except json.JSONDecodeError:
+            pass
+    for env_key, pkey, caster in (
+        ("AGENT_POLICY_POOL_TOKENS", "pool_tokens", int),
+        ("AGENT_POLICY_RERUN_CAP", "rerun_cap", int),
+        ("AGENT_POLICY_SOLVER_SLOTS", "solver_slots", int),
+        ("AGENT_POLICY_INSTANCE_SLOTS", "instance_slots", int),
+    ):
+        value = os.environ.get(env_key, "").strip()
+        if value:
+            try:
+                policy[pkey] = caster(float(value))
+            except ValueError:
+                pass
+    supervisor_on = os.environ.get("AGENT_SUPERVISOR", "").strip().lower()
+    if supervisor_on:
+        extra["supervisor"] = supervisor_on in ("1", "true", "yes", "y", "on")
 
     for env_key, field_name in ENV_MAP.items():
         if env_key in os.environ and os.environ[env_key].strip():
             raw[field_name] = _coerce(os.environ[env_key], DEFAULTS[field_name])
+
+    # [2026-11-14 初赛/正式赛适配] 官方 VPS 上平台只注入「大模型网关」的会话变量
+    # （ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY/OPENAI_BASE_URL/OPENAI_API_KEY，见《参赛接口文档》
+    # §8.3/§8.4）。我们没有显式配置 DEEPSEEK_*/LLM_* 时，回退到网关的 OpenAI 兼容端点，
+    # 这样封装器/容器里不用改代码就能走网关（封网后也只能走网关）。
+    _gw_base = os.environ.get("OPENAI_BASE_URL", "").strip()
+    if _gw_base and not (os.environ.get("DEEPSEEK_BASE_URL", "").strip()
+                         or os.environ.get("LLM_BASE_URL", "").strip()):
+        raw["llm_base_url"] = _gw_base
+        os.environ.setdefault("DEEPSEEK_BASE_URL", _gw_base)
+    _gw_key = (os.environ.get("OPENAI_API_KEY", "").strip()
+               or os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    if _gw_key and not (os.environ.get("DEEPSEEK_API_KEY", "").strip()
+                        or os.environ.get("LLM_API_KEY", "").strip()):
+        os.environ.setdefault("DEEPSEEK_API_KEY", _gw_key)
+        os.environ.setdefault("LLM_API_KEY", _gw_key)
+    # 网关里模型名由会话/厂商决定，允许用 OPENAI_MODEL / AGENT_MODEL 覆盖
+    _gw_model = (os.environ.get("OPENAI_MODEL", "").strip()
+                 or os.environ.get("AGENT_MODEL", "").strip())
+    if _gw_model and not os.environ.get("DEEPSEEK_MODEL", "").strip():
+        raw["model"] = _gw_model
 
     # P0-3 墙钟配置允许用环境变量注入：容器里没有命令行，平台只给 task.json + env，
     # 所以 deadline 必须能走 AGENT_* 说明。解析在 budget.apply_deadline（写错格式当没设）。
@@ -289,4 +339,5 @@ def load(config_path: Path | None = None, use_env_file: bool = True) -> Config:
         token=os.environ.get("CTFY_TOKEN", "").strip(),
         llm_api_key=os.environ.get("DEEPSEEK_API_KEY", "").strip(),
         extra=extra,
+        policy=policy,
     )

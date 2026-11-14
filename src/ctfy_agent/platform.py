@@ -436,10 +436,38 @@ class CtfyPlatform:
 
     # ---------- 调用 ----------
 
+    # [赛中修复 2026-11-14] TPCTF 开赛瞬间平台被所有 agent 打满：所有 MCP 工具都回
+    # `platform_busy: ... Send it again in N seconds.`（HTTP 503，但**工具级软失败**，
+    # 不抛异常，`call_tool(retries=...)` 也不会重试）。文案明确「did not process this
+    # request」⇒ 重试是安全的（不会重复提交）。这里统一按建议秒数退避重试，最多 4 次。
+    _BUSY_WAIT_RE = re.compile(r"in\s+(\d+)\s*seconds", re.I)
+
+    @classmethod
+    def _busy_wait(cls, result) -> int | None:
+        try:
+            text = render_call_result(result)
+        except Exception:  # noqa: BLE001
+            text = str(result)
+        low = str(text).lower()
+        if "platform_busy" not in low and "503 service unavailable" not in low:
+            return None
+        match = cls._BUSY_WAIT_RE.search(str(text))
+        return int(match.group(1)) if match else 5
+
+    def _call_with_busy_retry(self, name: str, arguments: dict, retries: int, tries: int = 4):
+        result = self.client.call_tool(name, arguments, retries=retries)
+        for _ in range(max(0, tries - 1)):
+            wait = self._busy_wait(result)
+            if wait is None:
+                break
+            time.sleep(min(wait + 1, 30))
+            result = self.client.call_tool(name, arguments, retries=retries)
+        return result
+
     def call(self, name: str, arguments: dict | None = None, *, retries: int = 0):
         arguments = self._clean_args(name, arguments)
         arguments = self._repair_runtime_args(name, arguments)
-        result = self.client.call_tool(name, arguments, retries=retries)
+        result = self._call_with_busy_retry(name, arguments, retries)
         # 兜底：参数已修正仍报 instance_not_found（例如缓存的实例已被平台回收）→ 用当前实例重试一次
         if isinstance(result, dict) and result.get("isError") and self._active_instance_id:
             try:
@@ -448,7 +476,7 @@ class CtfyPlatform:
                 err_text = ""
             if "instance_not_found" in err_text and arguments.get("instance_id") != self._active_instance_id:
                 arguments["instance_id"] = self._active_instance_id
-                result = self.client.call_tool(name, arguments, retries=retries)
+                result = self._call_with_busy_retry(name, arguments, retries)
         self._learn_from_result(name, arguments, result)
         return result
 
