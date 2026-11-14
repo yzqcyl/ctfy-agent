@@ -1807,16 +1807,23 @@ class Solver:
         challenge = self.store.require(challenge_id)
         # 知识问答/MCQ 题没有实例，提交必须走 submit_qa_answer(challenge_id, …)。
         # 否则会落进 instance 分支，被「本题还没有实例」拦死（实测 SECQA-0001 答对 D 却提交不了）。
-        # [P2 平台计数同步] 平台按「用户+题」全局累计提交次数（最多 5 轮，跨 run 不重置）。
+        # [P2 平台计数同步] 平台按「用户+题」全局累计提交次数（跨 run 不重置）。
         # 本地 per-question 闸只看自己的 state；换 run 目录重跑时平台额度可能已用满，继续交只是白送。
         # 只做「读回执 + 硬停」：不把平台 attempt 写进 challenge.attempts（那是本地解题轮次口径）。
-        # 0（或缺省=5 时配 0）表示关闭这个硬停，退回老行为。
+        # 0 表示关闭这个硬停，退回老行为。
+        # [P22] 上限口径以 CTFY（正赛平台）为准：CTFY 的 questions[].attempts_cap 实测为 10，
+        # 部分题为 null（不限额）；ctf2 练习场是 5（回执 attempt 字段）。优先用平台下发的
+        # attempts_cap；没有下发时才退回 config（默认 10，对齐 CTFY）。
         try:
-            platform_cap = int(self.config.extra.get("platform_submit_limit", 5))
+            platform_cap = int(self.config.extra.get("platform_submit_limit", 10))
         except (TypeError, ValueError):
-            platform_cap = 5
+            platform_cap = 10
+        challenge_cap = int(getattr(challenge, "attempts_cap", 0) or 0)
+        if challenge_cap > 0:
+            platform_cap = challenge_cap
         platform_cap = max(0, platform_cap)
         used_platform = int(getattr(challenge, "platform_attempts", 0) or 0)
+        _remaining = int(getattr(challenge, "attempts_remaining", -1) or -1)
         # [P17] 跨 run 账本：state.json 是 per-run 的，换 run/快照就清零，
         # 实测 cuteRE 被交到平台 attempt=6、菜刀流量把已判错的 NPF_{...} 在下一个 run 又交一次。
         # 这里把账本里的已用次数并进来，并直接拦「平台已判错的值」。
@@ -1826,6 +1833,12 @@ class Solver:
         _blocked = submit_ledger.blocked_reason(_ledger, challenge_id, answer, platform_cap)
         if _blocked:
             return _blocked, False
+        if _remaining == 0:
+            return (
+                "[提交被拦截] CTFY 回执显示本题 attempts_remaining=0（提交额度已用尽）。"
+                "再交不会被受理——不要再换值试探，直接复盘收口（把 flag 候选与依据写进 report）。",
+                False,
+            )
         if platform_cap > 0 and used_platform >= platform_cap:
             return (
                 f"[提交被拦截] 平台已累计本题 {used_platform} 次提交（上限 {platform_cap} 次，"
@@ -1943,6 +1956,17 @@ class Solver:
             if platform_cap > 0:
                 text += (f"\n[平台计数] 平台已累计第 {used_platform}/{platform_cap} 次提交"
                          "（用户+题全局计数，跨 run 不重置）。")
+        # [P22] CTFY 口径：回执/题目对象给 attempts_cap + attempts_remaining，用 cap-remaining
+        # 反推已用次数（CTFY 回执没有 attempt 字段）；remaining=0 → 后续提交直接硬停。
+        cap_seen, remaining_seen = self._platform_quota_from(result, text)
+        if remaining_seen >= 0:
+            used_platform = self.store.note_platform_remaining(challenge_id, remaining_seen, cap_seen)
+            if cap_seen > 0:
+                submit_ledger.note_attempt(_ledger_path, challenge_id, used_platform)
+                text += (f"\n[平台额度] CTFY attempts_remaining={remaining_seen}/{cap_seen}"
+                         f"（本题已用 {used_platform} 次提交额度）。")
+            elif remaining_seen == 0:
+                text += "\n[平台额度] CTFY 回执 attempts_remaining=0：本题提交额度已用尽。"
 
         if accepted is True:
             submit_ledger.note_accepted(_ledger_path, challenge_id, answer)
@@ -1967,6 +1991,53 @@ class Solver:
             # [v7.2 A4] 按题号记错交次数，供 per-question 额度闸用（v3 多轮换题号重交不被锁死）
             self.store.mark_submitted(challenge_id, answer, accepted=False, question_id=question_id)
         return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
+
+    def _platform_quota_from(self, result, text: str) -> tuple[int, int]:
+        """[P22] 从回执/题目对象里取 CTFY 的 (attempts_cap, attempts_remaining)。
+
+        CTFY（正赛平台）实测形状：`{"attempts_cap":10,"attempts_remaining":9}`，
+        也可能在 structuredContent / content 文本 JSON 里；缺失或 null → (0, -1)（未知，不猜）。
+        """
+        def _pick(obj, depth: int = 0) -> tuple[int, int]:
+            if not isinstance(obj, dict) or depth > 2:
+                return (0, -1)
+            cap = remaining = -1
+            try:
+                value = obj.get("attempts_cap")
+                cap = int(value) if value is not None else 0
+            except (TypeError, ValueError):
+                cap = 0
+            try:
+                value = obj.get("attempts_remaining")
+                remaining = int(value) if value is not None else -1
+            except (TypeError, ValueError):
+                remaining = -1
+            if remaining >= 0:
+                return (max(0, cap), remaining)
+            inner = obj.get("structuredContent")
+            if isinstance(inner, dict):
+                return _pick(inner, depth + 1)
+            return (max(0, cap), -1)
+
+        found = _pick(result)
+        if found[1] >= 0:
+            return found
+        try:
+            parsed = self.platform._as_json(text)
+        except Exception:  # noqa: BLE001 - 解析失败按「没读到」处理
+            parsed = None
+        found = _pick(parsed)
+        if found[1] >= 0:
+            return found
+        # 回执常带前缀（"----- 工具返回 -----"），从文本里截出最外层 JSON 对象再解析
+        if isinstance(text, str):
+            start, end = text.find("{"), text.rfind("}")
+            if 0 <= start < end:
+                try:
+                    return _pick(json.loads(text[start:end + 1]))
+                except (ValueError, TypeError):
+                    pass
+        return (0, -1)
 
     def _platform_attempt_from(self, result, text: str) -> int:
         """从提交回执里取平台的 attempt（用户+题全局累计）。取不到返回 0（绝不猜）。

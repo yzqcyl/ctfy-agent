@@ -179,11 +179,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/ctfy/src
 
-# 关思考模式：百炼（DashScope 兼容端点）默认开启思考，重推理步骤会把 max_tokens 烧在
+# 思考模式：百炼（DashScope 兼容端点）默认开启思考，重推理步骤会把 max_tokens 烧在
 # reasoning_content 上 → content 空 / finish_reason=length，白丢一步（实测坑）。
-# 本地所有实测都在 LLM_ENABLE_THINKING=0 下完成，镜像必须同口径。
-# 注意：11-21 正式赛换官方智谱后若该字段不被接受，重建时去掉这行即可。
-ENV LLM_ENABLE_THINKING=0
+# [2026-11-14] 用户要求开思考：显式置 1（比「不设置靠端点默认」更确定）。
+# 实测 dashscope + deepseek-v4.1-flash-1017 接受该字段（True→有 reasoning、False→无）。
+# 烧穿时有 completion_burned 保护（2 次连续即收口，重试会抬 max_tokens）。
+ENV LLM_ENABLE_THINKING=1
 
 # ---------- rev/pwn 工具箱：capstone 反汇编引擎（v5 新增） ----------
 # 为什么现在才装：docs/archive/rev-toolbox-plan.md 的 R2 项写着「capstone 进镜像，随 v4 重建一起做」，

@@ -3871,7 +3871,8 @@ def case_agent_seed(tmp: Path) -> None:
     config = _build_config(task, tmp, "http://x/v1/mcp/", env)
     # G6：非 "flag" 的题目 id 要传给 _submit 的默认值；F2：submit_limit 计入门控题
     assert config.extra.get("default_question_id") == "q1", config.extra
-    assert config.submit_limit == 6, config.submit_limit          # (1 明题 + 2 门控) * 2
+    # P22：下限按 CTFY 口径 10（attempts_cap 实测 10），(1 明题 + 2 门控)*2=6 < 10 → 取 10
+    assert config.submit_limit == 10, config.submit_limit
     # 归一化：角色 model 被剥掉（契约：单模型；网关也会按 LLM_MODEL 改写），max_tokens 统一到容器默认
     for spec in (config.extra.get("roles") or {}).values():
         if isinstance(spec, dict):

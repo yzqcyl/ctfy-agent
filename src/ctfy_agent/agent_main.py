@@ -324,8 +324,9 @@ def _build_config(task: dict | None, work_dir: Path, mcp_url: str | None, env) -
     if _tok_cap is None:
         _tok_cap = DEFAULT_MAX_TOKENS_PER_CHALLENGE
     config.max_tokens_per_challenge = _as_int(env.get("AGENT_MAX_TOKENS_PER_CHALLENGE"), _tok_cap)
-    # 统一口径：本地 submit_limit=5（与平台侧「用户+题最多 5 次」对齐），多问题再按题号数放大
-    config.submit_limit = max(5, (len(questions) + gated) * 2)
+    # 统一口径（P22，以 CTFY 正赛平台为准）：CTFY 的 questions[].attempts_cap 实测为 10
+    # （部分题为 null=不限额）；本地下限按 10 对齐，多问题再按题号数放大。
+    config.submit_limit = max(10, (len(questions) + gated) * 2)
     config.runs_dir = str(work_dir / "runs")
     # 读超时：长上下文+长输出的单次生成实测能挂满 300s（120s 默认太紧）。容器侧抬到 240s；
     # 配合 llm._post 把 TimeoutError 归一成可重试 LLMError，单次超时不再击穿整题。

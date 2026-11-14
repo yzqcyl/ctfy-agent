@@ -17,6 +17,12 @@
 
 ## 2. 致命缺陷：提交额度被未验证候选永久烧掉（P17/P18 的由来）
 
+> **口径修正（2026-11-14 09:4x，以 CTFY 为准）**：本节引用的「全局 5 次」是 **ctf2 练习场**的数字
+> （回执字段 `attempt`，实测上限 5，vigenere/cuteRE 等 4 题就是被打到 attempt=5/6）。
+> **CTFY 正赛平台的数字是另一个口径**（见 §10）：`questions[].attempts_cap` 实测为 **10**，
+> 部分题 `attempts_cap/attempts_remaining` 为 **null（不限额）**，且 CTFY 回执**没有 `attempt` 字段**，
+> 只有 `attempts_remaining`（错交一次减一）。因此不得再把「5 次」当成正赛额度。
+
 平台回执里的 `attempt` 是**「用户+题」全局计数，跨 run 不重置**（上限 5），而本地 `state.json` 是 per-run 的——
 每换批次/快照计数就清零，于是同一道题被反复「重新开始交」。收割 1370 份转录 + 全部 state.json 后的实况：
 
@@ -117,3 +123,46 @@ python tests/smoke_local_tools.py
 - **「有候选就交」在只有 5 次永久额度的平台上是负收益**：4 道题已经因为这条报废，任何「再试一次」都必须先问「这个值有执行证据吗」。
 - **本地口径 ≠ 镜像口径**（思考模式、工具链、沙箱）时，本地结论不能当结论；先对齐口径再比较模型。
 - **失败题的第一手材料是转录，不是猜测**：`cut`/`od`/`upx` 这些缺口全都是转录里一眼可查的，不是「模型不聪明」。
+
+## 10. 收尾后按用户要求对齐 CTFY 口径 + 开思考（2026-11-14 09:2x–09:5x）
+
+### 10.1 模型与思考模式
+- 模型：**`deepseek-v4.1-flash-1017`**（`config/agent.json` 与 `.env` 本就是这个值；round3 的
+  `qwen3.8-max-0902` 只是那次批次的**进程级 env 覆盖**，没有写进任何配置）。
+- 思考模式：用户要求**开**。实测（`probes/probe_thinking_field.py` / `probe_chat_shape.py`）：
+  dashscope + `deepseek-v4.1-flash-1017` **接受** `enable_thinking` 字段：
+  | payload | 回执 | completion_tokens |
+  |---|---|---|
+  | 不带字段 | 有 `reasoning_content`（端点默认=开） | 113 |
+  | `enable_thinking=True` | 有 `reasoning_content`（209 字符） | 74 |
+  | `enable_thinking=False` | 无 reasoning | 8 |
+- 落地：`llm.py` 由「只支持显式关」升级为**三态**（1/true/on → True；0/false/off → False；未设 → 不发，保持端点默认）；
+  `.env` 置 `LLM_ENABLE_THINKING = 1`；镜像 `Dockerfile` 同步改为 `ENV LLM_ENABLE_THINKING=1`（口径一致）。
+- 风险已隔离：开思考后重推理步骤更容易 `finish=length`，但 `solver` 的「补全打满且无输出」烧穿保护仍在
+  （连续 2 次 `completion_burned` 收口、重试抬 max_tokens）。
+
+### 10.2 CTFY 提交额度上限（以 CTFY 平台为准）
+取证脚本：`runs/_big/ctfy_attempts_audit.py`（扫全部转录）、`runs/_big/ctfy_attempts_evidence.py`（取原文片段）。
+CTFY（`ctfy.tsinghua.edu.cn`）回执/题目对象原文：
+
+| 证据 | 原文 |
+|---|---|
+| 题目对象带上限 | `"attempts_remaining": 10, "attempts_cap": 10`（CYBENCH-013 / CYBENCH-004 / bench1103 系列） |
+| 错交后递减 | `attempts_remaining` 出现 9 / 3 / 2 / 1（10 递减） |
+| 不限额题 | `"attempts_remaining": null, "attempts_cap": null`（658 次出现） |
+| 回执无 attempt 字段 | CTFY 提交回执是 `{"correct":…,"solve_rank":…,"attempts_remaining":…}`，**没有** ctf2 的 `attempt` |
+
+**结论：CTFY 每题提交上限 = 10（平台下发时），部分题 null=不限额；ctf2 练习场才是 5。**
+代码对齐（P22）：
+- `config/agent.json`：`submit_limit` / `platform_submit_limit` 5 → **10**；`agent_main` 下限 `max(10, …)`；
+- `state.Challenge` 新增 `attempts_cap` / `attempts_remaining`，`Store.note_platform_remaining()` 用
+  **cap − remaining 反推已用次数**（CTFY 没有 attempt 字段）；
+- `solver._submit`：上限优先取平台下发的 `attempts_cap`；`attempts_remaining == 0` 直接硬停；
+  提交后用 `_platform_quota_from()` 解析回执并把额度回显给模型。
+
+### 10.3 回归
+- `tests/smoke_thinking_flag.py`：三态 + 非 DashScope 端点不发（10 条全过）；
+- `tests/smoke_ctfy_quota.py`：额度反推/单调/用尽/null、三种承载位置解析、config=10（全过）；
+- `tests/smoke.py`：**180 passed / 0 failed**；
+- 端到端真实调用：`probes/probe_thinking_e2e.py`（thinking_on 131 tok vs off 8 tok）、
+  `probe_chat_shape.py`（content 正常返回、reasoning 209 字符）。

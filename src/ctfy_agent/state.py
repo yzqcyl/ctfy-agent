@@ -212,10 +212,19 @@ class Challenge:
     # 后续重跑不再自动自启实例（省一次写操作配额 + 一步步数），模型手动 start 也被确定性拦回。
     # 与 instance/instance_id 的分工：那两个是「有实例时的登记」，这个是「确定没有实例」的负缓存。
     instance_absent: bool = False
-    # 平台回执里的 attempt（平台按「用户+题」全局累计，跨 run；最多 5 轮）。
+    # 平台回执里的 attempt/额度（CTFY 口径：attempts_cap 实测 10，部分题 null=不限额；跨 run 累计）。
     # 与 attempts 的分工：attempts 是本地解题轮次，platform_attempts 只用于「平台还剩几次提交」
     # 与回显，绝不拿它当 solve 轮次（否则重试/预算策略会被平台计数污染）。
     platform_attempts: int = 0
+    # [2026-11-14 P22] CTFY 平台（正赛平台）回执/题目对象里的提交额度字段：
+    #   attempts_cap       = 0  → 平台未给上限（null 或字段缺失）
+    #   attempts_remaining = -1 → 未知；0 → 已无提交额度
+    # 实测（runs/**/transcripts 取证）：CTFY 的 questions[].attempts_cap = 10、
+    # attempts_remaining 从 10 递减；部分题两个字段都是 null（不限额）。
+    # 与 platform_attempts 的关系：能读到 cap/remaining 时用它反推已用次数（cap-remaining），
+    # 比平台回执里的 attempt 字段更权威（CTFY 回执没有 attempt 字段）。
+    attempts_cap: int = 0
+    attempts_remaining: int = -1
     steps: int = 0
     updated_at: str = field(default_factory=now)
 
@@ -689,6 +698,41 @@ class Store:
             item = self.require(challenge_id)
             if value > int(item.platform_attempts or 0):
                 item.platform_attempts = value
+                item.touch()
+                self.save()
+            return int(item.platform_attempts or 0)
+
+    def note_platform_remaining(self, challenge_id: str, remaining: int, cap: int = 0) -> int:
+        """[P22] 登记 CTFY 的 attempts_remaining/attempts_cap，并反推已用次数。
+
+        CTFY 回执没有 attempt 字段，只有 attempts_remaining（正确提交后回到 cap，错一次减一）；
+        用 cap-remaining 反推已用次数比本地自增更权威。remaining<0 表示平台没给值（null）→ 忽略。
+        返回合并后的已用次数（未知时返回 platform_attempts 原值）。
+        """
+        try:
+            left = int(remaining)
+            total = int(cap or 0)
+        except (TypeError, ValueError):
+            return 0
+        if left < 0:
+            # 平台给的是 null（不限额/未知）→ 不改任何额度，返回当前已用次数
+            return int(getattr(self.require(challenge_id), "platform_attempts", 0) or 0)
+        with _lock_exclusive(self._lock_path()):
+            self._refresh_flags(challenge_id)
+            item = self.require(challenge_id)
+            changed = False
+            if total > 0 and int(item.attempts_cap or 0) != total:
+                item.attempts_cap = total
+                changed = True
+            if int(item.attempts_remaining or -1) != left:
+                item.attempts_remaining = left
+                changed = True
+            if total > 0:
+                used = max(0, total - left)
+                if used > int(item.platform_attempts or 0):
+                    item.platform_attempts = used
+                    changed = True
+            if changed:
                 item.touch()
                 self.save()
             return int(item.platform_attempts or 0)
