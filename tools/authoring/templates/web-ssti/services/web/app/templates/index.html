@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Echo Notes</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 40px auto; }
+    form { display: grid; gap: 8px; margin-bottom: 24px; }
+    input, textarea { padding: 8px; font-size: 14px; }
+    .card { border: 1px solid #ddd; padding: 12px; margin: 8px 0; border-radius: 6px; }
+    .hint { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Echo Notes</h1>
+  <p class="hint">写下你的留言标题，预览卡片会即时显示在下方。</p>
+
+  <form action="{{ url_for('preview') }}" method="post">
+    <input name="title" placeholder="标题（会渲染成预览卡片）" required>
+    <textarea name="body" placeholder="正文（纯文本）" rows="3"></textarea>
+    <button type="submit">预览</button>
+  </form>
+
+  {% if preview %}
+  <div class="card">
+    <h3>预览</h3>
+    <p><strong>{{ preview.title }}</strong></p>
+    <p>{{ preview.body }}</p>
+  </div>
+  {% endif %}
+
+  <form action="{{ url_for('post') }}" method="post">
+    <input name="title" placeholder="发布标题" required>
+    <textarea name="body" placeholder="发布内容" rows="3"></textarea>
+    <button type="submit">发布</button>
+  </form>
+
+  {% for note in notes %}
+  <div class="card">
+    <strong>{{ note.title }}</strong>
+    <p>{{ note.body }}</p>
+  </div>
+  {% endfor %}
+</body>
+</html>

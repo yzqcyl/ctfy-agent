@@ -1,0 +1,10 @@
+name: "Echo Notes"
+description: "一个在线留言墙：注册后写下标题即可生成预览卡片，目标是拿到这张卡片背后的口令。"
+difficulty: medium
+category: web
+tags:
+  - web
+  - beginner-friendly-authoring
+questions:
+  - id: flag
+    prompt: "输入你找到的口令"

@@ -380,7 +380,7 @@ def _read_challenge_detail(platform, challenge_id: str, competition_id: str) -> 
 
 def fetch_challenge_files(platform, store, challenge_id: str, *, competition_id: str = "",
                           timeout: float = _DEFAULT_TIMEOUT, opener=None,
-                          on_event=None) -> list[dict]:
+                          on_event=None, mirrors: list[str] | None = None) -> list[dict]:
     """题目附件全部落进本题沙盒，返回清单（含失败项，供上层提示）。
 
     调用一次题目详情拿 files[]，再逐个下载。任何异常都在内部消化成
@@ -410,6 +410,7 @@ def fetch_challenge_files(platform, store, challenge_id: str, *, competition_id:
 
     root.mkdir(parents=True, exist_ok=True)
     for entry in entries:
+        entry = {**entry, "challenge_id": entry.get("challenge_id") or challenge_id}
         try:
             if entry.get("file_id") and url_tool:
                 rec = _fetch_one_url_mode(platform, url_tool, entry, challenge_id=challenge_id,
@@ -423,6 +424,14 @@ def fetch_challenge_files(platform, store, challenge_id: str, *, competition_id:
                 rec = {**entry, "ok": False, "error": "该附件没有 file_id，且平台无内容式下载工具"}
         except Exception as exc:  # noqa: BLE001 - 单个附件失败不放弃其它
             rec = {**entry, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        # P2-19：主通道失败 → 本地缓存/镜像兜底；成功路径顺手写缓存
+        name = _sanitize_filename(str(entry.get("name") or ""), "attachment.bin")
+        target = root / name
+        if not rec.get("ok"):
+            rec = fallback_fetch(entry, target, primary_error=str(rec.get("error") or ""),
+                                 mirrors=mirrors, timeout=timeout, opener=opener)
+        elif not rec.get("skipped"):
+            cache_put(entry, target)
         records.append(rec)
         if on_event:
             on_event("attachment", {"challenge_id": challenge_id, **rec})
@@ -436,6 +445,126 @@ def fetch_challenge_files(platform, store, challenge_id: str, *, competition_id:
     except OSError:
         pass
     return records
+
+
+# ---------------------------------------------------------------- 多源 fallback（P2-19）
+# 本场平台附件接口 503 两小时，最后靠手工写清华云盘下载器救场。教训：附件下载必须有
+# 多路兜底 —— 平台接口（主）→ 本地缓存（上次已下过）→ 镜像/云盘分享链接（备用源）。
+# 全部失败才记一条 warning；任何一路成功都写回缓存，下次同类题直接命中。
+_CACHE_ENV = "CTFY_ATTACH_CACHE"
+_MIRROR_ENV = "CTFY_ATTACH_MIRROR"
+
+
+def _cache_dir() -> Path:
+    raw = os.environ.get(_CACHE_ENV) or ""
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".ctfy_attachment_cache"
+
+
+def _cache_key(entry: dict) -> str:
+    raw = "|".join(str(entry.get(key) or "") for key in
+                   ("challenge_id", "file_id", "name"))
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def _cache_paths(entry: dict) -> tuple[Path, Path]:
+    base = _cache_dir()
+    key = _cache_key(entry)
+    return base / key, base / (key + ".json")
+
+
+def cache_put(entry: dict, source_path: Path) -> dict:
+    """把已下载的附件复制进缓存（原子写 + 元数据）。失败只记 warning。"""
+    data_path, meta_path = _cache_paths(entry)
+    try:
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        data = source_path.read_bytes()
+        tmp = data_path.with_suffix(".part")
+        tmp.write_bytes(data)
+        os.replace(tmp, data_path)
+        meta = {"file_id": entry.get("file_id"), "challenge_id": entry.get("challenge_id"),
+                "name": entry.get("name"), "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest()}
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "bytes": len(data), "sha256": meta["sha256"], "path": str(data_path)}
+    except OSError as exc:
+        return {"ok": False, "error": f"缓存写入失败 {type(exc).__name__}: {exc}"}
+
+
+def cache_get(entry: dict, target: Path) -> dict:
+    """缓存命中则复制到 target，返回 record（source=cache）；未命中返回 ok=False。"""
+    data_path, meta_path = _cache_paths(entry)
+    if not data_path.is_file():
+        return {"ok": False, "error": "缓存未命中"}
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        expected = meta.get("bytes")
+        if expected is not None and data_path.stat().st_size != int(expected):
+            return {"ok": False, "error": "缓存大小不符，视为未命中"}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data_path.read_bytes())
+        sha = hashlib.sha256(target.read_bytes()).hexdigest()
+        return {**entry, "ok": True, "name": target.name, "path": target.name,
+                "bytes": target.stat().st_size, "sha256": sha,
+                "source": "cache", "url_origin": "cache"}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"缓存读取失败 {type(exc).__name__}: {exc}"}
+
+
+def mirror_urls(entry: dict, mirrors: list[str] | None = None) -> list[str]:
+    """从显式 mirrors / 环境变量取候选 URL，按顺序展开模板。"""
+    templates = list(mirrors or [])
+    if not templates:
+        raw = os.environ.get(_MIRROR_ENV) or ""
+        templates = [item.strip() for item in raw.split(",") if item.strip()]
+    fields = {"file_id": str(entry.get("file_id") or ""),
+              "challenge_id": str(entry.get("challenge_id") or ""),
+              "name": str(entry.get("name") or "")}
+    urls: list[str] = []
+    for template in templates:
+        try:
+            url = template.format(**fields)
+        except (KeyError, IndexError, ValueError):
+            continue
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _fetch_from_mirrors(entry: dict, target: Path, *, mirrors: list[str] | None,
+                        timeout: float, opener=None) -> dict:
+    attempts: list[str] = []
+    for index, url in enumerate(mirror_urls(entry, mirrors)):
+        try:
+            size, sha = _download(url, target, timeout=timeout, opener=opener)
+            return {**entry, "ok": True, "name": target.name, "path": target.name,
+                    "bytes": size, "sha256": sha, "source": f"mirror:{index}",
+                    "url_origin": _mask_url(url)}
+        except Exception as exc:  # noqa: BLE001 - 逐个镜像试，别让一个坏源挡住其它
+            attempts.append(f"mirror:{index} {type(exc).__name__}: {str(exc)[:120]}")
+    return {"ok": False, "error": "; ".join(attempts) or "没有可用镜像源"}
+
+
+def fallback_fetch(entry: dict, target: Path, *, primary_error: str = "",
+                   mirrors: list[str] | None = None, timeout: float = _DEFAULT_TIMEOUT,
+                   opener=None, use_cache: bool = True) -> dict:
+    """主通道失败后的兜底：缓存 → 镜像；任一成功即写缓存并返回记录。"""
+    attempts: list[str] = [f"primary: {primary_error}"] if primary_error else []
+    if use_cache:
+        cached = cache_get(entry, target)
+        if cached.get("ok"):
+            cached["attempts"] = attempts
+            return cached
+        attempts.append("cache: " + str(cached.get("error") or "未命中"))
+    fetched = _fetch_from_mirrors(entry, target, mirrors=mirrors, timeout=timeout,
+                                  opener=opener)
+    if fetched.get("ok"):
+        cache_put(entry, target)
+        fetched["attempts"] = attempts
+        return fetched
+    attempts.append("mirror: " + str(fetched.get("error") or "全部失败"))
+    return {**entry, "ok": False, "error": "；".join(attempts), "attempts": attempts}
 
 
 def manifest_note(records: list[dict]) -> str:
@@ -457,10 +586,11 @@ def manifest_note(records: list[dict]) -> str:
 
 
 def hydrate(platform, store, challenge_id: str, *, competition_id: str = "",
-            on_event=None) -> str:
+            on_event=None, mirrors: list[str] | None = None) -> str:
     """一站式入口：下载附件 + 写 store 笔记载入 brief，返回清单文本（无附件则空串）。"""
     records = fetch_challenge_files(platform, store, challenge_id,
-                                    competition_id=competition_id, on_event=on_event)
+                                    competition_id=competition_id, on_event=on_event,
+                                    mirrors=mirrors)
     note = manifest_note(records)
     if note:
         try:
