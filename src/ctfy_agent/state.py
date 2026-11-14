@@ -225,6 +225,10 @@ class Challenge:
     # 比平台回执里的 attempt 字段更权威（CTFY 回执没有 attempt 字段）。
     attempts_cap: int = 0
     attempts_remaining: int = -1
+    # [P0-5 审计] 按题号的提交额度：question_id → {"cap": int, "remaining": int}
+    # 多问题题的额度是**按题号**的（CTFY questions[].attempts_cap），题级字段只用于展示；
+    # 某题号打空不能把同题其它题号一起锁死。
+    attempts_by_qid_quota: dict = field(default_factory=dict)
     steps: int = 0
     updated_at: str = field(default_factory=now)
 
@@ -454,6 +458,15 @@ class Store:
                     item.wrong_by_qid[str(qid)] = max(int(item.wrong_by_qid.get(str(qid)) or 0), int(cnt))
                 except (TypeError, ValueError):
                     continue
+        disk_quota = disk.get("attempts_by_qid_quota") or {}
+        if isinstance(disk_quota, dict):
+            current = item.attempts_by_qid_quota
+            if not isinstance(current, dict):
+                current = {}
+                item.attempts_by_qid_quota = current
+            for qid, entry in disk_quota.items():
+                if isinstance(entry, dict) and str(qid) not in current:
+                    current[str(qid)] = entry
         # 单调取 max
         item.attempts = max(item.attempts, int(disk.get("attempts") or 0))
         item.platform_attempts = max(item.platform_attempts, int(disk.get("platform_attempts") or 0))
@@ -702,7 +715,8 @@ class Store:
                 self.save()
             return int(item.platform_attempts or 0)
 
-    def note_platform_remaining(self, challenge_id: str, remaining: int, cap: int = 0) -> int:
+    def note_platform_remaining(self, challenge_id: str, remaining: int, cap: int = 0,
+                                question_id: str = "") -> int:
         """[P22] 登记 CTFY 的 attempts_remaining/attempts_cap，并反推已用次数。
 
         CTFY 回执没有 attempt 字段，只有 attempts_remaining（正确提交后回到 cap，错一次减一）；
@@ -732,10 +746,36 @@ class Store:
                 if used > int(item.platform_attempts or 0):
                     item.platform_attempts = used
                     changed = True
+            if question_id:
+                quotas = item.attempts_by_qid_quota
+                if not isinstance(quotas, dict):
+                    quotas = {}
+                    item.attempts_by_qid_quota = quotas
+                previous = quotas.get(str(question_id))
+                entry = {"cap": max(0, total), "remaining": left}
+                if previous != entry:
+                    quotas[str(question_id)] = entry
+                    changed = True
             if changed:
                 item.touch()
                 self.save()
             return int(item.platform_attempts or 0)
+
+    def remaining_for(self, challenge_id: str, question_id: str = "") -> int:
+        """该题号还剩几次提交额度（-1=未知/不限）。"""
+        item = self.require(challenge_id)
+        if question_id:
+            entry = (getattr(item, "attempts_by_qid_quota", None) or {}).get(str(question_id))
+            if isinstance(entry, dict):
+                try:
+                    return int(entry.get("remaining", -1))
+                except (TypeError, ValueError):
+                    return -1
+            return -1
+        try:
+            return int(item.attempts_remaining if item.attempts_remaining is not None else -1)
+        except (TypeError, ValueError):
+            return -1
 
     def bump_oracle(self, challenge_id: str, limit: int) -> bool:
         """登记一次 oracle 探针；返回 False 表示已达上限。"""

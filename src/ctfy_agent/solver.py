@@ -263,6 +263,33 @@ REFLECTION: 上一步的结果说明了什么、这一步为什么这么选，�
 输出风格：简短、可执行。不要长篇分析，把结论写进 note，把动作交给工具。"""
 
 
+def _object_verdict(obj) -> bool | None:
+    """从嵌套对象里取明确判定（只认 bool / 明确字符串）。"""
+    if not isinstance(obj, dict):
+        return None
+    for key in ("accepted", "correct", "passed"):
+        if key in obj:
+            value = obj[key]
+            if isinstance(value, bool):
+                return value
+            text_value = str(value).strip().lower() if value is not None else ""
+            if text_value in ("true", "yes", "1"):
+                return True
+            if text_value in ("false", "no", "0"):
+                return False
+    for key in ("status", "result"):
+        value = str(obj.get(key, "")).lower()
+        if value in ("correct", "accepted", "success", "ok", "true"):
+            return True
+        if value in ("wrong", "incorrect", "failed", "error", "false", "rejected"):
+            return False
+    for key in ("data", "result"):
+        inner = obj.get(key)
+        if isinstance(inner, dict):
+            return _object_verdict(inner)
+    return None
+
+
 def looks_accepted(text: str) -> bool | None:
     """从提交结果里判断是否通过。返回 None 表示判不出来。
 
@@ -292,15 +319,39 @@ def looks_accepted(text: str) -> bool | None:
             return False
 
     if isinstance(data, dict):
-        for key in ("accepted", "correct", "success", "ok", "passed"):
+        # 1) 明确判定字段（bool 才算；"false"/None 不能靠 bool() 洗白成 True）
+        for key in ("accepted", "correct", "passed"):
             if key in data:
-                return bool(data[key])
+                value = data[key]
+                if isinstance(value, bool):
+                    return value
+                text_value = str(value).strip().lower() if value is not None else ""
+                if text_value in ("true", "yes", "1"):
+                    return True
+                if text_value in ("false", "no", "0"):
+                    return False
+                return None
+        # 2) status/result 字符串
         for key in ("status", "result"):
             value = str(data.get(key, "")).lower()
             if value in ("correct", "accepted", "success", "ok", "true"):
                 return True
-            if value in ("wrong", "incorrect", "failed", "error", "false"):
+            if value in ("wrong", "incorrect", "failed", "error", "false", "rejected"):
                 return False
+        # 3) 嵌套 data/result dict 递归
+        for key in ("data", "result", "structuredContent"):
+            inner = data.get(key)
+            if isinstance(inner, dict):
+                nested = _object_verdict(inner)
+                if nested is not None:
+                    return nested
+        # 4) ok/success 只作兜底，且正文不能有否定词（{"ok":true,"message":"incorrect"}）
+        negative_now = ("incorrect", "wrong", "not correct", "not accepted", "failed",
+                        "rejected", "错误", "不正确", "失败")
+        if not any(word in lowered for word in negative_now):
+            for key in ("success", "ok"):
+                if isinstance(data.get(key), bool):
+                    return data[key]
 
     negative = ("incorrect", "wrong", "not correct", "not accepted", "failed", "rejected", "错误", "不正确", "失败")
     if any(word in lowered for word in negative):
@@ -1827,11 +1878,6 @@ class Solver:
             platform_cap = challenge_cap
         platform_cap = max(0, platform_cap)
         used_platform = int(getattr(challenge, "platform_attempts", 0) or 0)
-        _remaining_raw = getattr(challenge, "attempts_remaining", None)
-        try:
-            _remaining = int(_remaining_raw) if _remaining_raw is not None else -1
-        except (TypeError, ValueError):
-            _remaining = -1
         # 题号要在查账本前算出来：CTFY 的提交额度是**按题号**的，账本按 (题, 题号) 记，
         # 否则某题号烧完额度会把同题其它题号一起锁死（P0-5 审计 Q5-2）。
         qa_only = bool(getattr(challenge, "is_qa_only", False)) or any(
@@ -1849,6 +1895,11 @@ class Solver:
         )
         if qa_only and question_id == "flag":
             question_id = ""  # QA 题的题号不是 flag，交给平台默认，别硬塞瞎猜的值
+        # [P0-5 审计] 额度按题号查：某题号 attempts_remaining=0 不能把同题其它题号一起锁死
+        try:
+            _remaining = int(self.store.remaining_for(challenge_id, question_id))
+        except (TypeError, ValueError, KeyError):
+            _remaining = -1
         # [P17] 跨 run 账本：state.json 是 per-run 的，换 run/快照就清零，
         # 实测 cuteRE 被交到平台 attempt=6、菜刀流量把已判错的 NPF_{...} 在下一个 run 又交一次。
         # 这里把账本里的已用次数并进来，并直接拦「平台已判错的值」。
@@ -1860,6 +1911,8 @@ class Solver:
                                                 question_id=question_id)
         if _blocked:
             return _blocked, False
+        # 注：账本里「已收」的值不在提交前硬拦——跨 run 的 state 可能已清空，但回归/复用
+        # 同一账本的场景会误伤正常答题流程；已收值由 per-run accepted_map + 平台判定兜底。
         if _remaining == 0:
             return (
                 "[提交被拦截] CTFY 回执显示本题 attempts_remaining=0（提交额度已用尽）。"
@@ -1958,6 +2011,15 @@ class Solver:
             accepted = False
         else:
             accepted = looks_accepted(text)
+            if accepted is None:
+                # 多段回执（散文 + JSON / text + structuredContent）solver 的解析器只认开头，
+                # 这里复用 guard 的逐行 JSON 扫描，避免把「判错/通过」漏成 unknown
+                # （漏判 accepted + remaining=0 会走额度分支永久拉黑 —— P0-5 三审 P1-4）。
+                try:
+                    from .submit_guard import classify as _classify  # noqa: PLC0415
+                    accepted = _classify(result, text)["accepted"]
+                except Exception:  # noqa: BLE001
+                    accepted = None
         # 额度/计数在「追加本地文案之前」的原始回执上算：追加后的文本会污染 JSON 截取，
         # 也会让「429」这类字面量混进耗时/排名/flag（P0-5 审计 Q2-1/Q2-4）。
         cap_seen, remaining_seen = self._platform_quota_from(result, text)
@@ -1982,9 +2044,14 @@ class Solver:
         # [P22] CTFY 口径：回执/题目对象给 attempts_cap + attempts_remaining，用 cap-remaining
         # 反推已用次数（CTFY 回执没有 attempt 字段）；remaining=0 → 后续提交直接硬停。
         if remaining_seen >= 0:
-            used_platform = self.store.note_platform_remaining(challenge_id, remaining_seen, cap_seen)
-            if cap_seen > 0:
-                submit_ledger.note_attempt(_ledger_path, challenge_id, used_platform,
+            used_platform = self.store.note_platform_remaining(
+                challenge_id, remaining_seen, cap_seen, question_id=question_id)
+            # 题号账本只写**本回执**的已用次数（cap-remaining），不能拿 challenge 级
+            # used_platform（q1 用 5 次会让 q2 首交就记 5 —— P0-5 三审 P1-3）
+            per_q_used = (max(0, cap_seen - remaining_seen) if cap_seen > 0
+                          else (attempt_seen or 0))
+            if per_q_used > 0:
+                submit_ledger.note_attempt(_ledger_path, challenge_id, per_q_used,
                                            question_id=question_id)
                 text += (f"\n[平台额度] CTFY attempts_remaining={remaining_seen}/{cap_seen}"
                          f"（本题已用 {used_platform} 次提交额度）。")
@@ -2023,12 +2090,12 @@ class Solver:
             if cap_seen > 0:
                 submit_ledger.note_exhausted(_ledger_path, challenge_id, cap_seen,
                                              question_id=question_id)
-                note = f"已在跨 run 账本记满 {cap_seen} 次"
+                tail = f"已在跨 run 账本记满 {cap_seen} 次：此后本地会直接拦截。"
             else:
-                note = "平台未下发额度上限，账本不记满（仅本次提示）"
+                tail = "平台未下发额度上限，账本不记满；是否还有额度由平台下次判定。"
             return (
                 f"{text}\n\n[提交被拦截] 平台回执显示本题提交次数已用尽（attempt cap exceeded）。"
-                f"{note}：此后本地会直接拦截，不再消耗平台额度。"
+                f"{tail}"
                 "不要再换值试探，复盘收口并把候选写进 report。",
                 False,
             )

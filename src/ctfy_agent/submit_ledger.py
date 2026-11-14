@@ -27,6 +27,7 @@ import datetime as dt
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 ENV_PATH = "CTFY_SUBMIT_LEDGER"
@@ -48,22 +49,44 @@ def _empty() -> dict:
 
 
 def load(path: Path) -> dict:
-    """读账本。文件不存在 → 空账本；**损坏** → 先把原文件改名 `.corrupt.<ts>` 保住证据再返回空账本。"""
+    """读账本。
+
+    * 文件不存在 → 空账本；
+    * OSError（Windows 下读写同文件/杀软扫描的共享冲突）→ 退避重试，**绝不**当损坏；
+      重试仍失败才返回空账本（但不改名，避免把好账本误标成 .corrupt）；
+    * JSON 解析失败/结构不对 → 才把原文件改名 `.corrupt.<ts>` 保证据，返回空账本。
+    """
     path = Path(path)
     if not path.is_file():
         return _empty()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:      # 共享冲突：重试，别当损坏
+            last_error = exc
+            time.sleep(0.01 * (attempt + 1))
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            break                   # 真损坏：走下面的留证逻辑
         if isinstance(data, dict) and isinstance(data.get("challenges"), dict):
             return data
-    except (OSError, json.JSONDecodeError):
-        pass
+        break                       # 结构不对：按损坏处理
+    else:
+        # 连续 OSError：返回空账本但**不改名**（下次读可能就好了）
+        return _empty()
+    if last_error is not None:
+        return _empty()
     # 损坏：不静默覆盖历史。把坏文件改名留证，后续写入不会丢原始内容。
-    try:
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path.replace(path.with_name(f"{path.name}.corrupt.{stamp}"))
-    except OSError:
-        pass
+    for attempt in range(5):
+        try:
+            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            path.replace(path.with_name(f"{path.name}.corrupt.{stamp}"))
+            break
+        except OSError:
+            time.sleep(0.01 * (attempt + 1))
     return _empty()
 
 
@@ -79,7 +102,16 @@ def _save(path: Path, data: dict, *, merge: bool = False) -> None:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=1)
                 fh.write("\n")
-            os.replace(tmp, path)
+            # Windows 上目标被读者/杀软短暂持有 → os.replace PermissionError/共享冲突；
+            # 退避重试几次，仍失败才放弃（账本是省钱项，不能炸主流程，但更不能默默丢写）。
+            for attempt in range(6):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except OSError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -87,7 +119,6 @@ def _save(path: Path, data: dict, *, merge: bool = False) -> None:
                 pass
             raise
     except OSError:
-        # 账本是「省钱项」：写失败不能让提交主流程崩掉
         pass
 
 
@@ -114,6 +145,10 @@ def _merge(base: dict, new: dict) -> dict:
                 if str(value) not in values:
                     values.append(str(value))
             current[field] = values
+        # note_accepted 的「从 rejected 删掉」不能被并集又加回来
+        accepted_set = {str(v) for v in (current.get("accepted") or [])}
+        current["rejected"] = [v for v in (current.get("rejected") or [])
+                               if str(v) not in accepted_set]
     return merged
 
 
@@ -137,14 +172,23 @@ def _entry(data: dict, challenge_id: str, question_id: str = "") -> dict:
 
 
 def attempts(data: dict, challenge_id: str, question_id: str = "") -> int:
-    """已用提交次数：带题号时取「题号条目 ∪ 题级条目」的最大值（老数据兜底）。"""
-    best = 0
-    for key in (_key(challenge_id, question_id), _key(challenge_id)):
+    """已用提交次数。
+
+    带题号时**只认题号条目**（有的话）；没有题号条目才退回题级条目（老账本兜底）。
+    不能用 max(题号, 题级)：老账本题级的 attempts=10 会把新题号一上来就拦死，且
+    repair 不动 attempts，救不回来（P0-5 三审 P2）。
+    """
+    challenges = data.get("challenges", {}) or {}
+    scoped = challenges.get(_key(challenge_id, question_id)) if question_id else None
+    if isinstance(scoped, dict):
         try:
-            best = max(best, int((data.get("challenges", {}).get(key) or {}).get("attempts") or 0))
+            return int(scoped.get("attempts") or 0)
         except (TypeError, ValueError):
-            continue
-    return best
+            return 0
+    try:
+        return int((challenges.get(_key(challenge_id)) or {}).get("attempts") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def note_attempt(path: Path, challenge_id: str, attempt: int, question_id: str = "") -> int:
@@ -254,6 +298,21 @@ def remaining(data: dict, challenge_id: str, cap: int, question_id: str = "") ->
     return max(0, cap - attempts(data, challenge_id, question_id))
 
 
+def _accepted_by_challenge(data: dict) -> dict[str, set[str]]:
+    """按 challenge_id 前缀汇总所有键里的 accepted（含题号条目），用于跨键清理。"""
+    out: dict[str, set[str]] = {}
+    for key, entry in (data.get("challenges") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        cid = str(key).split("::", 1)[0]
+        bucket = out.setdefault(cid, set())
+        for value in entry.get("accepted") or []:
+            text = str(value or "").strip()
+            if text:
+                bucket.add(text)
+    return out
+
+
 def repair(path: Path, *, backup: bool = True) -> dict:
     """修复账本（幂等）：只修「值归属」，**不动 attempts**（attempts 是平台口径，本地猜不得）。
 
@@ -283,6 +342,7 @@ def repair(path: Path, *, backup: bool = True) -> dict:
         data = _empty()
     fixed: dict[str, dict] = {}
     changed = corrupt
+    cross: dict[str, set[str]] = {}
     challenges = data.get("challenges")
     for cid, entry in list(challenges.items()):
         if not isinstance(entry, dict):
@@ -312,13 +372,29 @@ def repair(path: Path, *, backup: bool = True) -> dict:
             attempts_value = 0
         entry.update({"attempts": attempts_value, "rejected": clean_rejected,
                       "accepted": accepted})
+        # 记下跨键要清的值（题级 accepted → 题号 rejected 也要删）
+        for value in accepted:
+            cross.setdefault(str(cid).split("::", 1)[0], set()).add(value)
         if json.dumps(entry, ensure_ascii=False, sort_keys=True) != before_json:
             changed = True
             fixed[str(cid)] = {"dropped_rejected": dropped, "attempts": attempts_value}
+    # 跨键清理：同题不同题号条目里的 accepted 值，不应再出现在 rejected 里
+    for cid, entry in list(challenges.items()):
+        if not isinstance(entry, dict):
+            continue
+        bucket = cross.get(str(cid).split("::", 1)[0]) or set()
+        if not bucket:
+            continue
+        before = entry.get("rejected") or []
+        cleaned = [v for v in before if str(v).strip() not in bucket]
+        if cleaned != before:
+            entry["rejected"] = cleaned
+            fixed.setdefault(str(cid), {"cross_key_dropped": len(before) - len(cleaned)})
+            changed = True
     if changed:
         if backup:
             try:
-                stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                 target = path.with_name(f"{path.name}.bak.{stamp}")
                 if not target.exists():
                     target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")

@@ -111,6 +111,8 @@ def case_repair_and_corrupt(tmp: Path) -> None:
 
 def case_question_scope(tmp: Path) -> None:
     """P0-5：额度按 (题, 题号) 记，某题号烧完不锁死同题其它题号。"""
+    import json
+
     path = tmp / "ledger5.json"
     submit_ledger.note_exhausted(path, "ch-q", 2, question_id="q1")
     data = submit_ledger.load(path)
@@ -124,6 +126,32 @@ def case_question_scope(tmp: Path) -> None:
     path2 = tmp / "ledger6.json"
     submit_ledger.note_exhausted(path2, "ch-u", 0)
     assert submit_ledger.attempts(submit_ledger.load(path2), "ch-u") == 0
+    # 老账本的题级 attempts 不能一上来就拦新题号（有题号条目时只认题号条目）
+    path3 = tmp / "ledger7.json"
+    path3.write_text(json.dumps({"schema": 1, "challenges": {
+        "ch-legacy": {"attempts": 10, "rejected": [], "accepted": []}}}), encoding="utf-8")
+    submit_ledger.note_attempt(path3, "ch-legacy", 1, question_id="q2")
+    data = submit_ledger.load(path3)
+    assert submit_ledger.attempts(data, "ch-legacy", "q2") == 1
+    assert submit_ledger.attempts(data, "ch-legacy") == 10
+    # 跨键清理：题级 accepted 的值也要从题号 rejected 里去掉
+    path4 = tmp / "ledger8.json"
+    path4.write_text(json.dumps({"schema": 1, "challenges": {
+        "ch-k": {"attempts": 1, "accepted": ["flag{ok}"], "rejected": []},
+        "ch-k::q1": {"attempts": 1, "accepted": [], "rejected": ["flag{ok}"]}}}),
+        encoding="utf-8")
+    assert submit_ledger.is_rejected(submit_ledger.load(path4), "ch-k", "flag{ok}", question_id="q1")
+    assert submit_ledger.repair(path4)["changed"] is True
+    assert not submit_ledger.is_rejected(submit_ledger.load(path4), "ch-k", "flag{ok}",
+                                         question_id="q1")
+    # merge 不能把 note_accepted 删掉的 rejected 并回来
+    path5 = tmp / "ledger9.json"
+    path5.write_text(json.dumps({"schema": 1, "challenges": {
+        "ch-m": {"attempts": 1, "accepted": [], "rejected": ["flag{x}"]}}}), encoding="utf-8")
+    submit_ledger.note_accepted(path5, "ch-m", "flag{x}")
+    data = submit_ledger.load(path5)
+    assert "flag{x}" not in data["challenges"]["ch-m"]["rejected"], data
+    assert "flag{x}" in data["challenges"]["ch-m"]["accepted"], data
 
 
 def case_receipt_classify(tmp: Path) -> None:

@@ -27,7 +27,8 @@ CAP_MARKERS = (
 TRANSIENT_MARKERS = (
     "rate limit", "too many requests", "timed out", "timeout", "temporarily unavailable",
     "service unavailable", "bad gateway", "gateway timeout", "connection reset",
-    "限流", "超时", "稍后重试",
+    "platform_busy", "platform busy", "did not process this request", "send it again in",
+    "server busy", "try again", "限流", "超时", "稍后重试", "平台繁忙", "平台忙",
 )
 
 
