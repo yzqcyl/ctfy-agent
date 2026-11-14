@@ -846,6 +846,9 @@ class Crew:
         # 实例并发 / TTL 这些平台事实，旧版完全没采集，导致模型在「必须先用 VPN」的场次里
         # 盲试直连。run 开始时只读拉一次，拼进协调者简报。
         self._access_lines: list[str] = []
+        # 外部（supervisor）预先钉住的接入约束：solve() 里拉比赛级约束时必须保留，
+        # 否则每次 solve 都会把它覆盖掉（隧道本地端口提示就丢了）
+        self._pinned_access_lines: list[str] = []
         self._access_cache: dict[str, list[str]] = {}
         # 集群-B：本次尝试的决策温度（None=不改各角色自带温度，行为同旧）；由 _delegate 盖到专家上
         self._attempt_temperature: float | None = None
@@ -1294,7 +1297,8 @@ class Crew:
         # 多问题/门控题：CLI/MCP 路径没有容器的 task.json，这里补一次只读 get_challenge
         self._question_info = self._fetch_challenge(challenge_id, solver)
         # 比赛级接入约束（tcp_access=vpn / 实例并发 / TTL…）：只读一次，进简报
-        self._access_lines = self._fetch_access_lines(challenge_id, solver)
+        self._access_lines = [*self._pinned_access_lines,
+                             *self._fetch_access_lines(challenge_id, solver)]
         brief = self._brief(challenge)
         if prior_text:
             # 集群-B 黑板继承：只把「结论事实 + 判错死路」前置到首发 brief，
@@ -2517,6 +2521,10 @@ class Crew:
         if not scope:
             return set()
         return self.platform.my_solved_ids(scope)
+
+    def pin_access_lines(self, lines: list[str]) -> None:
+        """钉住若干「平台事实」接入约束行（序号在比赛级约束之前渲染）。"""
+        self._pinned_access_lines = [str(line) for line in (lines or []) if str(line or "").strip()]
 
     def _fetch_access_lines(self, challenge_id: str, solver) -> list[str]:
         """只读拉一次比赛级接入约束（tcp_access / agent_internet / 实例并发 / TTL）→ 提示行。

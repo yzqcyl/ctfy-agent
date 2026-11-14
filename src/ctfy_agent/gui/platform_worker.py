@@ -421,7 +421,7 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 # 否则只留在 challenge dict 里没人读（模型会把 *.internal 连不上当成题挂了）。
                 tunnel_note = str(item.get("tunnel_note") or "").strip()
                 if tunnel_note:
-                    crew._access_lines = list(getattr(crew, "_access_lines", []) or []) + [tunnel_note]
+                    crew.pin_access_lines([tunnel_note])
                 summary = crew.solve(cid, cancel_event=task_cancel, force_rerun=cid in forced)
                 ch = store.get(cid)
                 flag = getattr(ch, "flag_value", "") if ch else ""
