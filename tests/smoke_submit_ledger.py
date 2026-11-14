@@ -83,6 +83,73 @@ def case_cap_disabled(tmp: Path) -> None:
     assert submit_ledger.blocked_reason(data, cid, "flag{x}", 0) == ""
 
 
+def case_repair_and_corrupt(tmp: Path) -> None:
+    """P0-5：repair 只修值归属、不动 attempts；损坏账本改名留证。"""
+    import json
+
+    path = tmp / "ledger3.json"
+    path.write_text(json.dumps({"schema": 1, "challenges": {
+        "ch-r": {"attempts": 1, "accepted": ["flag{ok}"],
+                 "rejected": ["flag{ok}", "flag{bad}", "flag{bad}"]},
+        "ch-x": "坏了",
+    }}, ensure_ascii=False), encoding="utf-8")
+    first = submit_ledger.repair(path)
+    data = submit_ledger.load(path)
+    entry = data["challenges"]["ch-r"]
+    assert first["changed"] is True, first
+    assert entry["rejected"] == ["flag{bad}"], entry
+    assert entry["attempts"] == 1, entry          # 不能按 len(accepted) 抬 attempts
+    assert isinstance(data["challenges"]["ch-x"], dict)
+    assert submit_ledger.repair(path)["changed"] is False    # 幂等
+    assert len(list(tmp.glob("ledger3.json.bak.*"))) == 1    # 时间戳备份不覆盖证据
+
+    broken = tmp / "ledger4.json"
+    broken.write_text('{"schema": 1, "challenges": {', encoding="utf-8")
+    assert submit_ledger.load(broken).get("challenges") == {}
+    assert len(list(tmp.glob("ledger4.json.corrupt.*"))) == 1
+
+
+def case_question_scope(tmp: Path) -> None:
+    """P0-5：额度按 (题, 题号) 记，某题号烧完不锁死同题其它题号。"""
+    path = tmp / "ledger5.json"
+    submit_ledger.note_exhausted(path, "ch-q", 2, question_id="q1")
+    data = submit_ledger.load(path)
+    assert submit_ledger.blocked_reason(data, "ch-q", "flag{a}", 2, question_id="q1")
+    assert submit_ledger.blocked_reason(data, "ch-q", "flag{a}", 2, question_id="q2") == ""
+    submit_ledger.note_accepted(path, "ch-q", "flag{q}", question_id="q2")
+    data = submit_ledger.load(path)
+    assert submit_ledger.is_accepted(data, "ch-q", "flag{q}", question_id="q2")
+    assert not submit_ledger.is_accepted(data, "ch-q", "flag{q}", question_id="q1")
+    # cap<=0（平台不限/未知）不写账本，避免把不限额题写成 10/10 永久拦死
+    path2 = tmp / "ledger6.json"
+    submit_ledger.note_exhausted(path2, "ch-u", 0)
+    assert submit_ledger.attempts(submit_ledger.load(path2), "ch-u") == 0
+
+
+def case_receipt_classify(tmp: Path) -> None:
+    """P0-5 审计回归：accepted 只认结构化字段；429/耗时里的 429 不能当额度用尽。"""
+    import json
+
+    from ctfy_agent import submit_guard
+
+    def mcp(payload):
+        return {"content": [{"type": "text",
+                             "text": json.dumps(payload, ensure_ascii=False)}]}
+
+    def text(payload):
+        return {"content": [{"type": "text", "text": payload}]}
+
+    assert submit_guard.classify(mcp({"correct": True, "attempts_remaining": 0,
+                                      "attempts_cap": 1}))["status"] == "accepted"
+    assert submit_guard.classify(text("incorrect"))["status"] == "rejected"
+    assert submit_guard.classify(text("correct"))["status"] == "unknown"
+    assert submit_guard.classify(text("HTTP 429 rate limited"))["status"] != "cap_exceeded"
+    assert submit_guard.classify(mcp({"correct": True, "solve_time_s": 429.4}))["status"] \
+        == "accepted"
+    assert submit_guard.quota_from_questions(
+        [{"id": "q1", "attempts_cap": 10, "attempts_remaining": 0}], "q2") == (0, -1)
+
+
 def main() -> int:
     # 不用系统临时目录：DSH 沙盒下 tempfile 清理会对目录 chmod，触发 WinError 5（实测）。
     import shutil
@@ -94,6 +161,9 @@ def main() -> int:
         case_paths(tmp)
         case_attempts_and_rejected(tmp)
         case_cap_disabled(tmp)
+        case_repair_and_corrupt(tmp)
+        case_question_scope(tmp)
+        case_receipt_classify(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("OK submit_ledger 全部通过")

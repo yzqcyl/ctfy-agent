@@ -1827,14 +1827,37 @@ class Solver:
             platform_cap = challenge_cap
         platform_cap = max(0, platform_cap)
         used_platform = int(getattr(challenge, "platform_attempts", 0) or 0)
-        _remaining = int(getattr(challenge, "attempts_remaining", -1) or -1)
+        _remaining_raw = getattr(challenge, "attempts_remaining", None)
+        try:
+            _remaining = int(_remaining_raw) if _remaining_raw is not None else -1
+        except (TypeError, ValueError):
+            _remaining = -1
+        # 题号要在查账本前算出来：CTFY 的提交额度是**按题号**的，账本按 (题, 题号) 记，
+        # 否则某题号烧完额度会把同题其它题号一起锁死（P0-5 审计 Q5-2）。
+        qa_only = bool(getattr(challenge, "is_qa_only", False)) or any(
+            str(t).lower() in ("qa", "mcq", "single_select") for t in (challenge.tags or [])
+        )
+        submit_name = (self.platform.try_resolve("submit_qa") if qa_only else None) \
+            or self.platform.resolve("submit_flag")
+        props = self.platform.prop_names(submit_name)
+        instance_mode = "instance_id" in props and not qa_only
+        question_id = str(
+            args.get("question_id")
+            or challenge.next_question_id
+            or self.platform.preferred_question_id("submit_answer")
+            or "flag"
+        )
+        if qa_only and question_id == "flag":
+            question_id = ""  # QA 题的题号不是 flag，交给平台默认，别硬塞瞎猜的值
         # [P17] 跨 run 账本：state.json 是 per-run 的，换 run/快照就清零，
         # 实测 cuteRE 被交到平台 attempt=6、菜刀流量把已判错的 NPF_{...} 在下一个 run 又交一次。
         # 这里把账本里的已用次数并进来，并直接拦「平台已判错的值」。
         _ledger_path = submit_ledger.ledger_path(getattr(self.store, "run_dir", None))
         _ledger = submit_ledger.load(_ledger_path)
-        used_platform = max(used_platform, submit_ledger.attempts(_ledger, challenge_id))
-        _blocked = submit_ledger.blocked_reason(_ledger, challenge_id, answer, platform_cap)
+        used_platform = max(used_platform,
+                            submit_ledger.attempts(_ledger, challenge_id, question_id))
+        _blocked = submit_ledger.blocked_reason(_ledger, challenge_id, answer, platform_cap,
+                                                question_id=question_id)
         if _blocked:
             return _blocked, False
         if _remaining == 0:
@@ -1850,23 +1873,6 @@ class Solver:
                 "直接复盘收口（把 flag 候选与依据写进 report）。",
                 False,
             )
-        qa_only = bool(getattr(challenge, "is_qa_only", False)) or any(
-            str(t).lower() in ("qa", "mcq", "single_select") for t in (challenge.tags or [])
-        )
-        submit_name = (self.platform.try_resolve("submit_qa") if qa_only else None) \
-            or self.platform.resolve("submit_flag")
-        props = self.platform.prop_names(submit_name)
-        instance_mode = "instance_id" in props and not qa_only
-        question_id = str(
-            args.get("question_id")
-            or challenge.next_question_id
-            or self.platform.preferred_question_id("submit_answer")
-            or "flag"
-        )
-
-        if qa_only and question_id == "flag":
-            question_id = ""  # QA 题的题号不是 flag，交给平台默认，别硬塞瞎猜的值
-
         # [fix 2026-11-03 v6.3] 多问题题防串味：同一题号已答对就别再交；
         # 已答对某题的值也不能拿去交另一题（SAMPLE-001 实测：slug 通过后又被当 flag 交了 5 次）。
         accepted_map = dict(getattr(challenge, "answers_by_qid", {}) or {})
@@ -1946,34 +1952,48 @@ class Solver:
                 False,
             )
         text = render_call_result(result)
-        if isinstance(result, dict) and result.get("isError"):
+        is_tool_error = bool(isinstance(result, dict) and result.get("isError"))
+        if is_tool_error:
             text = f"[工具报错] {text}"
             accepted = False
         else:
             accepted = looks_accepted(text)
+        # 额度/计数在「追加本地文案之前」的原始回执上算：追加后的文本会污染 JSON 截取，
+        # 也会让「429」这类字面量混进耗时/排名/flag（P0-5 审计 Q2-1/Q2-4）。
+        cap_seen, remaining_seen = self._platform_quota_from(result, text)
+        attempt_seen = self._platform_attempt_from(result, text)
+        # 传输/限流类错误：平台根本没判定这个值 → 不能记「答错」，回滚预留稍后重试。
+        if is_tool_error and self._looks_transient(text):
+            self.store.release_submit(challenge_id, answer)
+            return (
+                f"{text}\n\n[提交未判定] 平台/网络暂时不可用（限流或超时），本次提交没有被判定；"
+                "已回滚本地提交额度，稍后重试同一个值即可（不要换值试探）。",
+                False,
+            )
         # [P2 平台计数同步] 回执里 attempt = 平台按「用户+题」全局累计的提交次数（跨 run）。
         # 记进 platform_attempts（单调取 max）供下次开跑直接硬停，同时回显给模型看还剩几次。
-        attempt_seen = self._platform_attempt_from(result, text)
         if attempt_seen:
             used_platform = self.store.note_platform_attempt(challenge_id, attempt_seen)
-            submit_ledger.note_attempt(_ledger_path, challenge_id, attempt_seen)
+            submit_ledger.note_attempt(_ledger_path, challenge_id, attempt_seen,
+                                       question_id=question_id)
             if platform_cap > 0:
                 text += (f"\n[平台计数] 平台已累计第 {used_platform}/{platform_cap} 次提交"
                          "（用户+题全局计数，跨 run 不重置）。")
         # [P22] CTFY 口径：回执/题目对象给 attempts_cap + attempts_remaining，用 cap-remaining
         # 反推已用次数（CTFY 回执没有 attempt 字段）；remaining=0 → 后续提交直接硬停。
-        cap_seen, remaining_seen = self._platform_quota_from(result, text)
         if remaining_seen >= 0:
             used_platform = self.store.note_platform_remaining(challenge_id, remaining_seen, cap_seen)
             if cap_seen > 0:
-                submit_ledger.note_attempt(_ledger_path, challenge_id, used_platform)
+                submit_ledger.note_attempt(_ledger_path, challenge_id, used_platform,
+                                           question_id=question_id)
                 text += (f"\n[平台额度] CTFY attempts_remaining={remaining_seen}/{cap_seen}"
                          f"（本题已用 {used_platform} 次提交额度）。")
             elif remaining_seen == 0:
                 text += "\n[平台额度] CTFY 回执 attempts_remaining=0：本题提交额度已用尽。"
 
         if accepted is True:
-            submit_ledger.note_accepted(_ledger_path, challenge_id, answer)
+            submit_ledger.note_accepted(_ledger_path, challenge_id, answer,
+                                        question_id=question_id)
             # [fix 2026-11-03 B-3] 解析平台回执的 challenge_fully_solved：多问题题只过当前题号时
             # 传 fully_solved=False，让 mark_submitted 不置 status="submitted"，避免 precheck_fn 短路。
             fully_solved = self._fully_solved_from(result, text)
@@ -1988,13 +2008,53 @@ class Solver:
             )
         verdict_text = "判定为未通过" if accepted is False else "无法判定是否通过"
         if accepted is False:
-            # P2-4：记下这次错交，并回显全部已判错值——提交次数只有 3 次，错交一次就少 1/3
+            # P2-4：记下这次错交，并回显全部已判错值——错交一次就少一次额度
             self.store.note_rejected(challenge_id, answer)
             # [P17] 跨 run 记住判错值：下个 run/快照里同一个值不再白交一次
-            submit_ledger.note_rejected(_ledger_path, challenge_id, answer)
-            # [v7.2 A4] 按题号记错交次数，供 per-question 额度闸用（v3 多轮换题号重交不被锁死）
+            submit_ledger.note_rejected(_ledger_path, challenge_id, answer,
+                                        question_id=question_id)
+            # [v7.2 A4] 按题号记错交次数，供 per-question 额度闸用
             self.store.mark_submitted(challenge_id, answer, accepted=False, question_id=question_id)
+        # [P0-5] 额度用尽只作为「以后别交」的信息，放在判定之后，绝不覆盖 accepted
+        # （最后一击答对时 remaining 必然 0）；cap 未知时不抬账本，避免把不限额题写成
+        # 10/10 永久拦死（P0-5 审计 Q2-2/Q2-3）。
+        if self._submit_cap_exceeded(cap_seen, remaining_seen, text):
+            self.store.release_submit(challenge_id, answer)
+            if cap_seen > 0:
+                submit_ledger.note_exhausted(_ledger_path, challenge_id, cap_seen,
+                                             question_id=question_id)
+                note = f"已在跨 run 账本记满 {cap_seen} 次"
+            else:
+                note = "平台未下发额度上限，账本不记满（仅本次提示）"
+            return (
+                f"{text}\n\n[提交被拦截] 平台回执显示本题提交次数已用尽（attempt cap exceeded）。"
+                f"{note}：此后本地会直接拦截，不再消耗平台额度。"
+                "不要再换值试探，复盘收口并把候选写进 report。",
+                False,
+            )
         return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
+
+    @staticmethod
+    def _looks_transient(text: str) -> bool:
+        """回执是不是「平台暂时不可用/限流/超时」（这种没判定答案，不能记答错）。"""
+        from .submit_guard import TRANSIENT_MARKERS  # noqa: PLC0415
+
+        lowered = str(text or "").lower()
+        return any(mark in lowered for mark in TRANSIENT_MARKERS)
+
+    @staticmethod
+    def _submit_cap_exceeded(cap_seen: int, remaining_seen: int, text: str) -> bool:
+        """平台明确「本题提交次数已用尽」吗。
+
+        只认平台真实错误码，或「remaining==0 且 cap 已知」——不用 429 文本猜测
+        （回执里 attempt/uuid/耗时/排名都可能出现 429，会把正确提交误判成额度用尽）。
+        """
+        from .submit_guard import CAP_MARKERS  # noqa: PLC0415
+
+        lowered = str(text or "").lower()
+        if any(mark.lower() in lowered for mark in CAP_MARKERS):
+            return True
+        return remaining_seen == 0 and cap_seen > 0
 
     def _platform_quota_from(self, result, text: str) -> tuple[int, int]:
         """[P22] 从回执/题目对象里取 CTFY 的 (attempts_cap, attempts_remaining)。
