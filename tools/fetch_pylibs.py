@@ -93,11 +93,43 @@ def installed() -> list[str]:
     return rows
 
 
+# 关键库的真实导入检查。
+# [教训 2026-11-10] pip install --target 被中断时目录会「半截」：实测 psutil 缺 _common.py，
+# 结果 `from pwn import *` 报 "partially initialized module 'psutil'"，PWN 一上来就废。
+# 装完必须真 import 一遍，别只看 pip 的退出码。
+# 注意：**在进程内 import**，不要起子进程抓管道——Windows 沙盒下捕获子进程 stdio 会卡死。
+_CHECK_LIBS = ("Crypto", "sympy", "gmpy2", "pwn", "z3")
+
+
+def check_imports() -> int:
+    """用「和 agent shell 相同」的 sys.path 真 import 关键库，返回失败数。"""
+    sys.path.insert(0, str(TARGET))
+    dll_dirs = [str(p) for p in TARGET.glob("*.libs") if p.is_dir()]
+    if dll_dirs:
+        os.environ["PATH"] = os.pathsep.join(dll_dirs) + os.pathsep + os.environ.get("PATH", "")
+    bad = []
+    for mod in _CHECK_LIBS:
+        try:
+            __import__(mod)
+        except Exception as exc:  # noqa: BLE001 - 半截安装/缺 DLL 都要报出来
+            bad.append((mod, repr(exc)[:200]))
+    if not bad:
+        print("验证：关键库 import 全部正常（Crypto/sympy/gmpy2/pwn/z3）")
+        return 0
+    for mod, why in bad:
+        print(f"[verify] {mod} 导入失败：{why}", file=sys.stderr)
+    print("\n[verify] 有库导入失败：多半是上次 pip --target 半截中断。"
+          "重跑 `python tools/fetch_pylibs.py <该包>` 修复。", file=sys.stderr)
+    return len(bad)
+
+
 def main(argv: list[str]) -> int:
     if "--list" in argv:
         rows = installed()
         print("tools/pylibs 已装：" + ("、".join(rows) if rows else "（空）"))
         return 0
+    if "--check" in argv:
+        return check_imports()
     packages = [a for a in argv if not a.startswith("-")] or DEFAULT_PACKAGES
     _prepare_env()
     print(f"目标目录：{TARGET}")
@@ -114,7 +146,7 @@ def main(argv: list[str]) -> int:
         shutil.rmtree(child, ignore_errors=True)
     if code == 0:
         print("\n完成。已装：" + "、".join(installed()))
-        print("验证：PYTHONPATH=tools/pylibs python -c \"import Crypto, sympy, gmpy2; print('ok')\"")
+        code = check_imports() or code
     else:
         print(f"\npip 退出码 {code}；可看上面日志定位是哪个包不支持本机 Python 3.12。", file=sys.stderr)
     return code
