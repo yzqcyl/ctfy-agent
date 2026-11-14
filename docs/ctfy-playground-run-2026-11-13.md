@@ -151,31 +151,31 @@ python runs/_mon/final_verify.py --both
 2026-11-14 05:45 快照结果：练习场看板 **14/17**、`get_my_solves` **16/17**；
 SAMPLE 比赛看板 **15/17**（含 SAMPLE-023），QA 两题同为 0 计数。
 
-## 9. 附录：inal_verify.py --both 输出（2026-11-14 05:42 快照）
+## 9. 附录：inal_verify.py --both 输出（2026-11-14 08:32 收尾快照）
 
-# 练习场最终核对（2026-11-14 05:42:13）
+# 练习场最终核对（2026-11-14 08:32:30）
 
 ### 平台练习场
 
 | 题 | 平台计数 | 团队状态 | 我们已解的题号 |
 |---|---|---|---|
-| SAMPLE-001 | 209 | ✅ 完全解出 | flag, slug |
-| SAMPLE-003 | 168 | ✅ 完全解出 | flag |
+| SAMPLE-001 | 213 | ✅ 完全解出 | flag, slug |
+| SAMPLE-003 | 171 | ✅ 完全解出 | flag |
 | SAMPLE-005 | 0 | ⚠️ 平台有 solve 记录但看板未标完全解出 | - |
-| SAMPLE-006 | 62 | ✅ 完全解出 | deface |
+| SAMPLE-006 | 63 | ✅ 完全解出 | deface |
 | SAMPLE-007 | 54 | ✅ 完全解出 | outage |
-| SAMPLE-008 | 116 | ✅ 完全解出 | persist |
-| SAMPLE-009 | 41 | ✅ 完全解出 | flag, root |
+| SAMPLE-008 | 118 | ✅ 完全解出 | persist |
+| SAMPLE-009 | 44 | ✅ 完全解出 | flag, root |
 | SAMPLE-015 | 124 | ✅ 完全解出 | flag |
-| SAMPLE-016 | 159 | ✅ 完全解出 | flag |
-| SAMPLE-017 | 143 | ✅ 完全解出 | flag |
-| SAMPLE-018 | 154 | ✅ 完全解出 | flag |
-| SAMPLE-019 | 39 | ✅ 完全解出 | counter |
+| SAMPLE-016 | 161 | ✅ 完全解出 | flag |
+| SAMPLE-017 | 145 | ✅ 完全解出 | flag |
+| SAMPLE-018 | 156 | ✅ 完全解出 | flag |
+| SAMPLE-019 | 41 | ✅ 完全解出 | counter |
 | SAMPLE-020 | 0 | ⚠️ 平台有 solve 记录但看板未标完全解出 | - |
-| SAMPLE-021 | 125 | ✅ 完全解出 | flag |
-| SAMPLE-022 | 83 | ✅ 完全解出 | flag, gate |
-| SAMPLE-023 | 107 | ❌ 未解 | - |
-| SAMPLE-024 | 102 | ✅ 完全解出 | flag |
+| SAMPLE-021 | 126 | ✅ 完全解出 | flag |
+| SAMPLE-022 | 85 | ✅ 完全解出 | flag, gate |
+| SAMPLE-023 | 108 | ❌ 未解 | - |
+| SAMPLE-024 | 103 | ✅ 完全解出 | flag |
 
 平台看板完全解出：**14/17**；get_my_solves：**16** 题
 
@@ -184,7 +184,7 @@ SAMPLE 比赛看板 **15/17**（含 SAMPLE-023），QA 两题同为 0 计数。
 | 题 | 平台计数 | 团队状态 | 我们已解的题号 |
 |---|---|---|---|
 | SAMPLE-001 | 128 | ✅ 完全解出 | flag, slug |
-| SAMPLE-003 | 37 | ✅ 完全解出 | flag |
+| SAMPLE-003 | 38 | ✅ 完全解出 | flag |
 | SAMPLE-005 | 0 | ⚠️ 平台有 solve 记录但看板未标完全解出 | - |
 | SAMPLE-006 | 103 | ✅ 完全解出 | deface |
 | SAMPLE-007 | 73 | ✅ 完全解出 | outage |
@@ -196,9 +196,16 @@ SAMPLE 比赛看板 **15/17**（含 SAMPLE-023），QA 两题同为 0 计数。
 | SAMPLE-018 | 63 | ✅ 完全解出 | flag |
 | SAMPLE-019 | 33 | ✅ 完全解出 | counter |
 | SAMPLE-020 | 0 | ⚠️ 平台有 solve 记录但看板未标完全解出 | - |
-| SAMPLE-021 | 36 | ✅ 完全解出 | flag |
-| SAMPLE-022 | 39 | ✅ 完全解出 | flag, gate |
+| SAMPLE-021 | 37 | ✅ 完全解出 | flag |
+| SAMPLE-022 | 40 | ✅ 完全解出 | flag, gate |
 | SAMPLE-023 | 26 | ✅ 完全解出 | flag |
 | SAMPLE-024 | 19 | ✅ 完全解出 | flag |
 
 平台看板完全解出：**15/17**；get_my_solves：**22** 题
+
+
+### 08:00–08:40 最后一轮尝试（收尾前）
+
+- portal-first 收割再跑 6 轮（节点 .8×3 / .5 / .12×2），portal 均未起来；
+- 结论不变：SAMPLE-023 在练习场的 estate 部署整晚不稳定，除 07:0x 那一次 portal 短暂可用的窗口外，无法稳定打通；
+- 截至收尾，平台没有任何未清理的实例，后台任务全部结束。
