@@ -277,8 +277,8 @@ def install(mapping: dict[tuple[str, int], tuple[str, int]] | None,
             owner: str = "") -> dict:
     """安装/更新某个属主的映射表（同一属主原地替换；不同属主取并集）。
 
-    返回**合并后**的全量映射（便于调用方记日志）。不传 owner 的老调用方
-    （solver / 单题脚本）语义不变：每次 install 覆盖自己那一份。
+    返回**该属主自己的**映射（不含别人的条目；要看全量用 ``current()``）。
+    不传 owner 的老调用方（solver / 单题脚本）语义不变：每次 install 覆盖自己那一份。
     """
     owner = str(owner or "")
     normalized: dict[tuple[str, int], tuple[str, int]] = {}
@@ -292,7 +292,7 @@ def install(mapping: dict[tuple[str, int], tuple[str, int]] | None,
             _OWNERS.pop(owner, None)
             _owner_dropped_locked(owner)   # 空映射不留空属主，避免顺序表无限增长
         _rebuild_locked()
-        return dict(_MAP)
+        return dict(normalized)
 
 
 def clear(owner: str | None = None) -> None:
@@ -316,10 +316,11 @@ def current() -> dict[tuple[str, int], tuple[str, int]]:
 
 
 def restore() -> None:
-    """测试用：恢复原始 socket 实现。"""
-    global _INSTALLED
+    """测试用：恢复原始 socket 实现（映射/DNS 也要清干净，否则测试互相污染）。"""
+    global _INSTALLED, _MAP, _DNS_PORT, _DNS_PORTS, _CONFLICTS
     with _LOCK:
         _MAP = {}
+        _DNS_PORT = 0
         _OWNERS.clear()
         _DNS_OWNERS.clear()
         _ORDER.clear()

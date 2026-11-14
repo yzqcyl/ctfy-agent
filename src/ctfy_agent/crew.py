@@ -879,7 +879,7 @@ class Crew:
             try:
                 result = self.platform.stop_instance(iid)
                 if self._release_receipt_ok(result):
-                    self._forget_last_instance(challenge_id)
+                    self._forget_last_instance(challenge_id, iid)
                     return {"ok": True, "via": "stop_instance"}
                 err = f"stop_instance 软失败：{str(result)[:200]}"
             except Exception as exc:  # noqa: BLE001
@@ -892,7 +892,7 @@ class Crew:
             return {"ok": False, "error": f"{err}; 按题删除异常 {type(exc).__name__}: {exc}"}
         if not removed.get("ok"):
             return {"ok": False, "error": f"{err}; 按题删除失败：{str(removed.get('error') or '')[:200]}"}
-        self._forget_last_instance(challenge_id)
+        self._forget_last_instance(challenge_id, iid)
         return {"ok": True, "via": "delete_environment", "detail": removed}
 
     @staticmethod
@@ -909,7 +909,8 @@ class Crew:
             "[工具报错]", "缺少必填参数", "NOT_FOUND", "isError", "not found",
         ))
 
-    def _forget_last_instance(self, challenge_id: str) -> None:
+    def _forget_last_instance(self, challenge_id: str, instance_id: str = "") -> None:
+        last: dict = {}
         try:
             last = (self.store.meta or {}).get("last_instance") or {}
             if str(last.get("challenge_id") or "") == challenge_id:
@@ -920,14 +921,18 @@ class Crew:
         # 并撤掉 socket 改写，避免下一题拿到旧映射（同一进程串行跑全量时尤其重要）。
         # [2026-11-14 supervisor] 桥按实例 id 分键：只停本题那条，否则并发跑多题时
         # 一题的收尾会把别的题的隧道一起杀掉（表现为「另一题突然连不上」）。
+        # 必须按「本题实例 id」停：拿不到 id 时宁可不停，也绝不全局停桥——supervisor
+        # 并发跑多题时全局停会把别的题的隧道一起杀掉（表现为另一题突然连不上）。
+        target = str(instance_id or "")
+        if not target:
+            matches = str(last.get("challenge_id") or "") == challenge_id
+            target = str((last.get("instance_id") if matches else "") or "")
+        if not target:
+            return
         try:
             from .netbridge import stop_bridge  # noqa: PLC0415 - 只有收尾路径需要
 
-            instance_id = str((last or {}).get("instance_id") or "")
-            if instance_id:
-                stop_bridge(instance_id)
-            else:
-                stop_bridge()  # 老状态没记实例 id：退回旧的全停语义
+            stop_bridge(target)
         except Exception:  # noqa: BLE001 - 清理尽力而为
             pass
 

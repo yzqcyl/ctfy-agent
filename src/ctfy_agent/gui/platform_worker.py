@@ -417,6 +417,11 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
 
                 crew = Crew(config, platform, store,
                             lambda model=None: make_llm(config, model=model), on_event=on_event)
+                # supervisor 已建好本地隧道：把「照抄本地端口」作为**平台事实**放进简报可信区，
+                # 否则只留在 challenge dict 里没人读（模型会把 *.internal 连不上当成题挂了）。
+                tunnel_note = str(item.get("tunnel_note") or "").strip()
+                if tunnel_note:
+                    crew._access_lines = list(getattr(crew, "_access_lines", []) or []) + [tunnel_note]
                 summary = crew.solve(cid, cancel_event=task_cancel, force_rerun=cid in forced)
                 ch = store.get(cid)
                 flag = getattr(ch, "flag_value", "") if ch else ""

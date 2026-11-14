@@ -409,6 +409,41 @@ def main() -> int:
     check("冲突记录随清空复位", portmap.conflicts() == [], str(portmap.conflicts()))
     portmap.restore()
 
+    # ---- 5k) portmap.restore() 必须把映射与 DNS 都清干净（测试隔离，A4） ----
+    portmap.restore()
+    portmap.install({("keep.internal", 80): ("127.0.0.1", 19011)}, owner="inst-r")
+    portmap.set_dns_port(5301, owner="inst-r")
+    portmap.restore()
+    check("restore 清空映射表", portmap.current() == {}, str(portmap.current()))
+    check("restore 复位 DNS 端口", portmap.dns_port() == 0 and portmap.dns_ports() == [],
+          f"{portmap.dns_port()} {portmap.dns_ports()}")
+    portmap.restore()
+
+    # ---- 5l) 不传 key 的老调用方：单槽桥语义（第二条替换第一条），不并存 ----
+    old_fetch = netbridge.fetch_vpn_config
+    netbridge.fetch_vpn_config = lambda *a, **kw: VPN_CONF  # type: ignore[assignment]
+    try:
+        cfg = Cfg({"local_bridge": True, "wireproxy_path": str(work / "wireproxy-not-needed.exe"),
+                   "local_bridge_dir": str(work)})
+        inst_a = {"id": "legacy-a", "surface": {"services": [
+            {"service_type": "tcp", "host": "a.internal", "port": 1337, "access": "vpn"}]}}
+        inst_b = {"id": "legacy-b", "surface": {"services": [
+            {"service_type": "tcp", "host": "b.internal", "port": 1337, "access": "vpn"}]}}
+        try:
+            netbridge.start_bridge(cfg, inst_a, "comp", launch=False)
+        except netbridge.BridgeError:
+            pass  # 没有真 wireproxy：配置/端口/映射仍会装上，桥登记被摘掉
+        try:
+            netbridge.start_bridge(cfg, inst_b, "comp", launch=False)
+        except netbridge.BridgeError:
+            pass
+        check("不传 key 时只有单槽（老语义不并存）", len(netbridge._BRIDGES) <= 1,
+              str(list(netbridge._BRIDGES)))
+    finally:
+        netbridge.fetch_vpn_config = old_fetch  # type: ignore[assignment]
+        netbridge.stop_bridge()
+        portmap.restore()
+
     print()
     if FAILS:
         print(f"RESULT=FAIL ({len(FAILS)} 项): " + "; ".join(FAILS))
