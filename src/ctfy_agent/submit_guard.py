@@ -169,15 +169,29 @@ def _json_verdict(obj):
     """从单个 JSON 对象里取明确的通过/未通过判定；取不到返回 None。"""
     if not isinstance(obj, dict):
         return None
-    for key in ("accepted", "correct", "success", "ok", "passed"):
-        if key in obj and isinstance(obj[key], bool):
-            return obj[key]
+    for key in ("accepted", "correct", "passed"):
+        if key in obj:
+            value = obj[key]
+            if isinstance(value, bool):
+                return value
+            text_value = str(value).strip().lower() if value is not None else ""
+            if text_value in ("true", "yes", "1"):
+                return True
+            if text_value in ("false", "no", "0"):
+                return False
+            return None
     for key in ("status", "result"):
         value = str(obj.get(key, "")).lower()
-        if value in ("correct", "accepted", "success", "ok", "true"):
+        if value in ("correct", "accepted", "passed", "solved", "true"):
             return True
         if value in ("wrong", "incorrect", "failed", "error", "false", "rejected"):
             return False
+    for key in ("data", "structuredContent"):
+        inner = obj.get(key)
+        if isinstance(inner, dict):
+            nested = _json_verdict(inner)
+            if nested is not None:
+                return nested
     return None
 
 
@@ -222,8 +236,16 @@ def classify(result, text: str = "") -> dict:
         negatives = ("未通过", "不正确", "不对", "答案错误", "错误", "not passed")
         if any(word in lowered for word in negatives):
             accepted = False
+    if is_error and accepted is True:
+        # isError 表示工具调用失败（503/401/工具不存在…）：正文里的 ok/success 字段
+        # 不代表平台收了这个值，绝不能当 accepted（P0-5 四审 P0-1）。
+        accepted = None
     cap, remaining = quota_from_receipt(result, text)
     attempt = attempt_from_receipt(result, text)
+    if attempt <= 0 and cap > 0 and remaining >= 0:
+        # 回执没有 attempt 字段时，用 cap-remaining 反推已用次数（与 solver/账本口径一致）；
+        # 否则「判错 + remaining=0」的最后一击不会记进账本，下次还能再白打一次。
+        attempt = max(0, cap - remaining)
     out = {
         "status": "unknown",
         "accepted": accepted,

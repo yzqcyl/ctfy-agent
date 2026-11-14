@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -178,6 +179,71 @@ def case_receipt_classify(tmp: Path) -> None:
         [{"id": "q1", "attempts_cap": 10, "attempts_remaining": 0}], "q2") == (0, -1)
 
 
+def case_concurrent_writes(tmp: Path) -> None:
+    """并发写不丢写（P0-5 四审 P1-3：20 线程各写 1..20，曾只剩 1..16）。"""
+    import threading
+
+    path = tmp / "concurrent" / "submit_ledger.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def worker(start: int) -> None:
+        for value in range(start, start + 20):
+            submit_ledger.note_attempt(path, "C", value, question_id="flag")
+            submit_ledger.note_rejected(path, "C", f"v{value}", question_id="flag")
+
+    threads = [threading.Thread(target=worker, args=(1 + 20 * i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    data = submit_ledger.load(path)
+    used = submit_ledger.attempts(data, "C", "flag")
+    assert used == 120, f"并发丢写：attempts={used}（期望 120）"
+    rejected = len((data["challenges"].get("C::flag") or {}).get("rejected") or [])
+    assert rejected == 120, f"并发丢写：rejected={rejected}（期望 120）"
+
+
+def case_legacy_scope(tmp: Path) -> None:
+    """老账本题级 attempts 不能锁死新题号首交（P0-5 四审 P1-4）。"""
+    path = tmp / "legacy" / "submit_ledger.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    submit_ledger.note_attempt(path, "OLD", 10)          # 老账本：只有题级条目
+    data = submit_ledger.load(path)
+    assert submit_ledger.attempts(data, "OLD", "flag") == 10
+    assert submit_ledger.attempts(data, "OLD", "q2") == 0, "新题号被老题级 attempts 锁死"
+    assert submit_ledger.blocked_reason(data, "OLD", "x", 10, question_id="q2") == ""
+    # 默认题号（flag）仍按老账本硬停，兼容单问题题
+    assert submit_ledger.blocked_reason(data, "OLD", "x", 10, question_id="flag") != ""
+
+
+def case_verdict_no_ok_success(tmp: Path) -> None:
+    """ok/success 不能单独判 accepted；isError 回执不判 accepted（P0-5 四审 P0-1）。"""
+    from ctfy_agent import submit_guard
+
+    def mcp(payload, is_error=False):
+        row = {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]}
+        if is_error:
+            row["isError"] = True
+        return row
+
+    assert submit_guard.classify(mcp({"ok": True}))["accepted"] is not True
+    assert submit_guard.classify(mcp({"ok": True}))["status"] != "accepted"
+    assert submit_guard.classify(mcp({"success": True}))["status"] != "accepted"
+    assert submit_guard.classify(mcp({"ok": True}, is_error=True))["status"] != "accepted"
+    assert submit_guard.classify(mcp({"accepted": True}))["status"] == "accepted"
+    assert submit_guard.classify(mcp({"correct": True}))["status"] == "accepted"
+    # cap 已知但只是剩余 0（无明确判定）→ cap_exceeded；有 correct:false → rejected
+    assert submit_guard.classify(mcp({"attempts_remaining": 0, "attempts_cap": 10}))["status"] \
+        == "cap_exceeded"
+    assert submit_guard.classify(mcp({"correct": False, "attempts_remaining": 0,
+                                      "attempts_cap": 10}))["status"] == "rejected"
+    # isError + 泛泛失败不是答错；cap 报错也不是
+    assert submit_guard.classify(mcp({"message": "internal server error"}, True))["status"] != "rejected"
+    assert submit_guard.classify(
+        {"isError": True, "content": [{"type": "text", "text": "tool unavailable"}]}
+    )["status"] != "rejected"
+
+
 def main() -> int:
     # 不用系统临时目录：DSH 沙盒下 tempfile 清理会对目录 chmod，触发 WinError 5（实测）。
     import shutil
@@ -192,6 +258,9 @@ def main() -> int:
         case_repair_and_corrupt(tmp)
         case_question_scope(tmp)
         case_receipt_classify(tmp)
+        case_concurrent_writes(tmp)
+        case_legacy_scope(tmp)
+        case_verdict_no_ok_success(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("OK submit_ledger 全部通过")

@@ -24,6 +24,7 @@ attempts**——attempts 是平台口径，本地猜不得。
 from __future__ import annotations
 
 import datetime as dt
+import contextlib
 import json
 import os
 import tempfile
@@ -46,6 +47,77 @@ def ledger_path(run_dir: Path | str | None) -> Path:
 
 def _empty() -> dict:
     return {"schema": SCHEMA, "challenges": {}}
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path):
+    """跨进程排他锁（Windows msvcrt / POSIX fcntl），保护 read-modify-replace。
+
+    没有它时「读旧账本 → 合并 → 写回」在并发下会互相覆盖：实测 20 线程写
+    attempts 1..20，15/15 轮只落到 1..16（P0-5 三审 P1-3）。锁文件与账本同目录。
+    """
+    lock_path = Path(str(path) + ".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+    except OSError:
+        yield                      # 实在建不了锁文件：退化为无锁（不能因锁炸主流程）
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt  # noqa: PLC0415
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl  # noqa: PLC0415
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt  # noqa: PLC0415
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl  # noqa: PLC0415
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def load_strict(path: Path) -> dict | None:
+    """读账本；**读不到（OSError）返回 None**，与「文件真不存在」区分开。
+
+    `_save(merge=True)` 必须用它：读失败时返回空账本再去 merge 会把好账本整个覆盖掉
+    （P0-5 三审 P2-8 实测老条目全丢）。
+    """
+    path = Path(path)
+    if not path.is_file():
+        return _empty()
+    for attempt in range(5):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            time.sleep(0.01 * (attempt + 1))
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(data, dict) and isinstance(data.get("challenges"), dict):
+            return data
+        return None
+    return None
 
 
 def load(path: Path) -> dict:
@@ -90,13 +162,28 @@ def load(path: Path) -> dict:
     return _empty()
 
 
-def _save(path: Path, data: dict, *, merge: bool = False) -> None:
-    """原子写。merge=True 时先重读磁盘，做字段级合并（防并发晚写覆盖）。"""
+def _save(path: Path, data: dict, *, merge: bool = False) -> bool:
+    """原子写。merge=True 时在**文件锁内**重读磁盘做字段级合并（防并发晚写覆盖）。
+
+    返回 False 表示「没能安全写入」（读失败/OSError 最终失败），调用方不应假设已落盘。
+    """
     path = Path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        with _file_lock(path):
+            return _save_locked(path, data, merge=merge)
+    except OSError:
+        return False
+
+
+def _save_locked(path: Path, data: dict, *, merge: bool = False) -> bool:
+    try:
         if merge:
-            data = _merge(load(path), data)
+            disk = load_strict(path)
+            if disk is None:
+                # 读不到就绝不 merge 覆盖（否则空账本会把好账本抹掉）
+                return False
+            data = _merge(disk, data)
         fd, tmp = tempfile.mkstemp(prefix=".submit_ledger.", suffix=".tmp", dir=str(path.parent))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -107,7 +194,7 @@ def _save(path: Path, data: dict, *, merge: bool = False) -> None:
             for attempt in range(6):
                 try:
                     os.replace(tmp, path)
-                    return
+                    return True
                 except OSError:
                     if attempt == 5:
                         raise
@@ -119,7 +206,7 @@ def _save(path: Path, data: dict, *, merge: bool = False) -> None:
                 pass
             raise
     except OSError:
-        pass
+        return False
 
 
 def _merge(base: dict, new: dict) -> dict:
@@ -185,6 +272,10 @@ def attempts(data: dict, challenge_id: str, question_id: str = "") -> int:
             return int(scoped.get("attempts") or 0)
         except (TypeError, ValueError):
             return 0
+    if question_id and str(question_id).strip().lower() != "flag":
+        # 题号作用域：老账本的题级 attempts 只代表 "flag" 那一问，不能拦新题号首交
+        # （否则 q1 打满 → q2 永远拦、又永远不产生 q2 条目 → 死锁，P0-5 三审 P1-4）
+        return 0
     try:
         return int((challenges.get(_key(challenge_id)) or {}).get("attempts") or 0)
     except (TypeError, ValueError):

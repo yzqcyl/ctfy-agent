@@ -279,7 +279,7 @@ def _object_verdict(obj) -> bool | None:
                 return False
     for key in ("status", "result"):
         value = str(obj.get(key, "")).lower()
-        if value in ("correct", "accepted", "success", "ok", "true"):
+        if value in ("correct", "accepted", "passed", "solved", "true"):
             return True
         if value in ("wrong", "incorrect", "failed", "error", "false", "rejected"):
             return False
@@ -331,10 +331,11 @@ def looks_accepted(text: str) -> bool | None:
                 if text_value in ("false", "no", "0"):
                     return False
                 return None
-        # 2) status/result 字符串
+        # 2) status/result 字符串（只认判定词；ok/success 单独出现不算平台判定，
+        #    否则 {"ok": true, "message": "incorrect"} 之类会被洗白 —— P0-5 四审 P0-1）
         for key in ("status", "result"):
             value = str(data.get(key, "")).lower()
-            if value in ("correct", "accepted", "success", "ok", "true"):
+            if value in ("correct", "accepted", "passed", "solved", "true"):
                 return True
             if value in ("wrong", "incorrect", "failed", "error", "false", "rejected"):
                 return False
@@ -345,13 +346,8 @@ def looks_accepted(text: str) -> bool | None:
                 nested = _object_verdict(inner)
                 if nested is not None:
                     return nested
-        # 4) ok/success 只作兜底，且正文不能有否定词（{"ok":true,"message":"incorrect"}）
-        negative_now = ("incorrect", "wrong", "not correct", "not accepted", "failed",
-                        "rejected", "错误", "不正确", "失败")
-        if not any(word in lowered for word in negative_now):
-            for key in ("success", "ok"):
-                if isinstance(data.get(key), bool):
-                    return data[key]
+        # 4) 明确不再认 ok/success 兜底：它们只表示「请求成功」，不表示「答案正确」
+        #    （P0-5 四审 P0-1：{"ok": true} 曾直接把错值洗成 accepted）。
 
     negative = ("incorrect", "wrong", "not correct", "not accepted", "failed", "rejected", "错误", "不正确", "失败")
     if any(word in lowered for word in negative):
@@ -1873,11 +1869,10 @@ class Solver:
             platform_cap = int(self.config.extra.get("platform_submit_limit", 10))
         except (TypeError, ValueError):
             platform_cap = 10
-        challenge_cap = int(getattr(challenge, "attempts_cap", 0) or 0)
-        if challenge_cap > 0:
-            platform_cap = challenge_cap
         platform_cap = max(0, platform_cap)
-        used_platform = int(getattr(challenge, "platform_attempts", 0) or 0)
+        # 题级 cap/attempts 只用于回显：硬停一律按题号作用域（P0-5 四审 P1-5）——
+        # 否则 q1 打满 10 次会把同题 q2 一起锁死（q2 可能 cap=null 不限额）。
+        used_challenge = int(getattr(challenge, "platform_attempts", 0) or 0)
         # 题号要在查账本前算出来：CTFY 的提交额度是**按题号**的，账本按 (题, 题号) 记，
         # 否则某题号烧完额度会把同题其它题号一起锁死（P0-5 审计 Q5-2）。
         qa_only = bool(getattr(challenge, "is_qa_only", False)) or any(
@@ -1905,9 +1900,16 @@ class Solver:
         # 这里把账本里的已用次数并进来，并直接拦「平台已判错的值」。
         _ledger_path = submit_ledger.ledger_path(getattr(self.store, "run_dir", None))
         _ledger = submit_ledger.load(_ledger_path)
-        used_platform = max(used_platform,
-                            submit_ledger.attempts(_ledger, challenge_id, question_id))
-        _blocked = submit_ledger.blocked_reason(_ledger, challenge_id, answer, platform_cap,
+        used_q = submit_ledger.attempts(_ledger, challenge_id, question_id)
+        try:
+            q_cap = int(self.store.cap_for(challenge_id, question_id))
+        except (TypeError, ValueError, KeyError, AttributeError):
+            q_cap = 0
+        if q_cap <= 0:
+            # 题号没下发 cap 时用题级/配置的上限值兜底：**已用次数仍是题号作用域**
+            # （used_q），所以 q1 打满只会拦 q1，不会把 q2 锁死（P0-5 四审 P1-5）。
+            q_cap = max(platform_cap, int(getattr(challenge, "attempts_cap", 0) or 0))
+        _blocked = submit_ledger.blocked_reason(_ledger, challenge_id, answer, q_cap,
                                                 question_id=question_id)
         if _blocked:
             return _blocked, False
@@ -1919,11 +1921,11 @@ class Solver:
                 "再交不会被受理——不要再换值试探，直接复盘收口（把 flag 候选与依据写进 report）。",
                 False,
             )
-        if platform_cap > 0 and used_platform >= platform_cap:
+        if q_cap > 0 and used_q >= q_cap:
             return (
-                f"[提交被拦截] 平台已累计本题 {used_platform} 次提交（上限 {platform_cap} 次，"
-                "按「用户+题」全局计数、跨 run 不重置）。再交不会被受理——换新值也没额度了，"
-                "直接复盘收口（把 flag 候选与依据写进 report）。",
+                f"[提交被拦截] 平台已累计题号 `{question_id or '默认'}` {used_q} 次提交"
+                f"（上限 {q_cap} 次，按题号全局计数、跨 run 不重置）。"
+                "再交不会被受理——换新值也没额度了，直接复盘收口（把 flag 候选与依据写进 report）。",
                 False,
             )
         # [fix 2026-11-03 v6.3] 多问题题防串味：同一题号已答对就别再交；
@@ -2004,40 +2006,47 @@ class Solver:
                 f"{type(exc).__name__}: {exc}",
                 False,
             )
-        text = render_call_result(result)
+        raw_text = render_call_result(result)
         is_tool_error = bool(isinstance(result, dict) and result.get("isError"))
-        if is_tool_error:
-            text = f"[工具报错] {text}"
+        # 判定口径统一走 submit_guard.classify（与 guard/账本同一份逻辑）：
+        #   * isError 回执一律不判 accepted（平台没判定，ok/success 字段不算数）；
+        #   * ok/success 不再能单独洗白；
+        #   * cap_exceeded / transient / error 属于「未判定」，绝不能把候选值记成判错。
+        try:
+            from .submit_guard import classify as _classify  # noqa: PLC0415
+            verdict = _classify(result, raw_text)
+        except Exception:  # noqa: BLE001 - 判定模块异常时保守当「未判定」，不记账
+            verdict = {"status": "unknown", "accepted": None, "cap": 0, "remaining": -1}
+        status_seen = str(verdict.get("status") or "unknown")
+        if status_seen == "accepted":
+            accepted: bool | None = True
+        elif status_seen == "rejected":
             accepted = False
         else:
-            accepted = looks_accepted(text)
-            if accepted is None:
-                # 多段回执（散文 + JSON / text + structuredContent）solver 的解析器只认开头，
-                # 这里复用 guard 的逐行 JSON 扫描，避免把「判错/通过」漏成 unknown
-                # （漏判 accepted + remaining=0 会走额度分支永久拉黑 —— P0-5 三审 P1-4）。
-                try:
-                    from .submit_guard import classify as _classify  # noqa: PLC0415
-                    accepted = _classify(result, text)["accepted"]
-                except Exception:  # noqa: BLE001
-                    accepted = None
-        # 额度/计数在「追加本地文案之前」的原始回执上算：追加后的文本会污染 JSON 截取，
-        # 也会让「429」这类字面量混进耗时/排名/flag（P0-5 审计 Q2-1/Q2-4）。
-        cap_seen, remaining_seen = self._platform_quota_from(result, text)
-        attempt_seen = self._platform_attempt_from(result, text)
-        # 传输/限流类错误：平台根本没判定这个值 → 不能记「答错」，回滚预留稍后重试。
-        if is_tool_error and self._looks_transient(text):
-            self.store.release_submit(challenge_id, answer)
-            return (
-                f"{text}\n\n[提交未判定] 平台/网络暂时不可用（限流或超时），本次提交没有被判定；"
-                "已回滚本地提交额度，稍后重试同一个值即可（不要换值试探）。",
-                False,
-            )
-        # [P2 平台计数同步] 回执里 attempt = 平台按「用户+题」全局累计的提交次数（跨 run）。
-        # 记进 platform_attempts（单调取 max）供下次开跑直接硬停，同时回显给模型看还剩几次。
+            accepted = None
+        text = f"[工具报错] {raw_text}" if is_tool_error else raw_text
+        cap_seen, remaining_seen = self._platform_quota_from(result, raw_text)
+        attempt_seen = self._platform_attempt_from(result, raw_text)
+        # 未判定（限流/超时/5xx/工具不存在/额度码等）：平台没判这个值，回滚预留让下次还能交，
+        # 不能 note_rejected 把正确 flag 永久拉黑（P0-5 四审 P0-2）。
+        if accepted is None and status_seen in ("transient", "error", "unknown", "cap_exceeded"):
+            if status_seen != "cap_exceeded":
+                self.store.release_submit(challenge_id, answer)
+                reason = ("平台/网络暂时不可用（限流/超时/服务错误）"
+                          if status_seen in ("transient", "unknown")
+                          else "工具调用失败（平台未判定答案）")
+                return (
+                    f"{text}\n\n[提交未判定] {reason}；本次提交没有被判定，已回滚本地提交额度，"
+                    "稍后重试同一个值即可（不要换值试探，也不要把这次当成判错）。",
+                    False,
+                )
+        # [P2 平台计数同步] attempt = 平台按「用户+题」全局累计次数（跨 run）。题级值只写
+        # 题级键；题号条目只写 cap-remaining（P0-5 四审 P1-7，避免 q1 用 5 次让 q2 首交记 5）。
         if attempt_seen:
             used_platform = self.store.note_platform_attempt(challenge_id, attempt_seen)
-            submit_ledger.note_attempt(_ledger_path, challenge_id, attempt_seen,
-                                       question_id=question_id)
+            if not question_id or str(question_id).strip().lower() == "flag":
+                submit_ledger.note_attempt(_ledger_path, challenge_id, attempt_seen,
+                                           question_id=question_id)
             if platform_cap > 0:
                 text += (f"\n[平台计数] 平台已累计第 {used_platform}/{platform_cap} 次提交"
                          "（用户+题全局计数，跨 run 不重置）。")
@@ -2046,8 +2055,7 @@ class Solver:
         if remaining_seen >= 0:
             used_platform = self.store.note_platform_remaining(
                 challenge_id, remaining_seen, cap_seen, question_id=question_id)
-            # 题号账本只写**本回执**的已用次数（cap-remaining），不能拿 challenge 级
-            # used_platform（q1 用 5 次会让 q2 首交就记 5 —— P0-5 三审 P1-3）
+            # 题号账本只写**本回执**的已用次数（cap-remaining）
             per_q_used = (max(0, cap_seen - remaining_seen) if cap_seen > 0
                           else (attempt_seen or 0))
             if per_q_used > 0:
@@ -2073,8 +2081,11 @@ class Solver:
                                            "下一步派专家取剩余题的答案，不要重复交这一问。"),
                 True,
             )
-        verdict_text = "判定为未通过" if accepted is False else "无法判定是否通过"
-        if accepted is False:
+        # 只有「平台真判错」才记 rejected：isError 且只是泛泛失败（failed/error/500）属于未判定，
+        # 记了会让正确 flag 永远交不出去（repair 也不清 rejected）。
+        judged_wrong = accepted is False and (
+            not is_tool_error or self._durable_reject(raw_text))
+        if judged_wrong:
             # P2-4：记下这次错交，并回显全部已判错值——错交一次就少一次额度
             self.store.note_rejected(challenge_id, answer)
             # [P17] 跨 run 记住判错值：下个 run/快照里同一个值不再白交一次
@@ -2082,10 +2093,19 @@ class Solver:
                                         question_id=question_id)
             # [v7.2 A4] 按题号记错交次数，供 per-question 额度闸用
             self.store.mark_submitted(challenge_id, answer, accepted=False, question_id=question_id)
+        elif accepted is False:
+            # 判成「未通过」但依据只是工具层失败：不能进账本，按未判定处理
+            self.store.release_submit(challenge_id, answer)
+            return (
+                f"{text}\n\n[提交未判定] 回执看起来像失败但不像平台对答案的判定；"
+                "本次未记账、已回滚本地提交额度，稍后重试同一个值。",
+                False,
+            )
         # [P0-5] 额度用尽只作为「以后别交」的信息，放在判定之后，绝不覆盖 accepted
         # （最后一击答对时 remaining 必然 0）；cap 未知时不抬账本，避免把不限额题写成
         # 10/10 永久拦死（P0-5 审计 Q2-2/Q2-3）。
-        if self._submit_cap_exceeded(cap_seen, remaining_seen, text):
+        if status_seen == "cap_exceeded" or self._submit_cap_exceeded(cap_seen, remaining_seen,
+                                                                      raw_text):
             self.store.release_submit(challenge_id, answer)
             if cap_seen > 0:
                 submit_ledger.note_exhausted(_ledger_path, challenge_id, cap_seen,
@@ -2099,7 +2119,20 @@ class Solver:
                 "不要再换值试探，复盘收口并把候选写进 report。",
                 False,
             )
+        verdict_text = "判定为未通过" if judged_wrong else "无法判定是否通过"
         return f"{text}\n\n[判定] {verdict_text}，继续换思路。{self._rejected_hint(challenge_id)}", False
+
+    @staticmethod
+    def _durable_reject(text: str) -> bool:
+        """回执是否**明确判定答案错**（可进 rejected 账本）。
+
+        只认平台判定词；failed/error/500/超时这些是工具层失败，不代表答案被判错
+        （P0-5 四审 P0-2：把未判定回执记成判错会让正确 flag 永远交不出去）。
+        """
+        lowered = str(text or "").lower()
+        markers = ("incorrect", "wrong", "not correct", "not accepted", "not passed",
+                   "答案错误", "不正确", "不对", "未通过", "错误", "判错")
+        return any(mark in lowered for mark in markers)
 
     @staticmethod
     def _looks_transient(text: str) -> bool:

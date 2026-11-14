@@ -24,6 +24,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -53,6 +54,7 @@ KEY_FILES = {
     "cffi": [".so"],
     "zstandard": [".so"],
     "psutil": [".so"],
+    "freetype-py": ["freetype/libfreetype.so"],
 }
 
 
@@ -60,8 +62,12 @@ def normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower().strip()
 
 
-def parse_marker_requirements(spec: str) -> tuple[str, str, str]:
-    """'mako>=1.0.0; python_version >= "3"' -> (name, op, version, marker)。"""
+def parse_marker_requirements(spec: str) -> tuple[str, list[tuple[str, str]], str]:
+    """'mako>=1.0.0; python_version >= "3"' -> (name, [(op, version), ...], marker)。
+
+    版本约束可能是逗号分隔的多个 specifier（`unicorn!=2.1.3,!=2.1.4,>=2.0.1`），
+    必须全部校验；只取第一段会让明确被排除的版本混过静态检查（P0-6 四审 P2-10）。
+    """
     raw = spec.strip()
     marker = ""
     if ";" in raw:
@@ -70,15 +76,18 @@ def parse_marker_requirements(spec: str) -> tuple[str, str, str]:
     raw = raw.split("[", 1)[0].strip()
     match = re.match(r"^([A-Za-z0-9_.\-]+)\s*(.*)$", raw)
     if not match:
-        return ("", "", "", marker)
+        return ("", [], marker)
     name, rest = match.group(1), match.group(2).strip()
-    op = ""
-    version = ""
-    for candidate in (">=", "==", "<=", "~=", "!=", ">", "<"):
-        if rest.startswith(candidate):
-            op, version = candidate, rest[len(candidate):].strip()
-            break
-    return (normalize(name), op, version, marker)
+    specs: list[tuple[str, str]] = []
+    for piece in rest.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        for candidate in (">=", "==", "<=", "~=", "!=", ">", "<"):
+            if piece.startswith(candidate):
+                specs.append((candidate, piece[len(candidate):].strip()))
+                break
+    return (normalize(name), specs, marker)
 
 
 _MARKER_TOKEN = re.compile(r"\s*(\()\s*|\)\s*|(\b(?:and|or|in|not)\b)\s*"
@@ -215,6 +224,8 @@ def version_tuple(text: str) -> tuple:
 def satisfies(version: str, op: str, want: str) -> bool:
     if not op or not want:
         return True
+    if op not in (">=", "==", "<=", "~=", "!=", ">", "<"):
+        return False
     have, need = version_tuple(version), version_tuple(want)
     length = max(len(have), len(need))
     have += (0,) * (length - len(have))
@@ -311,15 +322,17 @@ def main() -> int:
     missing: list[str] = []
     for name, info in sorted(packages.items()):
         for spec in info["requires"]:
-            dep, op, want, marker = parse_marker_requirements(spec)
+            dep, specs, marker = parse_marker_requirements(spec)
             if not dep or not marker_allows(marker):
                 continue
             found = packages.get(dep)
             if found is None:
                 missing.append(f"{name} 需要 {dep}，bundle 里没有")
                 continue
-            if not satisfies(found["version"], op, want):
-                missing.append(f"{name} 需要 {dep}{op}{want}，bundle 里是 {found['version']}")
+            for op, want in specs:
+                if not satisfies(found["version"], op, want):
+                    missing.append(f"{name} 需要 {dep}{op}{want}，bundle 里是 {found['version']}")
+                    break
     if missing:
         fails.extend(missing)
         for line in missing:
@@ -374,7 +387,10 @@ def main() -> int:
             fails.append(f"离线 pip 只解析出 {len(wheels)} 个 wheel（预期 >30）")
         else:
             print(f"[ok] 离线 pip 解析出 {len(wheels)} 个 wheel（依赖闭包可满足）")
-        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            shutil.rmtree(tmp)
+        except OSError as exc:
+            print(f"[warn] 临时目录清理失败（可手动删）：{tmp}：{exc}")
     print()
     if fails:
         for line in fails:

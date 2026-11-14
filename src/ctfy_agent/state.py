@@ -777,6 +777,27 @@ class Store:
         except (TypeError, ValueError):
             return -1
 
+    def cap_for(self, challenge_id: str, question_id: str = "") -> int:
+        """该题号平台额度上限（0=未知/不限）。
+
+        题级 attempts_cap 只代表默认题号（flag / 空）：某些题不同题号 cap 不同（有 null=不限），
+        拿题级上限去卡其它题号会把 q2 锁死（P0-5 四审 P1-5）。
+        """
+        item = self.require(challenge_id)
+        if question_id:
+            entry = (getattr(item, "attempts_by_qid_quota", None) or {}).get(str(question_id))
+            if isinstance(entry, dict):
+                try:
+                    return max(0, int(entry.get("cap") or 0))
+                except (TypeError, ValueError):
+                    return 0
+            if str(question_id).strip().lower() != "flag":
+                return 0
+        try:
+            return max(0, int(item.attempts_cap or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def bump_oracle(self, challenge_id: str, limit: int) -> bool:
         """登记一次 oracle 探针；返回 False 表示已达上限。"""
         item = self.require(challenge_id)
