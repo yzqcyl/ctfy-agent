@@ -1,0 +1,4 @@
+# Linux 工具箱 wheel 缓存（约 40 个 wheel，几十 MB）不入库：
+# 需要时在联网机器上生成：python tools/linux_bootstrap/provision.py --download ./bundle
+# 离线安装清单见 tools/linux_bootstrap/bundle/manifest.resolved.json（同样由脚本生成）。
+/bundle/
