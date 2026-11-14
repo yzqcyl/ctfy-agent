@@ -104,6 +104,7 @@ class App:
         self._solved: list[dict] = []
         self._solved_rows: dict[str, dict] = {}
         # 复现栏懒加载：日期 → 当天条目 / 日期节点 iid → 日期 / 已加载的日期
+        self._day_runs: dict[str, list[str]] = {}
         self._day_rows: dict[str, list[dict]] = {}
         self._day_by_iid: dict[str, str] = {}
         self._day_loaded: set[str] = set()
@@ -547,15 +548,15 @@ class App:
         self._solved_loading(True)
         if background:
             def _bg() -> None:
-                rows = self._scan_solved()
+                days = self._scan_days()
                 try:
-                    self.after(0, self._apply_solved, rows)
+                    self.after(0, self._apply_days, days)
                 except (tk.TclError, RuntimeError, AttributeError):  # 窗口已关 / selftest 桩对象
                     pass
 
-            threading.Thread(target=_bg, name="scan-solved", daemon=True).start()
+            threading.Thread(target=_bg, name="scan-days", daemon=True).start()
             return
-        self._apply_solved(self._scan_solved())
+        self._apply_days(self._scan_days())
 
     def _solved_loading(self, on: bool) -> None:
         """骨架屏：扫描期间盖住列表（脉冲动画），扫完收起。"""
@@ -573,107 +574,62 @@ class App:
         except (tk.TclError, AttributeError):
             pass
 
-    def _scan_solved(self) -> list[dict]:
-        """纯扫描：读 runs/*/state.json 收集「解出」和「已停止」的条目（不碰界面，可放线程里跑）。
+    def _scan_days(self) -> list[tuple[str, list[str]]]:
+        """只 stat、不解析：列出「日期 → 当天有活动的 run」。
 
-        [2026-11-10 按用户要求改] 只解析 state.json（约 0.3s / 800 目录），**不读 transcript**：
-        列表一级只显示日期，展开某天才加载当天题目；每行再用「解出/停止时间」标记，
-        具体时刻在展开当天时从 `transcripts/<cid>.jsonl` 精确取（见 `_challenge_times`）。
-        state.json 里**没有**每题时间戳（旧代码拿 `ch.updated_at` 永远是空、退化成整个 run 的
-        state.json 修改时间，所以此前每行显示的都是同一个日期），这里显式区分 solved/stopped。
+        [用户要求 2026-11-10] **不要一次性载入所有已解题目**：启动时只拿日期列表
+        （`runs/<run>/state.json` 的修改日期），点开某一天才解析那天的 state.json、
+        并在展开当天时读 transcript 取精确时间。807 个目录只 stat 一次（毫秒级）。
         """
-        rows: list[dict] = []
+        buckets: dict[str, list[str]] = {}
         base = PROJECT_ROOT / "runs"
         try:
             entries = list(base.iterdir()) if base.is_dir() else []
         except OSError:
-            return rows
+            return []
         for d in entries:
             try:
-                if not d.is_dir():
-                    continue
-                if d.name.startswith("_"):
-                    # 约定：`_` 开头是测试/临时 run（tests/ 与调试脚本用），列进复现栏只会是噪音
-                    continue
-                st = d / "state.json"
-                if not st.is_file():
-                    continue
-                data = json.loads(st.read_text(encoding="utf-8-sig"))
-                mtime = float(st.stat().st_mtime)
-            except (OSError, ValueError):  # 不可读/半截文件：跳过，不拖垮刷新
+                if not d.is_dir() or d.name.startswith("_"):
+                    continue  # `_` 开头是测试/临时 run，列进来只是噪音
+                mtime = float((d / "state.json").stat().st_mtime)
+            except OSError:
                 continue
-            for cid, ch in (data.get("challenges") or {}).items():
-                if not isinstance(ch, dict):
-                    continue
-                flag = str(ch.get("flag_value") or "")
-                solved = bool(ch.get("submitted_ok")) or bool(flag)
-                status = str(ch.get("status") or "")
-                if not solved and status not in self._STOPPED_STATUS:
-                    continue  # `new`（从没跑过）之类不列：刷屏且没有时间信息
-                # 日期分组用「这道题自己的转录文件最后写入时间」（stat，几乎零成本），
-                # 比整个 run 的 state.json 修改时间更贴近「解出/停止」当天；没有转录再退回去。
-                ts = mtime
-                try:
-                    ts = float((d / "transcripts" / f"{cid}.jsonl").stat().st_mtime)
-                except OSError:
-                    pass
-                rows.append({
-                    "run": d.name, "cid": cid,
-                    "name": str(ch.get("name") or cid),
-                    "cat": str(ch.get("category") or "-"),
-                    "flag": flag,
-                    "solved": solved,
-                    "status": status,
-                    "ts": ts,  # 兜底时间；展开当天时用 transcript 精确覆盖
-                    "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)),
-                })
-        rows.sort(key=lambda r: float(r.get("ts") or 0), reverse=True)
-        return rows
+            day = time.strftime("%Y-%m-%d", time.localtime(mtime))
+            buckets.setdefault(day, []).append(d.name)
+        return sorted(buckets.items(), key=lambda kv: kv[0], reverse=True)
 
     # 这些状态表示「这一题停下来了」（值得显示停止时间）；`new` 不算
     _STOPPED_STATUS = ("stalled", "instance_up", "failed", "cancelled", "error",
                        "done", "timeout")
 
-    def _apply_solved(self, rows: list[dict]) -> None:
-        """把扫描结果按日期分层填进列表（必须在主线程调用）。
-
-        一级只插日期父节点（默认折叠）；当天题目在用户展开时由 `_load_day` 懒加载。
-        """
-        self._solved = rows
-        tv = self.tv_solved
-        tv.delete(*tv.get_children())
-        self._solved_rows = {}
+    def _apply_days(self, days: list[tuple[str, list[str]]]) -> None:
+        """只把日期父节点填进列表（折叠）；当天题目等用户展开再 `_load_day` 加载。"""
+        self._day_runs = dict(days)
         self._day_rows: dict[str, list[dict]] = {}
         self._day_by_iid: dict[str, str] = {}
         self._day_loaded: set[str] = set()
-        days = theme.group_by_date(rows)
-        total = solved_n = 0
-        for day, items in days:
-            n_solved = sum(1 for r in items if r.get("solved"))
-            if day == "未知日期":
-                title = f"未知日期 · {len(items)} 题（解出 {n_solved} / 停止 {len(items) - n_solved}）"
-            else:
-                title = (f"{day} · {len(items)} 题"
-                         f"（解出 {n_solved} / 停止 {len(items) - n_solved}）")
-            node = tv.insert("", "end", text=title, open=False, tags=("date",))
-            self._day_rows[day] = items
+        self._solved = []
+        tv = self.tv_solved
+        tv.delete(*tv.get_children())
+        self._solved_rows = {}
+        for day, runs in days:
+            node = tv.insert("", "end",
+                             text=f"{day} · {len(runs)} 个运行（展开加载当天题目）",
+                             open=False, tags=("date",))
             self._day_by_iid[node] = day
-            total += len(items)
-            solved_n += n_solved
         tv.tag_configure("date", font=theme.heading_font(10),
                          foreground=theme.TEXT_MUTED)
         tv.tag_configure("solved", foreground=theme.SUCCESS)
         tv.tag_configure("stopped", foreground=theme.TEXT_MUTED)
-        if total:
+        if days:
             self.lbl_solved.set(
-                f"已解出 {solved_n} 题 / 已停止 {total - solved_n} 题 · {len(days)} 个日期"
-                "（点日期左边的 ▸ 展开当天，双击题目看复现）")
+                f"{len(days)} 个日期（点开某个日期加载当天已解出/已停止的题目；双击题目看复现）")
         else:
-            self.lbl_solved.set("未发现已解出或已停止的题目（跑完一题后点「刷新已解出」）")
+            self.lbl_solved.set("runs/ 下还没有可复现的记录（跑完一题后点「刷新已解出」）")
         self._solved_loading(False)
 
     def _on_solved_open(self, _evt=None) -> None:
-        """用户展开某个日期：懒加载当天题目（读 transcript 取精确时间）。"""
+        """用户展开某个日期：此时才去加载当天题目（解析 state.json + 读 transcript）。"""
         try:
             iid = self.tv_solved.focus()
         except tk.TclError:
@@ -683,39 +639,69 @@ class App:
             self._load_day(iid, day)
 
     def _load_day(self, iid: str, day: str, background: bool = True) -> None:
-        """加载某一天的题目行：先放占位子节点，后台算好精确时间再填（不卡界面）。"""
+        """加载某一天的题目行：先放占位子节点，后台读好再填（不卡界面）。"""
         tv = self.tv_solved
         for child in tv.get_children(iid):
             tv.delete(child)
         tv.insert(iid, "end", text="加载当天题目…", values=("", "读取中…", "", ""),
                   tags=("stopped",))
-        items = list(self._day_rows.get(day) or [])
 
         if not background:
-            self._fill_day(day, iid, self._with_times(items))
+            self._fill_day(day, iid, self._load_day_rows(day))
             return
 
         def _bg() -> None:
-            filled = self._with_times(items)
+            items = self._load_day_rows(day)
             try:
-                self.after(0, self._fill_day, day, iid, filled)
+                self.after(0, self._fill_day, day, iid, items)
             except (tk.TclError, RuntimeError, AttributeError):  # 窗口已关 / selftest 桩对象
                 pass
 
         threading.Thread(target=_bg, name="load-day", daemon=True).start()
 
-    def _with_times(self, items: list[dict]) -> list[dict]:
-        """逐题补精确时间：解出取「平台接受那次 submit」的时刻，停止取转录最后一条的时刻。"""
-        out = []
-        for r in items:
-            r = dict(r)
-            times = self._challenge_times(str(r.get("run") or ""), str(r.get("cid") or ""))
-            pick = times.get("solved_at") if r.get("solved") else times.get("last_at")
-            if pick:
-                r["ts"] = pick
-                r["at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(pick))
-            out.append(r)
-        return out
+    def _load_day_rows(self, day: str) -> list[dict]:
+        """解析「这一天」涉及的 run：只留解出/已停止，并读 transcript 取精确时间。
+
+        这是真正「按天加载」的地方：只有被展开的日期才付解析 + 读转录的代价。
+        """
+        rows: list[dict] = []
+        for run in list(self._day_runs.get(day) or []):
+            d = PROJECT_ROOT / "runs" / run
+            try:
+                st = d / "state.json"
+                data = json.loads(st.read_text(encoding="utf-8-sig"))
+                mtime = float(st.stat().st_mtime)
+            except (OSError, ValueError):
+                continue
+            for cid, ch in (data.get("challenges") or {}).items():
+                if not isinstance(ch, dict):
+                    continue
+                flag = str(ch.get("flag_value") or "")
+                solved = bool(ch.get("submitted_ok")) or bool(flag)
+                status = str(ch.get("status") or "")
+                if not solved and status not in self._STOPPED_STATUS:
+                    continue  # `new`（从没跑过）之类不列：刷屏且没有时间信息
+                times = self._challenge_times(str(run), str(cid))
+                pick = times.get("solved_at") if solved else times.get("last_at")
+                fallback = mtime
+                try:
+                    fallback = float((d / "transcripts" / f"{cid}.jsonl").stat().st_mtime)
+                except OSError:
+                    pass
+                ts = float(pick or fallback)
+                rows.append({
+                    "run": run, "cid": str(cid),
+                    "name": str(ch.get("name") or cid),
+                    "cat": str(ch.get("category") or "-"),
+                    "flag": flag,
+                    "solved": solved,
+                    "status": status,
+                    "ts": ts,
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)),
+                })
+        rows.sort(key=lambda r: float(r.get("ts") or 0), reverse=True)
+        self._day_rows[day] = rows
+        return rows
 
     def _challenge_times(self, run: str, cid: str) -> dict:
         """从 transcript 里取这道题的两个时刻（秒级时间戳，取不到返回空 dict）。
@@ -746,7 +732,7 @@ class App:
         return {"solved_at": solved_at, "last_at": last_at}
 
     def _fill_day(self, day: str, iid: str, items: list[dict]) -> None:
-        """把当天题目插进表格（主线程）：时间列显示「解出 HH:MM:SS / 停止 HH:MM:SS」。"""
+        """把当天题目插进表格（主线程），并把该日期标题更新成「解出/停止」统计。"""
         tv = self.tv_solved
         try:
             if not tv.exists(iid):
@@ -761,7 +747,17 @@ class App:
                             str(r.get("run") or "")),
                     tags=("solved" if r.get("solved") else "stopped",))
                 self._solved_rows[kid] = r
+            n_solved = sum(1 for r in items if r.get("solved"))
+            title = f"{day} · 解出 {n_solved} / 停止 {len(items) - n_solved}"
+            if str(tv.item(iid, "text")).startswith(day + " ·"):
+                tv.item(iid, text=title)
             self._day_loaded.add(day)
+            loaded = [r for rs in self._day_rows.values() for r in rs]
+            self._solved = loaded
+            n_ok = sum(1 for r in loaded if r.get("solved"))
+            self.lbl_solved.set(
+                f"已加载 {len(self._day_loaded)}/{len(self._day_runs)} 个日期 · "
+                f"解出 {n_ok} / 停止 {len(loaded) - n_ok}（点开其他日期继续加载）")
         except tk.TclError:
             pass
 

@@ -258,48 +258,33 @@ def case_app_integration() -> None:
         assert str(app.root.cget("bg")) == theme.PAGE
         ok("App 骨架：控件契约齐全、根窗口用 GitHub 页面底色")
 
-        # 3.2 复现栏按日期分层：一级只显示日期（折叠），展开当天才加载题目 + 时间标记
-        app._apply_solved([
-            {"run": rid, "cid": "c1", "name": "已解一", "cat": "web",
-             "flag": "FLAG{a}", "solved": True, "status": "submitted",
-             "ts": time.mktime((2026, 11, 10, 20, 0, 0, 0, 0, -1)),
-             "at": "2026-11-10T20:00:00"},
-            {"run": rid, "cid": "c9", "name": "已解九", "cat": "misc",
-             "flag": "FLAG{b}", "solved": True, "status": "submitted",
-             "ts": time.mktime((2026, 11, 9, 10, 0, 0, 0, 0, -1)),
-             "at": "2026-11-09T10:00:00"},
-            {"run": rid, "cid": "c2", "name": "停止二", "cat": "pwn",
-             "flag": "", "solved": False, "status": "stalled",
-             "ts": time.mktime((2026, 11, 10, 21, 30, 5, 0, 0, -1)),
-             "at": "2026-11-10T21:30:05"},
-        ])
+        # 3.2 复现栏：一级只列日期（折叠），展开某一日才加载当天题目 + 解出/停止时间
+        rid_day = time.strftime("%Y-%m-%d", time.localtime(
+            os.path.getmtime(ROOT / "runs" / rid / "state.json")))
+        app._apply_days([(rid_day, [rid])])
         app.root.update()
         tops = app.tv_solved.get_children("")
-        assert len(tops) == 2, tops
-        texts = [app.tv_solved.item(i, "text") for i in tops]
-        assert any(t.startswith("2026-11-10") for t in texts), texts
-        assert any(t.startswith("2026-11-09") for t in texts), texts
-        # 一级只有日期：题目默认不加载（点开才懒加载当天）
-        for top in tops:
-            assert app.tv_solved.get_children(top) == (), "日期节点初始不该有子节点"
-            assert app.tv_solved.item(top, "open") in (0, "0", False)
-        # 日期标题带「解出 x / 停止 y」统计
-        day10 = next(i for i in tops if app.tv_solved.item(i, "text").startswith("2026-11-10"))
-        assert "解出 1 / 停止 1" in app.tv_solved.item(day10, "text"), app.tv_solved.item(day10, "text")
-        # 展开当天 → 同步加载（测试里 background=False）→ 题目行 + 解出/停止时间列
-        app._load_day(day10, app._day_by_iid[day10], background=False)
+        assert len(tops) == 1, tops
+        assert app.tv_solved.item(tops[0], "text").startswith(rid_day), app.tv_solved.item(tops[0], "text")
+        assert "展开加载当天题目" in app.tv_solved.item(tops[0], "text")
+        # 一级只有日期：题目默认一个都不加载（这是「不要一次性载入全部已解题目」的关键）
+        assert app.tv_solved.get_children(tops[0]) == (), "日期节点初始不该有子节点"
+        assert app.tv_solved.item(tops[0], "open") in (0, "0", False)
+        assert "个日期" in app.lbl_solved.get()
+        # 展开当天 → 同步加载（测试里 background=False）→ 真读 state.json + transcript
+        app._load_day(tops[0], app._day_by_iid[tops[0]], background=False)
         app.root.update()
-        kids = app.tv_solved.get_children(day10)
-        assert len(kids) == 2, kids
-        assert {app._solved_rows[k]["cid"] for k in kids} == {"c1", "c2"}
-        labels = {app._solved_rows[k]["cid"]: app.tv_solved.item(k, "values")[1] for k in kids}
-        assert labels["c1"].startswith("解出 "), labels
-        assert labels["c2"].startswith("停止 "), labels
-        # 骨架屏在扫完后必须收起
+        kids = app.tv_solved.get_children(tops[0])
+        assert kids, "展开后应当加载出当天题目"
+        row = app._solved_rows[kids[0]]
+        assert row["cid"] == "c1" and row["solved"] is True, row
+        assert app.tv_solved.item(kids[0], "values")[1].startswith("解出 "), app.tv_solved.item(kids[0], "values")
+        # 加载过的日期标题更新成「解出 x / 停止 y」
+        assert "解出 1 / 停止 0" in app.tv_solved.item(tops[0], "text"), app.tv_solved.item(tops[0], "text")
         assert not app.skel_solved.winfo_ismapped()
-        ok("复现栏：一级只列日期（折叠）、展开当天才加载题目，且每行标「解出/停止时间」")
+        ok("复现栏：一级只列日期（折叠、零题目加载），展开当天才加载题目并标「解出/停止时间」")
 
-        # 3.2b 真扫描：只收「解出 / 停止」，排除 new 与 `_` 临时 run；时间从 transcript 精确取
+        # 3.2b 真扫描：只列日期；`_` 临时 run 不列；解出时间取平台接受那次 submit
         scan_run = "ui_scan_fixture"  # 不能用 `_` 开头：那类是测试临时 run，会被过滤
         sr = ROOT / "runs" / scan_run
         shutil.rmtree(sr, ignore_errors=True)
@@ -313,7 +298,6 @@ def case_app_integration() -> None:
                     "s3": {"name": "没跑过", "category": "misc", "status": "new"},
                 }
             }, ensure_ascii=False), encoding="utf-8")
-            # 解出：平台接受那次 submit 的时刻；停止：最后一条记录的时刻
             (sr / "transcripts" / "s1.jsonl").write_text(
                 '{"at": "2026-11-10T20:00:03", "role": "solver", "tool": "submit", '
                 '"args": {"answer": "FLAG{x}"}, "result": "{\\"accepted\\": true}"}\n'
@@ -323,31 +307,29 @@ def case_app_integration() -> None:
                 '{"at": "2026-11-10T19:30:12", "role": "pwn", "content": "give up"}\n',
                 encoding="utf-8")
             probe = time.mktime((2026, 11, 10, 20, 0, 30, 0, 0, -1))
-            for name in ("s1.jsonl", "s2.jsonl"):
-                os.utime(sr / "transcripts" / name, (probe, probe))
-            rows = [r for r in app._scan_solved() if r["run"] == scan_run]
-            assert {r["cid"] for r in rows} == {"s1", "s2"}, rows
-            solved_row = next(r for r in rows if r["cid"] == "s1")
-            stopped_row = next(r for r in rows if r["cid"] == "s2")
-            assert solved_row["solved"] is True and stopped_row["solved"] is False
-            app._apply_solved(rows)
+            os.utime(sr / "state.json", (probe, probe))
+            days = app._scan_days()
+            probe_day = next(d for d, runs in days if scan_run in runs)
+            assert probe_day == "2026-11-10", probe_day
+            # 一级只拿日期：此时还没有任何题目行（不解析 state.json，更不读转录）
+            assert app._solved == [] or all(r["run"] != scan_run for r in app._solved)
+            app._apply_days([(probe_day, [scan_run])])
             app.root.update()
-            tops2 = app.tv_solved.get_children("")
-            assert len(tops2) == 1, tops2
-            assert "解出 1 / 停止 1" in app.tv_solved.item(tops2[0], "text")
-            app._load_day(tops2[0], app._day_by_iid[tops2[0]], background=False)
+            node = app.tv_solved.get_children("")[0]
+            app._load_day(node, probe_day, background=False)
             app.root.update()
-            kids2 = {app._solved_rows[k]["cid"]: app.tv_solved.item(k, "values")[1]
-                     for k in app.tv_solved.get_children(tops2[0])}
-            assert kids2["s1"] == "解出 20:00:03", kids2
-            assert kids2["s2"] == "停止 19:30:12", kids2
+            loaded = {app._solved_rows[k]["cid"]: app.tv_solved.item(k, "values")[1]
+                      for k in app.tv_solved.get_children(node)}
+            assert set(loaded) == {"s1", "s2"}, loaded  # s3（new）不列
+            assert loaded["s1"] == "解出 20:00:03", loaded
+            assert loaded["s2"] == "停止 19:30:12", loaded
         finally:
             shutil.rmtree(sr, ignore_errors=True)
-        ok("复现实扫描：只收解出/停止（排除 new 与临时 run），时间取 transcript 精确到秒")
+        ok("按天加载：只列日期零解析；展开当天才读 state.json/transcript，new 不列、时间精确到秒")
 
         # 3.3 跑题库：跳过已解出 / 重跑已解出（读真 state.json）
         assert app._solved_cids_for_run(rid) == {"c1"}
-        app._apply_solved([])
+        app._apply_days([])
         # 先喂一份题单（真实流程里由 _on_challenges 填入），再全选
         app._on_challenges({"items": [
             {"id": "c1", "name": "已解一", "category": "web"},
