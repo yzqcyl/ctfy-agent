@@ -28,6 +28,7 @@ import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -256,6 +257,36 @@ _PYLIBS_DIR = Path(__file__).resolve().parents[2] / "tools" / "pylibs"
 
 def _shims_available() -> bool:
     return (_SHIM_DIR / "shim.py").is_file() and (_SHIM_DIR / "head.cmd").is_file()
+
+
+_PY_SHIM_LOCK = threading.Lock()
+
+
+def _python_shim_dir(search_path: str) -> Path | None:
+    """POSIX 上只有 python3、没有 python 时，生成一个 `python` 兼容入口。
+
+    Ubuntu/Debian（VPS 官方镜像）默认不装 `python` 别名，而模型写脚本习惯用
+    `python x.py`；不补这一层，正式赛里每个 python 脚本都要多烧一轮才能发现。
+    Windows 侧已有「解释器目录前置 PATH」的做法，不需要 shim。
+    """
+    if os.name == "nt":
+        return None
+    import shutil as _shutil
+
+    if _shutil.which("python", path=search_path):
+        return None
+    target = Path(tempfile.gettempdir()) / "ctfy_pybin"
+    entry = target / "python"
+    body = f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'
+    try:
+        with _PY_SHIM_LOCK:
+            target.mkdir(parents=True, exist_ok=True)
+            if not entry.is_file() or entry.read_text(encoding="utf-8") != body:
+                entry.write_text(body, encoding="utf-8", newline="\n")
+                entry.chmod(0o755)
+        return target if entry.is_file() else None
+    except OSError:
+        return None
 
 
 PROBE_PATHS = (
@@ -2973,6 +3004,11 @@ class LocalTools:
             _dll_dirs = [str(p) for p in _pylibs.glob("*.libs") if p.is_dir()]
             if _dll_dirs:
                 env["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + env.get("PATH", "")
+        if os.name != "nt":
+            # POSIX（VPS/容器）补 `python` 别名：镜像常只有 python3
+            py_shim = _python_shim_dir(env.get("PATH", ""))
+            if py_shim is not None:
+                env["PATH"] = str(py_shim) + os.pathsep + env.get("PATH", "")
 
         try:
             # P0-2：有界收割 + 超时杀整棵进程树（旧写法是 capture_output 全量进内存后切片）

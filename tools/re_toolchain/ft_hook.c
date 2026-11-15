@@ -31,7 +31,9 @@
 
 typedef FT_Error (*FT_Load_Glyph_fn)(FT_Face, FT_UInt, FT_Int32);
 typedef FT_Error (*FT_Load_Char_fn)(FT_Face, FT_ULong, FT_Int32);
-typedef FT_Error (*FT_Outline_Decompose_fn)(const FT_Outline *, const FT_Outline_Funcs *,
+/* 注意：FreeType 官方签名是 FT_Outline*（非 const），dlsym 强转类型必须一致，
+   否则新编译器（C23 默认）会报 conflicting types 直接编译失败。 */
+typedef FT_Error (*FT_Outline_Decompose_fn)(FT_Outline *, const FT_Outline_Funcs *,
                                             void *);
 
 static FT_Load_Glyph_fn real_load_glyph = NULL;
@@ -108,7 +110,7 @@ FT_Error FT_Load_Char(FT_Face face, FT_ULong char_code, FT_Int32 load_flags) {
     return err;
 }
 
-FT_Error FT_Outline_Decompose(const FT_Outline *outline, const FT_Outline_Funcs *funcs,
+FT_Error FT_Outline_Decompose(FT_Outline *outline, const FT_Outline_Funcs *funcs,
                               void *user) {
     if (real_decompose == NULL) {
         real_decompose = (FT_Outline_Decompose_fn) dlsym(RTLD_NEXT, "FT_Outline_Decompose");
