@@ -127,7 +127,16 @@ def wireproxy_launcher(binary: str, *, root: pathlib.Path | None = None) -> str:
     if found:
         candidates.append(found)
     for path in candidates:
-        if path and pathlib.Path(path).is_file() and os.access(path, os.X_OK):
+        if not path or not pathlib.Path(path).is_file():
+            continue
+        if os.access(path, os.X_OK):
+            return str(path)
+        # Windows 打出来的 tar 会丢可执行位；解包后没跑 bootstrap 时兜底补上
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            continue
+        if os.access(path, os.X_OK):
             return str(path)
     return ""
 

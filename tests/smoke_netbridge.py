@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """smoke_netbridge.py — 本地端口桥 + socket 透明改写（无 TUN 环境的 VPN 接入层）。
 
@@ -254,8 +254,24 @@ def main() -> int:
             check("CTFY_WIREPROXY_LAUNCHER 显式优先",
                   netbridge.wireproxy_launcher("/nonexistent/wireproxy") == str(fake_lk))
             os.environ.pop("CTFY_WIREPROXY_LAUNCHER", None)
+            # 打包丢可执行位时（Windows 出的 tar）应自动补 0755
+            noexec_dir = lk_dir / "noexec"
+            noexec_dir.mkdir(parents=True, exist_ok=True)
+            noexec_wp = noexec_dir / "wireproxy"
+            noexec_wp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            noexec_wp.chmod(0o644)
+            noexec_lk = noexec_dir / "wireproxy_nolandlock"
+            noexec_lk.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            noexec_lk.chmod(0o644)
+            check("非可执行 launcher 会自动补 x 位",
+                  netbridge.wireproxy_launcher(str(noexec_wp)) == str(noexec_lk)
+                  and os.access(noexec_lk, os.X_OK))
             # 真起一次命令：包装器先拿到 wireproxy 路径，再传 -c/-s
             recorder = lk_dir / "argv.txt"
+            try:
+                recorder.unlink()      # 清掉上一次运行留下的空文件，避免假绿/假红
+            except OSError:
+                pass
             fake_lk.write_text(
                 "#!/bin/sh\nprintf \"%s\\n\" \"$@\" > " + f"\"{recorder}\"\n" + "exit 0\n",
                 encoding="utf-8")
@@ -264,7 +280,8 @@ def main() -> int:
             lk_bridge.config_path.write_text("stub", encoding="utf-8")
             lk_bridge._launch()
             deadline = time.time() + 5
-            while time.time() < deadline and not recorder.exists():
+            while time.time() < deadline and not (
+                    recorder.exists() and recorder.stat().st_size):
                 time.sleep(0.05)
             recorded = recorder.read_text(encoding="utf-8") if recorder.exists() else ""
             check("_launch 先经包装器再传 wireproxy 与 -c/-s",

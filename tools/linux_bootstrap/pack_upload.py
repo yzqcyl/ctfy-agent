@@ -59,6 +59,24 @@ EXCLUDE_PARTS = {
 }
 EXCLUDE_SUFFIX = {".jsonl", ".pyc", ".log", ".exe", ".tar.gz", ".zip"}
 
+# Windows 上没有可靠的 Unix 可执行位，tarfile 会把文件记成 0666；解包到 Linux 后
+# wireproxy_nolandlock / *.sh 之类必须可执行。这里显式写 0755。
+EXECUTABLE = {
+    "tools/linux_bootstrap/vps_bootstrap.sh",
+    "tools/re_toolchain/build_ft_hook.sh",
+    "tools/re_toolchain/run_hook_checker.sh",
+    ".tools/wireproxy/wireproxy",
+}
+EXECUTABLE_PREFIX = ("tools/linux_bootstrap/prebuilt/",)
+
+
+def tarinfo_for(bundle: tarfile.TarFile, path: pathlib.Path) -> tarfile.TarInfo:
+    rel = path.relative_to(ROOT).as_posix()      # Windows 下必须转 /，否则前缀判断失效
+    info = bundle.gettarinfo(str(path), arcname=rel)
+    if rel in EXECUTABLE or rel.endswith(".sh") or rel.startswith(EXECUTABLE_PREFIX):
+        info.mode = 0o755
+    return info
+
 
 def skip(path: pathlib.Path) -> bool:
     rel = path.relative_to(ROOT)
@@ -109,7 +127,9 @@ def main() -> int:
     total = 0
     with tarfile.open(out, "w:gz") as bundle:
         for path in files:
-            bundle.add(path, arcname=str(path.relative_to(ROOT)))
+            info = tarinfo_for(bundle, path)
+            with path.open("rb") as fh:
+                bundle.addfile(info, fh)
             total += path.stat().st_size
     size = out.stat().st_size
     digest = hashlib.sha256(out.read_bytes()).hexdigest()
