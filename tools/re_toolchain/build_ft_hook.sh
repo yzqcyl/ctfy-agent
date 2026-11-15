@@ -22,6 +22,23 @@ done
 mkdir -p "$outdir"
 out="${outdir}/ft_hook.so"
 
+# 官方 VPS 常无 gcc 且封网（装不了 freetype 头）：随包带一份 x86_64 预编译 .so。
+# 有编译器时优先本地真编译；没有编译器（或编译失败）再回落到预编译产物。
+use_prebuilt() {
+  local arch
+  arch="$(uname -m 2>/dev/null || echo unknown)"
+  for cand in "${script_dir}/prebuilt/${arch}/ft_hook.so" "${script_dir}/prebuilt/ft_hook.so"; do
+    if [ -f "$cand" ]; then
+      cp -f "$cand" "$out"
+      echo "未使用本地编译器，已回落到随包预编译：${cand} -> ${out}"
+      echo "（预编译由 glibc>=2.34 / x86_64 构建；其他架构请本地编译）"
+      echo "自检：LD_PRELOAD=${out} CTFY_HOOK_LOG=/tmp/hook.log /bin/true && head -3 /tmp/hook.log"
+      return 0
+    fi
+  done
+  return 1
+}
+
 cflags=""
 libs=""
 if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists freetype2; then
@@ -40,12 +57,21 @@ if command -v gcc >/dev/null 2>&1; then
 elif command -v zig >/dev/null 2>&1; then
   cc="zig cc"
 else
-  echo "找不到 gcc/zig：先在 VM 里安装编译工具（见脚本头注释）" >&2
+  if use_prebuilt; then
+    exit 0
+  fi
+  echo "找不到 gcc/zig，且包内没有预编译 ft_hook.so：先在 VM 里安装编译工具（见脚本头注释）" >&2
   exit 3
 fi
 
 # shellcheck disable=SC2086
-$cc -shared -fPIC -O2 -Wall -Wextra -o "$out" "${script_dir}/ft_hook.c" \
-    ${cflags} ${libs} -ldl
+if ! $cc -shared -fPIC -O2 -Wall -Wextra -o "$out" "${script_dir}/ft_hook.c" \
+    ${cflags} ${libs} -ldl; then
+  echo "本地编译失败（可能是缺 FreeType 头），尝试回落到预编译产物" >&2
+  if use_prebuilt; then
+    exit 0
+  fi
+  exit 4
+fi
 echo "已生成：${out}"
 echo "自检：LD_PRELOAD=${out} CTFY_HOOK_LOG=/tmp/hook.log /bin/true && head -3 /tmp/hook.log"

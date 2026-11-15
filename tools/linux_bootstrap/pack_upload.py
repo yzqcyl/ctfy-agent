@@ -22,11 +22,22 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 INCLUDE_DIRS = [
     "src",
     "tools/linux_bootstrap",
+    # 工具链/能力沉淀：VPS 上要能复编 ft_hook、跑 pwn 本地化、用出题模板
+    "tools/re_toolchain",
+    "tools/authoring",
+    "tools/pwn_local",
+    "tools/exploit_templates",
+    "tools/wordlists",
+    "tools/shims",
+    "docs",
+    "tests",
+    "roles",
     "runs/tpctf2026/attachments",
     "runs/tpctf2026/docs",
 ]
 INCLUDE_FILES = [
     "config/agent.json",
+    "config/platforms.json",
     "runs/tpctf2026/challenges.json",
     "runs/tpctf2026/challenges_raw.json",
     ".tools/wireproxy/wireproxy",
@@ -38,6 +49,7 @@ INCLUDE_FILES = [
 ]
 INCLUDE_GLOBS = [
     ("runs/_tpctf", "*.py"),          # 只带脚本，不带 wheels/brotli/pwnrev 等大目录
+    ("tools", "*.py"),                # tools 顶层工具脚本（bench_stats/check_*/secret_scan…）
 ]
 EXCLUDE_PARTS = {
     ".git", "__pycache__", ".pytest_cache", "node_modules",
@@ -55,7 +67,11 @@ def skip(path: pathlib.Path) -> bool:
     if path.name == ".env" or path.name.startswith(".env."):
         return True
     if path.suffix in EXCLUDE_SUFFIX:
-        return True
+        # tests/fixtures 下的压缩包是测试输入数据，不是构建产物——必须带上，
+        # 否则 VPS 上跑自检会因 zip/tar.gz 缺失而误报。
+        in_fixtures = len(rel.parts) >= 2 and rel.parts[0] == "tests" and rel.parts[1] == "fixtures"
+        if not in_fixtures:
+            return True
     return False
 
 

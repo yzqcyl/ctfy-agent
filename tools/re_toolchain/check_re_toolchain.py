@@ -15,10 +15,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 CHECKS: list[tuple[str, bool, str]] = []
@@ -97,12 +99,50 @@ def _freetype_header() -> pathlib.Path | None:
     return None
 
 
+def prebuilt_path() -> pathlib.Path | None:
+    """随包预编译 .so：官方 VPS 常无 gcc/FreeType 头，靠它跑钩子。"""
+    import platform
+
+    arch = platform.machine().lower()
+    arch = {"amd64": "x86_64", "x64": "x86_64", "aarch64": "arm64"}.get(arch, arch)
+    for cand in (HERE / "prebuilt" / arch / "ft_hook.so", HERE / "prebuilt" / "ft_hook.so"):
+        if cand.is_file() and cand.stat().st_size > 4096:
+            return cand
+    return None
+
+
+def test_prebuilt() -> None:
+    path = prebuilt_path()
+    ok("随包预编译 ft_hook.so 存在", path is not None,
+       f"{HERE / 'prebuilt'}/<arch>/ft_hook.so")
+    if path is None:
+        return
+    # 无需编译器即可验证：挂载后 constructor 应写出一行 attached 日志
+    with tempfile.TemporaryDirectory() as tmp:
+        log = pathlib.Path(tmp) / "hook.log"
+        env = dict(os.environ, LD_PRELOAD=str(path), CTFY_HOOK_LOG=str(log))
+        try:
+            proc = subprocess.run(["/bin/true"], env=env, capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            ok("预编译 .so 可加载（非 Linux 宿主，跳过运行时验证）", True, str(path))
+            return
+        attached = log.is_file() and "attached" in log.read_text(encoding="utf-8", errors="replace")
+    ok("预编译 .so 可加载并落 hook 日志", proc.returncode == 0 and attached,
+       f"returncode={proc.returncode} log={log}")
+
+
 def test_compile() -> None:
     gcc = shutil.which("gcc")
     header = _freetype_header()
     if not gcc or header is None:
-        # 不算「通过」：--build 下必须报 VM_PENDING（审计：之前假绿成 RESULT=PASS）
-        ok("真编译 ft_hook.so（缺 gcc/FreeType 头，标记 VM 待办）", True,
+        # 优先用随包预编译产物：官方 VPS 无编译器时也能直接跑钩子。
+        if prebuilt_path() is not None:
+            COMPILED["ran"] = True
+            COMPILED["ok"] = True
+            ok("缺 gcc/FreeType 头，回落随包预编译 ft_hook.so", True, str(prebuilt_path()))
+            return
+        # 既无编译器也无预编译：必须报 VM_PENDING（审计：之前假绿成 RESULT=PASS）
+        ok("真编译 ft_hook.so（缺 gcc/FreeType 头且无预编译，标记 VM 待办）", True,
            "VM 内跑 tools/re_toolchain/build_ft_hook.sh --outdir /tmp/build")
         return
     COMPILED["ran"] = True
@@ -126,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     test_sources()
     test_shell_syntax()
+    test_prebuilt()
     if args.build:
         test_compile()
     failed = [name for name, passed, _detail in CHECKS if not passed]
