@@ -40,3 +40,4 @@ inbox/
 .capcheck-tmp/
 pip-build-tracker-*/
 pip-download-_*/
+tools/re_toolchain/build/

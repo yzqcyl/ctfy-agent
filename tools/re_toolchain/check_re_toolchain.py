@@ -146,8 +146,8 @@ def test_compile() -> None:
            "VM 内跑 tools/re_toolchain/build_ft_hook.sh --outdir /tmp/build")
         return
     COMPILED["ran"] = True
-    outdir = HERE / "build"
-    outdir.mkdir(exist_ok=True)
+    # 编译产物落到临时目录：避免在仓库里留 tools/re_toolchain/build 脏目录
+    outdir = pathlib.Path(tempfile.mkdtemp(prefix="ft_hook_build_"))
     proc = subprocess.run(["bash", str(HERE / "build_ft_hook.sh"), "--outdir", str(outdir)],
                           capture_output=True)
     COMPILED["ok"] = proc.returncode == 0
