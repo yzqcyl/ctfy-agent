@@ -32,6 +32,16 @@ elif command -v wireproxy >/dev/null 2>&1; then
 else
   echo "!! 缺 wireproxy（Linux 版），VPN 题会受影响"
 fi
+# wireproxy 1.1.3 在支持 Landlock 网络规则的新内核（Linux>=6.7）上 TCP 监听 bind 会 EACCES；
+# 随包 seccomp 包装器让 landlock_* 返回 ENOSYS，netbridge 会自动优先用它。
+LAUNCHER="$HERE/prebuilt/$(uname -m 2>/dev/null || echo unknown)/wireproxy_nolandlock"
+[ -f "$LAUNCHER" ] || LAUNCHER="$HERE/prebuilt/wireproxy_nolandlock"
+if [ -f "$LAUNCHER" ]; then
+  chmod +x "$LAUNCHER" 2>/dev/null || true
+  echo "已内置 landlock 包装器：$LAUNCHER（新内核 VPN 隧道绕行）"
+else
+  echo "提示：没有 landlock 包装器；新内核上 wireproxy TCP 隧道可能不可用"
+fi
 
 echo
 echo "== 4) 冒烟测试 =="

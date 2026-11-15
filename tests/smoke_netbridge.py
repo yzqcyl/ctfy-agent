@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """smoke_netbridge.py — 本地端口桥 + socket 透明改写（无 TUN 环境的 VPN 接入层）。
 
@@ -226,6 +226,58 @@ def main() -> int:
 
     check("MCP 端点 → REST 根", netbridge.rest_base("https://ctfy.example/api/v1/mcp/") == "https://ctfy.example",
           netbridge.rest_base("https://ctfy.example/api/v1/mcp/"))
+    # ---- 4b) landlock seccomp 包装器（wireproxy 1.1.3 在新内核 TCP bind 会 EACCES 的绕行）----
+    lk_dir = ROOT / "runs" / "_t_netbridge" / "launcher_case"
+    lk_dir.mkdir(parents=True, exist_ok=True)
+    fake_wp = lk_dir / "wireproxy"
+    fake_wp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_lk = lk_dir / "wireproxy_nolandlock"
+    fake_lk.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(fake_wp, 0o755)
+    os.chmod(fake_lk, 0o755)
+    old_lk = {key: os.environ.get(key) for key in
+              ("CTFY_WIREPROXY_NOLANDLOCK", "CTFY_WIREPROXY_LAUNCHER")}
+    for _key in old_lk:
+        os.environ.pop(_key, None)
+    try:
+        if os.name == "nt":
+            check("Windows 不用 landlock 包装器（内核无 Landlock）",
+                  netbridge.wireproxy_launcher(str(fake_wp)) == "")
+        else:
+            check("POSIX 找到同目录 landlock 包装器",
+                  netbridge.wireproxy_launcher(str(fake_wp)) == str(fake_lk))
+            os.environ["CTFY_WIREPROXY_NOLANDLOCK"] = "0"
+            check("CTFY_WIREPROXY_NOLANDLOCK=0 可关闭包装",
+                  netbridge.wireproxy_launcher(str(fake_wp)) == "")
+            os.environ.pop("CTFY_WIREPROXY_NOLANDLOCK", None)
+            os.environ["CTFY_WIREPROXY_LAUNCHER"] = str(fake_lk)
+            check("CTFY_WIREPROXY_LAUNCHER 显式优先",
+                  netbridge.wireproxy_launcher("/nonexistent/wireproxy") == str(fake_lk))
+            os.environ.pop("CTFY_WIREPROXY_LAUNCHER", None)
+            # 真起一次命令：包装器先拿到 wireproxy 路径，再传 -c/-s
+            recorder = lk_dir / "argv.txt"
+            fake_lk.write_text(
+                "#!/bin/sh\nprintf \"%s\\n\" \"$@\" > " + f"\"{recorder}\"\n" + "exit 0\n",
+                encoding="utf-8")
+            os.chmod(fake_lk, 0o755)
+            lk_bridge = netbridge.LocalBridge(str(fake_wp), lk_dir)
+            lk_bridge.config_path.write_text("stub", encoding="utf-8")
+            lk_bridge._launch()
+            deadline = time.time() + 5
+            while time.time() < deadline and not recorder.exists():
+                time.sleep(0.05)
+            recorded = recorder.read_text(encoding="utf-8") if recorder.exists() else ""
+            check("_launch 先经包装器再传 wireproxy 与 -c/-s",
+                  recorded.splitlines()[:1] == [str(fake_wp)] and "-c" in recorded and "-s" in recorded,
+                  recorded.replace(chr(10), "|"))
+            lk_bridge.stop()
+    finally:
+        for _key, _value in old_lk.items():
+            if _value is None:
+                os.environ.pop(_key, None)
+            else:
+                os.environ[_key] = _value
+
 
     # ---- 5) 桥的生命周期（不依赖 wireproxy 二进制） ----
     # 配置/私钥只放仓库内 runs 下：临时目录在沙箱里不可写（workspace-write）

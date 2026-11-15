@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import pathlib
+import platform
 import re
 import shutil
 import socket
@@ -93,6 +94,42 @@ def bridge_settings(config, *, root: pathlib.Path | None = None) -> dict | None:
     return {"enabled": True, "binary": binary, "work_dir": work_dir,
             "port_base": int(extra.get("local_bridge_port_base")
                              or os.environ.get("CTFY_BRIDGE_PORT_BASE") or 19100)}
+
+
+def wireproxy_launcher(binary: str, *, root: pathlib.Path | None = None) -> str:
+    """找 seccomp 包装器：屏蔽 landlock，绕 wireproxy 1.1.3 的 TCP 绑定 bug。
+
+    实锤（2026-11-15 Linux/WSL，内核 6.18）：wireproxy v1.1.3 的 ``lockNetwork()`` 对
+    ``[TCPClientTunnel]`` 加的是 ``ConnectTCP(BindAddress.Port)``（应为 ``BindTCP``），
+    且漏了 ``ConnectTCP(Target.Port)``；在支持 Landlock 网络规则（ABI>=4，Linux>=6.7）的
+    内核上，隧道自己的 TCP 监听 ``bind()`` 直接 EACCES —— 真平台若用新内核会整条 VPN 不可用。
+    包装器让 ``landlock_*`` 返回 ENOSYS，go-landlock 的 ``BestEffort()`` 判定内核不支持 →
+    不做沙箱限制，TCP 隧道恢复；老内核本来就没有网络 ABI，包装无副作用。
+    关闭开关：``CTFY_WIREPROXY_NOLANDLOCK=0``；显式路径：``CTFY_WIREPROXY_LAUNCHER``。
+    """
+    if os.name == "nt":                      # Windows 内核无 Landlock，直接跑原二进制
+        return ""
+    if str(os.environ.get("CTFY_WIREPROXY_NOLANDLOCK", "1")).strip().lower() in (
+            "0", "false", "no", "off"):
+        return ""
+    explicit = str(os.environ.get("CTFY_WIREPROXY_LAUNCHER") or "").strip()
+    root = pathlib.Path(root or pathlib.Path(__file__).resolve().parents[2])
+    arch = platform.machine().lower()
+    arch = {"amd64": "x86_64", "x64": "x86_64", "aarch64": "arm64"}.get(arch, arch)
+    candidates: list[str] = [explicit] if explicit else []
+    candidates += [
+        str(pathlib.Path(binary).with_name("wireproxy_nolandlock")),
+        str(root / ".tools" / "wireproxy" / "wireproxy_nolandlock"),
+        str(root / "tools" / "linux_bootstrap" / "prebuilt" / arch / "wireproxy_nolandlock"),
+        str(root / "tools" / "linux_bootstrap" / "prebuilt" / "wireproxy_nolandlock"),
+    ]
+    found = shutil.which("wireproxy_nolandlock")
+    if found:
+        candidates.append(found)
+    for path in candidates:
+        if path and pathlib.Path(path).is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return ""
 
 
 # ---------- 平台配置获取 ----------
@@ -414,8 +451,16 @@ class LocalBridge:
         log_fh.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {self.instance_id} ====\n")
         log_fh.flush()
         try:
+            cmd = [self.binary, "-c", str(self.config_path), "-s"]
+            launcher = wireproxy_launcher(self.binary)
+            if launcher:
+                # 新内核（Landlock ABI>=4）上 wireproxy 1.1.3 自己 bind TCP 会 EACCES；
+                # 包装器把 landlock_* 变 ENOSYS，沙箱退化为 no-op（见 wireproxy_launcher 注释）
+                cmd = [launcher, *cmd]
+                log_fh.write(f"launcher: {launcher}\n")
+                log_fh.flush()
             self.proc = subprocess.Popen(  # noqa: S603 - 路径来自受信配置，参数固定
-                [self.binary, "-c", str(self.config_path), "-s"],
+                cmd,
                 stdin=subprocess.DEVNULL, stdout=log_fh, stderr=subprocess.STDOUT,
                 cwd=str(self.work_dir), close_fds=True,
             )
