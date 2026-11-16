@@ -49,6 +49,7 @@ INCLUDE_FILES = [
 ]
 INCLUDE_GLOBS = [
     ("runs/_tpctf", "*.py"),          # 只带脚本，不带 wheels/brotli/pwnrev 等大目录
+    ("runs/_tpctf", "*.sh"),          # L2 隔离彩排的 root wrapper（生成随机 flag，无明文）
     ("tools", "*.py"),                # tools 顶层工具脚本（bench_stats/check_*/secret_scan…）
 ]
 EXCLUDE_PARTS = {
