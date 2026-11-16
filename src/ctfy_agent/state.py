@@ -174,6 +174,9 @@ class Challenge:
     tags: list[str] = field(default_factory=list)   # 如 weak_password / osint / authentication_failures
     difficulty: str = ""                            # easy / medium / hard，也可能是数字
     solves_count: int | None = None                 # 已解队伍数（难度与方向的客观参照）
+    # 多问题题的分值结构（get_challenge 免费给）：[{id, prompt, share_percent, requires}]。
+    # 2026-11-16 起用于赛程级 EV 排序/按题预算（taskplan.py），不再只当展示字段。
+    questions: list = field(default_factory=list)
     is_qa_only: bool = False                        # 纯知识问答/MCQ：提交走 submit_qa_answer，不需要实例
     # 平台免费给的「要不要环境」两个字段（ctf2_get_practice_challenge 实测有）：
     # has_container=本题有容器靶标；requires_running_target=提交前必须靶标在跑。
@@ -406,6 +409,10 @@ class Store:
         solves = normalize_solves(data.get("solves_count"))
         if solves is not None:
             item.solves_count = solves
+        # 多问题题的分值结构：平台每次都会给，必须入库，赛程级排序要用（share_percent）
+        questions = data.get("questions")
+        if isinstance(questions, list) and questions:
+            item.questions = [q for q in questions if isinstance(q, dict)]
         item.touch()
         self.challenges[challenge_id] = item
         return item

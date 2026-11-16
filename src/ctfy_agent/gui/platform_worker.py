@@ -6,11 +6,14 @@ Crew / solve），不改动这些模块；结果经 queue 回主线程。
 """
 from __future__ import annotations
 
+import copy
 import queue
 import threading
 import time
+from dataclasses import replace
 
 from ..access_facts import playability_blockers
+from ..taskplan import plan as plan_tasks
 
 # 「按难度动态分配时间预算」（能力评估 §4.1/§6-②）：122 题里 43 题因墙钟被打断，
 # 固定 15 分钟对 Easy 太松、对 Hard 太紧。默认 Easy 10 / Medium 25 / Hard 40 分钟；
@@ -37,27 +40,38 @@ def _budget_minutes(config, difficulty: str) -> int | None:
         return None
 
 
-def _arm_budget(global_cancel: threading.Event, minutes: int | None) -> tuple[threading.Event, bool]:
-    """给单题装一个软停止信号：预算时间到或全局取消时置位；不影响其它题。
+def _arm_budget(global_cancel: threading.Event, minutes: int | None,
+                deadline: float | None = None) -> tuple[threading.Event, bool]:
+    """给单题装一个软停止信号：预算时间到 / deadline 到 / 全局取消时置位；不影响其它题。
 
-    返回 (event, engaged)。engaged=False 表示没装计时器（请直接用全局 cancel，避免额外线程）。
+    ``deadline`` 是**绝对时间戳**（epoch 秒，赛程结束或 supervisor 给的单题 deadline）；
+    与相对 ``minutes`` 取先到者。返回 (event, engaged)；engaged=False 表示没装计时器。
     """
     ev = threading.Event()
-    if not minutes or minutes <= 0:
+    if not minutes and not deadline:
         return ev, False
 
     def watch() -> None:
-        deadline = time.monotonic() + minutes * 60
+        stop_at = None
+        if minutes and minutes > 0:
+            stop_at = time.monotonic() + minutes * 60
+        if deadline:
+            left = float(deadline) - time.time()
+            if left <= 0:
+                ev.set()
+                return
+            deadline_mono = time.monotonic() + left
+            stop_at = deadline_mono if stop_at is None else min(stop_at, deadline_mono)
         while not ev.is_set():
             if global_cancel is not None and global_cancel.is_set():
                 ev.set()
                 return
-            if time.monotonic() >= deadline:
+            if stop_at is not None and time.monotonic() >= stop_at:
                 ev.set()
                 return
             time.sleep(1.0)
 
-    threading.Thread(target=watch, name=f"budget-{minutes}m", daemon=True).start()
+    threading.Thread(target=watch, name=f"budget-{minutes or 'deadline'}m", daemon=True).start()
     return ev, True
 
 
@@ -130,6 +144,102 @@ def preflight_playable(platform, competition_id: str | None, challenge_id: str) 
     except Exception:  # noqa: BLE001 - 读不到题目信息就当没阻塞，交给后续流程报错
         info = {}
     return playability_blockers(comp, info)
+
+
+# ---------- 赛程级排序 / 按题预算（见 ctfy_agent.taskplan） ----------
+
+def _parse_ts(value) -> float | None:
+    """平台时间字段 → epoch 秒；支持 数字 / 数字字符串 / ISO8601。认不出返回 None。"""
+    if value in (None, "", 0, "0"):
+        return None
+    if isinstance(value, (int, float)):
+        raw = float(value)
+        return raw / 1000.0 if raw > 1e12 else raw
+    text = str(value).strip()
+    try:
+        raw = float(text)
+        return raw / 1000.0 if raw > 1e12 else raw
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime  # noqa: PLC0415 - 只在解析 ISO 时用
+
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _contest_window(comp: dict | None) -> tuple[float | None, float]:
+    """比赛级 (截止时间戳, 已进行比例 0~1)。缺字段时 deadline=None、比例=0（不降权）。"""
+    if not isinstance(comp, dict):
+        return None, 0.0
+    deadline = None
+    for key in ("ends_at", "end_at", "closed_at", "deadline_at", "end_time"):
+        deadline = _parse_ts(comp.get(key))
+        if deadline:
+            break
+    start = None
+    for key in ("starts_at", "start_at", "started_at", "start_time"):
+        start = _parse_ts(comp.get(key))
+        if start:
+            break
+    elapsed = 0.0
+    if start and deadline and deadline > start:
+        elapsed = max(0.0, min(1.0, (time.time() - start) / (deadline - start)))
+    return deadline, elapsed
+
+
+def _policy_pool(config) -> float | None:
+    """配置里的 token 池；None/0 = 不限池（2026-11-16 用户决定：用自己的 key，不设总池）。
+
+    有限池时才做全局分摊；不限池时每题只受 taskplan 的难度 cap 约束。
+    """
+    policy = getattr(config, "policy", {}) or {}
+    raw = policy.get("pool_tokens") or policy.get("total_token_budget")
+    try:
+        return float(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _with_token_cap(config, quota: int):
+    """克隆一份 config，把单题 token 上限换成 quota（不改共享实例，避免并发串味）。
+
+    Crew 从 `config.max_tokens_per_challenge` 取单题累计上限（crew.py 的 Budget），
+    所以这里换掉就等价于"这题最多花多少"。非 dataclass（测试/包装对象）时浅拷贝兜底。
+    """
+    if quota <= 0:
+        return config
+    try:
+        return replace(config, max_tokens_per_challenge=int(quota))
+    except TypeError:
+        clone = copy.copy(config)
+        try:
+            setattr(clone, "max_tokens_per_challenge", int(quota))
+        except Exception:  # noqa: BLE001 - 只读配置对象：退回原对象
+            return config
+        return clone
+
+
+def _plan_row(ch, item: dict) -> dict:
+    """把 store 里的 Challenge（+GUI 行兜底）折成 taskplan 需要的纯 dict。"""
+    row: dict = {"id": str(item.get("id") or getattr(ch, "id", "") or "")}
+    for key in ("name", "points", "difficulty", "solves_count", "questions"):
+        value = getattr(ch, key, None) if ch is not None else None
+        if value in (None, "", [], {}):
+            value = item.get(key)
+        row[key] = value
+    solved: set[str] = set()
+    if ch is not None:
+        for attr in ("answers_by_qid", "verified_qids"):
+            value = getattr(ch, attr, None)
+            if isinstance(value, dict):
+                solved.update(str(k) for k in value)
+    row["my_solved_question_ids"] = sorted(solved)
+    row["my_fully_solved"] = bool(getattr(ch, "submitted_ok", False)) if ch is not None else False
+    # 已拿到部分题号 = near-miss：剩余题号通常更好打，quota 加注 50%（taskplan 里处理）
+    row["near_miss"] = bool(solved) and not row["my_fully_solved"]
+    return row
 
 
 def _hydrate_attachments(platform, store, challenge_id: str, competition_id: str,
@@ -410,14 +520,19 @@ def solve(config, challenge_id: str, run_id: str, competition_id: str,
 def solve_many(config, challenges: list, run_id: str, competition_id: str,
                q: queue.Queue, cancel: threading.Event, concurrency: int = 1,
                stop_after: threading.Event | None = None,
-               force_ids: frozenset[str] | set[str] | None = None) -> None:
+               force_ids: frozenset[str] | set[str] | None = None,
+               budget_tokens: int | None = None,
+               deadline: float | None = None) -> None:
     """按勾选批量解题，可并发。连接/Store 共享，每个任务自建 Platform 连接与 Crew。
 
-    challenges: [{"id": ..., "name": ...}]，顺序即执行顺序。
+    challenges: [{"id": ..., "name": ...}]，顺序即执行顺序（开了 contest_policy 时会按 EV 重排）。
     concurrency: 并发度；<=1 串行。
     cancel: 硬停止——立即掐断正在解的题。
     stop_after: 优雅停止——置位后不再开新题，等正在跑的题跑完。
     force_ids: 「重跑已解出」选中的题号——跳过 Crew 的两层已解出预检，真正重跑。
+    budget_tokens: 单题 token 上限（supervisor 传自己算好的 quota；给了就不再做内部 EV 分摊）。
+    deadline: 绝对时间戳（epoch 秒）——赛程结束或 supervisor 给的单题 deadline；
+             与难度墙钟取先到者，到点软停本题。
     事件：("task_start") / ("task_done") / ("batch_note") / ("done", {batch:True})
     """
     try:
@@ -436,7 +551,6 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
         forced = frozenset(str(x) for x in (force_ids or ()))
         total = len(challenges)
         conc = max(1, min(int(concurrency or 1), max(1, total)))
-
         # 整批级预检：比赛暂停/关闭时连题都不用拉，直接全部标记「不可玩」（0 token）
         batch_block = playability_blockers(_competition_info(platform0, competition_id), None)
         if batch_block:
@@ -455,6 +569,41 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 "stopped": False, "flag_value": "", "candidates": [], "submitted": False,
             }))
             return
+
+        # 赛程级排序 + 按题 token 预算（taskplan）：默认只受难度 cap 约束（用户决定不限总池）。
+        # supervisor 传了 budget_tokens（它自己按 EV 分摊的 quota）时跳过内部分摊，尊重上游。
+        budgets: dict[str, dict] = {}
+        contest_deadline = deadline
+        if config.extra.get("contest_policy", True) and not budget_tokens:
+            comp = _competition_info(platform0, competition_id)
+            deadline_from_comp, elapsed_ratio = _contest_window(comp)
+            contest_deadline = contest_deadline or deadline_from_comp
+            rows: list[dict] = []
+            for item in challenges:
+                cid = str(item.get("id") or "")
+                if not cid:
+                    continue
+                try:
+                    # 补 points/questions/solves_count（EV 排序要用；单题最多一次读）
+                    ensure_challenge_meta(platform0, store, cid)
+                except Exception:  # noqa: BLE001 - 元数据缺失只影响排序，不拦解题
+                    pass
+                rows.append(_plan_row(store.get(cid), item))
+            plans = plan_tasks(rows, pool=_policy_pool(config), elapsed_ratio=elapsed_ratio,
+                               near_miss_ids=[str(r.get("id") or "") for r in rows
+                                              if r.get("near_miss")])
+            if plans:
+                budgets = {p["id"]: p for p in plans}
+                order = {p["id"]: p["order"] for p in plans}
+                ranked = sorted([c for c in challenges if str(c.get("id") or "") in order],
+                                key=lambda c: order[str(c.get("id"))])
+                ranked += [c for c in challenges if str(c.get("id") or "") not in order]
+                challenges = ranked
+                brief = "；".join(f"{p['id']} {int(p['quota']) // 1000}k" for p in plans[:8])
+                q.put(("batch_note", f"按 EV 排序 + 单题 token 上限：{brief}"))
+                if contest_deadline:
+                    left_min = max(0, int((contest_deadline - time.time()) / 60))
+                    q.put(("batch_note", f"赛程剩余 {left_min} 分钟，到点自动软停"))
 
         def work(item: dict, idx: int) -> dict:
             cid = str(item.get("id") or "")
@@ -492,18 +641,21 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 )
                 _hydrate_attachments(platform, store, cid, competition_id or "", on_event)
 
-                # 按难度分配时间预算：软停止只作用于本题，不波及并发中的其它题。
+                # 按难度分配时间预算 + 按题 token 上限：软停止只作用于本题，不波及并发中的其它题。
                 ch0 = store.get(cid)
                 diff = str(getattr(ch0, "difficulty", "") or "")
                 budget_mins = _budget_minutes(config, diff)
-                ev, budget_engaged = _arm_budget(cancel, budget_mins)
+                quota = int((budgets.get(cid) or {}).get("quota") or 0) or int(budget_tokens or 0)
+                task_config = _with_token_cap(config, quota)
+                ev, budget_engaged = _arm_budget(cancel, budget_mins, deadline=contest_deadline)
                 task_cancel = ev if budget_engaged else cancel
                 if budget_engaged:
+                    extra = f" / token 上限 {quota // 1000}k" if quota > 0 else ""
                     q.put(("batch_note", f"[{cid}] 难度 {diff or '?'} → 时间预算 "
-                                         f"{budget_mins} 分钟"))
+                                         f"{budget_mins} 分钟{extra}"))
 
-                crew = Crew(config, platform, store,
-                            lambda model=None: make_llm(config, model=model), on_event=on_event)
+                crew = Crew(task_config, platform, store,
+                            lambda model=None: make_llm(task_config, model=model), on_event=on_event)
                 # supervisor 已建好本地隧道：把「照抄本地端口」作为**平台事实**放进简报可信区，
                 # 否则只留在 challenge dict 里没人读（模型会把 *.internal 连不上当成题挂了）。
                 tunnel_note = str(item.get("tunnel_note") or "").strip()
@@ -517,7 +669,10 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 presolved = str((summary or {}).get("reason") or "") == "already_solved"
                 note = ""
                 if budget_engaged and task_cancel.is_set() and not cancel.is_set():
-                    note = f"时间预算到（{budget_mins} 分钟，难度 {diff or '?'}）"
+                    if contest_deadline and time.time() >= contest_deadline:
+                        note = f"赛程时间到（{budget_mins} 分钟预算，难度 {diff or '?'}）"
+                    else:
+                        note = f"时间预算到（{budget_mins} 分钟，难度 {diff or '?'}）"
                 if ok and not flag:
                     # 平台说已解、本地没有 flag（常见于平台侧已解但本 agent 没记到 flag）：
                     # 不能既显示「已解出」又在详情写「未解出」，要说明真实原因。

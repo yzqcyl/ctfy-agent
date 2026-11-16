@@ -88,6 +88,9 @@ def normalize_challenge(item: dict) -> dict:
         "tags": normalize_tags(pick("tags", "tag", "labels", "topics")),
         "difficulty": pick("difficulty", "level", "difficulty_level"),
         "solves_count": pick("solves_count", "solve_count", "solves", "solved", "solved_by"),
+        # 多问题题的分值结构（id/share_percent/requires）：赛程级 EV 排序与按题预算要用，
+        # 以前只当展示字段丢掉了（2026-11-16 起 taskplan.py 依赖它算 remaining share）。
+        "questions": [q for q in (pick("questions") or []) if isinstance(q, dict)],
         # 知识问答题（MCQ/QA）：提交走 submit_qa_answer，且不需要实例。
         # 曾因不认这个字段，QA 题在提交时被「本题还没有实例」挡住，正确答案直接丢（实测 SECQA-0001）。
         "is_qa_only": bool(pick("is_qa_only")),
@@ -107,7 +110,9 @@ def ensure_challenge_meta(platform, store: Store, challenge_id: str) -> str | No
     盲跑的根因。返回 None 表示正常，返回字符串表示致命错误（调用方据此退出）。
     """
     item = store.get(challenge_id)
-    if item is not None and (item.tags or item.difficulty):
+    # questions 也参与「线索是否齐」判定：赛程级 EV 排序需要 share_percent，
+    # 老 state 里没这个字段时要补一次（单问题题补完仍为空也无妨，每题最多补一次）。
+    if item is not None and item.tags and item.difficulty and item.questions:
         return None
 
     try:
