@@ -132,19 +132,26 @@ def case_s1a_s1c(tmp: Path) -> None:
             assert prev_tail not in persisted, f"call{k-1} 的尾部时变消息泄漏进历史"
         _ok("S1a 任务头字节稳定；事实板=尾部时变消息，不入历史")
 
-        # ---- S1c：烧穿×2 → completion_burned；烧穿×1 后恢复 → 继续 ----
-        burn2 = _BurnLLM([
+        # ---- S1c：烧穿×3 → completion_burned；烧穿×1 后恢复 → 继续 ----
+        # 2026-11-16 改：首次烧穿不再立刻终止（实测 18~29 次/轮白白废掉专家轮），
+        # 改为「首次→关思考+注入『直接调工具』提示；第2次→加倍补全上限；第3次才终止」。
+        burn3 = _BurnLLM([
+            {"content": "", "finish_reason": "length"},
             {"content": "", "finish_reason": "length"},
             {"content": "", "finish_reason": "length"},
         ])
-        r2 = solver.run_role("web-01", role="web", llm=burn2, system="s", task="t",
-                             specs=[], max_steps=6,
+        r3 = solver.run_role("web-01", role="web", llm=burn3, system="s", task="t",
+                             specs=[], max_steps=8,
                              platform_names=solver._platform_names())
-        assert r2["reason"] == "completion_burned", r2
-        assert r2["steps"] == 2, r2
-        assert len(burn2.received) == 2, len(burn2.received)
-        # 第 2 次请求的历史与第 1 次等长：空 assistant 没有回喂
-        assert len(burn2.received[1]) == len(burn2.received[0]), "烧穿步的空消息不应回喂历史"
+        assert r3["reason"] == "completion_burned", r3
+        assert r3["steps"] == 3, r3
+        assert len(burn3.received) == 3, len(burn3.received)
+        # 空 assistant 消息不回喂；但首次烧穿会追加一条「直接调工具」系统提示（历史 +1）
+        assert len(burn3.received[1]) == len(burn3.received[0]) + 1, \
+            f"首次烧穿应追加提示而不是回喂空消息：{len(burn3.received[0])}→{len(burn3.received[1])}"
+        assert "系统提示" in str(burn3.received[1][-1].get("content") or ""), burn3.received[1][-1]
+        assert getattr(burn3, "enable_thinking_override", None) is False, \
+            "首次烧穿后应把 llm.enable_thinking_override 置 False（dashscope 关思考）"
 
         burn1 = _BurnLLM([
             {"content": "", "finish_reason": "length"},
@@ -158,7 +165,7 @@ def case_s1a_s1c(tmp: Path) -> None:
         assert r1["reason"] == "no_more_actions", r1
         assert "侦察完成" in r1["report"], r1
         assert r1["steps"] == 3 and len(burn1.received) == 3, r1
-        _ok("S1c 思考烧穿不回喂；连续2次终止=completion_burned，单次可恢复")
+        _ok("S1c 思考烧穿不回喂；首次注入提示可恢复，连续3次终止=completion_burned")
     finally:
         server.shutdown()
         mcp.shutdown()

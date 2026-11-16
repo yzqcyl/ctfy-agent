@@ -191,8 +191,13 @@ class DeepSeekLLM:
         # [2026-11-14 P21] 支持显式开启：实测 dashscope + deepseek-v4.1-flash-1017 认该字段
         # （enable_thinking=True 返回 reasoning_content、False 无 reasoning、不带字段=端点默认开）。
         _thinking_env = os.environ.get("LLM_ENABLE_THINKING", "").strip().lower()
+        # 运行期覆盖（Solver 的"思考烧穿"护栏用）：某次调用把 reasoning 烧满后，
+        # 对本轮后续调用强制 enable_thinking=False，避免连续烧穿把整轮专家预算耗尽。
+        _override = getattr(self, "enable_thinking_override", None)
         if _accepts_enable_thinking(self.base_url):
-            if _thinking_env in ("0", "false", "no", "off"):
+            if _override is not None:
+                payload["enable_thinking"] = bool(_override)
+            elif _thinking_env in ("0", "false", "no", "off"):
                 payload["enable_thinking"] = False
             elif _thinking_env in ("1", "true", "yes", "on"):
                 payload["enable_thinking"] = True

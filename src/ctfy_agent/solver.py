@@ -2821,7 +2821,13 @@ class Solver:
 
         # 专家只收到协调者写的 task，看不到 Challenge —— 平台给的题型先验必须确定性送达，
         # 否则「这是什么题」只能靠协调者转述（上一轮 50 万 token 盲跑的根因）。
-        context = self._role_context(challenge)
+        # 2026-11-16：额外的沙盒文件清单/状态文件尾部也在这里注入（省掉重复 ls/cat）。
+        sandbox_dir = ""
+        try:
+            sandbox_dir = str(local._sandbox_dir())
+        except Exception:  # noqa: BLE001
+            sandbox_dir = ""
+        context = self._role_context(challenge, sandbox=sandbox_dir or None)
         if context:
             task = f"{context}\n\n{task}"
 
@@ -2896,30 +2902,43 @@ class Solver:
             if content.strip():
                 last_content = content.strip()
 
-            # S1c 思考护栏（run_role 同款）：烧穿步不回喂空 assistant 消息；连续 2 次终止。
+            # S1c 思考护栏（run_role 同款）：烧穿步不回喂空 assistant 消息。
+            # 2026-11-16 实测（clean-room 四轮）：75% completion 花在 reasoning 上，每轮 18~29 次
+            # “思考烧穿”，单轮白扔 15~24 万 token。这里改成：第 1 次烧穿→本轮后续调用关思考
+            # （DashScope 的 enable_thinking=False）+ 注入「直接调工具」提示；第 2 次才加倍补全上限；
+            # 第 3 次才终止（不再 2 次就废掉整轮专家）。
             if not calls and not content.strip() and response.get("finish_reason") == "length":
                 burns += 1
                 self.store.append_transcript(
                     challenge_id,
                     {"step": step, "role": role,
-                     "content": f"[思考烧穿] 补全打满且无输出，第 {burns} 次，空消息不回喂历史"},
+                     "content": f"[思考烧穿] 补全打满且无输出，第 {burns} 次，本轮后续关思考"},
                 )
-                if burns >= 2:
+                try:
+                    llm.enable_thinking_override = False  # dashscope 认这个字段（llm.py 已支持覆盖）
+                except Exception:  # noqa: BLE001
+                    pass
+                if burns >= 3:
                     report = f"[思考烧穿终止] 连续 {burns} 次补全打满且无输出（reasoning 占满 max_tokens）"
                     reason = "completion_burned"
                     break
                 try:
-                    cur = int(getattr(self.llm, "max_tokens", 0) or 0)
-                    if cur and cur < 16384:
-                        self.llm.max_tokens = min(16384, cur * 2)
+                    cur = int(getattr(llm, "max_tokens", 0) or 0)
+                    if burns == 2 and cur and cur < 16384:
+                        llm.max_tokens = min(16384, cur * 2)
                         self.store.append_transcript(
                             challenge_id,
                             {"step": step, "role": "note",
-                             "content": f"[思考烧穿] max_tokens {cur} -> {self.llm.max_tokens}（容纳 reasoning）"},
+                             "content": f"[思考烧穿] max_tokens {cur} -> {llm.max_tokens}（容纳 reasoning）"},
                         )
                 except Exception:  # noqa: BLE001
                     pass
-                continue
+                messages.append({
+                    "role": "user",
+                    "content": "【系统提示】上一次输出把思考预算烧满且没有任何可见内容。"
+                               "现在不要写长篇分析：直接调用一个工具（优先 shell 跑已有脚本/命令），"
+                               "用不超过 2 行说明你要验证什么。",
+                })
                 continue
             burns = 0
             if len(calls) > self.config.max_calls_per_step:
@@ -3177,11 +3196,15 @@ class Solver:
         return "打法提示（按平台题型 tag 生成，仅供参考）：\n" + "\n".join(f"- {c}" for c in cards)
 
     @staticmethod
-    def _role_context(challenge) -> str:
+    def _role_context(challenge, sandbox: str | None = None) -> str:
         """专家的确定性题目背景：id/分类/难度/已解队数/tags + 题面摘要。
 
         与 _initial_prompt 的区别：专家在 crew 里拿不到 Challenge 对象，
         这里把「平台说了什么」压成一屏以内的数据块，随 task 一起注入。
+
+        2026-11-16 实测（clean-room 四轮）：专家把 ~65% 的 shell 调用花在 ls/cat/grep 重复
+        读同样的文件，且每轮都重新发现"沙盒里有什么"。这里一次性注入**沙盒文件清单**
+        （名字+大小）和状态文件尾部，省掉这些往返；并加一条"执行优先"规则。
         """
         bits = [f"本题：{challenge.id}" + (f"（{challenge.name}）" if challenge.name else "")]
         if challenge.category:
@@ -3195,7 +3218,51 @@ class Solver:
         hint = Solver._method_hint(challenge)
         if hint:
             text += "\n\n" + hint
+        inventory = Solver._sandbox_inventory(sandbox)
+        if inventory:
+            text += "\n\n## 沙盒现状（自动注入，别再 ls 一遍）\n" + inventory
+        text += (
+            "\n\n## 执行优先（硬规则）\n"
+            "- 已有脚本就先跑（`python3 <脚本> 2>&1 | tail -20`），再根据输出决定下一步；"
+            "不要连续两次 grep/阅读同一文件。\n"
+            "- 每步只做一件可验证的事，输出一行结论 + 下一条命令；"
+            "上一步已确认的结论直接引用，不要重新验证。\n"
+            "- 每次读 8 字节/任意地址都要打印长度与 hex 并断言（短读立即停下来修读法）。"
+        )
         return text
+
+    @staticmethod
+    def _sandbox_inventory(sandbox: str | None) -> str:
+        """沙盒文件名+大小（最多 30 个）+ 常见状态文件尾部（≤900 字符）。"""
+        if not sandbox:
+            return ""
+        try:
+            import pathlib
+
+            root = pathlib.Path(sandbox)
+            if not root.is_dir():
+                return ""
+            lines = []
+            for path in sorted(root.iterdir(), key=lambda p: p.name)[:30]:
+                if path.is_dir():
+                    lines.append(f"  {path.name}/")
+                else:
+                    try:
+                        lines.append(f"  {path.name}  ({path.stat().st_size} B)")
+                    except OSError:
+                        lines.append(f"  {path.name}")
+            for state_name in ("B_STATE.md", "STATE.md", "state.md", "NOTES.md"):
+                state_path = root / state_name
+                if state_path.is_file():
+                    try:
+                        tail = state_path.read_text(encoding="utf-8", errors="replace")[-900:]
+                    except OSError:
+                        continue
+                    lines.append(f"\n[{state_name} 尾部]\n{tail.strip()}")
+                    break
+            return "\n".join(lines)
+        except Exception:  # noqa: BLE001 - 清单只是增强项
+            return ""
 
     @staticmethod
     def _initial_prompt(challenge, local: LocalTools) -> str:
