@@ -1027,7 +1027,8 @@ class Crew:
         return guard
 
     def _delegate(self, challenge_id: str, role: str, task: str, solver: Solver, prior: list[str] | None = None,
-                  ledger: Ledger | None = None, facts_sink: list[str] | None = None) -> str:
+                  ledger: Ledger | None = None, facts_sink: list[str] | None = None,
+                  cancel_event=None) -> str:
         spec = self.roles.get(role)
         if not spec:
             return f"[拒绝] 未知角色 {role!r}，可选：{sorted(self.roles)}"
@@ -1061,6 +1062,7 @@ class Crew:
             keep_tail=spec.get("keep_tail"),
             facts_max=spec.get("facts_max"),
             facts_chars=spec.get("facts_chars"),
+            cancel_event=cancel_event,
         )
         self.on_event("report", {"role": role, "report": result["report"]})
         if facts_sink is not None:
@@ -1638,7 +1640,7 @@ class Crew:
                             try:
                                 text = self._delegate(
                                     challenge_id, role_name, task_text, solver, prior=reports, ledger=ledger,
-                                    facts_sink=facts_sink,
+                                    facts_sink=facts_sink, cancel_event=cancel_event,
                                 )
                             except LLMError as exc:
                                 text = f"[专家执行失败] {exc}"

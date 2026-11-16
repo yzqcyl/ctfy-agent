@@ -2799,11 +2799,14 @@ class Solver:
         keep_tail: int | None = None,
         facts_max: int | None = None,
         facts_chars: int | None = None,
+        cancel_event=None,
     ) -> dict:
         """给专家角色跑一个有界对话：只执行工具、不提交；调用 report 或停手即结束。
 
         与 solve() 的区别：不判定 accepted、不自动起实例（由协调者统筹），
         结束信号是 report 工具 / 不再调工具 / 步数或预算耗尽。
+        cancel_event：外部墙钟/预算/他路取消信号；每步前检查（否则单轮可能超时很久，
+        2026-11-16 L2 彩排实测：12 分钟墙钟预算被一个专家轮次拖到 27 分钟仍未停）。
         返回 {"report": str, "steps": int, "reason": str}。
         """
         challenge = self.store.require(challenge_id)
@@ -2856,6 +2859,12 @@ class Solver:
         seg_first_step = 1  # P2-1：当前链段首步（PLAN 变更即换段，段内不软压缩）
         burns = 0  # S1c：连续「补全打满且无输出」计数（思考烧穿护栏）
         for step in range(1, int(max_steps) + 1):
+            # 每步前检查外部取消（墙钟/预算/他路已解）：以前只在协调者轮间检查，
+            # 单个专家轮次可能拖很久（2026-11-16 L2 实测 12 分钟预算被拖到 27 分钟）。
+            if cancel_event is not None and cancel_event.is_set():
+                report = "[已取消，停止] 收到墙钟/预算/并发取消信号"
+                reason = "cancelled"
+                break
             try:
                 # S1a 稳定前缀（run_role 同款）：任务头首步定稿，事实板/预算行走尾部时变消息。
                 if step == 1:
