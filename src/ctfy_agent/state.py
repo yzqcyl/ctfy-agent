@@ -177,6 +177,9 @@ class Challenge:
     # 多问题题的分值结构（get_challenge 免费给）：[{id, prompt, share_percent, requires}]。
     # 2026-11-16 起用于赛程级 EV 排序/按题预算（taskplan.py），不再只当展示字段。
     questions: list = field(default_factory=list)
+    # 是否已用 get_challenge 补过一次完整元数据（questions/tags/difficulty）；
+    # 防止「平台本来就没有 questions」时每次任务都白拉一次题目详情。
+    meta_probed: bool = False
     is_qa_only: bool = False                        # 纯知识问答/MCQ：提交走 submit_qa_answer，不需要实例
     # 平台免费给的「要不要环境」两个字段（ctf2_get_practice_challenge 实测有）：
     # has_container=本题有容器靶标；requires_running_target=提交前必须靶标在跑。
@@ -413,6 +416,8 @@ class Store:
         questions = data.get("questions")
         if isinstance(questions, list) and questions:
             item.questions = [q for q in questions if isinstance(q, dict)]
+        if data.get("meta_probed"):
+            item.meta_probed = True
         item.touch()
         self.challenges[challenge_id] = item
         return item

@@ -192,10 +192,13 @@ def _contest_window(comp: dict | None) -> tuple[float | None, float]:
 def _policy_pool(config) -> float | None:
     """配置里的 token 池；None/0 = 不限池（2026-11-16 用户决定：用自己的 key，不设总池）。
 
-    有限池时才做全局分摊；不限池时每题只受 taskplan 的难度 cap 约束。
+    只有**显式**给了 `config.policy.pool_tokens` 或 `config.extra.contest_pool_tokens`
+    才做全局分摊。supervisor 的 `policy.total_token_budget` 是它自己的池，GUI 批量
+    不能拿它重复分摊（否则 unlimited 决策被旧配置悄悄改回 4M）。
     """
+    extra = getattr(config, "extra", {}) or {}
     policy = getattr(config, "policy", {}) or {}
-    raw = policy.get("pool_tokens") or policy.get("total_token_budget")
+    raw = extra.get("contest_pool_tokens") or policy.get("pool_tokens")
     try:
         return float(raw) if raw else None
     except (TypeError, ValueError):
@@ -605,6 +608,56 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                     left_min = max(0, int((contest_deadline - time.time()) / 60))
                     q.put(("batch_note", f"赛程剩余 {left_min} 分钟，到点自动软停"))
 
+        # ---- 中途统计（正式赛/GUI 都能看；0=关闭，比赛场建议 300s）----
+        stats_interval = float(config.extra.get("stats_interval_s") or 0)
+        stats_stop = threading.Event()
+        stats_log: list[dict] = []
+        phase_by_cid: dict[str, str] = {}
+        skipped_ids: set[str] = set()
+        started_at = time.time()
+
+        def _stats_snapshot() -> dict:
+            items: list[dict] = []
+            total_tokens = 0
+            solved = 0
+            for item in challenges:
+                cid = str(item.get("id") or "")
+                ch = store.get(cid)
+                tokens = dict(getattr(ch, "tokens", None) or {}) if ch is not None else {}
+                used = int(tokens.get("total_tokens") or 0)
+                total_tokens += used
+                flag = getattr(ch, "flag_value", "") if ch is not None else ""
+                if flag:
+                    solved += 1
+                quota = int((budgets.get(cid) or {}).get("quota") or 0) or int(budget_tokens or 0)
+                items.append({
+                    "id": cid,
+                    "tokens": used,
+                    "calls": int(tokens.get("calls") or 0),
+                    "quota": quota,
+                    "used_ratio": round(used / quota, 3) if quota else None,
+                    "phase": phase_by_cid.get(cid, ""),
+                    "skipped": cid in skipped_ids,
+                })
+            return {
+                "at": time.strftime("%H:%M:%S"),
+                "elapsed_s": int(time.time() - started_at),
+                "remaining_s": (max(0, int(contest_deadline - time.time()))
+                                if contest_deadline else None),
+                "total_tokens": total_tokens,
+                "solved": solved,
+                "items": items,
+            }
+
+        def _stats_loop() -> None:
+            while not stats_stop.wait(stats_interval):
+                snap = _stats_snapshot()
+                stats_log.append(snap)
+                q.put(("stats", snap))
+
+        if stats_interval > 0:
+            threading.Thread(target=_stats_loop, name="solve-stats", daemon=True).start()
+
         def work(item: dict, idx: int) -> dict:
             cid = str(item.get("id") or "")
             if not cid or cancel.is_set():
@@ -622,12 +675,15 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 # 单题级预检：关闭/暂停/平台已解的题不进入预算与派活（0 token 跳过）
                 blocked = preflight_playable(platform, competition_id, cid)
                 if blocked:
+                    skipped_ids.add(cid)
+                    phase_by_cid[cid] = "不可玩"
                     return {"id": cid, "ok": False, "flag": "",
                             "note": "不可玩：" + "；".join(blocked), "skipped": True}
 
                 def on_event(kind, payload=None):  # noqa: ANN001
                     data = dict(payload or {})
                     data["_cid"] = cid  # 并发时让界面能标出属于哪一题
+                    phase_by_cid[cid] = str(kind)[:16]   # 中途统计用：最近事件类型=粗阶段
                     q.put(("event", kind, data))
 
                 # 附件先落沙盒（同 solve()）：批量跑时每题各自拉自己的附件
@@ -728,11 +784,18 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
             order = {str(c.get("id")): n for n, c in enumerate(challenges)}
             results.sort(key=lambda r: order.get(str(r.get("id")), 10**6))
 
+        stats_stop.set()
+        if stats_interval > 0:
+            final_snap = _stats_snapshot()
+            stats_log.append(final_snap)
+            q.put(("stats", final_snap))
+
         flags = [r["flag"] for r in results if r.get("flag")]
         q.put(("done", {
             "run_id": run_id,
             "batch": True,
             "results": results,
+            "stats": stats_log,
             "stopped": cancel.is_set() or stop_after.is_set(),
             "flag_value": flags[0] if flags else "",
             "candidates": list(dict.fromkeys(flags)),

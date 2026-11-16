@@ -110,8 +110,10 @@ def ensure_challenge_meta(platform, store: Store, challenge_id: str) -> str | No
     盲跑的根因。返回 None 表示正常，返回字符串表示致命错误（调用方据此退出）。
     """
     item = store.get(challenge_id)
-    # questions 也参与「线索是否齐」判定：赛程级 EV 排序需要 share_percent，
-    # 老 state 里没这个字段时要补一次（单问题题补完仍为空也无妨，每题最多补一次）。
+    # questions 也参与「线索是否齐」判定：赛程级 EV 排序需要 share_percent。
+    # meta_probed 兜底：只要补过一次（成功或平台本来就不给 questions），就不再重复拉详情。
+    if item is not None and item.meta_probed:
+        return None
     if item is not None and item.tags and item.difficulty and item.questions:
         return None
 
@@ -125,6 +127,7 @@ def ensure_challenge_meta(platform, store: Store, challenge_id: str) -> str | No
 
     normalized = normalize_challenge(data if isinstance(data, dict) else {"id": challenge_id})
     normalized["id"] = normalized.get("id") or challenge_id
+    normalized["meta_probed"] = True     # 补过一次就不再重复拉详情（见上方 early return）
     store.upsert(normalized)
     store.save()
 

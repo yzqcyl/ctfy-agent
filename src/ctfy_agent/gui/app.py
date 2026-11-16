@@ -2071,6 +2071,15 @@ class App:
             self._log(f"{tag}[{_NOW()}] {str(p.get('note') or '')[:160]}")
         elif kind == "preflight":
             self._log(f"{tag}[!] 跳过（不可玩）：{str(p.get('note') or '')[:200]}")
+        elif kind == "stats":
+            items = p.get("items") or []
+            used = [f"{i.get('id')} {int(i.get('tokens') or 0) // 1000}k"
+                    + (f"/{int(i.get('quota') or 0) // 1000}k" if i.get("quota") else "")
+                    for i in items if int(i.get("tokens") or 0) > 0]
+            remain = p.get("remaining_s")
+            tail = f"剩 {int(remain) // 60} 分钟" if remain is not None else "无赛程截止"
+            self._log(f"{tag}[统计] 已用 {int(p.get('total_tokens') or 0) // 1000}k token；"
+                      f"已解 {p.get('solved') or 0}；{tail}；" + ("；".join(used[:6]) or "暂无消耗"))
         elif kind == "attachments":
             self._log(f"{tag}[{_NOW()}] 附件：{str(p.get('note') or '')[:400]}")
             self._tool_line(f"{tag}───── 附件已落盘 ─────")
