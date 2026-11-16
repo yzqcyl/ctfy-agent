@@ -65,11 +65,20 @@ def default_manifest() -> list[dict]:
         "colorama",
         # FreeType（自带 libfreetype.so，无需 apt；rev 的 checker 就是动态链它）
         "freetype-py",
+        # 2026-11-16 补：crypto 约束求解（z3）+ pwn/rev gadget 搜索（ROPgadget 已在上面，
+        # ropper 是另一套 gadget 工具）。filebytes 是 ropper 的运行时依赖，见下方本地 wheel 条目。
+        "z3-solver", "ropper",
     ]
     # unicorn 固定 2.1.1：pwntools 4.15 明确排除 2.1.3/2.1.4（它自己的已知坏版本）
     entries = [{"name": "unicorn", "kind": "pypi", "dest": "pylibs", "version": "2.1.1"}]
     entries += [{"name": name, "kind": "pypi", "dest": "pylibs"}
                 for name in deps if name != "unicorn"]
+    # filebytes 在 PyPI 只有 sdist，pypi_wheel() 只收 wheel → 用本地预构建 wheel
+    # （bundle 里已带；sha256 固定，离线安装走 kind=wheel 解包）。
+    entries.append({"name": "filebytes", "kind": "wheel", "dest": "pylibs",
+                    "filename": "filebytes-0.10.2-py3-none-any.whl",
+                    "url": "", "sha256": "6d957bcf6f5c8f673dc0cf33199860777612da55d9c380a3dd3dfcd5911d98be",
+                    "size": 27852})
     return entries
 
 
