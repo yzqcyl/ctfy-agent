@@ -2069,6 +2069,8 @@ class App:
             self._tool_line(f"{tag}• [{self.active_role or '?'}] {p.get('name')} {self._short(p.get('args'))} → {self._short(p.get('result'))}")
         elif kind == "instance_guard":
             self._log(f"{tag}[{_NOW()}] {str(p.get('note') or '')[:160]}")
+        elif kind == "preflight":
+            self._log(f"{tag}[!] 跳过（不可玩）：{str(p.get('note') or '')[:200]}")
         elif kind == "attachments":
             self._log(f"{tag}[{_NOW()}] 附件：{str(p.get('note') or '')[:400]}")
             self._tool_line(f"{tag}───── 附件已落盘 ─────")

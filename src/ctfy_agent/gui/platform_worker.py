@@ -10,6 +10,8 @@ import queue
 import threading
 import time
 
+from ..access_facts import playability_blockers
+
 # 「按难度动态分配时间预算」（能力评估 §4.1/§6-②）：122 题里 43 题因墙钟被打断，
 # 固定 15 分钟对 Easy 太松、对 Hard 太紧。默认 Easy 10 / Medium 25 / Hard 40 分钟；
 # 经 config.extra.{time_budget, time_budget_minutes, time_budget_fallback} 可关/可调。
@@ -84,6 +86,50 @@ def _seed_bridge(platform, competition_id: str | None) -> None:
     bridge = getattr(platform, "_arg_bridge", None)
     if bridge is not None and competition_id:
         bridge.seed(competition_id=competition_id)
+
+
+# 比赛级只读信息（play_open / 下一局时间）按 competition_id 缓存一次，避免并发线程重复拉。
+_COMP_CACHE: dict[str, dict] = {}
+_COMP_LOCK = threading.Lock()
+
+
+def _competition_info(platform, competition_id: str | None) -> dict:
+    """只读拉一次比赛信息；失败返回 {}，永不抛（拿不到就当没有阻塞）。"""
+    cid = str(competition_id or "").strip()
+    if not cid:
+        return {}
+    with _COMP_LOCK:
+        cached = _COMP_CACHE.get(cid)
+    if cached is not None:
+        return cached
+    data: dict = {}
+    try:
+        raw = platform.get_competition(cid)
+        if isinstance(raw, dict):
+            data = raw
+    except Exception:  # noqa: BLE001 - 只读增强，失败不拦解题
+        data = {}
+    with _COMP_LOCK:
+        _COMP_CACHE[cid] = data
+    return data
+
+
+def preflight_playable(platform, competition_id: str | None, challenge_id: str) -> list[str]:
+    """开跑前问平台「这题现在能不能玩」，返回阻塞原因（空列表=可以跑）。
+
+    2026-11-16 实测：练习场关闭后（play_open=false / 题目 closed=true / scoring=closed）
+    批量解题仍按难度给每题 20 分钟预算并烧掉 41~79 万 token，最后把「题不可玩」显示成
+    「未解出 / 时间预算到」。这里在起预算、派专家**之前**判定，命中即 0 token 跳过。
+    """
+    comp = _competition_info(platform, competition_id)
+    info: dict = {}
+    try:
+        raw = platform.get_challenge(challenge_id)
+        if isinstance(raw, dict):
+            info = raw
+    except Exception:  # noqa: BLE001 - 读不到题目信息就当没阻塞，交给后续流程报错
+        info = {}
+    return playability_blockers(comp, info)
 
 
 def _hydrate_attachments(platform, store, challenge_id: str, competition_id: str,
@@ -310,6 +356,22 @@ def solve(config, challenge_id: str, run_id: str, competition_id: str,
             q.put(("error", "题目信息", problem))
             return
 
+        # 不可玩就立刻收口：别起预算、别派专家（关闭/暂停场次里跑只会白烧 token）
+        blocked = preflight_playable(platform, competition_id, challenge_id)
+        if blocked:
+            reason = "不可玩：" + "；".join(blocked)
+            q.put(("event", "preflight", {"challenge_id": challenge_id, "note": reason}))
+            q.put(("done", {
+                "run_id": run_id,
+                "challenge_id": challenge_id,
+                "summary": {"reason": "not_playable", "submitted": False, "note": reason},
+                "flag_value": "",
+                "candidates": [],
+                "submitted": False,
+                "note": reason,
+            }))
+            return
+
         def on_event(kind, payload=None):
             q.put(("event", kind, payload or {}))
 
@@ -375,6 +437,25 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
         total = len(challenges)
         conc = max(1, min(int(concurrency or 1), max(1, total)))
 
+        # 整批级预检：比赛暂停/关闭时连题都不用拉，直接全部标记「不可玩」（0 token）
+        batch_block = playability_blockers(_competition_info(platform0, competition_id), None)
+        if batch_block:
+            reason = "不可玩：" + "；".join(batch_block)
+            q.put(("batch_note", f"整批判为不可玩，直接跳过：{reason}"))
+            blocked_results: list[dict] = []
+            for i, item in enumerate(challenges, 1):
+                cid = str(item.get("id") or "")
+                q.put(("task_start", {"index": i, "total": total, "id": cid,
+                                      "name": item.get("name") or ""}))
+                row = {"id": cid, "ok": False, "flag": "", "note": reason, "skipped": True}
+                blocked_results.append(row)
+                q.put(("task_done", row))
+            q.put(("done", {
+                "run_id": run_id, "batch": True, "results": blocked_results,
+                "stopped": False, "flag_value": "", "candidates": [], "submitted": False,
+            }))
+            return
+
         def work(item: dict, idx: int) -> dict:
             cid = str(item.get("id") or "")
             if not cid or cancel.is_set():
@@ -388,6 +469,12 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 problem = ensure_challenge_meta(platform, store, cid)
                 if problem:
                     return {"id": cid, "ok": False, "flag": "", "note": problem}
+
+                # 单题级预检：关闭/暂停/平台已解的题不进入预算与派活（0 token 跳过）
+                blocked = preflight_playable(platform, competition_id, cid)
+                if blocked:
+                    return {"id": cid, "ok": False, "flag": "",
+                            "note": "不可玩：" + "；".join(blocked), "skipped": True}
 
                 def on_event(kind, payload=None):  # noqa: ANN001
                     data = dict(payload or {})

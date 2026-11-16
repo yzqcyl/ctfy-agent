@@ -100,6 +100,38 @@ def competition_access_lines(comp: dict | None) -> list[str]:
     return lines
 
 
+def playability_blockers(competition: dict | None, challenge: dict | None) -> list[str]:
+    """平台/题目级「现在根本不该开跑」的硬阻塞（与难度无关，跑也只会白烧预算）。
+
+    2026-11-16 实测（TPCTF 练习场关闭后重跑 5 题）：``play_open=false``、题目
+    ``closed=true`` / ``scoring=closed``，start/submit 一律 403 ``competition_paused``，
+    但 GUI 批量解题仍给每道题开满 20 分钟预算、烧掉 41~79 万 token，最后显示成
+    「未解出 / 时间预算到」——把「题不可玩」误报成「解题失败」。这里把判定抽成纯函数，
+    调用方在起预算/派活**之前**先问一次，命中就立刻标记跳过（0 token）。
+
+    返回空列表 = 可以开跑；每条是一条人类可读的阻塞原因。
+    """
+    blockers: list[str] = []
+    comp = competition if isinstance(competition, dict) else {}
+    info = challenge if isinstance(challenge, dict) else {}
+
+    if comp.get("play_open") is False:
+        next_start = str(comp.get("next_session_starts_at") or "").strip()
+        tail = f"，下一局 {next_start}（UTC）开始" if next_start else ""
+        blockers.append(f"比赛当前暂停（play_open=false{tail}）；start/submit 会 403 competition_paused")
+
+    if info.get("closed") is True:
+        blockers.append("题目已关闭（closed=true）")
+
+    scoring = str(info.get("scoring") or "").strip().lower()
+    if scoring in ("closed", "disabled", "off", "paused"):
+        blockers.append(f"题目已停止计分（scoring={scoring}）")
+
+    if info.get("my_fully_solved") is True:
+        blockers.append("平台记录本题已解出（my_fully_solved=true），无需重跑")
+    return blockers
+
+
 def instance_access_lines(instance: dict | None) -> list[str]:
     """实例 surface → 可直接照做的连接说明（服务清单 / VPN / 回调 / per-team 附件）。"""
     if not isinstance(instance, dict):
