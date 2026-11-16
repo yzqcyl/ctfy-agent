@@ -278,6 +278,13 @@ DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
      "PWN 进阶：格式化串先 %p 泄栈找自己输入的位置（tcp_batch 批量试 %1$p..%20$p 一次收敛）；"
      "没有 win 函数走 ROP，elfpeek view=gadgets filter=rdi|rsi|rdx|syscall；堆题先看 malloc/free 顺序"
      "与 tcache 是否 double-free，别急着一次打通；远程先泄漏 libc 基址再算偏移。"),
+    (("heap", "asan", "sanitizer", "use_after_free", "uaf", "arbitrary_read"),
+     "PWN 泄漏链四步（ASan 记录管理器类）：① 先用已打通的任意读写『记录结构固定字段』——self/label/"
+     "blob.data 里通常就有 heap 与 PIE 指针；② 用 elfpeek view=info/plt-got/symbols + 附件 libc 的符号"
+     "偏移把 PIE 指针→PIE base、GOT 项→libc 符号→libc base；③ 每次读 8 字节都要打印 hex 与**实际长度**"
+     "并断言长度=8（短读先修读取长度/预算约束，别假设成功——exploit_b 就卡在『泄漏读取不足 8 字节』）；"
+     "④ 拿到 base 后再构造 openat/read/write 或 ret2libc；每步落一个可重跑脚本 + 一条断言，失败先看是哪一步。"
+     "镜像 v7.3 起内置 gdb，崩溃用 `gdb -batch -q -ex run -ex 'info registers' -ex bt ./poc` 看现场。"),
     (("rsa", "small_e", "wiener", "common_modulus"),
      "CRYPTO RSA 先自动试：rsatool op=small_e（c 开 e 次根）/ wiener（d 小）/ common_modulus（同 n 两组）/ "
      "fermat（p、q 相邻）。有「明文结构」线索就走格攻击：message=m0+x 且 x 小、或 f(x)≡0 (mod N) 有小根 → "

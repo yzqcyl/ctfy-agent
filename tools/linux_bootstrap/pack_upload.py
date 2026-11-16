@@ -34,6 +34,7 @@ INCLUDE_DIRS = [
     "roles",
     "runs/tpctf2026/attachments",
     "runs/tpctf2026/docs",
+    "runs/_tpctf/l2_assets",          # L2 团队资产（leak_helpers.py 等，不含 flag）
 ]
 INCLUDE_FILES = [
     "config/agent.json",

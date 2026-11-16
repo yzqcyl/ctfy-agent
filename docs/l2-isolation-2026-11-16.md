@@ -116,3 +116,38 @@ wsl.exe -d Ubuntu-24.04 -- bash .../l2_isolated_run.sh --mode rev --budget 20000
 **结论**：clean-room 属于"要跨过 libc/收口这一步"的硬题；两轮 800k 把 agent 推到
 "A 段 + 任意读 + PIE 基址 + libc 基址"但仍未出 flag。继续加预算的边际收益在下降，
 建议按时间预算决定是否第三轮，或转向 rev/crypto/web 的隔离彩排。
+
+## 第三轮（23:00–23:50）：补了"泄漏链能力"后仍然无 flag
+
+**本轮改动**（针对二轮卡点"libc 基址算不出/泄漏短读"）：
+1. 新增团队资产 `runs/_tpctf/l2_assets/leak_helpers.py`（拷进沙盒供 import）：
+   - `ElfOffsets` / `LibcOffsets`：pyelftools/readelf 双路解析符号、GOT 槽、629 条
+     `R_X86_64_RELATIVE` 槽位与 addend → 泄漏一个已知位置指针即可反推 PIE 基址；
+   - `read8()`：任意读统一收口，**短读直接抛错并打印长度/地址**（正是二轮 exploit_b 的坑）；
+   - `MenuClient`：clean-room 行菜单协议客户端（expect/sendline/recv 定长）；
+2. `method_cards.py` 新增 PWN 泄漏链卡（tags: heap/sanitizer/asan/uaf/arbitrary_read）：
+   "① 读记录结构固定字段拿 heap/PIE 指针 → ② ELF 偏移换算 PIE/libc base → ③ 每次读 8 字节
+   断言长度 → ④ 再构造 openat/read/write 或 ret2libc"；
+3. 题面 tags 注入（隔离平台 get_challenge/list_challenges 带 tags），确保方法卡真的被送进专家上下文。
+
+**结果**：
+
+| 指标 | 值 |
+|---|---|
+| tokens / calls | **800,079 / 169**（800k 预算 100% 用尽） |
+| 结果 | 未解出、无提交 |
+| 真实环境错误 / 命令错误 | **0 / 0** |
+| 被拒绝的 /answers 访问 | 1 次（隔离生效） |
+| 工具 | shell 158、write_file 16、elfpeek 3、get_challenge 1 |
+
+**推进（泄漏链能力生效）**：
+- B 段 **libc 基址判定完成并交叉验证**：PIE base = `0x5d47c99a5000`（由 blob `label` 指针 −
+  `LABEL_VADDR 0x1343a0` 得出，与 `/proc/pid/maps` 完全一致 PIE_OK=True），
+  `__libc_start_main` 泄漏 → libc base 也能对上；
+- 但 C 段（远程 ROP/收口）**没来得及执行**：预算 99% 时只剩收口调用，agent 按纪律交卡点，
+  没有对远程发起交互、也没有提交猜测值。
+
+**四轮累计**：687k + 796k + 792k + 800k ≈ **3.08M tokens**，仍未解出 clean-room。
+结论：该题在当前 agent + 800k/题预算下属于"能力边界外"；泄漏链资产把 B 段从"算不出"变成
+"可验证"，但完整利用链（栈写 + ROP 收口）需要更多轮次/预算。**建议停止在该题烧预算**，
+把隔离彩排转向 rev/crypto/web，等有真实比赛窗口再验证。
