@@ -89,3 +89,30 @@ wsl.exe -d Ubuntu-24.04 -- bash .../l2_isolated_run.sh --mode rev --budget 20000
 
 结论：隔离后数据可信；**800k/50min 不足以让当前 agent 解出 clean-room**，但它已从
 "只会分析"推进到"有可控写原语 + 任意读 + PIE 基址线索"的 near-miss 状态。
+
+## 二轮续跑（20:36–21:24，同一沙盒、再 800k，有效数据）
+
+- 机制：新增 `--continue-from <上一轮 run-id>`，把上一轮 sandbox 里 agent 自己产出的
+  15 个文件（`exploit_a.py`、日志、dump 脚本等）拷进新一轮；题面追加「续跑说明：A 段已完成，
+  直接从 B 段开始，优先算 libc 基址」；预算、隔离、墙钟与上一轮相同。
+- 结果：
+
+| 指标 | 值 |
+|---|---|
+| tokens / calls | **792,078 / 150**（预算 800k 绑定） |
+| 结果 | 未解出，无提交 |
+| 真实环境错误 / 命令错误 | **0 / 0** |
+| 被拒绝的 /answers 访问 | **2 次**（隔离继续生效） |
+| delegates / 工具调用 | 8 次派活；shell 154、elfpeek 20、write_file 16、pwnrop 1 |
+
+- **推进**：A 段写原语复核通过；B 段第一步 **libc 基址算出并可复现**
+  （`calc_base_final.py`）；写了 `exploit_b.py` 并对真实靶跑了一次，卡在
+  "泄漏读取不足 8 字节"，未完成 openat/read/write 收口。
+- **两轮合计**：约 **158.8 万 tokens**（687k + 792k + 中间 staged 跑 796k——实际单题累计
+  三轮 ≈227.5 万），仍未解出 clean-room。
+- 实现 bug：本轮结束写 summary 时 `args` 变量被循环覆盖导致崩溃（数据本身完整，已由
+  `state.json`+transcripts 重建为 `summary_iso_pwn3.json`），代码已修（改名 `tool_args`）。
+
+**结论**：clean-room 属于"要跨过 libc/收口这一步"的硬题；两轮 800k 把 agent 推到
+"A 段 + 任意读 + PIE 基址 + libc 基址"但仍未出 flag。继续加预算的边际收益在下降，
+建议按时间预算决定是否第三轮，或转向 rev/crypto/web 的隔离彩排。
