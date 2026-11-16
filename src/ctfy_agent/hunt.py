@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -39,15 +40,66 @@ def _normalize_url(u: str) -> str:
     return u
 
 
-def _seed_run(config, *, urls, category, difficulty, name, brief, run_id) -> str:
+# 离线附件：复制进 runs/<run>/sandbox/<cid>/attachments/。
+# shell 的 cwd 就是 runs/<run>/sandbox/<cid>，所以模型直接 `ls attachments` 就能看到。
+ATTACH_SUBDIR = "attachments"
+ATTACH_MAX_BYTES = 300 * 1024 * 1024  # 单文件 300MB 上限：再大该走靶场自己下载
+
+
+def _copy_attachments(config, run_id: str, cid: str, paths) -> list[dict]:
+    """把本地附件复制到本题沙盒的 attachments/ 下，返回 [{name, bytes, source}]。
+
+    同名文件自动改名（a.zip / a_1.zip），不覆盖先前的附件；路径不存在/不是文件直接报错，
+    让 GUI/CLI 立刻看到问题，而不是跑起来才发现附件没带。
+    """
+    if not paths:
+        return []
+    dst = Path(config.run_dir(run_id)) / "sandbox" / str(cid) / ATTACH_SUBDIR
+    copied: list[dict] = []
+    for raw in paths:
+        src = Path(str(raw)).expanduser()
+        try:
+            src = src.resolve()
+        except OSError:
+            pass
+        if not src.is_file():
+            raise ValueError(f"附件不存在或不是文件：{src}")
+        size = int(src.stat().st_size)
+        if size > ATTACH_MAX_BYTES:
+            raise ValueError(
+                f"附件过大（{size / 1048576:.0f} MB > {ATTACH_MAX_BYTES / 1048576:.0f} MB）：{src.name}")
+        dst.mkdir(parents=True, exist_ok=True)
+        target = dst / src.name
+        n = 1
+        while target.exists():
+            target = dst / f"{src.stem}_{n}{src.suffix}"
+            n += 1
+        shutil.copy2(src, target)
+        copied.append({"name": target.name, "bytes": size, "source": str(src)})
+    return copied
+
+
+def _attach_lines(copied: list[dict]) -> list[str]:
+    if not copied:
+        return []
+    lines = ["", "【附件】本题附件已放在当前工作目录的 `attachments/` 下（shell 的 cwd 就是本题工作目录）："]
+    for item in copied:
+        lines.append(f"- attachments/{item['name']}  ({item['bytes'] / 1024:.1f} KB)")
+    lines.append("附件是题目原始文件（压缩包/二进制/源码等），需要时先解压或读取再分析。")
+    return lines
+
+
+def _seed_run(config, *, urls, category, difficulty, name, brief, run_id, attachments=None) -> str:
     """在 run store 里播种一条离线挑战，返回 challenge_id。写 .offline 标记供历史列表识别。"""
+    cid = "HUNT-" + _slug(name or urls[0].split("://")[-1].split("/")[0])
+    copied = _copy_attachments(config, run_id, cid, attachments)
+
     desc_lines = ["【离线靶场（人工已启动，目标如下，直接攻击，不要调用 start_instance）】"]
     desc_lines += [f"- {u}" for u in urls]
     if brief:
         desc_lines += ["", brief]
+    desc_lines += _attach_lines(copied)
     desc = "\n".join(desc_lines)
-
-    cid = "HUNT-" + _slug(name or urls[0].split("://")[-1].split("/")[0])
     store = Store(config.run_dir(run_id)).load()
     store.upsert(normalize_challenge({
         "id": cid, "name": name, "category": category,
@@ -61,8 +113,10 @@ def _seed_run(config, *, urls, category, difficulty, name, brief, run_id) -> str
     store.save()
 
     marker = Path(config.run_dir(run_id)) / _MARKER
-    marker.write_text(json.dumps({"run_id": run_id, "challenge_id": cid, "name": name}, ensure_ascii=False),
-                      encoding="utf-8")
+    marker.write_text(json.dumps({
+        "run_id": run_id, "challenge_id": cid, "name": name,
+        "attachments": [c["name"] for c in copied],
+    }, ensure_ascii=False), encoding="utf-8")
     return cid
 
 
@@ -137,12 +191,13 @@ def _run_crew(config, store: Store, cid: str, *, on_event, on_answer, cancel_eve
 
 
 def run_hunt(config, *, urls, category="web", difficulty="medium", name="", brief="",
-             run_id="hunt", on_event=None, on_answer=None, cancel_event=None) -> dict:
-    """新建离线任务并跑完整解题。urls: list[str]。返回结果 dict。"""
+             run_id="hunt", attachments=None, on_event=None, on_answer=None,
+             cancel_event=None) -> dict:
+    """新建离线任务并跑完整解题。urls: list[str]；attachments: 本地附件路径列表。返回结果 dict。"""
     urls = [_normalize_url(u) for u in urls]
     cid = _seed_run(config, urls=urls, category=category, difficulty=difficulty,
                     name=name or _slug(urls[0].split("://")[-1].split("/")[0]),
-                    brief=brief, run_id=run_id)
+                    brief=brief, run_id=run_id, attachments=attachments)
     store = Store(config.run_dir(run_id)).load()
     result = _run_crew(config, store, cid, on_event=on_event, on_answer=on_answer,
                        cancel_event=cancel_event)
@@ -182,6 +237,8 @@ def main(argv=None) -> int:
     ap.add_argument("--name", default="", help="题名（用于 run 内 id，默认取第一个 host）")
     ap.add_argument("--desc", default="", help="题面文字（与 --brief 二选一或都用）")
     ap.add_argument("--brief", default="", help="题面 md/txt 文件路径")
+    ap.add_argument("--attach", action="append", default=[],
+                    help="附件文件路径，可多次（开始时会复制到本题工作目录 attachments/）")
     ap.add_argument("--run-id", default="hunt", help="run 目录名（默认 hunt）")
     ap.add_argument("--config", default=None, help="config 路径（默认 config/agent.json）")
     args = ap.parse_args(argv)
@@ -221,7 +278,7 @@ def main(argv=None) -> int:
 
     result = run_hunt(
         config, urls=args.url, category=args.category, difficulty=args.difficulty,
-        name=args.name, brief=brief, run_id=args.run_id,
+        name=args.name, brief=brief, run_id=args.run_id, attachments=args.attach,
         on_event=on_event, on_answer=on_answer,
     )
 

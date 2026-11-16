@@ -31,6 +31,19 @@ _NOW = lambda: time.strftime("%H:%M:%S")
 _ACCEPTED_RE = re.compile(r'"accepted"\s*:\s*true')
 
 
+def _fmt_bytes(n: int) -> str:
+    """人读的字节数：123 B / 4.5 KB / 3.2 MB / 1.1 GB。"""
+    try:
+        size = float(n)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}".replace(".0 ", " ")
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
 def _iso_ts(value) -> float | None:
     """把转录里的 ISO 时间（`2026-11-10T15:30:39`）转成本地时间戳；解析不了就 None。"""
     text = str(value or "").strip()
@@ -112,6 +125,7 @@ class App:
         self._run_task: dict[str, dict] = {}
         self._batch_size = 1
         self._offline_base: dict | None = None
+        self._attach_paths: list[str] = []  # 离线附件（本地路径，开始时复制进题目沙盒）
 
         self.root = root or tk.Tk()
         self.root.title("CTF 自动解题（离线 / 平台）")
@@ -255,6 +269,25 @@ class App:
         theme.RoundedButton(frm_new, text="从文件载入题面", icon="folder", variant="ghost",
                             pad_x=12, pad_y=7, command=self._load_brief).pack(
             anchor="w", pady=(6, 0))
+        theme.label(frm_new, "附件（可选，可多选；开始时复制到本题工作目录 attachments/）",
+                    muted=True, size=9).pack(anchor="w", pady=(10, 0))
+        c_att = theme.Card(frm_new, radius=theme.RADIUS_INPUT, padding=(1, 1))
+        c_att.pack(fill="x", pady=(4, 0))
+        self.lb_attach = tk.Listbox(c_att.body, height=3)
+        theme.style_listbox(self.lb_attach)
+        self.lb_attach.pack(fill="x")
+        att_row = tk.Frame(frm_new, bg=theme.CANVAS)
+        att_row.pack(fill="x", pady=(6, 0))
+        theme.RoundedButton(att_row, text="添加附件", icon="folder", variant="ghost",
+                            pad_x=12, pad_y=7,
+                            command=self._add_attachments).pack(side="left")
+        theme.RoundedButton(att_row, text="移除选中", variant="ghost", pad_x=10, pad_y=7,
+                            command=self._remove_attachment).pack(side="left", padx=(6, 0))
+        theme.RoundedButton(att_row, text="清空", variant="ghost", pad_x=10, pad_y=7,
+                            command=self._clear_attachments).pack(side="left", padx=(6, 0))
+        self.lbl_attach = tk.StringVar(value="未选择附件")
+        tk.Label(frm_new, textvariable=self.lbl_attach, bg=theme.CANVAS,
+                 fg=theme.TEXT_MUTED, font=theme.body_font(9)).pack(anchor="w", pady=(4, 0))
         theme.label(frm_new, "运行名（run-id）", muted=True,
                     size=9).pack(anchor="w", pady=(8, 0))
         self.var_run = tk.StringVar(value="hunt")
@@ -982,6 +1015,57 @@ class App:
             self.txt_brief.delete("1.0", "end")
             self.txt_brief.insert("1.0", Path(path).read_text(encoding="utf-8", errors="replace"))
 
+    # ---------------- 离线附件 ----------------
+
+    def _add_attachments(self, paths=None) -> None:
+        """添加附件；paths 为 None 时弹文件选择框（多选）。GUI 里点按钮、测试里直接传路径。"""
+        if paths is None:
+            paths = filedialog.askopenfilenames(title="选择附件（可多选）")
+        changed = False
+        for raw in paths or ():
+            path = str(raw)
+            if not path or path in self._attach_paths:
+                continue
+            self._attach_paths.append(path)
+            changed = True
+        if changed or paths is None:
+            self._refresh_attach_list()
+
+    def _remove_attachment(self) -> None:
+        sel = list(self.lb_attach.curselection())
+        for idx in reversed(sel):
+            if 0 <= idx < len(self._attach_paths):
+                del self._attach_paths[idx]
+        self._refresh_attach_list()
+
+    def _clear_attachments(self) -> None:
+        self._attach_paths.clear()
+        self._refresh_attach_list()
+
+    def _attachment_paths(self) -> list[str]:
+        return list(self._attach_paths)
+
+    def _refresh_attach_list(self) -> None:
+        lb = getattr(self, "lb_attach", None)
+        if lb is None:  # selftest 桩对象 / 极早期调用
+            return
+        lb.delete(0, "end")
+        total = 0
+        for path in self._attach_paths:
+            try:
+                size = Path(path).stat().st_size
+            except OSError:
+                size = 0
+            total += size
+            lb.insert("end", f"{Path(path).name}  ({_fmt_bytes(size)})")
+        lbl = getattr(self, "lbl_attach", None)
+        if lbl is not None:
+            if self._attach_paths:
+                lbl.set(f"已选 {len(self._attach_paths)} 个附件，共 {_fmt_bytes(total)}"
+                        "（开始时复制进本题工作目录 attachments/）")
+            else:
+                lbl.set("未选择附件")
+
     def _refresh_history(self) -> None:
         self.lb_hist.delete(0, "end")
         for name in _history_entries():
@@ -1001,7 +1085,9 @@ class App:
         if m.exists():
             try:
                 d = json.loads(m.read_text(encoding="utf-8"))
-                self._set_status("查看历史：" + str(d.get("name") or rid))
+                atts = list(d.get("attachments") or [])
+                self._set_status("查看历史：" + str(d.get("name") or rid)
+                                 + (f"（附件 {len(atts)} 个）" if atts else ""))
             except Exception:  # noqa: BLE001
                 pass
         self._refresh_solved()
@@ -1057,16 +1143,27 @@ class App:
         ):
             return
 
-        spec = {
-            "urls": urls,
+        missing = [p for p in self._attach_paths if not Path(p).is_file()]
+        if missing:
+            messagebox.showwarning(
+                "附件不存在",
+                "以下附件已不存在，请先移除或重新选择：\n" + "\n".join("  " + p for p in missing))
+            return
+        spec = self._offline_spec()
+        self.run_id = spec["run_id"]
+        self._begin_thread(worker.start_hunt, (self.config, spec, self.q, self.cancel))
+
+    def _offline_spec(self) -> dict:
+        """离线任务的启动参数（单独成方法：GUI 测试能直接断言附件确实被带上）。"""
+        return {
+            "urls": self._collect_urls(),
             "category": self.cb_cat.get(),
             "difficulty": self.cb_diff.get(),
             "name": self.var_name.get().strip(),
             "brief": self.txt_brief.get("1.0", "end").strip(),
             "run_id": self.var_run.get().strip() or "hunt",
+            "attachments": self._attachment_paths(),
         }
-        self.run_id = spec["run_id"]
-        self._begin_thread(worker.start_hunt, (self.config, spec, self.q, self.cancel))
 
     def _begin_thread(self, fn, args, batch_size: int = 1) -> None:
         self.cancel.clear()

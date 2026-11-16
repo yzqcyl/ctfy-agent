@@ -976,6 +976,50 @@ def case_force_rerun_really_reruns() -> None:
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
+def case_offline_attachments() -> None:
+    """离线附件：选/移除/清空、去重、启动参数里真的带上附件路径。"""
+    from ctfy_agent.gui.app import App
+
+    tmp = ROOT / "runs" / "_t_gui_attach"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    f1 = tmp / "题面.txt"
+    f1.write_text("hello", encoding="utf-8")
+    f2 = tmp / "bin.dat"
+    f2.write_bytes(b"\x00\x01\x02" * 100)
+    app = None
+    try:
+        app = App()
+        app.root.update()
+        assert app._attachment_paths() == []
+        app._add_attachments([str(f1), str(f2)])
+        assert app._attachment_paths() == [str(f1), str(f2)]
+        assert app.lb_attach.size() == 2
+        assert "2 个附件" in app.lbl_attach.get() or "已选" in app.lbl_attach.get()
+        # 重复添加同一个文件不重复入列
+        app._add_attachments([str(f1)])
+        assert app._attachment_paths() == [str(f1), str(f2)]
+        assert app.lb_attach.size() == 2
+        # 启动参数必须带上附件（否则 UI 选了等于白选）
+        app.txt_urls.delete("1.0", "end")
+        app.txt_urls.insert("1.0", "127.0.0.1:9")
+        spec = app._offline_spec()
+        assert spec["attachments"] == [str(f1), str(f2)], spec
+        assert spec["urls"], spec
+        # 移除选中 + 清空
+        app.lb_attach.selection_set(0)
+        app._remove_attachment()
+        assert app._attachment_paths() == [str(f2)]
+        app._clear_attachments()
+        assert app._attachment_paths() == [] and app.lb_attach.size() == 0
+        assert app.lbl_attach.get() == "未选择附件"
+        ok("离线附件：多选/去重/移除/清空，且启动参数里真的带上附件路径")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if app is not None:
+            app.root.destroy()
+
+
 def main() -> int:
     try:
         case_tokens()
@@ -990,6 +1034,7 @@ def main() -> int:
         case_table_scrollbars()
         case_settings_dialog()
         case_force_rerun_really_reruns()
+        case_offline_attachments()
     except AssertionError as exc:  # 断言失败直接报出上下文
         print(f"FAIL: {exc}")
         raise
