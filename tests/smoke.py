@@ -5365,6 +5365,8 @@ def main() -> int:
         ("v66_answer_status", case_v66_answer_status),
     ]
     for name, case in cases:
+        # 进度行：全量套件 30+ 分钟，卡住/挂起时必须能看出卡在哪个用例（原先只在失败时打印）。
+        print(f"[run] {name}", flush=True)
         try:
             case(tmp)
         except Exception:

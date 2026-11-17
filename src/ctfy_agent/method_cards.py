@@ -270,7 +270,8 @@ DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
     (("bof", "stack", "elf"),
      "PWN 栈溢出四步：elfpeek info 看 PIE/NX/canary → symbols/strings 找 gets/read/system/win → "
      "pwngen op=cyclic 生成模式串、tcp 发超长触发崩溃 → pwnfind 反查精确偏移。"
-     "有附件 libc 就 elfpeek view=lookup 拿 system、/bin/sh 偏移走 ret2libc；"
+     "有附件 libc 就直接 pwnkit(op=libc,path=libc.so.6) 拿 system、/bin/sh、build-id，"
+     "泄漏任一符号后用 pwnkit(op=ret2libc,symbol=puts,leaked=0x7f...) 一步出基址+system+/bin/sh+gadget；"
      "payload 一律 pwngen op=build 组装后 tcp(hex_mode=true) 发，别手搓转义串。"
      "崩溃看不懂就用 shell 跑批处理 gdb 看现场：`gdb -batch -q -ex run -ex 'info registers' -ex 'x/8gx $rsp' "
      "-ex bt ./poc < payload.bin`（镜像 v7.3 起内置 gdb；不用交互式，拿寄存器/RIP 覆盖值就够）。"
@@ -285,6 +286,8 @@ DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
      "偏移把 PIE 指针→PIE base、GOT 项→libc 符号→libc base；③ 每次读 8 字节都要打印 hex 与**实际长度**"
      "并断言长度=8（短读先修读取长度/预算约束，别假设成功——exploit_b 就卡在『泄漏读取不足 8 字节』）；"
      "④ 拿到 base 后再构造 openat/read/write 或 ret2libc；每步落一个可重跑脚本 + 一条断言，失败先看是哪一步。"
+     "工具：基址换算用 pwnkit(op=ret2libc)（别再手算）；写真实栈前 pwnkit(op=asan,addr=...) 算解封 shadow，"
+     "完整解封写栈流程用团队资产 pwnkit(op=assets) 取 asan_shadow.py/pwn_stack_probe.py，泄链用 leak_helpers.py。"
      "镜像 v7.3 起内置 gdb，崩溃用 `gdb -batch -q -ex run -ex 'info registers' -ex bt ./poc` 看现场。"),
     (("rsa", "small_e", "wiener", "common_modulus"),
      "CRYPTO RSA 先自动试：rsatool op=small_e（c 开 e 次根）/ wiener（d 小）/ common_modulus（同 n 两组）/ "

@@ -163,7 +163,7 @@ DEFAULT_ROLES: dict[str, dict] = {
     # agent.json 之外没有任何兜底来源）。工具面按 agent.json 的同名角色抄全，避免兜底退化。
     "pwn": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True,
             "platform": ["read", "instance"],
-            "local": ["shell", "elfpeek", "tcp", "tcp_batch", "netcheck", "udp"]},
+            "local": ["shell", "elfpeek", "pwnkit", "tcp", "tcp_batch", "netcheck", "udp"]},
     # [web-ai-gap 2026-10-30] ai 兜底按 agent.json 抄全（开 shell、local 补 shell/decode_blob），
     # 避免 config 丢失时退化成「无载荷构造」的旧面。
     # platform 用组名：oracle 组 = verify_answer + verify_exploit，校验通道无需单列。

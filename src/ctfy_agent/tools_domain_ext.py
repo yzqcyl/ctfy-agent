@@ -2704,6 +2704,104 @@ def _pwn_module():
     return _pylibs.import_or_none("pwn")
 
 
+# >>> [pwn-hardening 2026-11-17] ===== pwnkit：libc 识别 / ret2libc 地址推导 / ASan shadow =====
+# 真实 PWN 题的三个机械步骤（算 libc 偏移、反推基址、ASan 解封 shadow）交给确定性代码，
+# 模型只负责「打哪条链」。纯 stdlib，实现见 pwn_kit.py，单测 tests/smoke_pwn_kit.py。
+def _pwn_num(text: str, what: str) -> int:
+    """pwnkit 数值参数：hex/十进制都收，空/垃圾给可读错误。"""
+    raw = str(text or "").strip().replace("_", "")
+    if not raw:
+        raise DomainToolError("%s 不能为空" % what)
+    low = raw.lower()
+    # 模型常省略 0x（如 leaked=7ffff7c802c0）：出现 a-f 就按 16 进制收，否则十进制。
+    base = 16 if low.startswith("0x") or any(c in "abcdef" for c in low) else 10
+    try:
+        return int(raw, base)
+    except ValueError as exc:
+        raise DomainToolError("%s 不是合法整数：%r（支持 0x1234 / 4660 / 裸 hex）" % (what, text)) from exc
+
+
+def _pwnkit_read(path: str) -> tuple[bytes, str]:
+    if not path:
+        raise DomainToolError("op=libc/ret2libc 需要 path=<沙盒里的 libc.so.6 路径>")
+    from pathlib import Path
+    fp = Path(path).expanduser()
+    if not fp.is_file():
+        raise DomainToolError("文件不存在：%s（先用 download_challenge_attachment 落盘附件）" % path)
+    try:
+        return fp.read_bytes(), str(fp)
+    except OSError as exc:
+        raise DomainToolError("读文件失败：%s" % exc) from exc
+
+
+def pwnkit(op: str = "libc", path: str = "", symbol: str = "", leaked: str = "",
+           addr: str = "", size: int = 8, bits: int = 64) -> str:
+    from .pwn_kit import PwnKitError, asan_shadow, assets, libc_info, ret2libc
+    try:
+        if op == "libc":
+            data, real = _pwnkit_read(path)
+            info = libc_info(data, path=real)
+            lines = ["libc：%s / %s" % (info["class"], info["machine"])]
+            for v in info["version"]:
+                lines.append("版本串：%s" % v)
+            if not info["version"]:
+                lines.append("版本串：未找到（精简/strip 过的 glibc，按符号偏移走）")
+            lines.append("build-id：%s" % (info["build_id"] or "无"))
+            lines.append("关键符号偏移（vaddr；基址 = 泄漏值 - 偏移）：")
+            for name, s in info["symbols"].items():
+                lines.append("  %-20s %12s  size=%s" % (name, s["hex"], s["size"]))
+            if info["missing_symbols"]:
+                lines.append("缺：" + "、".join(info["missing_symbols"][:8]))
+            if info["binsh"]:
+                b = info["binsh"][0]
+                lines.append('"/bin/sh"：vaddr=%s file_off=%s' % (b["vaddr_hex"], hex(b["file_off"])))
+            else:
+                lines.append('"/bin/sh"：文件里没有（静态链接或字符串被编码）')
+            lines.append("下一步：泄漏 puts/read 任一符号的运行地址 → op=ret2libc 直接出 system 与 /bin/sh 地址")
+            return "\n".join(lines)
+        if op == "ret2libc":
+            data, real = _pwnkit_read(path)
+            if not symbol.strip():
+                raise DomainToolError("op=ret2libc 需要 symbol=<泄漏的符号名>（如 puts / read）")
+            out = ret2libc(data, symbol.strip(), _pwn_num(leaked, "leaked"), path=real)
+            lines = ["libc：%s" % real,
+                     "符号 %s 偏移 %s ← 泄漏值 %s" % (out["symbol"], out["symbol_offset"], out["leaked"]),
+                     "libc 基址：%s（十进制 %s）" % (out["base"], out["base_dec"])]
+            for k in ("system", "__libc_system", "execve"):
+                if k in out:
+                    lines.append("%-18s %s" % (k, out[k]))
+            if "binsh" in out:
+                lines.append("/bin/sh            %s（偏移 %s）" % (out["binsh"], out["binsh_offset"]))
+            for k, vs in (out.get("gadgets") or {}).items():
+                lines.append("gadget %-12s %s" % (k, ", ".join(vs[:2])))
+            if out.get("gadgets_note"):
+                lines.append("注意：" + out["gadgets_note"])
+            lines.append("链示例（64 位 ret2libc）：pop_rdi → /bin/sh → system；注意栈 16 字节对齐（多压一个 ret）")
+            return "\n".join(lines)
+        if op == "asan":
+            plan = asan_shadow(_pwn_num(addr, "addr"), size=int(size or 8), bits=int(bits or 64))
+            lines = ["目标 %s（%s 字节，%s 位）" % (plan["addr"], plan["size"], plan["bits"]),
+                     "shadow 公式：shadow = (addr >> 3) + %s" % plan["shadow_offset"],
+                     "shadow 区间：%s" % plan["shadow_span"],
+                     "要写的 shadow 字节（每字节管 8 个真实字节，低 3 位=可用前缀长度）："]
+            for item in plan["plan"]:
+                lines.append("  %s = %s（%s，覆盖 %s）" % (item["shadow_addr"], item["value_hex"],
+                                                          item["shadow_value"], item["covers"]))
+            lines.append("还原：" + plan["restore_hint"])
+            lines.append("模板：pwnkit(op=assets) 看 asan_shadow.py / pwn_stack_probe.py 的完整解封写栈流程")
+            return "\n".join(lines)
+        if op == "assets":
+            info = assets()
+            lines = ["pwn 团队资产目录：%s（存在=%s）" % (info["dir"], info["exists"])]
+            for f in info["files"]:
+                lines.append("  %-22s %6s B" % (f["name"], f["bytes"]))
+            lines.append(info["usage"])
+            return "\n".join(lines)
+        raise DomainToolError("pwnkit 不支持的 op：%s（可用 libc/ret2libc/asan/assets）" % op)
+    except PwnKitError as exc:
+        raise DomainToolError(str(exc)) from exc
+
+
 def pwnrop(path: str = "", op: str = "rop", func: str = "", args: str = "",
            arg_strings: str = "", filt: str = "", limit: int = 40) -> str:
     """pwntools ELF/ROP 的受控入口（原生库被系统策略拦截时给可操作提示）。"""
@@ -3136,6 +3234,36 @@ PYCRYPT_SPEC = {
     },
 }
 
+PWNKIT_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "pwnkit",
+        "description": (
+            "PWN 确定性计算（纯 stdlib，不依赖 pwntools）："
+            "op=libc 解析题目附件 libc.so.6（版本串/build-id/关键符号偏移//bin/sh 位置）；"
+            "op=ret2libc 由「泄漏到的符号运行地址」反推 libc 基址并算 system、/bin/sh、pop rdi;ret 等地址；"
+            "op=asan 算 ASan shadow 地址与解封字节（真实栈被 poison 时先算再写）；"
+            "op=assets 列出团队 pwn 资产（泄漏链/ASan 解封写栈模板）在沙盒里的路径。"
+            "典型：落盘 libc.so.6 后 op=libc；泄漏 puts 后 op=ret2libc,symbol=puts,leaked=0x7f...；"
+            "ASan 题 op=asan,addr=0x7fffffffe000,size=8。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["libc", "ret2libc", "asan", "assets"],
+                       "description": "libc=解析 libc；ret2libc=算基址/system/binsh/gadget；asan=算 shadow 解封；assets=团队资产清单"},
+                "path": {"type": "string", "description": "op=libc/ret2libc：libc.so.6 在沙盒里的路径"},
+                "symbol": {"type": "string", "description": "op=ret2libc：泄漏的是哪个符号（puts/read/__libc_start_main）"},
+                "leaked": {"type": "string", "description": "op=ret2libc：泄漏到的运行地址（hex 或十进制）"},
+                "addr": {"type": "string", "description": "op=asan：要写/要读的真实地址（hex 或十进制）"},
+                "size": {"type": "integer", "description": "op=asan：窗口字节数（默认 8，上限 65536）"},
+                "bits": {"type": "integer", "description": "op=asan：64 或 32（默认 64）"},
+            },
+            "required": ["op"],
+        },
+    },
+}
+
 PWNROP_SPEC = {
     "type": "function",
     "function": {
@@ -3204,7 +3332,7 @@ LISTEN_SPEC = {
 
 DOMAIN_SPECS = [TCP_SPEC, UDP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC, PWNGEN_SPEC, PWNFIND_SPEC,
                 RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC, LISTEN_SPEC,
-                Z3SOLVE_SPEC, PYCRYPT_SPEC, PWNROP_SPEC]
+                Z3SOLVE_SPEC, PYCRYPT_SPEC, PWNROP_SPEC, PWNKIT_SPEC]
 
 DOMAIN_NAMES = {s["function"]["name"] for s in DOMAIN_SPECS}
 
@@ -3348,6 +3476,16 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
                 key=str(args.get("key") or ""), data=str(args.get("data") or ""),
                 iv=str(args.get("iv") or ""), nonce=str(args.get("nonce") or ""),
                 aad=str(args.get("aad") or ""), tag=str(args.get("tag") or ""),
+            )
+        if name == "pwnkit":  # [pwn-hardening 2026-11-17]
+            return pwnkit(
+                op=str(args.get("op") or "libc"),
+                path=str(args.get("path") or ""),
+                symbol=str(args.get("symbol") or ""),
+                leaked=str(args.get("leaked") or ""),
+                addr=str(args.get("addr") or ""),
+                size=_to_int(args.get("size"), 8, "size"),
+                bits=_to_int(args.get("bits"), 64, "bits"),
             )
         if name == "pwnrop":  # [libs 2026-11-12]
             return pwnrop(

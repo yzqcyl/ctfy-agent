@@ -22,6 +22,7 @@
 | `z3solve(smt2, vars, timeout, count)` | z3 解 SMT-LIB2 约束（`count>1` 枚举多解，`vars` 过滤输出）；缺 z3 时明确提示安装 | rev 的 flag 校验器、crypto 模方程/多变量约束、字节级比较 |
 | `pycrypt(op, mode, key, data, iv, nonce, aad, tag)` | pycryptodome：AES 的 `gcm/eax/cfb/ofb`（AEAD 自动出/验 tag）、`des3_*`；补齐 `aesblock` 只有 ECB/CBC/CTR 的缺口 | AES-GCM 认证加密、3DES、CBC 变体 |
 | `pwnrop(path, op, func, args, arg_strings, filt, limit)` | pwntools：`checksec` / `symbols`（plt+got）/ `gadgets` / `rop`（`func=system, arg_strings=/bin/sh` 直接出链 hex） | pwn 缓解判断、地址泄漏后的 ROP 链拼装 |
+| `pwnkit(op, path, symbol, leaked, addr, size, bits)` | 纯 stdlib PWN 确定性计算（2026-11-17 追加）：`libc`（版本串/build-id/关键符号偏移/`/bin/sh`）/ `ret2libc`（泄漏值→基址+system+binsh+gadget，**自动加基址**）/ `asan`（shadow 地址与解封字节）/ `assets`（团队资产目录） | 有附件 libc 的 ret2libc 题、ASan 栈题最后一步写栈、不想手算偏移时 |
 
 ### `listen` 的由来（2026-11-12）
 
@@ -42,7 +43,7 @@ SAMPLE-024 是「靶场回连我们」的题型（beacon 把 flag 投递到 `ctf
   再交给 `tools_domain_ext.call_domain()`。
 - 角色授权（`config/agent.json`）：`rev.local += [elfpeek, tcp, tcp_batch, netcheck, listen, z3solve]`；
   `crypto.local += [tcp, tcp_batch, netcheck, listen, z3solve, pycrypt]`；
-  `pwn.local += [pwngen, pwnfind, tcp, tcp_batch, netcheck, listen, z3solve, pwnrop]`；
+  `pwn.local += [pwngen, pwnfind, tcp, tcp_batch, netcheck, listen, z3solve, pwnrop]`，2026-11-17 再追加 `pwnkit`（见 docs/pwn-hardening-2026-11-17.md）；
   `misc.local += [tcp, tcp_batch, netcheck, listen, z3solve]`；`web.local += [listen]`（SSRF 回调）。
   ai/coordinator 不可见（门禁断言已覆盖）。
 

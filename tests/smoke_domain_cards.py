@@ -39,7 +39,9 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    check("方向卡共 8 张（4 方向 × 2）", len(DOMAIN_CARDS) == 8, str(len(DOMAIN_CARDS)))
+    # 8 张 = 4 方向 × 2（rev/pwn/crypto/misc 各 2）；2026-11-13 又补了 udp 卡（UDP 服务打法），
+    # 所以现在是 9 张。改了卡表就同步这里，别让计数漂移成「测试过期」。
+    check("方向卡共 9 张（4 方向 × 2 + udp）", len(DOMAIN_CARDS) == 9, str(len(DOMAIN_CARDS)))
 
     cases = {
         "REV": ["python", "xor", "per-team-artifact"],
