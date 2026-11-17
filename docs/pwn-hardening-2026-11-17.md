@@ -125,4 +125,6 @@ debug_* → shell 里的 gdb -batch（仅容器内），connect/send_* → pwnse
 eport。
 ileview 同时接进 pwn.local / 
 ev.local 与 DEFAULT_ROLES 兜底；回归见 	ests/smoke_pwnsession.py（含 fileview 用例）。
-仍缺：反编译器、pwndbg、one_gadget/FSOP 模板、堆脚手架——这些是镜像依赖，不是提示词能补的（详见调研文档 §5.5）。
+反编译器不缺：镜像自 2026-11-17 起有 Ghidra headless `ghidra_decompile`（rev2 彩排实测 7 次调用解出判据链），
+提示词已把 `decompile` 映射到「容器内 shell 调 `ghidra_decompile`」，宿主机没有时退化到 elfpeek 分段。
+仍缺的是 pwndbg、one_gadget/FSOP 模板、堆脚手架——这些才是镜像依赖（详见调研文档 §5.5）。

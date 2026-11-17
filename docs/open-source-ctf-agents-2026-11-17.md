@@ -54,7 +54,10 @@
 | GhidraMCP / re-mcp / IDA-MCP 全套工具面 | 依赖 IDA/Ghidra 本机安装（Windows 可装，但镜像里不可用），且工具面过大（几十个工具）会挤压上下文；如果要给「本机开发增强」用，建议单开 profile，不并入提交镜像 |
 | PwnAI 的四 agent 拆分 | 多一层 agent = 多一层 token 与协作开销；我们的协调者已经把「静态/动态/利用」按轮次分工，先看 `pwnsession` + 提示词改动的收益再说 |
 | NextCTF-Agent 的本地 RAG 知识库 | 需要 embedding 模型与向量库（非 stdlib），收益不确定；我们的 `method_cards` + 方向提示词已覆盖「按题型推打法」 |
-| 反编译器（decompile） | 纯 stdlib 没有可用反编译器；`elfpeek view=disasm` + 调用点/引用导航是目前性价比最高的替代 |
+| 反编译器（decompile） | **我们已经有**：2026-11-17 起镜像内置 Ghidra headless `ghidra_decompile`
+（`tools/linux_bootstrap/ghidra_decompile.py`，rev2 彩排实测 7 次调用解出判据链，见 `docs/ghidra-rev-2026-11-17.md`），
+以 shell CLI 形态存在、不是域工具。缺的是 re-mcp 那种「按函数/xref 导航」的 MCP 工具面；本仓库用
+`ghidra_decompile --function` + `fileview` 替代 |
 
 ## 5. 实测（轮 3 / 轮 4，easyROPtocol，LLM 403 已解除后）
 
@@ -92,8 +95,9 @@
 | `instance_template` 的 challenge 注入 / flag format / 提交指引 | 已有 `_instance_hint` + 题面注入 + `report` 纪律 | — |
 
 明确没抄的部分及原因：EnIGMA 的 shell 函数式 ACI（我们的 ACI 是工具调用式，直接搬会破坏 32k 上下文与账本）、
-SWE-agent 的 summarizer/演示轨迹机制（需要额外 LLM 调用，我们已有工具输出裁剪）、gdb/pwndbg 全家桶
-（镜像只带 gdb -batch，无 pwndbg；宿主机测不了）。
+SWE-agent 的 summarizer/演示轨迹机制（需要额外 LLM 调用，我们已有工具输出裁剪）、pwndbg 全家桶
+（镜像只带 gdb -batch，无 pwndbg）。**反编译器不是缺口**：镜像已有 Ghidra headless `ghidra_decompile`，
+提示词里的 `decompile` 已直接映射到它（容器内 `shell: ghidra_decompile ./bin --function NAME`）。
 
 ---
 
