@@ -112,3 +112,17 @@ rev 提示词加了「静态优先 + 差分」顺序。
   多轮交互式利用需要 `pwnsession` 支持 step 内变量/计算（见调研文档 §6）。
 - 两轮用量：轮 3 billed ~437k（人工停跑）；轮 4 billed 358,623 / raw 1,989,289，10 个协调步、
   `coordinator_done` 主动收口；平台实例两次收尾均 `NOT_FOUND`（无残留、提交配额未动）。
+
+### 6.1 二轮：整篇移植 EnIGMA 的 pwn/rev ACI
+
+在用户要求「别再坚守、基本全抄」之后，放弃了只补几条纪律的做法：
+config/agent.json 的 
+oles.pwn.system / 
+oles.rev.system 按 EnIGMA（SWE-agent 0.7 CTF）的 system_template
+结构整篇重写（SETTING → 环境 → 工具映射 → RESPONSE FORMAT → IMPORTANT TIPS → 方向打法顺序 → 提交纪律），
+工具名映射到本地：open/goto/scroll/search/edit → 新工具 **fileview**，disassemble/decompile → elfpeek 多视图，
+debug_* → shell 里的 gdb -batch（仅容器内），connect/send_* → pwnsession/	cp，submit → 
+eport。
+ileview 同时接进 pwn.local / 
+ev.local 与 DEFAULT_ROLES 兜底；回归见 	ests/smoke_pwnsession.py（含 fileview 用例）。
+仍缺：反编译器、pwndbg、one_gadget/FSOP 模板、堆脚手架——这些是镜像依赖，不是提示词能补的（详见调研文档 §5.5）。

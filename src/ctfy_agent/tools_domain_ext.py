@@ -218,6 +218,69 @@ def tcp(host: str, port: int, payload: str = "", hex_mode: bool = False,
 #     Interactive Agent Tools（debugger + server-connection REPL）。pwn 的菜单/协议题是
 #     「连上 → 逐步收发」，旧 tcp/tcp_batch 每步都要重连、模型按步数烧预算；这里一次调用
 #     跑完一段脚本化会话（banner + 多步 send/expect），把 REPL 语义压成单次工具调用。
+# >>> [copy-EnIGMA 2026-11-17] EnIGMA 的文件编辑/浏览命令（open/goto/scroll_up/scroll_down/create/
+#     edit/search_file/search_dir）在 SWE-agent 里是 shell 函数；我们的 ACI 是结构化工具，这里落一个
+#     等价物：按行窗口看文本、按关键词搜行、按行区间替换。二进制/附件仍走 hexpeek/elfpeek。
+def fileview(path: str, mode: str = "lines", start_line: int = 1, count: int = 120,
+             needle: str = "", replace: str = "", line_end: int = 0) -> str:
+    """文本文件视图（EnIGMA open/goto/scroll/search/edit 的本地等价物）。
+
+    mode:
+      lines   显示 [start_line, start_line+count) 行（带行号）
+      search  在文件里搜 needle（最多 40 条命中，带行号；不区分大小写）
+      edit    把 [start_line, line_end] 行替换为 replace（必须显式给 line_end）
+      tail    显示最后 count 行
+      list    列目录（path 为目录时）
+    """
+    fp = Path(path)
+    if mode == "list" or fp.is_dir():
+        if not fp.is_dir():
+            raise DomainToolError("list 模式需要目录：%s" % path)
+        rows = []
+        for item in sorted(fp.iterdir())[:200]:
+            size = item.stat().st_size if item.is_file() else 0
+            rows.append("%s%s  %d B" % (item.name, "/" if item.is_dir() else "", size))
+        return _clip("目录 %s（%d 项）\n%s" % (fp, len(rows), "\n".join(rows)))
+    if not fp.is_file():
+        raise DomainToolError("文件不存在：%s" % path)
+    raw = fp.read_bytes()
+    if len(raw) > 4 * 1024 * 1024:
+        raise DomainToolError("文件 %d 字节 > 4MB：用 hexpeek/elfpeek 分段看" % len(raw))
+    if b"\x00" in raw[:4096] and mode not in ("search",):
+        raise DomainToolError("看起来是二进制（前 4KB 含 NUL）：用 hexpeek 或 elfpeek view=info/sections 看")
+    text_data = raw.decode("utf-8", "replace")
+    lines = text_data.splitlines()
+
+    if mode == "search":
+        if not needle:
+            raise DomainToolError("search 模式需要 needle")
+        low = needle.lower()
+        hits = [(i + 1, ln) for i, ln in enumerate(lines) if low in ln.lower()][:40]
+        if not hits:
+            return "未命中 %r（共 %d 行）" % (needle, len(lines))
+        body = "\n".join("%6d | %s" % (n, ln[:300]) for n, ln in hits)
+        return _clip("命中 %d 处 %r（共 %d 行）\n%s" % (len(hits), needle, len(lines), body))
+
+    if mode == "edit":
+        if line_end <= 0:
+            raise DomainToolError("edit 模式必须给 line_end（要替换到的行号，含）")
+        if line_end > len(lines):
+            raise DomainToolError("line_end=%d 超过总行数 %d" % (line_end, len(lines)))
+        new_lines = replace.splitlines() if replace else []
+        out = lines[:start_line - 1] + new_lines + lines[line_end:]
+        fp.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+        return _clip("已改写 %s：%d-%d 行 -> %d 行（现有 %d 行）" % (
+            fp.name, start_line, line_end, len(new_lines), len(out)))
+
+    if mode == "tail":
+        start = max(1, len(lines) - count + 1)
+    else:
+        start = max(1, start_line)
+    end = min(len(lines), start + count - 1)
+    window = "\n".join("%6d | %s" % (i, lines[i - 1][:400]) for i in range(start, end + 1))
+    return _clip("文件 %s 共 %d 行，显示 %d-%d\n%s" % (fp.name, len(lines), start, end, window))
+
+
 def pwnsession(host: str, port: int, steps: list, tls: bool = False, sni: str = "",
                read_timeout: float = 2.0, max_recv: int = 8192,
                total_timeout: float = 45.0) -> str:
@@ -3051,6 +3114,32 @@ TCP_BATCH_SPEC = {
     },
 }
 
+FILEVIEW_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "fileview",
+        "description": (
+            "文本文件视图（EnIGMA 的 open/goto/scroll/search/edit 的结构化等价物）：按行窗口带行号查看、"
+            "按关键词搜行、列目录。看源码/脚本/README/伪代码输出用；二进制与二进制字符串走 hexpeek/elfpeek。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径（沙盒内）；或 list 模式下的目录"},
+                "mode": {"type": "string", "enum": ["lines", "search", "edit", "tail", "list"],
+                         "description": "默认 lines"},
+                "start_line": {"type": "integer", "description": "起始行（1-based，默认 1）"},
+                "count": {"type": "integer", "description": "显示行数（默认 120）"},
+                "needle": {"type": "string", "description": "search 模式的关键词"},
+                "replace": {"type": "string", "description": "edit 模式的替换文本（预览，不写盘）"},
+                "line_end": {"type": "integer", "description": "edit 模式的结束行（含）"},
+            },
+            "required": ["path"],
+        },
+    },
+}
+
+
 PWN_SESSION_SPEC = {
     "type": "function",
     "function": {
@@ -3476,7 +3565,7 @@ LISTEN_SPEC = {
     },
 }
 
-DOMAIN_SPECS = [TCP_SPEC, UDP_SPEC, TCP_BATCH_SPEC, PWN_SESSION_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC,
+DOMAIN_SPECS = [TCP_SPEC, UDP_SPEC, TCP_BATCH_SPEC, PWN_SESSION_SPEC, FILEVIEW_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC,
                 PWNGEN_SPEC, PWNFIND_SPEC,
                 RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC, LISTEN_SPEC,
                 Z3SOLVE_SPEC, PYCRYPT_SPEC, PWNROP_SPEC, PWNKIT_SPEC]
@@ -3488,6 +3577,15 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
     """按工具名分发。参数已由 LocalTools 侧做过白名单/签名过滤。"""
     args = dict(arguments or {})
     try:
+        if name == "fileview":
+            return fileview(
+                str(args.get("path", "")), mode=str(args.get("mode") or "lines"),
+                start_line=_to_int(args.get("start_line"), 1, "start_line"),
+                count=_to_int(args.get("count"), 120, "count"),
+                needle=str(args.get("needle") or ""),
+                replace=str(args.get("replace") or ""),
+                line_end=_to_int(args.get("line_end"), 0, "line_end"),
+            )
         if name == "pwnsession":
             return pwnsession(
                 str(args.get("host", "")), int(args.get("port") or 0),

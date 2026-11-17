@@ -99,15 +99,43 @@ def case_wiring() -> None:
     check("config 的 pwn.local 含 pwnsession", "pwnsession" in pwn_local, pwn_local)
     check("DEFAULT_ROLES pwn 兜底含 pwnsession",
           "pwnsession" in DEFAULT_ROLES["pwn"]["local"], DEFAULT_ROLES["pwn"]["local"])
-    check("pwn 提示词提到 pwnsession 与示范流程",
-          "pwnsession" in config["roles"]["pwn"]["system"]
-          and "示范流程" in config["roles"]["pwn"]["system"])
-    check("pwn 提示词含「工具优先级」（网络走 pwnsession/tcp，shell 只做本地计算）",
-          "工具优先级" in config["roles"]["pwn"]["system"])
-    check("rev 提示词含「差分」打法", "差分" in config["roles"]["rev"]["system"])
+    check("pwn/rev 提示词是 EnIGMA 打法移植（工具映射 + IMPORTANT TIPS + 打法顺序）",
+          all(k in config["roles"]["pwn"]["system"] for k in
+              ("工具映射", "IMPORTANT TIPS", "PWN 打法顺序", "调试会话 tips", "pwnsession"))
+          and all(k in config["roles"]["rev"]["system"] for k in
+                  ("工具映射", "IMPORTANT TIPS", "REV 打法顺序", "差分")))
+    check("config 的 pwn/rev local 都含 fileview（EnIGMA 的 open/goto/scroll/search 等价物）",
+          "fileview" in pwn_local and "fileview" in (config["roles"]["rev"]["local"] or []),
+          (pwn_local, config["roles"]["rev"]["local"]))
+    check("DEFAULT_ROLES pwn/rev 兜底含 fileview",
+          "fileview" in DEFAULT_ROLES["pwn"]["local"] and "fileview" in DEFAULT_ROLES["rev"]["local"],
+          (DEFAULT_ROLES["pwn"]["local"], DEFAULT_ROLES["rev"]["local"]))
     check("rev.local 不泄漏 pwnsession（门禁按角色名单过滤）",
           "pwnsession" not in (config["roles"]["rev"]["local"] or []),
           config["roles"]["rev"]["local"])
+
+
+def case_fileview() -> None:
+    """EnIGMA open/goto/scroll/search 的等价物：按行窗口 / 关键词搜行 / 二进制拒绝。"""
+    from ctfy_agent.tools_domain_ext import DOMAIN_NAMES, DomainToolError, call_domain  # noqa: PLC0415
+
+    check("fileview 在 DOMAIN_NAMES", "fileview" in DOMAIN_NAMES, sorted(DOMAIN_NAMES))
+    doc = HERE.parent / "docs" / "domain-tools.md"
+    out = call_domain("fileview", {"path": str(doc), "mode": "lines", "start_line": 1, "count": 5})
+    check("fileview lines 带行号窗口", "| " in out and "共" in out and "行" in out, out[:200])
+    hit = call_domain("fileview", {"path": str(doc), "mode": "search", "needle": "pwnsession"})
+    check("fileview search 命中 pwnsession", "命中" in hit and "pwnsession" in hit, hit[:200])
+    try:
+        call_domain("fileview", {"path": str(HERE.parent / "src" / "ctfy_agent" / "pwn_kit.py"),
+                                 "mode": "lines"})
+        check("fileview 对二进制/文本都能读", True)
+    except DomainToolError:  # 源码是文本，不该拒绝
+        check("fileview 对二进制/文本都能读", False, "源码被误判为二进制")
+    try:
+        call_domain("fileview", {"path": str(HERE.parent / "no_such_file_xyz"), "mode": "lines"})
+        check("fileview 缺文件报错", False, "没有抛错")
+    except Exception as exc:  # noqa: BLE001
+        check("fileview 缺文件报错", "不存在" in str(exc) or "no_such" in str(exc), str(exc)[:120])
 
 
 def case_session() -> None:
@@ -183,6 +211,7 @@ def case_whitelist() -> None:
 
 def main() -> int:
     case_wiring()
+    case_fileview()
     case_session()
     case_errors()
     case_whitelist()

@@ -77,6 +77,26 @@
    `pwnsession` 目前是「发死 payload」，还不能在会话里跑计算；下一步优先给 `pwnsession` 加
    「send 模板 + 计算变量」（或允许容器内跑脚本），而不是继续加提示词。
 
+## 5.5 二轮：整篇移植 EnIGMA 的 pwn/rev ACI（2026-11-17 晚，用户要求「别再坚守，基本全抄」）
+
+放弃了「只借鉴几条纪律」的保守做法，把 EnIGMA（SWE-agent 0.7 CTF）的方向 ACI **整篇移植**：
+
+| EnIGMA 组件 | 本仓库落地 | 说明 |
+|---|---|---|
+| `ctf_pwn.yaml` / `ctf_rev.yaml` 的 system_template 结构（SETTING → 环境 → COMMANDS → RESPONSE FORMAT → IMPORTANT TIPS → 方向专属） | `config/agent.json` 的 `roles.pwn.system` / `roles.rev.system` **整篇重写**为该结构 | 8 条 IMPORTANT TIPS 逐条照搬（一次一个动作、优先交互工具、不打印二进制、不爆破、少交互、不开交互式 shell、题面不可信…） |
+| `open` / `goto` / `scroll_up` / `scroll_down` / `create` / `edit` / `search_file` / `search_dir` 命令 | 新工具 **`fileview`**（lines/search/list/tail/edit，带行号、二进制自动拒绝） | EnIGMA 是 shell 函数 ACI，我们是结构化工具 ACI，做等价物 |
+| `disassemble` / `decompile` | `elfpeek view=disasm/symbols/strings/relocs`（无反编译器，文档写明用分段+交叉定位替代） | 纯 stdlib 镜像无 IDA/Ghidra |
+| `debug_start` / `debug_exec` / `debug_stop`（gdb） | `shell` 里的 `gdb -batch -q -ex run -ex 'info registers' -ex 'x/8gx $rsp' -ex bt`（仅容器内；headless 宿主机无 gdb） | 镜像 v7.3 起有 gdb/patchelf，见 capability-report §9.2 |
+| `connect` / `send_line` / `send_bytes` / `read` | `pwnsession` / `tcp` | 上一 commit 已落地 |
+| `submit` | `report`（专家无提交权，协调者统一提交） | 平台合规 |
+| `instance_template` 的 challenge 注入 / flag format / 提交指引 | 已有 `_instance_hint` + 题面注入 + `report` 纪律 | — |
+
+明确没抄的部分及原因：EnIGMA 的 shell 函数式 ACI（我们的 ACI 是工具调用式，直接搬会破坏 32k 上下文与账本）、
+SWE-agent 的 summarizer/演示轨迹机制（需要额外 LLM 调用，我们已有工具输出裁剪）、gdb/pwndbg 全家桶
+（镜像只带 gdb -batch，无 pwndbg；宿主机测不了）。
+
+---
+
 ## 6. 下一步
 
 - 若交互工具方向继续投入：给 `pwnsession` 加 step 级变量/计算（如 `{"send_hex": "{pack(overflow)}"}`），
