@@ -261,7 +261,8 @@ DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
      "REV 定型四步：hexpeek 看魔数判型（ELF/PE/pyc/脚本）→ elfpeek view=info（架构/PIE/入口）→ "
      "view=symbols 找校验函数（被 strip 就靠 view=strings 的提示串与常量推理）→ view=disasm 只反汇编"
      "可疑函数那一段。.pyc/PyInstaller 用 view=bytecode 先列目录再 extract（PYZ 用 pyz:模块名）。"
-     "别整段反汇编，步数会烧光。"),
+     "**若 PATH 里有 `ghidra_decompile <bin> [--limit N]`（Ghidra headless），先跑一次出伪代码再定点读**"
+     "——strip/大二进制时它比逐段反汇编省 10 倍步数；没有它再退回 disasm。别整段反汇编，步数会烧光。"),
     (("xor", "rc4", "rc4_xor", "bytecode"),
      "REV 算法复现：先用已知输入（全 0、全 1、题面样例）在本地把加密函数跑出来，再对密文求逆；"
      "XOR/查表/位运算优先写 python 复现并对拍。爆破空间 <1e6 直接穷举；更大就找前缀匹配、CRC、"
