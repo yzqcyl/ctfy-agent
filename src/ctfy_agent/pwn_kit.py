@@ -68,6 +68,27 @@ class PwnKitError(ValueError):
 # ---------------------------------------------------------------- ELF 解析
 
 
+def _symtab_names(elf: "Elf", link: int) -> list[str]:
+    """取某节 link 指向的符号表的符号名列表（重定位里按 r_info 的高位索引查名）。"""
+    secs = elf.sections()
+    if not 0 <= link < len(secs):
+        return []
+    st = secs[link]
+    strtab = b""
+    if 0 <= st["link"] < len(secs):
+        s = secs[st["link"]]
+        strtab = elf.data[s["offset"]:s["offset"] + s["size"]]
+    entsize = st["entsize"] or (24 if elf.is64 else 16)
+    out: list[str] = []
+    for i in range(st["size"] // entsize if entsize else 0):
+        off = st["offset"] + i * entsize
+        if off + entsize > len(elf.data):
+            break
+        st_name = struct.unpack_from(elf.endian + "I", elf.data, off)[0]
+        out.append(_cstr(strtab, st_name))
+    return out
+
+
 class Elf:
     """最小 ELF 解析器：只做 CTF 需要的读取，不执行、不做重定位。"""
 
@@ -178,6 +199,50 @@ class Elf:
 
     def executable_sections(self) -> list[dict]:
         return [s for s in self.sections() if s["flags"] & _SHF_EXECINSTR and s["size"]]
+
+    # -- 重定位（GOT / RELATIVE）------------------------------------
+    def relocs(self) -> list[dict]:
+        """解析 SHT_RELA/SHT_REL：[{section, offset, type, name, sym_index, addend}]。
+
+        用途：``type==8``（R_X86_64_RELATIVE）的槽位运行时值 = 基址 + addend（泄漏它反推 PIE base）；
+        ``JUMP_SLOT``（x86_64 是 type 7）的 offset 即 ``foo@got``（泄漏 GOT 项反推 libc base）。
+        说明：SHT_RELR（type 19，现代发行版 libc 用的压缩 RELATIVE 表）尚未解析——这类文件里
+        用符号偏移反推基址（ret2libc）即可，不依赖 RELATIVE 槽位。
+        """
+        out: list[dict] = []
+        e = self.endian
+        for sec in self.sections():
+            if sec["type"] not in (4, 9):  # SHT_RELA / SHT_REL
+                continue
+            is_rela = sec["type"] == 4
+            if self.is64:
+                entsize = sec["entsize"] or (24 if is_rela else 16)
+            else:
+                entsize = sec["entsize"] or (12 if is_rela else 8)
+            names = _symtab_names(self, sec["link"])
+            count = sec["size"] // entsize if entsize else 0
+            for i in range(count):
+                off = sec["offset"] + i * entsize
+                if off + entsize > len(self.data):
+                    break
+                if self.is64:
+                    r_offset, r_info = struct.unpack_from(e + "QQ", self.data, off)
+                    sym_index = r_info >> 32
+                    rtype = r_info & 0xFFFFFFFF
+                    addend = (struct.unpack_from(e + "q", self.data, off + 16)[0]
+                              if is_rela else 0)
+                else:
+                    r_offset, r_info = struct.unpack_from(e + "II", self.data, off)
+                    sym_index = r_info >> 8
+                    rtype = r_info & 0xFF
+                    addend = (struct.unpack_from(e + "i", self.data, off + 8)[0]
+                              if is_rela else 0)
+                out.append({
+                    "section": sec["name"], "offset": r_offset, "type": rtype,
+                    "sym_index": sym_index, "addend": addend,
+                    "name": names[sym_index] if 0 <= sym_index < len(names) else "",
+                })
+        return out
 
     # -- 其它 -------------------------------------------------------
     def notes(self) -> list[tuple[str, int, bytes]]:
@@ -408,6 +473,8 @@ def assets() -> dict:
         "dir": str(PWN_ASSETS_DIR),
         "exists": PWN_ASSETS_DIR.is_dir(),
         "files": files,
-        "usage": "shell 里 `python3 <dir>/<file> --help` 或 import（目录见 dir）；"
-                 "泄漏链先跑 leak_helpers.py，ASan 题用 asan_shadow.py + pwn_stack_probe.py",
+        "usage": "都按包路径 import / 运行（镜像 PYTHONPATH=/ctfy/src）："
+                 "`python3 -m ctfy_agent.pwn_assets.leak_helpers <challenge> [libc]` 打印关键偏移；"
+                 "`python3 -m ctfy_agent.pwn_assets.pwn_stack_probe` 看 ASan 解封写栈自检；"
+                 "代码里 `from ctfy_agent.pwn_assets.leak_helpers import ElfOffsets` 等",
     }

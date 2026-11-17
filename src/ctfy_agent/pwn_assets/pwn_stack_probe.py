@@ -8,7 +8,7 @@
 
 用法（把题目自己的 read8/write8 原语接进来）：
 
-    from pwn_stack_probe import StackProbe
+    from ctfy_agent.pwn_assets.pwn_stack_probe import StackProbe
     from exploit_a import Svc              # 上一轮留下的原语脚本
 
     svc = Svc(host, port)                  # 题目自己的连接/原语封装
@@ -19,14 +19,15 @@
         print("shadow 解封 + 写真实栈 成功 → 可以构造 ROP/调用链了")
     svc.close()
 
-也可以直接跑 `python3 pwn_stack_probe.py` 看自检（用模拟内存，不连靶）。
+也可以直接跑 `python3 -m ctfy_agent.pwn_assets.pwn_stack_probe` 看自检（模拟内存，不连靶）。
 """
 from __future__ import annotations
 
 import sys
 
-from asan_shadow import (ASAN_SHADOW_OFFSET, classify, explain as shadow_explain,
-                         shadow_addr, shadow_span, unpoison_plan)
+from ctfy_agent.pwn_assets.asan_shadow import (ASAN_SHADOW_OFFSET, classify,
+                                              explain as shadow_explain, shadow_addr,
+                                              shadow_span, unpoison_plan)
 
 
 class StackProbe:

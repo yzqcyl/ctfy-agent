@@ -13,7 +13,7 @@
 | 2 | 团队 pwn 资产入包 | `src/ctfy_agent/pwn_assets/`（`leak_helpers.py` / `asan_shadow.py` / `pwn_stack_probe.py` + README） | 原来在 `runs/_tpctf/l2_assets/`（gitignored）；现在随 `COPY src/` 进镜像，不会丢 |
 | 3 | pwn 角色接线 + 提示词 | `config/agent.json`（`roles.pwn.local += pwnkit`、system 补一段）、`crew.DEFAULT_ROLES["pwn"]` 兜底 | 工具不接线=不存在；兜底也要有，防 agent.json 丢失退化 |
 | 4 | 方法卡更新 | `src/ctfy_agent/method_cards.py`（栈溢出卡 + ASan 泄漏链卡） | 题面命中 pwn tag 时直接把「用 pwnkit 算，不要手算」推到模型眼前 |
-| 5 | 回归 | `tests/smoke_pwn_kit.py`（34 项） | 数学、真实 libc 解析、错误路径、接线、资产一致性全部钉住 |
+| 5 | 回归 | `tests/smoke_pwn_kit.py`（48 项） | 数学、真实 libc 解析、错误路径、接线、资产一致性全部钉住 |
 
 ## 2. `pwnkit` 能力与边界
 
@@ -33,7 +33,7 @@ ASan 语义细节（本轮修过一版）：`shadow(addr) = (addr>>3)+0x7fff8000
 ## 3. 验证
 
 ```bash
-python tests/smoke_pwn_kit.py      # 34 项：ASan 数学 / 真 libc 解析 / ret2libc / 资产 / 接线
+python tests/smoke_pwn_kit.py      # 48 项：ASan 数学 / 真 libc 解析 / ret2libc / 资产纯 stdlib / 接线
 python tests/smoke_pwn.py          # 24/24（既有 pwngen/pwnfind/elfpeek 回归）
 python tests/smoke_libs.py         # 33 项通过（pwnrop/z3/pycrypt 接线，2 组因无 ELF 编译环境跳过）
 python tests/smoke_domain_cards.py # 方向卡（同步把计数 8→9：udp 卡是 11-13 加的，测试之前过期）
@@ -47,6 +47,7 @@ python tools/sync_roles.py --check # 三源零漂移
 ## 4. 还没验证的部分（不要吹）
 
 - 全部是离线单测：**没有在真实 PWN 题上跑过 pwnkit**（需要用户批配额/起靶，见 TODO）；
+- 资产脚本已改成纯 stdlib + 包内 `pwn_kit`：原 `leak_helpers` 用 pyelftools/readelf （镜像里都没有，沙盒一跑就挂），现在 `leak_helpers`/`pwn_stack_probe` 都能 `python3 -m` 自检（实测 exit 0）；`tests/smoke.py::stdlib_only` 恢复绿；
 - 真实收益要等下次 pwn 批次对比：预期减少「算偏移/推导基址」类步数，但**不会**自动解决 ASan/堆题；
 - 下一个该补的短板（按收益排序）：libc 版本匹配（只给偏移找 libc）、one_gadget/FSOP 模板、
   堆（tcache/fastbin）脚手架、seccomp 落地后的 ORW 链模板。

@@ -19,13 +19,15 @@ ASan shadow 解封。本测试把新增的确定性能力钉住：
      8) 泄漏值小于偏移 / 符号不存在 → 可读错误（不猜）。
   D. 团队资产
      9) `ctfy_agent.pwn_assets` 三个资产文件在包内、可 import、ASan 常量与 pwn_kit 一致；
-    10) pwnkit(op=assets) 打印目录 + 文件清单。
+    10) 资产纯 stdlib（无 pyelftools/readelf）——镜像删了 pip 也能跑（回归 `smoke.py::stdlib_only`）；
+    11) `pwn_stack_probe` 模拟内存自检通过；`leak_helpers` 用真 libc 解析出的符号/GOT 偏移与 pwn_kit 一致；
+    12) pwnkit(op=assets) 打印目录 + 文件清单。
   E. 工具接线
-    11) pwnkit 进 DOMAIN_SPECS / MISC_EXT_SPECS，且 pwn 角色 local 名单含 pwnkit
+    13) pwnkit 进 DOMAIN_SPECS / MISC_EXT_SPECS，且 pwn 角色 local 名单含 pwnkit
         （config/agent.json 与 crew.DEFAULT_ROLES 兜底都含）；
-    12) 工具层错误（不支持 op / 缺 path / 缺文件 / asan 非法地址）都给可读文本。
+    14) 工具层错误（不支持 op / 缺 path / 缺文件 / asan 非法地址）都给可读文本。
 
-运行: python tests/smoke_pwn_kit.py   （纯离线；没有 libc 样本时 B/C 组自动跳过）
+运行: python tests/smoke_pwn_kit.py   （纯离线，48 项；没有 libc 样本时 B/C 组自动跳过）
 """
 from __future__ import annotations
 
@@ -168,6 +170,35 @@ def case_assets() -> None:
           [f["name"] for f in info["files"]] ==
           ["asan_shadow.py", "leak_helpers.py", "pwn_stack_probe.py"],
           str([f["name"] for f in info["files"]]))
+
+    # 资产必须能在「删了 pip 的镜像」里跑：不允许 pyelftools/readelf 这类运行时依赖。
+    for name in ("leak_helpers.py", "asan_shadow.py", "pwn_stack_probe.py"):
+        text = (PWN_ASSETS_DIR / name).read_text(encoding="utf-8")
+        check(f"{name} 没有 pyelftools/readelf 外部依赖",
+              "from elftools" not in text and "import elftools" not in text
+              and '["readelf"' not in text, name)
+
+    # pwn_stack_probe 自检：模拟内存里「poison → 解封 → 写回读回」全流程必须过。
+    from ctfy_agent.pwn_assets import pwn_stack_probe  # noqa: PLC0415
+    probe_rc = pwn_stack_probe.main([])
+    check("pwn_stack_probe 自检返回 0（模拟内存解封写栈）", probe_rc == 0, str(probe_rc))
+
+    # leak_helpers 用包内 pwn_kit 解析真 libc：符号/GOT 偏移要与 pwn_kit 一致。
+    if LIBC_SAMPLE.is_file():
+        from ctfy_agent.pwn_assets import leak_helpers  # noqa: PLC0415
+        lh = leak_helpers.LibcOffsets(str(LIBC_SAMPLE))
+        base_info = libc_info(LIBC_SAMPLE.read_bytes())
+        check("leak_helpers.sym(system) == pwn_kit 的 system 偏移",
+              lh.sym("system") == base_info["symbols"]["system"]["value"],
+              f"{lh.sym('system'):#x} vs {base_info['symbols']['system']['value']:#x}")
+        # libc 自身的 PLT 项很少（puts 是本地定义），用外部符号 realloc 验 GOT 解析。
+        check("leak_helpers.got(realloc) 解析出 JUMP_SLOT 槽位",
+              lh.got("realloc") > 0, str(lh.got("realloc")))
+        fake = 0x7FFFF7000000
+        check("leak_helpers.base_from(泄漏 puts) 反推基址",
+              lh.base_from(fake + base_info["symbols"]["puts"]["value"], "puts") == fake)
+    else:
+        skip("leak_helpers 真 libc 解析组", "仓库里没有 libc 样本")
 
 
 # ---------------------------------------------------------------- E. 接线

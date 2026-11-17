@@ -5,15 +5,19 @@
 
 | 文件 | 干什么 | 怎么用 |
 |---|---|---|
-| `leak_helpers.py` | 泄漏链辅助：`read8()` 短读直接报错不静默、`ElfOffsets`/`LibcOffsets` 查符号与 GOT 偏移、`base_from()` 反推基址 | `python3 leak_helpers.py <challenge> <libc.so.6>` 打印关键偏移；或 `from leak_helpers import ...` |
-| `asan_shadow.py` | ASan shadow 数学：`shadow(addr)=(addr>>3)+0x7fff8000`、`unpoison_plan()`、poison 分类 | `python3 asan_shadow.py` 自检；把题目 read8/write8 原语接进 `unpoison_plan` |
+| `leak_helpers.py` | 泄漏链辅助：`read8()` 短读直接报错不静默、`ElfOffsets`/`LibcOffsets` 查符号与 GOT 偏移、`base_from()` 反推基址 | `python3 -m ctfy_agent.pwn_assets.leak_helpers <challenge> <libc.so.6>` 打印关键偏移；或 `from ctfy_agent.pwn_assets.leak_helpers import ...` |
+| `asan_shadow.py` | ASan shadow 数学：`shadow(addr)=(addr>>3)+0x7fff8000`、`unpoison_plan()`、poison 分类 | `python3 -m ctfy_agent.pwn_assets.asan_shadow` 自检；把题目 read8/write8 原语接进 `unpoison_plan` |
 | `pwn_stack_probe.py` | 「解封 shadow → 写真实栈 → 读回验证」模板，含每步断言 | 接题目读写原语后 `StackProbe(read8=..., write8=...).probe(addr, 64)` |
 
 ## 在 agent 里怎么找到本目录
 
 - 工具：`pwnkit(op="assets")` → 打印绝对路径 + 文件清单 + 用法；
 - 代码：`from ctfy_agent.pwn_assets import asan_shadow`（镜像里包已安装）；
-- shell：`python3 <pwnkit 给的目录>/pwn_stack_probe.py` 可直接自检。
+- shell：`python3 -m ctfy_agent.pwn_assets.pwn_stack_probe` 可直接自检（镜像 PYTHONPATH=/ctfy/src）。
+
+## 纯 stdlib 约束
+
+三个脚本只 import 标准库 + 包内 `ctfy_agent.pwn_kit`（ELF 解析），镜像删了 pip 也能跑；`tests/smoke.py::stdlib_only` 会把整包源码扫一遍，第三方 import 会直接让 CI 红。
 
 ## 边界
 

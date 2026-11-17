@@ -8,9 +8,12 @@
   2) PIE/libc 基址换算 —— 用 ``ElfOffsets`` / ``LibcOffsets`` 直接查 ELF 符号与 GOT 槽偏移，
      不用手算 readelf 输出；``base_from()`` 从泄漏值反推基址。
 
-用法（在题目沙盒里）::
+纯 stdlib（镜像删了 pip，第三方 import 会直接 ImportError；ELF 解析复用包内 pwn_kit）。
 
-    from leak_helpers import MenuClient, ElfOffsets, LibcOffsets, read8, u64, p64
+用法（在题目沙盒里；镜像 PYTHONPATH=/ctfy/src，所以按包路径 import）::
+
+    from ctfy_agent.pwn_assets.leak_helpers import (
+        MenuClient, ElfOffsets, LibcOffsets, read8, u64, p64)
 
     elf = ElfOffsets("challenge")          # 附件 PIE 二进制
     libc = LibcOffsets("libc.so.6")
@@ -22,14 +25,15 @@
     # ... 用自己的任意读原语实现 read_fn(addr) -> bytes ...
     # leak = read8(read_fn, pie_base + elf.got("malloc"))
 
-自检：``python3 leak_helpers.py challenge libc.so.6`` 会打印关键偏移。
+自检：``python3 -m ctfy_agent.pwn_assets.leak_helpers challenge libc.so.6`` 会打印关键偏移。
 """
 from __future__ import annotations
 
 import socket
 import struct
-import subprocess
 import sys
+
+from ctfy_agent.pwn_kit import Elf as _PwnElf  # 包内 ELF 解析：纯 stdlib，镜像里可直接 import
 
 
 def u64(data: bytes) -> int:
@@ -55,7 +59,11 @@ def hexdump(data: bytes, base: int = 0, limit: int = 128) -> str:
 
 
 class _Elf:
-    """pyelftools 读符号/GOT；没有 pyelftools 时退回 readelf 文本解析。"""
+    """复用 pwn_kit.Elf（纯 stdlib）读符号 / GOT(JUMP_SLOT) / RELATIVE 槽位。
+
+    2026-11-17 改：原来优先 pyelftools、退化 readelf 子进程——镜像里两者都没有，脚本在沙盒里
+    一跑就 ImportError/FileNotFoundError。现在只依赖包内 pwn_kit（镜像 PYTHONPATH=/ctfy/src）。
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -65,80 +73,27 @@ class _Elf:
         self._load()
 
     def _load(self) -> None:
-        try:
-            from elftools.elf.elffile import ELFFile  # noqa: PLC0415
-
-            with open(self.path, "rb") as fh:
-                elf = ELFFile(fh)
-                for section_name in (".symtab", ".dynsym"):
-                    section = elf.get_section_by_name(section_name)
-                    if section is None:
-                        continue
-                    for sym in section.iter_symbols():
-                        name = sym.name
-                        value = int(sym["st_value"] or 0)
-                        if name and value and name not in self._syms:
-                            self._syms[name] = value
-                dynsym = elf.get_section_by_name(".dynsym")
-                for section_name in (".rela.plt", ".rela.dyn"):
-                    section = elf.get_section_by_name(section_name)
-                    if section is None:
-                        continue
-                    for rel in section.iter_relocations():
-                        try:
-                            offset = int(rel["r_offset"] or 0)
-                            rel_type = int(rel["r_info_type"] or 0)
-                            if rel_type == 8:      # R_X86_64_RELATIVE：槽位值 = 基址 + addend
-                                self._relatives[offset] = int(rel["r_addend"] or 0)
-                                continue
-                            sym_index = int(rel["r_info_sym"] or 0)
-                            if not sym_index or dynsym is None:
-                                continue
-                            name = dynsym.get_symbol(sym_index).name
-                        except Exception:  # noqa: BLE001 - 单条 relocation 格式差异
-                            continue
-                        if name and name not in self._got:
-                            self._got[name] = offset
-            return
-        except Exception:  # noqa: BLE001 - 没有 pyelftools / 非 ELF 就走 readelf
-            self._load_readelf()
-
-    def _load_readelf(self) -> None:
-        out = subprocess.run(["readelf", "-sW", self.path], capture_output=True, text=True).stdout
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 8 and parts[3] == "FUNC":
-                try:
-                    self._syms.setdefault(parts[7], int(parts[1], 16))
-                except ValueError:
-                    continue
-        got_out = subprocess.run(["readelf", "-rW", self.path], capture_output=True,
-                                 text=True).stdout
-        for line in got_out.splitlines():
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            if parts[2] == "R_X86_64_JUMP_SLOT" and len(parts) >= 5:
-                try:
-                    self._got.setdefault(parts[4], int(parts[0], 16))
-                except (ValueError, IndexError):
-                    continue
-            elif parts[2] == "R_X86_64_RELATIVE" and len(parts) >= 4:
-                try:
-                    self._relatives.setdefault(int(parts[0], 16), int(parts[3], 16))
-                except ValueError:
-                    continue
+        with open(self.path, "rb") as fh:
+            elf = _PwnElf(fh.read())
+        for sym in elf.symbols():
+            name, value = sym["name"], sym["value"]
+            if name and value and name not in self._syms:
+                self._syms[name] = value
+        for rel in elf.relocs():
+            if rel["type"] == 8:  # R_X86_64_RELATIVE：槽位值 = 基址 + addend
+                self._relatives.setdefault(int(rel["offset"]), int(rel["addend"]))
+            elif rel["name"] and rel["name"] not in self._got:
+                self._got[rel["name"]] = int(rel["offset"])
 
     def sym(self, name: str) -> int:
         if name not in self._syms:
-            raise KeyError(f"{self.path} 里没有符号 {name!r}（用 readelf -s 看可用符号）")
+            near = sorted(n for n in self._syms if name.lower() in n.lower())[:8]
+            raise KeyError(f"{self.path} 里没有符号 {name!r}（相近：{near or '无'}）")
         return self._syms[name]
 
     def got(self, name: str) -> int:
-        if not self._got:
-            self._load_readelf()
         if name not in self._got:
-            raise KeyError(f"{self.path} GOT 里没有 {name!r}（用 readelf -r 看）")
+            raise KeyError(f"{self.path} GOT 里没有 {name!r}（可先用 view=relocs 看 JUMP_SLOT）")
         return self._got[name]
 
     def has(self, name: str) -> bool:
@@ -153,8 +108,6 @@ class _Elf:
 
         PIE 运行时该槽位值 = 模块基址 + addend，所以泄漏到它就能反推基址。
         """
-        if not self._relatives:
-            self._load_readelf()
         if slot_offset not in self._relatives:
             raise KeyError(f"{self.path} 在偏移 {slot_offset:#x} 没有 RELATIVE 重定位")
         return self._relatives[slot_offset]
@@ -165,8 +118,6 @@ class _Elf:
 
     def relatives(self) -> dict[int, int]:
         """全部 RELATIVE 槽位 {槽位文件偏移: addend}，按偏移排序（找"已知位置的 PIE 指针"用）。"""
-        if not self._relatives:
-            self._load_readelf()
         return dict(sorted(self._relatives.items()))
 
     def first_relatives(self, count: int = 10) -> list[tuple[int, int]]:
@@ -235,7 +186,7 @@ def read8(read_fn, addr: int) -> int:
 
 def _selftest() -> int:
     if len(sys.argv) < 2:
-        print("usage: python3 leak_helpers.py <challenge> [libc.so.6]")
+        print("usage: python3 -m ctfy_agent.pwn_assets.leak_helpers <challenge> [libc.so.6]")
         return 2
     elf = ElfOffsets(sys.argv[1])
     print("== challenge ==")
