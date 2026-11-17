@@ -20,6 +20,7 @@
 | [pylibs-bridge.md](pylibs-bridge.md) | 第三方库接入（镜像内置清单 + 本机外挂 + Windows 限制矩阵） | 动库/z3/pwntools 时 |
 | [ui-design-2026-11-10.md](ui-design-2026-11-10.md) | GUI 设计规范（本地开发用，**不进提交镜像**） | 改 GUI 时 |
 | [pwn-hardening-2026-11-17.md](pwn-hardening-2026-11-17.md) | **PWN 硬化**：`pwnkit`（libc 识别/ret2libc 推导/ASan shadow）+ 团队资产入包 + 回归；改 PWN 工具/提示词或排 PWN 短板时看 | 动 pwn 或评估 pwn 能力时 |
+| [open-source-ctf-agents-2026-11-17.md](open-source-ctf-agents-2026-11-17.md) | **开源 CTF Agent 调研**：EnIGMA/SWE-agent 0.7、PwnAI、D-CIPHER、re-mcp、NextCTF-Agent 的 pwn/rev 打法；本轮采纳 `pwnsession` 与 pwn/rev 提示词改动，含不采纳理由 | 想借鉴外部方案、改 pwn/rev 交互或提示词时 |
 | [global-token-ledger.md](global-token-ledger.md) | 跨题/跨进程 token 总账口径 | 查用量/预算来源 |
 | [plan-hardening-2026-11-10.md](plan-hardening-2026-11-10.md) | 硬化计划（P0/P1/P2 项与状态） | 排优先级 |
 | [plan-prelim-2026-11-15.md](plan-prelim-2026-11-15.md) | 资格赛/初选赛方案（正式赛内容，当前挂起） | 恢复正式赛工作时 |

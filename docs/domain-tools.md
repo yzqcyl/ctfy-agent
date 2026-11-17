@@ -8,7 +8,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `src/ctfy_agent/tools_domain_ext.py` | 8 个工具：`tcp` / `tcp_batch` / `elfpeek` / `netcheck` / `listen`（纯 stdlib）+ `z3solve` / `pycrypt` / `pwnrop`（外挂库，见 `docs/pylibs-bridge.md`） |
+| `src/ctfy_agent/tools_domain_ext.py` | 16 个工具：`tcp` / `tcp_batch` / `pwnsession` / `elfpeek` / `netcheck` / `listen` / `udp` / `pwngen` / `pwnfind` / `pwnkit` / `rsatool` / `aesblock` / `prng`（纯 stdlib）+ `z3solve` / `pycrypt` / `pwnrop`（外挂库，见 `docs/pylibs-bridge.md`） |
 
 ## 工具说明
 
@@ -16,6 +16,7 @@
 |---|---|---|
 | `tcp(host, port, payload, hex_mode, expect, read_timeout, max_recv)` | 单次 TCP 往返：连实例 → 发 payload（文本或 hex）→ 收回显（hex + ascii 双视图） | pwn 打栈溢出、crypto 连 oracle 服务、misc 连通性 |
 | `tcp_batch(host, port, payloads, hex_mode, read_timeout, same_conn)` | 同连接顺序发 N 个 payload 并汇总每条响应（≤200/次） | padding oracle、盲爆破 |
+| `pwnsession(host, port, steps, tls, sni, read_timeout, max_recv, total_timeout)` | **持久** TCP/TLS 会话：一次调用跑完「banner → 多步 send/expect」（≤40 步），每步返回 hex+ascii 回显；`send_hex` 发二进制、`expect` 命中即下一步 | pwn 菜单/协议题、nc 式交互（借鉴 EnIGMA 的 Interactive Agent Tools，见 `docs/open-source-ctf-agents-2026-11-17.md`） |
 | `elfpeek(path, view, min_len, limit)` | 纯 stdlib ELF 解析：`info`（架构/入口/PIE/NX/canary/RELRO）/`sections`/`symbols`/`strings`/`gadgets` | pwn 偏移与缓解、reverse 静态 |
 | `netcheck(host, port)` | DNS 是否解析 + TCP 是否可连；`*.internal` 解析失败时明确提示「VPN 隧道未接入」 | pwn/crypto 连不上时先诊断，避免盲目重试烧预算 |
 | `listen(port, bind, proto, timeout, max_conns, reply, send_first, trigger_url, trigger_host, …)` | 本地起监听等靶场**主动回连**，取回它发来的数据；可选**先 bind 再触发**（`trigger_url` / `trigger_host`）后 accept，解决单线程 agent 做不了「后台监听」的顺序问题；返回里列出本机 IP | beacon 外带 / SSRF 回调 / reverse connection / 「把结果投递到你的 host:port」类题 |
@@ -43,7 +44,7 @@ SAMPLE-024 是「靶场回连我们」的题型（beacon 把 flag 投递到 `ctf
   再交给 `tools_domain_ext.call_domain()`。
 - 角色授权（`config/agent.json`）：`rev.local += [elfpeek, tcp, tcp_batch, netcheck, listen, z3solve]`；
   `crypto.local += [tcp, tcp_batch, netcheck, listen, z3solve, pycrypt]`；
-  `pwn.local += [pwngen, pwnfind, tcp, tcp_batch, netcheck, listen, z3solve, pwnrop]`，2026-11-17 再追加 `pwnkit`（见 docs/pwn-hardening-2026-11-17.md）；
+  `pwn.local += [pwngen, pwnfind, tcp, tcp_batch, netcheck, listen, z3solve, pwnrop]`，2026-11-17 再追加 `pwnkit`（见 docs/pwn-hardening-2026-11-17.md）与 `pwnsession`（见 docs/open-source-ctf-agents-2026-11-17.md）；
   `misc.local += [tcp, tcp_batch, netcheck, listen, z3solve]`；`web.local += [listen]`（SSRF 回调）。
   ai/coordinator 不可见（门禁断言已覆盖）。
 

@@ -214,6 +214,112 @@ def tcp(host: str, port: int, payload: str = "", hex_mode: bool = False,
     return _clip("\n".join(parts))
 
 
+# >>> [borrow-EnIGMA 2026-11-17] 交互式会话工具：借鉴 EnIGMA / SWE-agent 0.7 的
+#     Interactive Agent Tools（debugger + server-connection REPL）。pwn 的菜单/协议题是
+#     「连上 → 逐步收发」，旧 tcp/tcp_batch 每步都要重连、模型按步数烧预算；这里一次调用
+#     跑完一段脚本化会话（banner + 多步 send/expect），把 REPL 语义压成单次工具调用。
+def pwnsession(host: str, port: int, steps: list, tls: bool = False, sni: str = "",
+               read_timeout: float = 2.0, max_recv: int = 8192,
+               total_timeout: float = 45.0) -> str:
+    """持久会话：连接一次，按 steps 逐步「发送 → 读到空闲/expect」，返回标注过的完整回显。
+
+    steps 每项是 dict：
+      {"send": "1\n"}            文本发送（JSON 里换行写 \n）
+      {"send_hex": "41ff..."}     二进制发送（hex）
+      {"expect": "flag"}          读到该子串即停（也可与 send 同项）
+      {"wait": 1.5}               本步读多久（默认 read_timeout）
+    典型菜单题：steps=[{"send":"1\n","expect":">>"},{"send_hex":"<payload>"},{"wait":1}]
+    """
+    if not (0 < int(port) < 65536):
+        raise DomainToolError("端口非法：%r" % (port,))
+    if not isinstance(steps, list) or not steps:
+        raise DomainToolError("steps 必须是非空数组（每项 {send|send_hex|expect|wait}）")
+    if len(steps) > 40:
+        raise DomainToolError("steps 最多 40 步（当前 %d），请拆成多次会话" % len(steps))
+    # 模型常把 max_recv 写得离谱：夹到 64KB（上下文上限 6000 字符，读再多也会丢）
+    max_recv = max(1, min(int(max_recv), 65536))
+    read_timeout = max(0.05, min(float(read_timeout), float(total_timeout)))
+    t0 = time.time()
+    sock = _connect(host, int(port), min(10.0, total_timeout), tls=bool(tls), sni=sni)
+    lines: list[str] = ["会话 %s:%s（tls=%s）" % (host, port, bool(tls))]
+
+    def _read_window(wait: float, expect_b: bytes | None) -> tuple[bytes, bool]:
+        """读最多 wait 秒，空闲即停；返回 (数据, 是否 EOF)。"""
+        buf = b""
+        sock.settimeout(min(0.35, max(0.05, wait)))
+        deadline = time.time() + max(0.05, wait)
+        while len(buf) < int(max_recv) and time.time() < deadline:
+            try:
+                chunk = sock.recv(min(4096, int(max_recv) - len(buf)))
+            except socket.timeout:
+                if buf:
+                    break
+                continue
+            except OSError:
+                return buf, True
+            if not chunk:
+                return buf, True
+            buf += chunk
+            if expect_b and expect_b in buf:
+                break
+        return buf, False
+
+    closed = False
+    try:
+        banner, closed = _read_window(float(read_timeout), None)
+        if banner:
+            lines.append("banner：" + _fmt_stream(banner, "收到"))
+        else:
+            lines.append("banner：无（服务端先等输入，或连接刚建立）")
+        for idx, step in enumerate(steps, 1):
+            if not isinstance(step, dict):
+                raise DomainToolError("steps[%d] 不是对象：%r" % (idx, step))
+            if closed:
+                lines.append("第 %d 步跳过：连接已被服务端关闭" % idx)
+                break
+            if time.time() - t0 > total_timeout:
+                lines.append("…总超时 %.0fs，已执行 %d/%d 步" % (total_timeout, idx - 1, len(steps)))
+                break
+            raw = b""
+            if step.get("send_hex") is not None:
+                try:
+                    raw = bytes.fromhex(str(step["send_hex"]).strip())
+                except ValueError as exc:
+                    raise DomainToolError("steps[%d].send_hex 不是合法 hex：%s" % (idx, exc)) from None
+            elif step.get("send") is not None:
+                raw = str(step["send"]).encode("utf-8", "surrogateescape")
+            if raw:
+                try:
+                    sock.sendall(raw)
+                except OSError as exc:
+                    lines.append("第 %d 步发送失败：%s" % (idx, exc))
+                    break
+                lines.append("[%d] 发送 %d 字节 hex=%s" % (idx, len(raw), raw[:32].hex()))
+            expect = str(step.get("expect") or "")
+            wait = step.get("wait")
+            wait_f = float(wait) if wait is not None else float(read_timeout)
+            got, closed = _read_window(wait_f, expect.encode("utf-8", "surrogateescape") if expect else None)
+            if got:
+                lines.append("[%d] 收到 %d 字节：%s" % (idx, len(got), _fmt_stream(got, "回显")))
+                if expect and expect.encode("utf-8", "surrogateescape") in got:
+                    lines.append("[%d] 已命中 expect=%r" % (idx, expect))
+            elif expect:
+                lines.append("[%d] 未等到 expect=%r（%.1fs 内无回显）" % (idx, expect, wait_f))
+            else:
+                lines.append("[%d] 无回显（%.1fs）" % (idx, wait_f))
+            if closed:
+                lines.append("[%d] 服务端关闭连接（EOF）" % idx)
+                break
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    lines.append("会话结束：%d 步 / %.1fs%s" % (
+        len(steps), time.time() - t0, "（连接被关闭）" if closed else ""))
+    return _clip("\n".join(lines))
+
+
 def tcp_batch(host: str, port: int, payloads: list[str], hex_mode: bool = True,
               read_timeout: float = 2.0, max_recv: int = 1024,
               same_conn: bool = True, total_timeout: float = 40.0,
@@ -2945,6 +3051,46 @@ TCP_BATCH_SPEC = {
     },
 }
 
+PWN_SESSION_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "pwnsession",
+        "description": (
+            "对平台实例开一个**持久** TCP/TLS 会话，按步骤脚本一次跑完多轮收发（pwn 菜单/协议题、"
+            "nc 式交互；借鉴 EnIGMA 的 Interactive Agent Tools）。旧 tcp 每条都要重连，"
+            "这里「连接 → 逐步 send/expect」压成一次调用：先收 banner，再按 steps 逐项发送并读回显。"
+            "只能连本题 start_instance 返回的 host:port（白名单外拒绝）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "实例主机"},
+                "port": {"type": "integer", "description": "实例端口"},
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "send": {"type": "string", "description": "要发送的文本（换行写 \n）"},
+                            "send_hex": {"type": "string", "description": "要发送的二进制（hex 串）"},
+                            "expect": {"type": "string", "description": "收到该子串立即进入下一步"},
+                            "wait": {"type": "number", "description": "本步读多久（秒，默认 read_timeout）"},
+                        },
+                    },
+                    "description": "步骤数组：每项 {send|send_hex|expect|wait}，最多 40 步",
+                },
+                "tls": {"type": "boolean", "description": "是否 TLS（实例 nc_ssl=true 时必须）"},
+                "sni": {"type": "string", "description": "TLS SNI，默认等于 host"},
+                "read_timeout": {"type": "number", "description": "每步读空闲超时秒（默认 2.0）"},
+                "max_recv": {"type": "integer", "description": "每步最多读多少字节（默认 8192）"},
+                "total_timeout": {"type": "number", "description": "整段会话总超时秒（默认 45）"},
+            },
+            "required": ["host", "port", "steps"],
+        },
+    },
+}
+
+
 # >>> [udp-tool 2026-11-13] UDP 规格（经 DOMAIN_SPECS 自动注册）。CTFY SAMPLE-015 实测：
 #     平台 UDP 服务对源端口敏感，必须同一 socket 连发 hello / flag。
 UDP_SPEC = {
@@ -3330,7 +3476,8 @@ LISTEN_SPEC = {
     },
 }
 
-DOMAIN_SPECS = [TCP_SPEC, UDP_SPEC, TCP_BATCH_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC, PWNGEN_SPEC, PWNFIND_SPEC,
+DOMAIN_SPECS = [TCP_SPEC, UDP_SPEC, TCP_BATCH_SPEC, PWN_SESSION_SPEC, ELFPEEK_SPEC, NETCHECK_SPEC,
+                PWNGEN_SPEC, PWNFIND_SPEC,
                 RSATOOL_SPEC, AESBLOCK_SPEC, PRNG_SPEC, LISTEN_SPEC,
                 Z3SOLVE_SPEC, PYCRYPT_SPEC, PWNROP_SPEC, PWNKIT_SPEC]
 
@@ -3341,6 +3488,16 @@ def call_domain(name: str, arguments: dict | None = None) -> str:
     """按工具名分发。参数已由 LocalTools 侧做过白名单/签名过滤。"""
     args = dict(arguments or {})
     try:
+        if name == "pwnsession":
+            return pwnsession(
+                str(args.get("host", "")), int(args.get("port") or 0),
+                args.get("steps") if isinstance(args.get("steps"), list) else [],
+                tls=bool(args.get("tls", False)),
+                sni=str(args.get("sni") or ""),
+                read_timeout=float(args.get("read_timeout", 2.0)),
+                max_recv=int(args.get("max_recv", 8192)),
+                total_timeout=float(args.get("total_timeout", 45.0)),
+            )
         if name == "tcp":
             return tcp(
                 str(args.get("host", "")), int(args.get("port") or 0),

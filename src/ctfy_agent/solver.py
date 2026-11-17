@@ -3419,7 +3419,7 @@ class Solver:
         elif access:
             lines.append("- 回执端点：" + access[:200])
         lines.append("- 只允许连这一个实例；不要扫描其它主机。")
-        lines.append("- 本机没有 Linux 运行时（无 wsl/docker/gdb）：不要找它们，也不能本地跑 ELF；"
+        lines.append("- 本轮 headless 宿主机没有 Linux 运行时（无 wsl/docker/gdb）：不要找它们，也不能本地跑 ELF（提交镜像容器里才有 gdb -batch）；"
                      "动态验证一律打上面的实例，静态分析用 elfpeek/pwnrop。")
         return "\n".join(lines)
 

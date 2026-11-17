@@ -93,3 +93,16 @@ token / 96 calls；第 2 轮 121,758 token / 38 calls（均未提交 flag，提�
 - 真实收益要等下次 pwn 批次对比：预期减少「算偏移/推导基址」类步数，但**不会**自动解决 ASan/堆题；
 - 下一个该补的短板（按收益排序）：libc 版本匹配（只给偏移找 libc）、one_gadget/FSOP 模板、
   堆（tcache/fastbin）脚手架、seccomp 落地后的 ORW 链模板。
+
+## 6. 追加：开源 CTF Agent 借鉴（同日，见 `docs/open-source-ctf-agents-2026-11-17.md`）
+
+第 1 轮复盘里「pwn 专家找不到实例端点 / 想找本地 gdb / 反复写正则扫 PLT」这三个问题，
+除已做的简报注入 + 提示词补丁外，又按 EnIGMA（SWE-agent 0.7）的 Interactive Agent Tools 补了
+**`pwnsession`**：一次调用跑完「连接 → banner → 多步 send/expect（≤40 步）」，`send_hex` 发二进制，
+每步回 hex+ascii；菜单/协议题不必每步重连。pwn 提示词同时加了「12 步示范流程」，
+rev 提示词加了「静态优先 + 差分」顺序。
+
+- 该工具已接线到 `config/agent.json roles.pwn.local` 与 `crew.DEFAULT_ROLES` 兜底，白名单复用
+  `LocalTools._call_domain_tool`（未登记实例仍被拒）；
+- 离线回归 `python tests/smoke_pwnsession.py`（本地菜单服务，不依赖平台）；
+- **真实赛题收益同样待验证**：需 LLM 额度恢复后用同一道 `easyROPtocol` 重跑对比「首次有效远端交互步数」。
