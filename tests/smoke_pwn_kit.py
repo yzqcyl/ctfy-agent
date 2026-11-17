@@ -242,7 +242,31 @@ def case_wiring() -> None:
             check(name, needle in str(exc), f"{exc!r}")
 
 
+def case_gdb_pwn_helper() -> None:
+    """pwndbg-lite（gdb_pwn.py）：文件在、语法能过、cyclic 反查算法与 pwntools 一致。"""
+    import ast as _ast  # noqa: PLC0415
+    import pathlib as _pathlib  # noqa: PLC0415
+
+    path = _pathlib.Path(__file__).resolve().parent.parent / "tools" / "linux_bootstrap" / "gdb_pwn.py"
+    check("gdb_pwn.py 存在（随包发布）", path.is_file(), str(path))
+    src = path.read_text(encoding="utf-8")
+    _ast.parse(src)  # 语法非法会抛
+    body = src.split("import gdb", 1)[1].split("class _Cmd", 1)[0]
+    ns: dict = {}
+    exec('ALPHABET = "abcdefghijklmnopqrstuvwxyz"\n'
+         'LOOKUP = {c: i for i, c in enumerate(ALPHABET)}\n' + body, ns)
+    cyclic, off = ns["_cyclic"], ns["_cyclic_offset"]
+    pat = cyclic(64)
+    check("gdb_pwn cyclic 与 pwntools 对齐", pat[:16] == b"aaaabaaacaaadaaa", pat[:16])
+    check("gdb_pwn pwnoff 偏移正确",
+          off(int.from_bytes(pat[8:16], "little")) == 8
+          and off(int.from_bytes(pat[16:24], "little")) == 16
+          and off(0xDEADBEEFCAFEBABE) == -1)
+
+
 def main() -> int:
+    case_gdb_pwn_helper()
+
     # config 里的 pwn 提示词长度上限：避免有人把提示词写成大段文档（吃每轮上下文）
     cfg = json.loads((ROOT / "config" / "agent.json").read_text(encoding="utf-8"))
     prompt_len = len(cfg["roles"]["pwn"]["system"])

@@ -43,3 +43,4 @@
 
 > 归档不等于删除：`git log --follow docs/archive/<name>` 可追溯；需要复活某份文档时
 > `git mv docs/archive/<name> docs/<name>` 并更新引用即可。
+| [`pwn-toolbox-2026-11-17.md`](pwn-toolbox-2026-11-17.md) | PWN 工具箱补缺：pwndbg-lite、one_gadget、FSOP/堆配方、xrefs |
