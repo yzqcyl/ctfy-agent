@@ -93,3 +93,28 @@ ghidra_decompile <binary> --limit 60 --timeout 600
 - 推论：要么 checker 实际遍历的是 x/y 交替的 8 字节槽（条件同时作用于 y），要么它用的
   char/字号/load flags 与默认不同；下一轮应先打印 glyph_index/charmap、再用 ctypes 或 gdb
   实测 checker 循环里那 16 个 long 到底是 x 还是 x/y 混合，再决定求解空间（z3 或随机重启）。
+
+## 追加（2026-11-17）：进程内 harness `rev_hint_harness.py` + 一个关键发现
+
+按"做 1"建了团队资产 `runs/_tpctf/l2_assets/rev_hint_harness.py`：
+
+- 用 ctypes 在进程内复现 checker 的真实校验链（依据 rev4 的 shim 日志 + asm/dec 交叉验证）：
+  `coords = [nibble<<16]*24` → 两块各 8 步 `step(ch)`（FUN_001018a0：SetVar→Get_Char_Index→
+  Load_Glyph(gid, flags=0x8008)→校验 'ltuo'/n_points≥0x44→按 points+0x28 步长 64 采 16 个 u64、
+  要求 ≤0x3c0 且 %64==0→写回 (v>>6)<<16）→ 第 9 个字符 final_read（FUN_00101990：
+  读 `points + n_points*16 - 0x18`）→ 要求 == 0x280(640)；blocks = "ABCDEFGHI"/"JKLMNOPQR"。
+- **验证**：对输入 `0123456789abcdef01234567`，harness 的 18 步 coords 序列与 rev4 沙盒里
+  LD_PRELOAD shim 的实测日志**逐位一致**（这是硬验证，不是推断）。
+- 附带 `--search N` 随机搜索、`--check` 打印链路。
+
+**用它做的离线实验（0 LLM token）**：
+1. 随机 24-nibble 输入 20000 次搜索 accepted：0 命中（9.6 分钟，35 次/秒）；
+2. final_read 分布：300 个随机输入 × 2 block → **全部 128**；直接对 200 组随机 16-nibble
+   坐标调 final_read（不走链）→ 也**全部 128**；`HINT_PEDANTIC`（flags 0x8088）同样 128。
+
+**结论（重要）**：本地这套 `checker + challenge.ttf` 下，`final_read`（checker 最后与 0x280
+比较的那个值）恒为 128，而 accepted 要求 640 —— 也就是说**在我们的 L2 复现里该 checker 对任意
+24-hex 输入都只可能 rejected**。这解释了 rev 四轮"越读越清楚但永远不出 flag"：
+不是 agent 能力问题，而是**靶的可解性/附件匹配问题**（也可能需要真实平台环境的其他条件，
+如 HINT_FONT/服务端字体）。→ 应停止在本地 rev 靶上烧 token；下一次真实平台窗口先验证该题
+可解性，再决定是否重测。
