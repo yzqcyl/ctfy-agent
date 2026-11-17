@@ -95,7 +95,7 @@ def skip(path: pathlib.Path) -> bool:
     return False
 
 
-def collect() -> list[pathlib.Path]:
+def collect(skip_bundle: bool = False) -> list[pathlib.Path]:
     files: list[pathlib.Path] = []
     for rel in INCLUDE_FILES:
         path = ROOT / rel
@@ -105,12 +105,18 @@ def collect() -> list[pathlib.Path]:
         base = ROOT / rel
         if base.is_dir():
             for path in base.rglob("*"):
+                if skip_bundle and path.relative_to(ROOT).parts[:3] == (
+                        "tools", "linux_bootstrap", "bundle"):
+                    continue
                 if path.is_file() and not skip(path):
                     files.append(path)
     for rel, pattern in INCLUDE_GLOBS:
         base = ROOT / rel
         if base.is_dir():
             for path in base.glob(pattern):
+                if skip_bundle and path.relative_to(ROOT).parts[:3] == (
+                        "tools", "linux_bootstrap", "bundle"):
+                    continue
                 if path.is_file() and not skip(path):
                     files.append(path)
     # 去重 + 排序
@@ -119,12 +125,19 @@ def collect() -> list[pathlib.Path]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="dist/tpctf-agent-upload.tar.gz")
+    parser.add_argument("--out", default=None,
+                        help="输出路径（缺省：完整包 dist/tpctf-agent-upload.tar.gz；"
+                             "--no-bundle 时 dist/tpctf-agent-core.tar.gz）")
+    parser.add_argument("--no-bundle", action="store_true",
+                        help="排除离线依赖 bundle（tools/linux_bootstrap/bundle，约 85MB）；"
+                             "VPS 有网/已装好依赖时用这个，日常更新只传 core 包")
     parser.add_argument("--serve", action="store_true")
     args = parser.parse_args()
 
-    files = collect()
-    out = ROOT / args.out
+    files = collect(skip_bundle=args.no_bundle)
+    default_out = ("dist/tpctf-agent-core.tar.gz" if args.no_bundle
+                   else "dist/tpctf-agent-upload.tar.gz")
+    out = ROOT / (args.out or default_out)
     out.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     with tarfile.open(out, "w:gz") as bundle:
