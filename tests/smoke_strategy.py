@@ -66,6 +66,22 @@ def test_role_context() -> None:
     check("上下文含状态文件尾部", "B_STATE.md 尾部" in ctx and "批量搜索脚本" in ctx)
     check("上下文含执行优先规则", "执行优先" in ctx and "不要连续两次 grep" in ctx)
 
+    # 2026-11-17 ctf2 easyROPtocol 实测事故：专家简报没有实例端点，pwn 专家翻了 20+ 步 shell
+    # （还去读 state.json 被沙盒拦）才拿到 host:port。实例接入必须确定性送达每个专家。
+    with_instance = Challenge(
+        id="PWN-02", name="demo", category="pwn", points=100, difficulty="medium", tags=[],
+        instance={"access_ready": True,
+                  "access_urls": [{"host": "1.2.3.4", "port": 9999, "nc_ssl": True}]},
+    )
+    ctx_inst = Solver._role_context(with_instance)
+    check("简报含实例接入块", "实例接入" in ctx_inst, ctx_inst[:400])
+    check("简报含 host:port", "1.2.3.4" in ctx_inst and "9999" in ctx_inst)
+    check("简报提示 nc_ssl 要 tls=true", "tls=true" in ctx_inst)
+    check("简报说明无本地 Linux 运行时", "wsl/docker/gdb" in ctx_inst)
+    no_inst = Challenge(id="PWN-03", name="demo", category="pwn", points=100,
+                        difficulty="medium", tags=[])
+    check("无实例时不注入接入块", "实例接入" not in Solver._role_context(no_inst))
+
 
 def test_crew_brief() -> None:
     from ctfy_agent.crew import Crew  # noqa: PLC0415

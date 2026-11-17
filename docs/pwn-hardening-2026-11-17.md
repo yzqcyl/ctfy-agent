@@ -38,15 +38,57 @@ python tests/smoke_pwn.py          # 24/24（既有 pwngen/pwnfind/elfpeek 回�
 python tests/smoke_libs.py         # 33 项通过（pwnrop/z3/pycrypt 接线，2 组因无 ELF 编译环境跳过）
 python tests/smoke_domain_cards.py # 方向卡（同步把计数 8→9：udp 卡是 11-13 加的，测试之前过期）
 python tools/sync_roles.py --check # 三源零漂移
+python tests/smoke_strategy.py     # 策略回归：新增 6 项断言（本机 DSH 沙盒禁写系统 TEMP，
+                                   # 本次用内联断言复核过；CI/容器里应正常）
+python tests/smoke.py              # 全量 180 passed / 0 failed（含 crew/solver 改动回归）
 ```
 
 真 libc 解析用仓库里的跑批残留样本 `runs/tpctf2026/attachments/AUTHORED-31FB487C/libc.so.6`
 （Debian GLIBC 2.41），验证到：版本串、40 位 build-id、system/puts/read 偏移、`/bin/sh` vaddr 全部可复算；
 `ret2libc` 用构造泄漏值反推基址，与「base+偏移」逐项对齐。**没有样本时该组自动跳过**（`runs/` 被 gitignore）。
 
-## 4. 还没验证的部分（不要吹）
+## 4. ctf2 真实平台实测（2026-11-17 晚）
 
-- 全部是离线单测：**没有在真实 PWN 题上跑过 pwnkit**（需要用户批配额/起靶，见 TODO）；
+> 用户指定「去 ctf2 找一题中等难度测试」，实际跑了同一题两轮。
+
+**选题**：`ctf2` 练习场 `BUUCTF` 的 `easyROPtocol`（PWN / Medium / 85 队已解；附件 `pwn` 14,968 B +
+`libc-2.31.so` 2,029,224 B；实例 `nc_ssl=true` 即 TLS）。平台档案切换后 whoami / 练习场列表 / 题单过滤
+（category=pwn + difficulty=Medium）/ 附件下载 / 起实例全部可用。
+
+**pwnkit 在真 libc 上算对了**（离线、零配额）：`libc-2.31.so` 解析出
+`Ubuntu GLIBC 2.31-0ubuntu9.2`、build-id `099b9225…`、`system=0x55410`、`puts=0x875a0`、`/bin/sh=0x1b75aa`
+——与公开 libc 数据库的 glibc 2.31 偏移逐项一致（上一轮只验过 Debian 2.41）。
+
+**实测第 1 轮**（自压 40 万 token / 24 步）：实例起成功、TLS banner 与菜单抓到，96 次模型调用、
+400,343 token，`stalled` 无 flag。复盘转录（`runs/ctf2-easyrop/transcripts/…jsonl`）暴露三条打法问题：
+
+1. **专家拿不到实例端点**：协调者简报里有 `access_url`，专家简报没有 → pwn 专家花 20+ 步
+   shell 翻目录找 host:port（还去读 `state.json` 被沙盒边界拒绝），最后靠协调者转述才连上；
+2. **把宿主机当 Linux 用**：在 Windows 沙盒里查 `wsl/docker/gdb`、写反汇编脚本时被 `dis.py`
+   遮蔽标准库坑住，反复换正则解析 PLT stub（同一假设加了 5 个扫描脚本）；
+3. `pwnkit` 只被调用 1 次（没走到「泄漏后算链」阶段），偏离「先算再打」的设计意图。
+
+**针对性的打法修复（随本提交）**：
+
+- `solver._role_context` 新增「实例接入」块：把 `host/port`、`nc_ssl→tls=true`、允许连的实例、
+  「本机无 Linux 运行时（无 wsl/docker/gdb）」确定性注入每个专家简报（`_instance_hint`，无实例时不注入）；
+- `config/agent.json roles.pwn.system` 补「实测事故补丁」：菜单/协议题先单字节探路、`tls=true`、
+  别找 state.json、反汇编一个假设最多 1 个脚本、每 3 步无新观测换假设；
+- `crew.COORDINATOR_PROMPT` 加硬规则：派 pwn/rev 任务**不要**要求「本地 gdb/wsl 验证偏移」；
+- `tests/smoke_strategy.py` 加 6 项覆盖（实例接入块 / host:port / tls 提示 / 无实例不注入）。
+
+**实测第 2 轮（80 万预算）没跑起来**：起实例与附件正常，第 3 步 `reason=llm_error`——LLM 端点
+（DashScope 兼容接口）返回 `403 AccessDenied.Unpurchased` / `400 Access denied, account is in good
+standing`，逐个试 `deepseek-v4.1-flash` / `v4.1-flash-1017` / `qwen` / `glm` 均被拒。**这是账户/额度问题，
+不是代码问题**；需要用户处理 key/余额后才能继续验证打法修复的真实收益。消费记录：第 1 轮 400,343
+token / 96 calls；第 2 轮 121,758 token / 38 calls（均未提交 flag，提交配额未动）。
+
+两轮实例均已在收尾时按 `challenge_id` 回收（`delete_environment` 回 `NOT_FOUND`，平台侧无残留环境）。
+
+## 5. 还没验证的部分（不要吹）
+
+- 离线单测全绿 + 真 libc 解析验证过，但**真实赛题上 pwnkit 带来的收益还没被证明**（第 2 轮因账户
+  问题中断；第 1 轮受 40 万上限与上述打法问题影响）；
 - 资产脚本已改成纯 stdlib + 包内 `pwn_kit`：原 `leak_helpers` 用 pyelftools/readelf （镜像里都没有，沙盒一跑就挂），现在 `leak_helpers`/`pwn_stack_probe` 都能 `python3 -m` 自检（实测 exit 0）；`tests/smoke.py::stdlib_only` 恢复绿；
 - 真实收益要等下次 pwn 批次对比：预期减少「算偏移/推导基址」类步数，但**不会**自动解决 ASan/堆题；
 - 下一个该补的短板（按收益排序）：libc 版本匹配（只给偏移找 libc）、one_gadget/FSOP 模板、

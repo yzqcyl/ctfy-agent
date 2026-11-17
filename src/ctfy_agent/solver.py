@@ -3335,6 +3335,9 @@ class Solver:
         inventory = Solver._sandbox_inventory(sandbox)
         if inventory:
             text += "\n\n## 沙盒现状（自动注入，别再 ls 一遍）\n" + inventory
+        inst_hint = Solver._instance_hint(challenge)
+        if inst_hint:
+            text += "\n\n" + inst_hint
         text += (
             "\n\n## 执行优先（硬规则）\n"
             "- 已有脚本就先跑（`python3 <脚本> 2>&1 | tail -20`），再根据输出决定下一步；"
@@ -3377,6 +3380,48 @@ class Solver:
             return "\n".join(lines)
         except Exception:  # noqa: BLE001 - 清单只是增强项
             return ""
+
+    @staticmethod
+    def _instance_hint(challenge) -> str:
+        """专家简报里的「实例接入」块：host:port + TLS 提示（只给本机允许连的那个实例）。
+
+        2026-11-17 ctf2 easyROPtocol 实测：协调者简报里有实例回执，专家没有 —— pwn 专家
+        为此翻了 20+ 步 shell（还去读 state.json 被沙盒拦），最后才靠协调者转述拿到 host:port。
+        动态验证只能打这一个实例，端点必须确定性送达。
+        """
+        instance = getattr(challenge, "instance", None)
+        if not instance:
+            return ""
+        raw = instance if isinstance(instance, dict) else {"raw": instance}
+        lines = ["## 实例接入（远程靶标；动态验证只能打它，别再找地址）"]
+        host = port = ""
+        tls = False
+        urls = raw.get("access_urls") or []
+        if isinstance(urls, list) and urls and isinstance(urls[0], dict):
+            host = str(urls[0].get("host") or "")
+            port = str(urls[0].get("port") or "")
+            tls = bool(urls[0].get("nc_ssl") or urls[0].get("tls"))
+        access = str(raw.get("access_url") or "")
+        if not host and "://" in access:
+            netloc = access.split("://", 1)[1].split("/", 1)[0]
+            if ":" in netloc:
+                host, _, port = netloc.rpartition(":")
+        surface = raw.get("surface")
+        if not host and isinstance(surface, dict):
+            services = surface.get("services") or []
+            if services and isinstance(services[0], dict):
+                host = str(services[0].get("host") or "")
+                port = str(services[0].get("port") or "")
+                tls = bool(services[0].get("nc_ssl") or services[0].get("tls"))
+        if host:
+            call = 'tcp(host="%s", port=%s%s)' % (host, port or "?", ", tls=true" if tls else "")
+            lines.append("- 直连：" + call + ("（服务端要 TLS，必须带 tls=true）" if tls else ""))
+        elif access:
+            lines.append("- 回执端点：" + access[:200])
+        lines.append("- 只允许连这一个实例；不要扫描其它主机。")
+        lines.append("- 本机没有 Linux 运行时（无 wsl/docker/gdb）：不要找它们，也不能本地跑 ELF；"
+                     "动态验证一律打上面的实例，静态分析用 elfpeek/pwnrop。")
+        return "\n".join(lines)
 
     @staticmethod
     def _initial_prompt(challenge, local: LocalTools) -> str:
