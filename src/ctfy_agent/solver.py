@@ -2864,6 +2864,17 @@ class Solver:
         still_rounds = 0
         seg_first_step = 1  # P2-1：当前链段首步（PLAN 变更即换段，段内不软压缩）
         burns = 0  # S1c：连续「补全打满且无输出」计数（思考烧穿护栏）
+        # 2026-11-17 策略护栏（反思 550 万 token 未出 flag 后加的硬规则）：
+        # - 分析桶 ≤30%：纯分析（无工具调用）token 占比过高 → 强制下一次调用必须带工具；
+        # - 静态阅读连击：连续两步只有 ls/cat/grep/objdump 类调用 → 注入"做实验"提示并强制工具；
+        # - 实验计数：整轮 0 次实验（脚本/oracle/gdb run/nc/curl 等）→ 报告标注未验证。
+        analysis_tokens = 0
+        role_tokens = 0
+        read_streak = 0
+        experiments = 0
+        nudged_read = False
+        nudged_analysis = False
+        need_experiment = False
         for step in range(1, int(max_steps) + 1):
             # 每步前检查外部取消（墙钟/预算/他路已解）：以前只在协调者轮间检查，
             # 单个专家轮次可能拖很久（2026-11-16 L2 实测 12 分钟预算被拖到 27 分钟）。
@@ -2885,7 +2896,8 @@ class Solver:
                 # P0-3 兜底闸门：专家路径不能只靠 llm.chat 内部的检查（墙钟必须每步前生效）
                 if getattr(llm, "budget", None) is not None:
                     llm.budget.check()
-                response = llm.chat(out_messages, tools=specs)
+                step_tool_choice = "required" if (need_experiment or read_streak >= 2) else "auto"
+                response = llm.chat(out_messages, tools=specs, tool_choice=step_tool_choice)
             except BudgetExceeded as exc:
                 # P0-3：墙钟到期与预算耗尽对模型是两回事（一个没钱，一个没时间收口）
                 wall = getattr(exc, "kind", "") == "wall_clock"
@@ -2901,6 +2913,59 @@ class Solver:
             content = response.get("content") or ""
             if content.strip():
                 last_content = content.strip()
+
+            # 2026-11-17 策略护栏：统计「分析 vs 实验」与静态阅读连击（口径见循环前注释）。
+            usage = response.get("usage") or {}
+            step_tokens = int(usage.get("total_tokens") or 0)
+            role_tokens += step_tokens
+            step_has_experiment = False
+            step_read_like = False
+            for call in calls:
+                function = call.get("function") or {}
+                kind = self._classify_call(function.get("name") or "",
+                                           function.get("arguments") or "")
+                if kind == "experiment":
+                    step_has_experiment = True
+                elif kind == "read":
+                    step_read_like = True
+            if step_has_experiment:
+                experiments += 1
+                read_streak = 0
+                need_experiment = False
+            elif step_read_like:
+                read_streak += 1
+            if not calls:
+                analysis_tokens += step_tokens
+            if (not calls and not nudged_analysis and role_tokens > 3000
+                    and analysis_tokens > 0.30 * role_tokens):
+                nudged_analysis = True
+                need_experiment = True
+                messages.append({
+                    "role": "user",
+                    "content": "【策略硬规则·分析桶】纯分析（无工具调用）已占本轮约 30% token。"
+                               "下一步必须调用工具做实验：写/跑一个能输出机器可判结果的脚本"
+                               "（本地二进制/oracle 服务/批量搜索），不要再写长篇推断。",
+                })
+                self.store.append_transcript(
+                    challenge_id,
+                    {"step": step, "role": "note",
+                     "content": f"[策略] 分析桶触发：analysis={analysis_tokens}/{role_tokens}，强制实验"},
+                )
+            if read_streak >= 2 and not nudged_read:
+                nudged_read = True
+                need_experiment = True
+                messages.append({
+                    "role": "user",
+                    "content": "【策略硬规则·实验优先】连续两步只有静态阅读（ls/cat/grep/objdump 类），已触警。"
+                               "停止阅读：① 本地有二进制/服务就用它当 oracle 写批量脚本（秒级可跑 10^3~10^5 次，"
+                               "成本≈0 token）；② 用 gdb/ltrace 做决定性观测（直接看真实参数/返回值）；"
+                               "③ 每个结论必须附「命令 + 原始输出 + exit code」。",
+                })
+                self.store.append_transcript(
+                    challenge_id,
+                    {"step": step, "role": "note",
+                     "content": f"[策略] 静态阅读连击 {read_streak}：强制实验"},
+                )
 
             # S1c 思考护栏（run_role 同款）：烧穿步不回喂空 assistant 消息。
             # 2026-11-16 实测（clean-room 四轮）：75% completion 花在 reasoning 上，每轮 18~29 次
@@ -3133,6 +3198,14 @@ class Solver:
             tail = self._action_summary(actions, last_content)
             if tail:
                 report += "\n最近动作：\n" + tail
+        # 2026-11-17 策略护栏收口：整轮 0 次实验 → 报告标注未验证（避免"纯推理结论"被下轮当事实）。
+        self.store.append_transcript(
+            challenge_id,
+            {"role": role, "strategy_stats": {"experiments": experiments, "read_streak": read_streak,
+                                              "analysis_tokens": analysis_tokens, "role_tokens": role_tokens}},
+        )
+        if experiments == 0 and report and not report.startswith("[无实验输出"):
+            report = "[无实验输出·未验证] " + report
         return {"report": report, "steps": step, "reason": reason, "facts": facts.as_list()}
 
     @staticmethod
@@ -3194,6 +3267,47 @@ class Solver:
         if not cards:
             return ""
         return "打法提示（按平台题型 tag 生成，仅供参考）：\n" + "\n".join(f"- {c}" for c in cards)
+
+    # ---- 2026-11-17 策略护栏：工具调用分类（分析 / 静态阅读 / 实验）----
+    _READ_CMD_RE = re.compile(
+        r"^\s*(?:cd\s+[^;&|]+\s*&&\s*)?(?:ls|cat|head|tail|grep|awk|sed|strings|objdump|"
+        r"readelf|nm|file|wc|stat|md5sum|sha256sum|sort|uniq|find|diff|xxd|od|hexdump)\b",
+        re.IGNORECASE)
+    _EXP_CMD_RE = re.compile(
+        r"(?:^|[;&|]\s*)(?:python3?|pwn|sage|z3|gdb|nc|netcat|socat|curl|wget|timeout\s+\S+\s+python3?)"
+        r"|^\s*\./", re.IGNORECASE)
+
+    @classmethod
+    def _is_read_like_shell(cls, command: str) -> bool:
+        return bool(cls._READ_CMD_RE.search(command or ""))
+
+    @classmethod
+    def _is_experiment_command(cls, command: str) -> bool:
+        return bool(cls._EXP_CMD_RE.search(command or ""))
+
+    @classmethod
+    def _classify_call(cls, name: str, raw_args: str) -> str:
+        """返回 experiment / read / other。experiment=能产出机器可判结果的动作。"""
+        name = (name or "").strip()
+        args = {}
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+        except (JSONDecodeError, TypeError):
+            args = {}
+        if name == "shell":
+            command = str(args.get("command") or "")
+            if cls._is_experiment_command(command):
+                return "experiment"
+            if cls._is_read_like_shell(command):
+                return "read"
+            return "other"
+        if name in ("tcp", "tcp_batch", "http_request", "http_batch", "netcheck", "crawl",
+                    "connect", "ssh", "start_instance", "submit_answer", "verify_answer"):
+            return "experiment" if name != "start_instance" else "other"
+        if name in ("elfpeek", "pwnrop", "hexpeek", "decode_blob", "unpack_archive",
+                    "list_challenge_attachments", "get_challenge"):
+            return "read"
+        return "other"
 
     @staticmethod
     def _role_context(challenge, sandbox: str | None = None) -> str:
