@@ -105,4 +105,10 @@ rev 提示词加了「静态优先 + 差分」顺序。
 - 该工具已接线到 `config/agent.json roles.pwn.local` 与 `crew.DEFAULT_ROLES` 兜底，白名单复用
   `LocalTools._call_domain_tool`（未登记实例仍被拒）；
 - 离线回归 `python tests/smoke_pwnsession.py`（本地菜单服务，不依赖平台）；
-- **真实赛题收益同样待验证**：需 LLM 额度恢复后用同一道 `easyROPtocol` 重跑对比「首次有效远端交互步数」。
+- **实测（轮 3/4，限额 80 万→50 万）**：`pwnsession` 首次调用即打通 TLS 握手并拿到 banner 243 B + 菜单
+  （轮 1 曾花 20+ 步找端点）；轮 4 交付「main 菜单分发 + submit 溢出精确偏移 + gadget 集」与 exploit 蓝图，
+  但仍未拿 flag，且 pwn 仍大量用 shell 重写 TLS 客户端（轮 3 72 次/轮 4 81 次）——已补「工具优先级」
+  与协调者「同一 objective 连派 ≤2 次」两条纪律。剩余卡点：headless 宿主机跑不了 pwntools exploit 脚本，
+  多轮交互式利用需要 `pwnsession` 支持 step 内变量/计算（见调研文档 §6）。
+- 两轮用量：轮 3 billed ~437k（人工停跑）；轮 4 billed 358,623 / raw 1,989,289，10 个协调步、
+  `coordinator_done` 主动收口；平台实例两次收尾均 `NOT_FOUND`（无残留、提交配额未动）。

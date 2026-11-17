@@ -102,6 +102,8 @@ def case_wiring() -> None:
     check("pwn 提示词提到 pwnsession 与示范流程",
           "pwnsession" in config["roles"]["pwn"]["system"]
           and "示范流程" in config["roles"]["pwn"]["system"])
+    check("pwn 提示词含「工具优先级」（网络走 pwnsession/tcp，shell 只做本地计算）",
+          "工具优先级" in config["roles"]["pwn"]["system"])
     check("rev 提示词含「差分」打法", "差分" in config["roles"]["rev"]["system"])
     check("rev.local 不泄漏 pwnsession（门禁按角色名单过滤）",
           "pwnsession" not in (config["roles"]["rev"]["local"] or []),

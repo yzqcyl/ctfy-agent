@@ -56,13 +56,35 @@
 | NextCTF-Agent 的本地 RAG 知识库 | 需要 embedding 模型与向量库（非 stdlib），收益不确定；我们的 `method_cards` + 方向提示词已覆盖「按题型推打法」 |
 | 反编译器（decompile） | 纯 stdlib 没有可用反编译器；`elfpeek view=disasm` + 调用点/引用导航是目前性价比最高的替代 |
 
-## 5. 下一步（待 LLM 额度恢复后验证）
+## 5. 实测（轮 3 / 轮 4，easyROPtocol，LLM 403 已解除后）
 
-- 用同一道 ctf2 `easyROPtocol`（Medium PWN，TLS 菜单题）重跑：观察 pwn 专家是否在第 2-4 步就用 `pwnsession` 建立会话、是否不再找 gdb/state.json；
-- 指标：达到「首次有效远端交互」的步数、拿不到 flag 时的卡点是否前移（从「找端点」变成「协议/利用本身」）；
-- 若交互工具确实降低步数，再考虑把 `pwnsession` 泛化给 misc/crypto 的 nc 式题（门禁不变）。
+> 说明：轮 3 之前两轮分别因为「专家简报缺实例端点」和「LLM 403」没跑起来；轮 3/4 是第一次带着
+> `pwnsession` + 新提示词真打。两轮都**没拿到 flag**，但把卡点从「环境」推到了「利用本身」。
 
-## 6. 来源
+| 轮次 | 配置 | 结果 | 关键观测 |
+|---|---|---|---|
+| #3 | 32 步 / 80 万 token | 中途人工停跑（已花 ~437k billed，55%） | `pwnsession` 首次调用即拿到 **TLS banner 243 B + 菜单**（协议握手打通）；但 pwn 仍用 `shell` 写 ssl/socket 脚本反复跑（72 次 shell 调用），协调者把「摸协议」原样连派十几次，烧到 40 万 token 仍在同一假设上打转 |
+| #4 | 24 步 / 50 万 token | `coordinator_done`（协调者主动收口），无 flag | 打补丁后又跑：pwn 用 `pwnsession` 3 次 + `elfpeek` 16 次 + `pwnkit`/`pwnrop`，交付「main 菜单分发 + submit 溢出精确偏移 + 唯一可用 gadget 集」+ 可续做 exploit 蓝图；billed 358,623 / raw 1,989,289，10 个协调步 |
+
+补丁（轮 3 之后加，已随代码提交）：
+- pwn 提示词加【工具优先级】：与实例的交互一律走 `pwnsession`/`tcp`（走白名单），**不要**用 shell 写 TLS 客户端；
+  shell 只做本地静态计算；静态解析用 elfpeek 多视图，别拼 grep/sed。
+- 协调者加规则 5：同一角色、同一 objective 最多连派 2 次，第 3 次必须换假设/换角色/收口。
+
+结论：
+1. **交互式工具确实有效**：轮 3 第一次远程交互就拿到 banner 与菜单，此前轮 1 花 20+ 步找地址、轮 2 没跑起来；
+2. 剩余卡点变成「本地跑不了 pwntools exploit 脚本」（headless Windows 无 pwn 模块）+「多轮交互式利用」——
+   `pwnsession` 目前是「发死 payload」，还不能在会话里跑计算；下一步优先给 `pwnsession` 加
+   「send 模板 + 计算变量」（或允许容器内跑脚本），而不是继续加提示词。
+
+## 6. 下一步
+
+- 若交互工具方向继续投入：给 `pwnsession` 加 step 级变量/计算（如 `{"send_hex": "{pack(overflow)}"}`），
+  让 offset→payload→发送在**一次会话内**完成，避免「本地算不出/发不出」的断点；
+- 若不再投入：当前状态下这题的天花板就是「静态事实完整、利用未打通」，需要在容器内（有 pwntools）跑脚本才能闭环；
+- 可把 `pwnsession` 泛化给 misc/crypto 的 nc 式题（门禁不变）。
+
+## 7. 来源
 
 - EnIGMA 论文：<https://arxiv.org/abs/2409.16165>｜项目页（含 Benchmark 结果与 IAT 说明）：<https://enigma-agent.com/>
 - SWE-agent 0.7（EnIGMA 实现所在仓库）：<https://github.com/SWE-agent/SWE-agent/tree/v0.7>
