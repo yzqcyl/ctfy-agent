@@ -68,3 +68,28 @@ ghidra_decompile <binary> --limit 60 --timeout 600
   先出伪代码再定点读，比逐段反汇编省 10 倍步数"；
 - 题面/环境提示：rev 隔离彩排的题面会告知 `ghidra_decompile` 可用；
 - 真实 VPS 上跑 `ghidra_setup.sh` 即可获得同样能力（需 ~1.1GB 磁盘）。
+## 追加：团队资产 `rev_ft_helpers.py` + rev 第三轮（800k）
+
+按"先做 2"（先造资产再续跑）执行：
+
+**资产**：`runs/_tpctf/l2_assets/rev_ft_helpers.py`（随包发布，隔离沙盒自动拷入）
+- ctypes 封装 libfreetype：`axis_info()`（fvar 24 轴）、`FreeTypeFont`（`set_design_coords` /
+  `outline_points` / `glyph_index`）、`hex_to_coords()`（nibble n → n<<16）、`grid_check()`
+  （x≤960 且 x%64==0）、`delta_matrix()`、`solve_linear()`（Fraction 精确高斯消元）；
+- 自检：`python3 rev_ft_helpers.py challenge.ttf A` → axis_count=24、n_points=68、
+  与 checker 的 "点数 ≥0x44" 完全对上。
+
+**rev3（继续 rev2 沙盒 + 资产，800k/45min）**：794,637 tok / 129 calls，未解出、无提交；
+环境错误 0 / 命令错误 2（agent 自己脚本）；工具 shell 121 / write_file 30 / hexpeek 1。
+- 新事实：objdump 逐字锁定判定分支（x ≤ 960 且 x%64==0、n_points ≥ 0x44、'ltuo' 标签）；
+  修正前几轮"x-grid vs y-delta"矛盾；沙盒留 asm.txt/dec.txt；
+- 未完成：还差"x 是否真随输入变化"的实测确认与求解。
+
+**离线探针（不花 LLM token，直接用资产跑）**：对 0 输入 vs 随机 24-nibble 输入比较 outline：
+- **x 坐标与输入无关**（x相同=True）；y 随输入变化（hinting flags=0 时 14 个点不同）；
+  flags=FT_LOAD_NO_HINTING 时 y 也不变；
+- 在 ppem 8/16/24/32/48/64 × flags {0, NO_HINTING, 0x8088, 0x8000} 全部组合下，
+  x 都**不满足** 64 网格（如 ppem32: x=102/163/204/266…）。
+- 推论：要么 checker 实际遍历的是 x/y 交替的 8 字节槽（条件同时作用于 y），要么它用的
+  char/字号/load flags 与默认不同；下一轮应先打印 glyph_index/charmap、再用 ctypes 或 gdb
+  实测 checker 循环里那 16 个 long 到底是 x 还是 x/y 混合，再决定求解空间（z3 或随机重启）。
