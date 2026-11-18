@@ -95,6 +95,25 @@ def main() -> int:
     lg.record("http_request", {"url": "http://t/x"}, '{"body":"FLAG{real1}"}')
     check("只凭记忆拼 flag 仍拒绝", lg.verify_evidence("FLAG{real2}") is None)
 
+    # 2026-11-18 P1：近似逐字兜底（长证据改 1 个字符仍接受）与「拼行」分片兜底
+    lg = _ledger()
+    lg.record("http_request", {"url": "http://t/long"},
+              'result: token=abcdefghijklmnopqrstuvwx end')
+    check("近似逐字（1 字符差异）接受",
+          lg.verify_evidence("result: token=abcdefghijklmnopqrstuvwz end") is not None)
+    check("近似逐字：改写措辞仍拒绝",
+          lg.verify_evidence("completely different words here 999") is None)
+
+    from ctfy_agent.solver import Solver  # noqa: PLC0415
+
+    lg = _ledger()
+    lg.record("shell", {"command": "cat a"}, "alpha line with enough length 1111")
+    lg.record("shell", {"command": "cat b"}, "beta line with enough length 2222")
+    spliced = "alpha line with enough length 1111\nbeta line with enough length 2222"
+    check("整段拼接不是逐字子串", lg.verify_evidence(spliced) is None)
+    chunks = Solver._evidence_chunks(spliced, "")
+    check("分片能切出真实行", any(lg.verify_evidence(c) for c in chunks), str(chunks[:3]))
+
     print()
     if FAILS:
         print(f"失败 {len(FAILS)} 项: {FAILS}")

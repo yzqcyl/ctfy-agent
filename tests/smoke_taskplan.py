@@ -77,19 +77,19 @@ def test_pure() -> None:
     ranked = [row["id"] for row in taskplan.rank(rows, elapsed_ratio=0.6)]
     check("EV 排序：hard0 沉底", ranked[-1] == "hard0", str(ranked))
 
-    check("难度 cap：easy/medium/hard/unknown", (
-        taskplan.token_cap({"difficulty": "easy"}) == 250_000
-        and taskplan.token_cap({"difficulty": "medium"}) == 350_000
-        and taskplan.token_cap({"difficulty": "hard"}) == 600_000
-        and taskplan.token_cap({"difficulty": "?"}) == taskplan.FALLBACK_CAP))
-    check("near-miss 加注 50%",
-          taskplan.token_cap({"difficulty": "medium"}, near_miss=True) == 525_000)
+    check("难度 cap：easy/medium/hard/unknown 全部 800k（2026-11-18 全开）", (
+        taskplan.token_cap({"difficulty": "easy"}) == 800_000
+        and taskplan.token_cap({"difficulty": "medium"}) == 800_000
+        and taskplan.token_cap({"difficulty": "hard"}) == 800_000
+        and taskplan.token_cap({"difficulty": "?"}) == taskplan.FALLBACK_CAP == 800_000))
+    check("near-miss 加注但封顶 800k",
+          taskplan.token_cap({"difficulty": "medium"}, near_miss=True) == 800_000)
 
     unlimited = taskplan.plan(rows)
     check("不限池（默认）：quota=难度 cap、按 EV 排序",
-          [p["id"] for p in unlimited][0] == "easy1"
-          and unlimited[0]["quota"] == 250_000
-          and unlimited[-1]["quota"] == 600_000,
+          [p["id"] for p in unlimited][0] == "med2"
+          and unlimited[0]["quota"] == 800_000
+          and unlimited[-1]["quota"] == 800_000,
           str([(p["id"], p["quota"]) for p in unlimited]))
 
     limited = taskplan.plan(rows, pool=2_000_000, reserve_ratio=0.1)
@@ -241,16 +241,16 @@ def test_wiring() -> None:
     }
     events, platform = run_batch(rows)
     order = [e[1]["id"] for e in events if e[0] == "task_start"]
-    check("solve_many 按 EV 重排执行顺序", order == ["CH-EASY", "CH-MED", "CH-HARD"], str(order))
+    check("solve_many 按 EV 重排执行顺序", order == ["CH-MED", "CH-EASY", "CH-HARD"], str(order))
 
     caps = {item["id"]: item["cap"] for item in FakeCrew.seen}
     check("每题 quota 落成 config.max_tokens_per_challenge",
-          caps == {"CH-EASY": 250_000, "CH-MED": 350_000, "CH-HARD": 600_000}, str(caps))
-    check("GUI 批量不再用 800k 全局上限", all(c < 800_000 for c in caps.values()), str(caps))
+          caps == {"CH-EASY": 800_000, "CH-MED": 800_000, "CH-HARD": 800_000}, str(caps))
+    check("GUI 批量单题上限 = 800k（2026-11-18 全开）", all(c == 800_000 for c in caps.values()), str(caps))
 
     batches = [e[1] for e in events if e[0] == "batch_note"]
     check("batch_note 报告 EV 排序与上限",
-          any("按 EV 排序" in str(b) and "250k" in str(b) for b in batches), str(batches)[:300])
+          any("按 EV 排序" in str(b) and "800k" in str(b) for b in batches), str(batches)[:300])
 
     done = [e[1] for e in events if e[0] == "task_done"]
     check("3 题都回调 task_done", len(done) == 3, str(len(done)))
@@ -270,7 +270,7 @@ def test_wiring() -> None:
         answers_by_qid={"flag1": "x"})}
     run_batch(part)
     caps_part = [item["cap"] for item in FakeCrew.seen]
-    check("near-miss 题 quota 加注 50%（350k → 525k）", caps_part == [525_000], str(caps_part))
+    check("near-miss 题 quota 加注后仍封顶 800k", caps_part == [800_000], str(caps_part))
 
     # deadline 透传：单题仍拿得到 cancel_event（计时器装上）
     run_batch(rows, budget_tokens=50_000, deadline=None)

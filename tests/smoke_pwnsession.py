@@ -209,6 +209,21 @@ def case_errors() -> None:
         except (DomainToolError, ToolError) as exc:
             check(label, True, str(exc)[:80])
 
+    # 2026-11-18 P1：缺/错 host·port 时，错误必须告诉模型「从 access_url 里取」
+    for label, args in (
+        ("端口 0 报错并提示 access_url",
+         {"host": "127.0.0.1", "port": 0, "steps": [{"wait": 0.01}]}),
+        ("端口空串报错并提示 access_url",
+         {"host": "127.0.0.1", "port": "", "steps": [{"wait": 0.01}]}),
+        ("缺 host 报错并提示 access_url",
+         {"port": 9, "steps": [{"wait": 0.01}]}),
+    ):
+        try:
+            call_domain("pwnsession", args)
+            check(label, False, "没有抛异常")
+        except (DomainToolError, ToolError) as exc:
+            check(label, "access_url" in str(exc), str(exc)[:120])
+
 
 def case_whitelist() -> None:
     from ctfy_agent.tools_local import LocalTools  # noqa: PLC0415

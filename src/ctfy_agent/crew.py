@@ -292,6 +292,18 @@ def _strategy_nudge(prior: list[str]) -> str:
     )
 
 
+# ---------- P0：预算 ≥80% 强制收口提交候选（2026-11-18） ----------
+# 实证：Linux 批次 4 题里 3 题烧到 100% 才停，attempts=0 —— 一个候选都没交。
+# 这里做成「确定性护栏」而不是又一句提示：
+#   80% 起每轮注入硬规则（只准 submit 账本候选，禁止再开新面）；
+#   90% 起或提示 2 轮仍未提交 → 代码直接交最有把握的候选（受平台 submit_limit 约束，交过就停）。
+_FORCE_SUBMIT_HINT = (
+    "[强制收口·预算已用 ≥80%] 硬规则：下一动作**只能是 submit**。\n"
+    "候选（账本逐字收录）：{cands}\n"
+    "禁止 delegate / shell / 开新攻击面；没有候选就立刻用 report 交付卡点。\n"
+    "预算耗尽前不提交 = 这一题 0 分。"
+)
+
 # ---------- 候选闸门 + 假设收敛（v3 P0） ----------
 # 实测三臂（SAMPLE-009 crew 806k / AGENTBENCH-002 crew 804k / SAMPLE-009 solo 642k）
 # 全部 attempts=0、oracle_calls=0、observations=0：agent 在「探测」层无限打转，从不进入
@@ -1327,6 +1339,7 @@ class Crew:
 
         # 候选闸门 / 假设收敛 状态（v3 P0）
         done_blocks = 0
+        force_submit_rounds = 0  # P0：预算≥80% 强制提交候选的轮次计数
         idle_nudges = 0  # [fix 2026-11-05 P1] 空动作早停守卫计数
         last_open = -1
         last_refuted = -1
@@ -1452,6 +1465,40 @@ class Crew:
                     self.store.append_transcript(
                         challenge_id, {"role": "coordinator", "step": rnd, "budget": budget_line}
                     )
+                # [P0 2026-11-18] ≥80%：把「强制提交候选」做成确定性护栏（不再只是话术）。
+                if not submitted and BudgetPhase.must_submit(
+                        getattr(coordinator, "budget", None), _base_total, _base_calls):
+                    _live = [c for c in _ledger_candidates(ledger) if c not in refuted_values]
+                    if _live:
+                        if force_submit_rounds == 0:
+                            _shown = "、".join(f"`{c}`" for c in _live[:3])
+                            messages.append({"role": "user",
+                                             "content": _FORCE_SUBMIT_HINT.format(cands=_shown)})
+                            self.store.append_transcript(
+                                challenge_id,
+                                {"role": "gate", "step": rnd,
+                                 "note": f"[强制收口] 预算≥80%：注入「必须提交」，候选 {len(_live)} 个"},
+                            )
+                        force_submit_rounds += 1
+                        _ratio = BudgetPhase.ratio(getattr(coordinator, "budget", None),
+                                                   _base_total, _base_calls) or 0.0
+                        if _ratio >= 0.90 or force_submit_rounds >= 2:
+                            for _cand in _live[:2]:
+                                try:
+                                    _txt, _ok = solver._submit({"answer": _cand}, challenge_id)
+                                except Exception as exc:  # noqa: BLE001 - 提交异常不能毁 run
+                                    _txt, _ok = f"submit 异常：{exc}", False
+                                self.store.append_transcript(
+                                    challenge_id,
+                                    {"role": "gate", "step": rnd,
+                                     "note": f"[强制收口] 自动提交 {_cand!r} → {_txt[:180]}"},
+                                )
+                                if _ok:
+                                    submitted = True
+                                    reason = "forced_submit_at_budget"
+                                    break
+                            if submitted:
+                                break
                 try:
                     messages = _compact_history(messages, self.config.max_context_tokens)
                     response = _chat_with_recovery(

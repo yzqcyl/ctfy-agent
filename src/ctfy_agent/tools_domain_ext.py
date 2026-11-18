@@ -136,6 +136,27 @@ def _recv_until(sock: socket.socket, expect: bytes | None, read_timeout: float, 
     return buf
 
 
+def _require_endpoint(host: object, port: object, *, tool: str) -> None:
+    """host/port 前置校验（P1 2026-11-18）。
+
+    实测模型会把 port 传成 0/空（忘了从实例回执的 access_url 取），旧报错只有「端口非法：0」，
+    模型看不出怎么改 → 原样重试又被 ledger 拦。这里把「从哪取」直接写进错误文案。
+    """
+    hp = str(host or "").strip()
+    if not hp:
+        raise DomainToolError(
+            f"{tool} 缺少 host：请从本题实例回执的 access_url（形如 "
+            "`<id>.tcp-ctf2.dasctf.com:9999`）里取主机名传入。")
+    try:
+        pnum = int(str(port).strip())
+    except (TypeError, ValueError):
+        pnum = 0
+    if not (0 < pnum < 65536):
+        raise DomainToolError(
+            f"{tool} 端口非法（收到 {port!r}）：请把 access_url 冒号后的数字端口传进来"
+            "（例如 9999）。别传 0、空串或整条 URL；也不要猜端口。")
+
+
 def tcp(host: str, port: int, payload: str = "", hex_mode: bool = False,
         expect: str = "", read_timeout: float = 3.0, max_recv: int = 4096,
         total_timeout: float = 20.0, tls: bool = False, sni: str = "") -> str:
@@ -145,8 +166,7 @@ def tcp(host: str, port: int, payload: str = "", hex_mode: bool = False,
     expect 非空时，收到该子串立即返回（服务端有 banner/多段输出时省时间）。
     tls=true 时做 TLS 握手（平台 access=tls_sni 的 443 接入），sni 默认为 host。
     """
-    if not (0 < int(port) < 65536):
-        raise DomainToolError("端口非法：%r" % (port,))
+    _require_endpoint(host, port, tool="tcp")
     if hex_mode:
         try:
             raw = bytes.fromhex(payload.strip())
@@ -359,8 +379,7 @@ def pwnsession(host: str, port: int, steps: list, tls: bool = False, sni: str = 
       {"wait": 1.5}               本步读多久（默认 read_timeout）
     典型菜单题：steps=[{"send":"1\n","expect":">>"},{"send_hex":"<payload>"},{"wait":1}]
     """
-    if not (0 < int(port) < 65536):
-        raise DomainToolError("端口非法：%r" % (port,))
+    _require_endpoint(host, port, tool="pwnsession")
     if not isinstance(steps, list) or not steps:
         raise DomainToolError("steps 必须是非空数组（每项 {send|send_hex|expect|wait}）")
     if len(steps) > 40:

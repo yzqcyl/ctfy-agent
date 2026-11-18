@@ -86,6 +86,15 @@ def case_progress(tmp: Path) -> None:  # noqa: ARG001
     line = BudgetPhase.line(_B(400_000, 32, 500_000))
     assert "收口期" in line and "80%" in line and "禁止开辟新攻击面" in line, line
 
+    # 7b) 2026-11-18 P0：≥80% 强制提交判定（crew 用它做确定性护栏）
+    assert BudgetPhase.ratio(_B(400_000, 32, 500_000)) == 0.8
+    assert BudgetPhase.must_submit(_B(400_000, 32, 500_000)) is True
+    assert BudgetPhase.must_submit(_B(399_999, 32, 500_000)) is False
+    assert BudgetPhase.must_submit(None) is False
+    assert BudgetPhase.must_submit(_B(100, 1, 0)) is False
+    # 重跑口径：本轮 allowance=100k，已烧 80k → 80% 触发
+    assert BudgetPhase.must_submit(_B(480_000, 1, 500_000), base_total=400_000) is True
+
     # 8) 接线仍在（防回退）：solver 两条路径 + crew 协调者都应引用 progress
     solver_src = (ROOT / "src" / "ctfy_agent" / "solver.py").read_text(encoding="utf-8")
     crew_src = (ROOT / "src" / "ctfy_agent" / "crew.py").read_text(encoding="utf-8")

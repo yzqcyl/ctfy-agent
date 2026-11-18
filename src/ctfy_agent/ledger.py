@@ -613,6 +613,32 @@ class Ledger:
             for inner in _decoded_strings(item.raw):
                 if raw_evidence in inner or (folded and folded in _fold_key(inner)):
                     return item.label
+        # [P1 2026-11-18] 近似逐字兜底：模型抄长文本时常改一两个字符。只对 ≥24 字符的证据做
+        # 相似度比较（阈值 0.92），避免把「概括」当证据放行。
+        if len(folded) >= 24:
+            import difflib  # noqa: PLC0415 - 只在兜底路径用
+
+            best, best_label = 0.0, None
+            win = len(folded)
+            for item in reversed(self.order):
+                if not item.raw:
+                    continue
+                for hay in [item.raw, *_decoded_strings(item.raw)]:
+                    hay_folded = _fold_key(hay)
+                    if len(hay_folded) < 24:
+                        continue
+                    step = max(1, win // 2)
+                    for start in range(0, max(1, len(hay_folded) - win + 1), step):
+                        seg = hay_folded[start:start + win]
+                        ratio = difflib.SequenceMatcher(None, folded, seg).ratio()
+                        if ratio > best:
+                            best, best_label = ratio, item.label
+                    if best >= 0.995:
+                        break
+                if best >= 0.995:
+                    break
+            if best >= 0.92 and best_label:
+                return best_label
         return None
 
     # ---- 假设轮换 ----

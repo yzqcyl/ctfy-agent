@@ -239,6 +239,30 @@ class BudgetPhase:
 
     CONVERGE_AT = 0.50   # 已用 ≥50%：转向收敛（对应 §10.7 方案的 50% 收敛候选）
     CLOSE_AT = 0.75      # 已用 ≥75%：收口（对应 75% 禁新探索）
+    # [P0 2026-11-18] ≥80%：crew 不再只提示，而是强制提交已有候选并禁止开新面。
+    # 依据：Linux 批次 4 题里 3 题烧到 100% 才停、attempts=0，候选白扔。
+    FORCE_SUBMIT_AT = 0.80
+
+    @staticmethod
+    def ratio(budget, base_total: int = 0, base_calls: int = 0) -> float | None:
+        """返回「本轮已用比例」（0~1）；无 token 上限时 None。与 line() 的分母口径一致。"""
+        if budget is None:
+            return None
+        cap = int(getattr(budget, "max_tokens", 0) or 0)
+        if cap <= 0:
+            return None
+        base_total = max(0, int(base_total or 0))
+        total = int(budget.total_tokens or 0)
+        if base_total > 0:
+            allowance = max(0, cap - base_total)
+            return ((max(0, total - base_total)) / allowance) if allowance > 0 else 1.0
+        return total / cap
+
+    @staticmethod
+    def must_submit(budget, base_total: int = 0, base_calls: int = 0) -> bool:
+        """已用 ≥ FORCE_SUBMIT_AT → True（crew 据此强推候选提交，见 _FORCE_SUBMIT_HINT）。"""
+        r = BudgetPhase.ratio(budget, base_total, base_calls)
+        return r is not None and r >= BudgetPhase.FORCE_SUBMIT_AT
 
     @staticmethod
     def line(budget, base_total: int = 0, base_calls: int = 0) -> str | None:

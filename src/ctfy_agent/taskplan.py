@@ -23,11 +23,11 @@ from typing import Any, Iterable
 
 # 单题 token 上限（难度 cap）。这是"最多给一题烧多少"，不是"预期用量"；
 # 预计用量见 EST_TOKENS（只进 EV 分母，不影响真实上限）。
-DIFFICULTY_CAPS: dict[str, int] = {"easy": 250_000, "medium": 350_000, "hard": 600_000}
-FALLBACK_CAP = 300_000
+DIFFICULTY_CAPS: dict[str, int] = {"easy": 800_000, "medium": 800_000, "hard": 800_000}
+FALLBACK_CAP = 800_000
 
 # EV 分母用的"预计开销"（沿用 policy.py 的难度时长 × 每分钟 token 直觉）。
-EST_TOKENS: dict[str, int] = {"easy": 150_000, "medium": 350_000, "hard": 600_000}
+EST_TOKENS: dict[str, int] = {"easy": 800_000, "medium": 800_000, "hard": 800_000}
 FALLBACK_EST = 300_000
 
 # 已有候选/near-miss 的题加注 50%（不突破难度 cap × 1.5）
@@ -132,7 +132,8 @@ def token_cap(row: dict, *, near_miss: bool = False) -> int:
     """单题 token 上限：难度 cap（near-miss 加注 50%，仍不突破 cap×1.5）。"""
     cap = DIFFICULTY_CAPS.get(normalize_difficulty(row.get("difficulty")), FALLBACK_CAP)
     if near_miss:
-        cap = int(round(cap * NEAR_MISS_BONUS))
+        # near-miss 加注 50%，但**任何情况下单题不超过 800k**（2026-11-18 用户定：预算全开 800k）
+        cap = min(int(round(cap * NEAR_MISS_BONUS)), 800_000)
     return int(cap)
 
 

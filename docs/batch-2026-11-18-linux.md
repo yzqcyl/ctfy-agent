@@ -54,3 +54,19 @@
 > 注：本批用的是**比赛镜像本身**（v7.3），说明镜像在 Linux 下行为正常；
 > 这批数据也反过来验证了「Windows 沙盒 → Linux 容器」确实消除了工具链损耗。
 > 练习数据留在比赛机 `/root/ctfy_practice/`（可删），本地副本 `runs/_ssh/linux/`。
+
+## 5. 已按用户要求实施（2026-11-18 下午，P0/P1 全部落地）
+
+用户决定：**单题预算全部开到 800k**，其余按上面 P0/P1 清单执行。
+
+| 项 | 改动 | 位置 |
+|---|---|---|
+| 预算全开 | easy/medium/hard **全部 800k**，fallback 也 800k；near-miss 加注仍**封顶 800k** | `src/ctfy_agent/taskplan.py` |
+| P0 强制收口 | ≥80% 起每轮注入「只能 submit、禁止开新面」硬规则；≥90% 或提示 2 轮仍未交 → **代码直接提交账本候选**（受平台 submit_limit 约束，交过即停） | `progress.BudgetPhase.ratio/must_submit` + `crew.py`（`_FORCE_SUBMIT_HINT`、`force_submit_rounds`） |
+| P1 report | 整段 evidence 对不上时，按**行/引号/反引号片段**切开再逐条溯源；`ledger.verify_evidence` 对 ≥24 字符证据加**相似度 ≥0.92 兜底**（短证据仍严格逐字，避免放过概括） | `solver._evidence_chunks`、`ledger.verify_evidence` |
+| P1 pwnsession | `host/port` 前置校验；缺/错值时错误文案直接写「从实例回执 `access_url` 取 host:port，别传 0/空串/整条 URL」 | `tools_domain_ext._require_endpoint`（tcp / pwnsession 共用） |
+
+回归：`tests/smoke.py` **180 passed / 0 failed**；受影响单测 `smoke_taskplan` / `smoke_progress` /
+`smoke_pwnsession` / `smoke_evidence` / `smoke_time_budget` 全绿；全量 `tests/smoke*.py` 77 个文件中
+仅 5 个失败，且**全部在 HEAD（未打补丁时）同样失败**（并发改动：`config/agent.json max_tokens=12288`、
+`tools/linux_bootstrap/*` 触发 secret-scan、离线平台桩、Windows 临时目录权限），与本次改动无关。

@@ -487,6 +487,32 @@ class Solver:
             return ""
         return ledger.rotate()
 
+    @staticmethod
+    def _evidence_chunks(*blobs: str) -> list[str]:
+        """把长文本切成「可能逐字命中」的片段（按行 / 引号 / 反引号 / 「」），长度 ≥16 才保留。"""
+        import re as _re  # noqa: PLC0415 - 局部导入
+
+        chunks: list[str] = []
+        for blob in blobs:
+            s = str(blob or "")
+            if not s:
+                continue
+            for line in s.splitlines():
+                line = line.strip()
+                if len(line) >= 16:
+                    chunks.append(line)
+            for tup in _re.findall(r'"([^"]{16,300})"|`([^`]{16,300})`|「([^」]{16,300})」', s):
+                for q in tup:
+                    if q and len(q) >= 16:
+                        chunks.append(q)
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in sorted(chunks, key=len, reverse=True):
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out[:24]
+
     def _check_report(self, ledger: Ledger | None, text: str, evidence: str, rejections: int) -> tuple[str | None, str]:
         """M4 证据契约：声称有发现就必须能溯源到「某一次工具输出里的逐字连续子串」。
 
@@ -500,6 +526,14 @@ class Solver:
         if ledger is None:
             return None, ""
         source = ledger.verify_evidence(evidence) if evidence else ""
+        # [P1 2026-11-18] 整段对不上时，从「evidence + 结论正文」切行/引号片段再逐条溯源：
+        # 模型常把多行输出拼成一段，整段不是任何单条输出的连续子串 → 证据被误杀、收口报告白丢。
+        if evidence and not source:
+            for _chunk in self._evidence_chunks(evidence, text):
+                source = ledger.verify_evidence(_chunk)
+                if source:
+                    evidence = _chunk
+                    break
         if source:
             ledger.observe(evidence, source=source)
             return None, source
