@@ -25,6 +25,7 @@ from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -722,6 +723,33 @@ TRAFFIC_SPEC = {
     },
 }
 
+PWNLOCAL_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "pwnlocal",
+        "description": (
+            "在本解题容器里**本地运行**附件二进制（Linux；比远端盲试可靠得多）："
+            "可喂 stdin（hex/文本）、传 argv、限时；gdb=true 时用 gdb -batch 跑一遍并回"
+            "寄存器/崩溃指令/调用栈/内存映射。ELF 直接原生跑（含 32 位静态），"
+            "本地验证过偏移/崩溃/exp 再打远端；本地跑不起来的（.exe/.apk）会明确报错。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "附件路径（相对本题沙盒根）"},
+                "stdin_hex": {"type": "string", "description": "喂给 stdin 的 hex（如 41414141）"},
+                "stdin_text": {"type": "string", "description": "喂给 stdin 的文本（与 stdin_hex 二选一）"},
+                "argv": {"type": "array", "items": {"type": "string"}, "description": "命令行参数"},
+                "timeout": {"type": "integer", "default": 10},
+                "gdb": {"type": "boolean", "default": False, "description": "用 gdb -batch 跑并抓寄存器/崩溃点"},
+                "gdb_cmds": {"type": "array", "items": {"type": "string"},
+                             "description": "gdb 额外命令（如 ['info registers','bt']）"},
+            },
+            "required": ["path"],
+        },
+    },
+}
+
 SHELL_SPEC = {
     "type": "function",
     "function": {
@@ -1046,6 +1074,7 @@ class LocalTools:
             specs.append(CHAT_SPEC)
         if self.allow_shell:
             specs.append(SHELL_SPEC)
+            specs.append(PWNLOCAL_SPEC)  # 本地运行附件 + gdb 批处理（PWN/REV 共用）
         specs.append(FUZZ_SPEC)  # ffuf 封装；按角色可见性由 crew._role_specs 的 local 名单过滤
         specs.append(AUTHDIFF_SPEC)  # P3：越权/鉴权对照探针
         specs.append(JSRECON_SPEC)   # P3：JS 静态侦察
@@ -2943,6 +2972,95 @@ class LocalTools:
                     "只用本题沙盒根目录下的附件与你自己写的文件。"
                 )
         return ""
+
+    # ---------- 本地运行/调试（PWN/REV） ----------
+
+    _PWNLOCAL_GDB_DEFAULT = [
+        "set pagination off",
+        "set confirm off",
+        "info registers",
+        "x/12i $pc",
+        "bt",
+        "info proc mappings",
+    ]
+
+    def pwnlocal(self, path: str, stdin_hex: str = "", stdin_text: str = "",
+                 argv: list | None = None, timeout: int = 10, gdb: bool = False,
+                 gdb_cmds: list | None = None) -> str:
+        """在容器内本地运行附件（可选 gdb -batch），返回退出码/信号/输出/寄存器。
+
+        设计取舍：只用 stdlib；不引入 pwntools 依赖（镜像里有，但工具层保持可离线单测）。
+        """
+        import subprocess  # noqa: PLC0415 - 仅本地执行时需要
+
+        target = Path(self._resolve_path(path))
+        if not target.is_file():
+            raise ToolError(f"pwnlocal 找不到文件：{path}")
+        if os.name == "nt":
+            raise ToolError(
+                "pwnlocal 只在 Linux 容器里可用（当前是 Windows 开发机）。"
+                "本地 Windows 上请用 shell 跑 python 脚本；正式比赛/练习容器内可直接用。")
+        payload = b""
+        if stdin_hex:
+            try:
+                payload = bytes.fromhex("".join(str(stdin_hex).split()))
+            except ValueError as exc:
+                raise ToolError(f"stdin_hex 不是合法 hex：{exc}") from None
+        elif stdin_text:
+            payload = str(stdin_text).encode("utf-8", "surrogateescape")
+        args = [str(a) for a in (argv or [])]
+        try:
+            limit = max(1, min(int(timeout), 60))
+        except (TypeError, ValueError):
+            limit = 10
+        cmd = [str(target), *args]
+        gdb_infile = None
+        try:
+            if gdb:
+                gdb_bin = shutil.which("gdb")
+                if not gdb_bin:
+                    raise ToolError("容器里没有 gdb（镜像应内置 gdb 16.3）；py 结论请改用远端观测。")
+                gdb_infile = target.parent / "_pwnlocal_stdin.bin"
+                gdb_infile.write_bytes(payload)
+                cmds = ["set pagination off", "set confirm off", f"run < {gdb_infile}"]
+                cmds += [str(c) for c in (gdb_cmds or self._PWNLOCAL_GDB_DEFAULT)]
+                cmd = [gdb_bin, "-batch", "-q", "-nx"]
+                for c in cmds:
+                    cmd += ["-ex", c]
+                cmd += ["--args", str(target), *args]
+                if args:
+                    # gdb --args 已带参数；上面的 run < 已足够
+                    pass
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=str(target.parent), timeout=limit, capture_output=True,
+                    input=None if gdb else payload,
+                )
+            except subprocess.TimeoutExpired:
+                return f"[pwnlocal] 超时（>{limit}s）：{target.name}（可能是等待输入的服务）"
+            out = (proc.stdout or b"").decode("utf-8", "replace")
+            err = (proc.stderr or b"").decode("utf-8", "replace")
+            rc = proc.returncode
+            signal_note = f"signal={-rc} ({'-'}SIG)" if rc < 0 else f"exit={rc}"
+            head = (f"[pwnlocal] {target.name} gdb={bool(gdb)} {signal_note} "
+                    f"stdin={len(payload)}B argv={args}")
+            def _clip(s: str, n: int = 3000) -> str:
+                s = s.strip()
+                return s if len(s) <= n else s[:n] + f"\n…(截断，共 {len(s)} 字符)"
+            parts = [head]
+            if out.strip():
+                parts.append("--- stdout ---\n" + _clip(out))
+            if err.strip():
+                parts.append("--- stderr ---\n" + _clip(err))
+            if not out.strip() and not err.strip():
+                parts.append("(无输出：可能崩溃/信号终止，或程序等待输入)")
+            return "\n".join(parts)
+        finally:
+            if gdb_infile is not None:
+                try:
+                    gdb_infile.unlink()
+                except OSError:
+                    pass
 
     def shell(self, command: str, timeout: int = 60) -> str:
         if not self._warned_shell:

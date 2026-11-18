@@ -155,7 +155,7 @@ ROLE_MAX_STEPS = 40
 DEFAULT_ROLES: dict[str, dict] = {
     "coordinator": {"max_steps": ROLE_MAX_STEPS, "platform": ["read", "instance", "oracle", "submit"], "local": []},
     "web": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["get_challenge", "list_challenge_attachments", "download_challenge_attachment", "list_hints", "view_hint", "start_instance", "list_instance_attachments", "download_instance_attachment", "verify_answer", "verify_exploit"], "local": ["http_request", "udp"], "keep_tail": 5, "facts_max": 12, "facts_chars": 780},
-    "rev": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell", "fileview", "udp"], "keep_tail": 4},
+    "rev": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance"], "local": ["shell", "pwnlocal", "fileview", "udp"], "keep_tail": 4},
     "crypto": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True, "platform": ["read", "instance", "oracle"], "local": ["shell", "udp"]},
     "misc": {"max_steps": ROLE_MAX_STEPS, "allow_shell": False, "platform": ["read", "instance"], "local": ["http_request", "udp"]},
     # pwn/ai 与 config/agent.json 的 roles 键对齐：DEFAULT_ROLES 是「角色丢失时的兜底」，
@@ -163,7 +163,7 @@ DEFAULT_ROLES: dict[str, dict] = {
     # agent.json 之外没有任何兜底来源）。工具面按 agent.json 的同名角色抄全，避免兜底退化。
     "pwn": {"max_steps": ROLE_MAX_STEPS, "allow_shell": True,
             "platform": ["read", "instance"],
-            "local": ["shell", "fileview", "elfpeek", "pwnkit", "pwnsession", "tcp", "tcp_batch", "netcheck", "udp"]},
+            "local": ["shell", "pwnlocal", "fileview", "elfpeek", "pwnkit", "pwnsession", "tcp", "tcp_batch", "netcheck", "udp"]},
     # [web-ai-gap 2026-10-30] ai 兜底按 agent.json 抄全（开 shell、local 补 shell/decode_blob），
     # 避免 config 丢失时退化成「无载荷构造」的旧面。
     # platform 用组名：oracle 组 = verify_answer + verify_exploit，校验通道无需单列。
