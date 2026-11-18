@@ -43,14 +43,17 @@ CAT_ORDER = {"pwn": 0, "rev": 1, "crypto": 2, "misc": 3, "web": 4}
 DIFF_WALL = {"easy": 15, "medium": 25, "hard": 40}
 
 
-def _platform():
+def _platform(profile_name: str = "CTFY"):
+    """按指定 profile 连平台（必须显式指定：并行会话可能把 active 改成 ctf2）。"""
     from ctfy_agent.config import load  # noqa: PLC0415
     from ctfy_agent.gui import profiles  # noqa: PLC0415
     from ctfy_agent.platform import CtfyPlatform  # noqa: PLC0415
 
     cfg = load()
     data = profiles.load()
-    name = data.get("active") or "CTFY"
+    name = str(profile_name or "CTFY").strip()
+    if name not in (data.get("profiles") or {}):
+        raise SystemExit(f"profile {name!r} 不存在；可选：{sorted((data.get('profiles') or {}))}")
     prof = (data.get("profiles") or {}).get(name) or {}
     profiles.apply(cfg, prof)
     p = CtfyPlatform(cfg.mcp_url, cfg.token, timeout=60, connect_timeout=25,
@@ -176,7 +179,7 @@ def monitor(run_dir: Path, log: Path, stop_when) -> None:
 
 
 def cmd_plan(args) -> int:
-    platform = _platform()
+    platform = _platform(args.profile)
     rows = fetch_challenges(platform, args.competition_id)
     print(f"抓到 {len(rows)} 题")
     for r in rows:
@@ -203,7 +206,7 @@ def cmd_run(args) -> int:
             print(f"[wait] 距开赛 {left/60:.1f} 分钟", flush=True)
             time.sleep(min(120, max(5, left)))
     # 2) 重新抓题（题目开盘才公布）
-    platform = _platform()
+    platform = _platform(args.profile)
     rows = []
     for attempt in range(10):
         rows = fetch_challenges(platform, args.competition_id)
