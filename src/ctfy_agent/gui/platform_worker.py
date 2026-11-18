@@ -75,6 +75,16 @@ def _arm_budget(global_cancel: threading.Event, minutes: int | None,
     return ev, True
 
 
+def _is_transient_net(message: str) -> bool:
+    """平台/网关瞬断判定（供单题重试用）。确定性错误（401/404/参数错）不重试。"""
+    msg = str(message).lower()
+    return any(key in msg for key in (
+        "remote end closed", "connection reset", "connection aborted", "eof occurred",
+        "incompleteread", "broken pipe", "timed out", "timeout", "502", "503", "504",
+        "bad gateway", "service unavailable", "temporarily unavailable",
+    ))
+
+
 def _platform(config, verbose: bool = False, cancel=None):
     from ..cli import make_platform  # noqa: PLC0415
     from .platform_adapter import install  # noqa: PLC0415
@@ -680,6 +690,8 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                     return {"id": cid, "ok": False, "flag": "",
                             "note": "不可玩：" + "；".join(blocked), "skipped": True}
 
+                transient_retried: set[str] = set()
+
                 def on_event(kind, payload=None):  # noqa: ANN001
                     data = dict(payload or {})
                     data["_cid"] = cid  # 并发时让界面能标出属于哪一题
@@ -736,7 +748,15 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 return {"id": cid, "ok": ok, "flag": flag, "note": note,
                         "presolved": presolved}
             except Exception as exc:  # noqa: BLE001 - 单题失败不中断批量
-                return {"id": cid, "ok": False, "flag": "", "note": str(exc)[:200]}
+                # [P1 2026-11-18] 平台瞬断（Remote end closed / 连接重置）不该让整题报废：
+                # 同一题隔 10s 重试一次（Linux 批次实测 baby_rop 32s 被瞬断判死，白丢一题）。
+                msg = str(exc)
+                if _is_transient_net(msg) and cid not in transient_retried:
+                    transient_retried.add(cid)
+                    q.put(("batch_note", f"[{cid}] 平台瞬断（{msg[:60]}），10s 后整题重试一次"))
+                    time.sleep(10)
+                    return work(item, i)
+                return {"id": cid, "ok": False, "flag": "", "note": msg[:200]}
 
         results: list[dict] = []
         stop_after = stop_after or threading.Event()

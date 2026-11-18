@@ -70,3 +70,31 @@
 `smoke_pwnsession` / `smoke_evidence` / `smoke_time_budget` 全绿；全量 `tests/smoke*.py` 77 个文件中
 仅 5 个失败，且**全部在 HEAD（未打补丁时）同样失败**（并发改动：`config/agent.json max_tokens=12288`、
 `tools/linux_bootstrap/*` 触发 secret-scan、离线平台桩、Windows 临时目录权限），与本次改动无关。
+
+### 5.1 复测（800k 版本，run-id `batch-linux-easy2-2026-11-18`）
+
+同一批 4 题在比赛机容器里重跑，**结果仍是 0/4，但暴露了三个新事实**（见 `runs/_ssh/linux2/`）：
+
+| 题 | 结果 | 用时 | token | attempts | 关键观测 |
+|---|---|---|---|---|---|
+| warmup | 未解 | ~14 min | 800,184 | 0 | **ledger 重复拦截 42 次**（每次参数不同，逐条 streak 断路器抓不到） |
+| baby_rop | 未解 | **32 s** | ~0 | 0 | 平台/网关瞬断 `Remote end closed connection without response` → 整题报废 |
+| CrackMe | 未解 | ~7 min | 794,069 | 0 | 预算耗尽；ledger 拦截 22 次 |
+| brichfire | 未解 | ~11.5 min | 802,343 | 0 | 预算耗尽 |
+
+结论：
+1. **800k 单题预算本身不是充分条件**：三题都烧穿 800k 且 `attempts=0`——账本里始终没有候选值，
+   `80% 强制提交`没有候选可交（护栏本身工作正常，但没有输入）。
+2. **ledger 重复拦截是主要浪费源**：warmup 42 次、CrackMe 22 次，每次拦截都仍消耗一次模型调用。
+3. **瞬断会让整题在 30 秒内报废**：baby_rop 只因一次网关断连就丢掉整题。
+
+### 5.2 针对上述三条的补丁（同轮提交）
+
+| 问题 | 补丁 |
+|---|---|
+| 平台瞬断 | `cli.ensure_challenge_meta` 对 `get_challenge` 瞬断重试 3 次（2s/5s）；`solve_many` 单题瞬断隔 10s **整题重试一次** |
+| ledger 累计打转 | `crew` 新增**累计拦截刹车**：≥6 次注入「换信息维度/换专家」提示，≥14 次强提示，≥22 次升级为 action_loop 前最后警告 |
+| 无候选可提交 | 保持 80% 护栏；同时靠 ledger 刹车把预算留给「真正能产出候选」的路线 |
+
+回归：`tests/smoke.py` 180/0；`smoke_clusterb_crew` / `smoke_platform_seed` / `smoke_taskplan` /
+`smoke_progress` / `smoke_budget_phase_rerun` / `smoke_submit_ledger` / `smoke_evidence` 全绿。

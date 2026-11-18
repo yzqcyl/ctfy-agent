@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 from .budget import Budget
 from .config import PROJECT_ROOT, Config, load
@@ -102,6 +103,16 @@ def normalize_challenge(item: dict) -> dict:
     }
 
 
+def _transient_net_error(exc: BaseException) -> bool:
+    """判断异常是否是「网络瞬断」（值得重试），而不是确定性失败（400/404/鉴权）。"""
+    msg = str(exc).lower()
+    return any(key in msg for key in (
+        "remote end closed", "connection reset", "connection aborted", "connection refused",
+        "temporarily unavailable", "timed out", "timeout", "eof occurred", "incompleteread",
+        "broken pipe", "502", "503", "504", "bad gateway", "service unavailable",
+    ))
+
+
 def ensure_challenge_meta(platform, store: Store, challenge_id: str) -> str | None:
     """保证 state 里有这道题，且题型线索（difficulty/solves_count/tags）已入库。
 
@@ -117,12 +128,24 @@ def ensure_challenge_meta(platform, store: Store, challenge_id: str) -> str | No
     if item is not None and item.tags and item.difficulty and item.questions:
         return None
 
-    try:
-        data = platform.get_challenge(challenge_id)
-    except Exception as exc:  # noqa: BLE001 - 缺线索不该拦住解题
+    # [P1 2026-11-18] 平台/网关瞬断（Remote end closed / 连接重置）会让整题直接报废
+    # （Linux 批次实测：baby_rop 32s 就被 "Remote end closed connection without response" 判死）。
+    # get_challenge 是只读调用，瞬断重试 3 次（2s/5s）再决定是否继续。
+    data = None
+    last_exc: Exception | None = None
+    for _try in range(3):
+        try:
+            data = platform.get_challenge(challenge_id)
+            break
+        except Exception as exc:  # noqa: BLE001 - 缺线索不该拦住解题
+            last_exc = exc
+            if not _transient_net_error(exc) or _try >= 2:
+                break
+            time.sleep(2 + 3 * _try)
+    if data is None and last_exc is not None:
         if item is None:
-            return f"取题目失败：{exc}"
-        print(f"[warn] 题型线索补齐失败，按现有信息继续：{exc}", file=sys.stderr)
+            return f"取题目失败：{last_exc}"
+        print(f"[warn] 题型线索补齐失败，按现有信息继续：{last_exc}", file=sys.stderr)
         return None
 
     normalized = normalize_challenge(data if isinstance(data, dict) else {"id": challenge_id})

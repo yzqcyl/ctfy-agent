@@ -292,6 +292,24 @@ def _strategy_nudge(prior: list[str]) -> str:
     )
 
 
+# ---------- P1：ledger 重复调用「累计」刹车（2026-11-18） ----------
+# Linux 批次实测：warmup 单题被 ledger 拦了 42 次（每次参数都不同，所以逐条 streak 断路器
+# 永远攒不满）—— 模型在「换个参数再试一次」的循环里烧掉整个 800k。
+# 这里按「本 run 累计拦截数」升级：6 次提示换路线、14 次强提示、22 次直接收口 action_loop。
+_LEDGER_DUP_HINT = (
+    "[重复调用刹车] 本 run 已有 {n} 次调用因「与前面完全相同」被 ledger 拦下。\n"
+    "这不是运气问题，是探索在打转。现在必须换**信息维度**：换工具、换端点/偏移/参数族，\n"
+    "或 delegate 给另一个专家重开一条链路；禁止继续在同一族参数里微调重试。"
+)
+_LEDGER_DUP_STOP = (
+    "[重复调用刹车·升级] 本 run 已被 ledger 拦 {n} 次，预算正在被空转吃掉。\n"
+    "下一动作只允许两种：①delegate 一个**不同方法族**的增量目标；②report 交付卡点。\n"
+    "再出现重复调用将直接按 action_loop 收口。"
+)
+LEDGER_DUP_HINT_AT = 6
+LEDGER_DUP_STRONG_AT = 14
+LEDGER_DUP_STOP_AT = 22
+
 # ---------- P0：预算 ≥80% 强制收口提交候选（2026-11-18） ----------
 # 实证：Linux 批次 4 题里 3 题烧到 100% 才停，attempts=0 —— 一个候选都没交。
 # 这里做成「确定性护栏」而不是又一句提示：
@@ -1340,6 +1358,7 @@ class Crew:
         # 候选闸门 / 假设收敛 状态（v3 P0）
         done_blocks = 0
         force_submit_rounds = 0  # P0：预算≥80% 强制提交候选的轮次计数
+        ledger_dup_hinted = 0     # P1：ledger 累计重复拦截的刹车档位（0/1/2）
         idle_nudges = 0  # [fix 2026-11-05 P1] 空动作早停守卫计数
         last_open = -1
         last_refuted = -1
@@ -1986,6 +2005,30 @@ class Crew:
                         self.store.append_transcript(
                             challenge_id, {"role": "ledger", "step": rnd, "content": digest}
                         )
+                # [P1 2026-11-18] 累计重复拦截 → 分级升级提示（逐条 streak 断路器抓不到「换参数打转」）
+                _dups = int((ledger.stats() or {}).get("duplicates_intercepted") or 0)
+                if _dups >= LEDGER_DUP_STOP_AT and ledger_dup_hinted < 3 and not submitted:
+                    ledger_dup_hinted = 3
+                    messages.append({"role": "user", "content": _LEDGER_DUP_STOP.format(n=_dups)})
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "gate", "step": rnd,
+                         "note": f"ledger 累计重复 {_dups} 次：升级为 action_loop 收口前最后警告"},
+                    )
+                elif _dups >= LEDGER_DUP_STRONG_AT and ledger_dup_hinted < 2 and not submitted:
+                    ledger_dup_hinted = 2
+                    messages.append({"role": "user", "content": _LEDGER_DUP_STOP.format(n=_dups)})
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "gate", "step": rnd, "note": f"ledger 累计重复 {_dups} 次：强提示换族"},
+                    )
+                elif _dups >= LEDGER_DUP_HINT_AT and ledger_dup_hinted < 1 and not submitted:
+                    ledger_dup_hinted = 1
+                    messages.append({"role": "user", "content": _LEDGER_DUP_HINT.format(n=_dups)})
+                    self.store.append_transcript(
+                        challenge_id,
+                        {"role": "gate", "step": rnd, "note": f"ledger 累计重复 {_dups} 次：注入换路线提示"},
+                    )
 
                 # 候选出现（v3 P0·候选闸门）：账本自动收录了工具输出里的 flag 形态 → 立即推去验证/提交。
                 # 只推「flag 形态」的观测：report 的 evidence 溯源也会写进 observations（可能是
