@@ -236,7 +236,7 @@ RUN set -eux; \
     printf 'gmpy2==%s --hash=sha256:%s\n' "${GMPY2_VERSION}" "${GMPY2_SHA256}" >> /tmp/ext-req.txt; \
     printf 'z3-solver==%s --hash=sha256:%s\n' "${Z3_VERSION}" "${Z3_SHA256}" >> /tmp/ext-req.txt; \
     python -m pip install --no-cache-dir --require-hashes -r /tmp/ext-req.txt; \
-    python -m pip install --no-cache-dir "pwntools==${PWNYTOOLS_VERSION}" "sympy==${SYMPY_VERSION}"; \
+    python -m pip install --no-cache-dir "pwntools==${PWNYTOOLS_VERSION}" "sympy==${SYMPY_VERSION}" "ROPgadget==7.7"; \
     rm -f /tmp/ext-req.txt; \
     for b in as cpp gcc objdump readelf; do \
         command -v "$b" >/dev/null || { echo "缺工具链 $b（pwntools asm = cpp 预处理 + as 汇编，ROP/disasm 要 objdump/readelf）" >&2; exit 1; }; \

@@ -730,6 +730,36 @@ def solve_many(config, challenges: list, run_id: str, competition_id: str,
                 if tunnel_note:
                     crew.pin_access_lines([tunnel_note])
                 summary = crew.solve(cid, cancel_event=task_cancel, force_rerun=cid in forced)
+
+                # [抄 verialabs/ctf-agent 2026-11-18] 多模型接力：首选模型未解出 → 换模型再战一轮。
+                # 不配置 extra.swarm_models 时这段完全跳过（零额外成本）。
+                _swarm = [str(m).strip() for m in (config.extra.get("swarm_models") or [])
+                          if str(m).strip()]
+                if _swarm:
+                    _used_models = {str(getattr(task_config, "model", "") or "")}
+                    _ok_now = bool((summary or {}).get("submitted")) or bool(
+                        getattr(store.get(cid), "flag_value", ""))
+                    for _model in _swarm:
+                        if _ok_now or task_cancel.is_set() or not _model:
+                            break
+                        if _model in _used_models:
+                            continue
+                        _used_models.add(_model)
+                        q.put(("batch_note",
+                               f"[{cid}] 首选模型未解出 → 换 `{_model}` 再战（接力，共享预算）"))
+                        try:
+                            _cfg2 = replace(task_config, model=_model)
+                            crew2 = Crew(_cfg2, platform, store,
+                                         lambda model=None, _c=_cfg2: make_llm(_c, model=model),
+                                         on_event=on_event)
+                            summary = crew2.solve(cid, cancel_event=task_cancel, force_rerun=True)
+                        except Exception as exc:  # noqa: BLE001 - 接力失败不毁主流程
+                            q.put(("batch_note", f"[{cid}] 换模型 {_model} 失败：{exc}"))
+                            continue
+                        _ok_now = bool((summary or {}).get("submitted")) or bool(
+                            getattr(store.get(cid), "flag_value", ""))
+                        if _ok_now:
+                            break
                 ch = store.get(cid)
                 flag = getattr(ch, "flag_value", "") if ch else ""
                 ok = bool((summary or {}).get("submitted")) or bool(flag)
