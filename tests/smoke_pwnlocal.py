@@ -106,8 +106,11 @@ def case_real_run() -> None:
         check("本地运行回报 exit=0", "exit=0" in out, out[:200])
         out2 = t.call("pwnlocal", {"path": "echo_test", "gdb": True, "argv": ["X"]})
         low = out2.lower()
-        check("gdb 模式抓到寄存器", ("rip" in low or "eip" in low), out2[:400])
-        check("gdb 模式抓到崩溃/运行信息", ("pwnlocal" in out2 and "gdb=true" in low), out2[:200])
+        # echo 正常退出时 gdb 报 "exited normally"（无寄存器）；只有崩溃才给 rip/eip。
+        check("gdb 模式有确定的运行结论",
+              (("rip" in low or "eip" in low) or "exited normally" in low
+               or "exited with code" in low), out2[:400])
+        check("gdb 模式回报头正确", ("pwnlocal" in out2 and "gdb=true" in low), out2[:200])
     except ToolError as exc:
         check("Linux 实跑", False, f"ToolError: {exc}")
     finally:

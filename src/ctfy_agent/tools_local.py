@@ -2978,6 +2978,7 @@ class LocalTools:
     _PWNLOCAL_GDB_DEFAULT = [
         "set pagination off",
         "set confirm off",
+        "set disable-randomization off",
         "info registers",
         "x/12i $pc",
         "bt",
