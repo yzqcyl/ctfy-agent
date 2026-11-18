@@ -310,6 +310,43 @@ DOMAIN_CARDS: list[tuple[tuple[str, ...], str]] = [
 ]
 
 
+# ---------- 2026-11-18：按 category 的兜底打法卡（抄经典 writeup 的决策表） ----------
+# 触发条件：题目没有可命中的 tags（BUUCTF 题库常见）时，用 category 给一张压缩决策表。
+# 内容全部是我方固定文案（不含题面可控文本），注入面为零。
+CATEGORY_FALLBACK: dict[str, str] = {
+    "pwn": (
+        "PWN 决策表（按保护与可用原语选路线，先用 pwnlocal 本地验证再打远端）："
+        "① 有后门/win 函数且栈可执行 → ret2text（覆盖返回地址直接跳）；"
+        "② 无后门但能泄露（puts/write/printf 任一可调）→ ret2libc：泄露 GOT → 算 libc base → system(/bin/sh)；"
+        "③ 静态链接无 libc（32 位）→ ret2syscall：找 pop eax/ebx/ecx/edx + int 0x80 造 execve，"
+        "或「只有 syscall 包装」时用 SROP（sigreturn frame 设 execve，先把 frame 写到可写段）；"
+        "④ 64 位无 pop rdi → ret2csu（__libc_csu_init 的 call gadget）；"
+        "⑤ 有格式化串 → 先 %p 定位参数偏移，再 %n 任意写；⑥ 堆题 → 先看 malloc/free 顺序、tcache double-free/UAF。"
+        "纪律：偏移用 pwnlocal+gdb 本地确认（gdb=true 看 $eip/$rip 与栈），本地跑不通不许打远端。"
+    ),
+    "rev": (
+        "REV 决策表：① 先判型（ELF 7f454c46 / PE 4d5a / .pyc / APK / 脚本 / 压缩包）；"
+        "② ELF 先 strings+symbols 定位「校验函数/提示串/硬编码比较值」，再只反汇编该函数（不要全文读）；"
+        "③ 能本地执行就差分验证：同一二进制喂不同输入比对分支/输出（pwnlocal 或 shell 跑），"
+        "用差分把「输入→比较→输出」钉死；④ 校验是方程/约束 → 把比较翻成 z3（z3solve）解；"
+        "⑤ 常见算法手工复现：异或/RC4/TEA/XTEA/迷宫/矩阵乘法/Base 变体；"
+        "⑥ 静态链接/被 strip → 用 relocs 与字符串交叉定位；.pyc/PyInstaller 用 elfpeek view=bytecode。"
+    ),
+    "crypto": (
+        "CRYPTO 决策表：① 先判题型（RSA/分组密码/流密码/哈希/格/协议）；② RSA 先试 "
+        "rsatool op=small_e / wiener / common_modulus / fermat，再考虑 Coppersmith 小根与 LLL；"
+        "③ 分组密码先判模式（ECB 重复块、CBC 字节翻转、CTR 复用流）；④ 流密码查 nonce/密钥复用；"
+        "⑤ 一切「给定方程/多项式」优先把约束喂 z3solve，不要手推。"
+    ),
+}
+
+
+def fallback_cards(category: str, limit: int = 1) -> list[str]:
+    """按 category 返回兜底打法卡（无 tags 时用）；未知类别返回空列表。"""
+    card = CATEGORY_FALLBACK.get(str(category or "").strip().lower(), "")
+    return [card][:limit] if card else []
+
+
 def domain_cards(tags, limit: int = MAX_CARDS) -> list[str]:
     """非 web 方向（rev/pwn/crypto/misc）的打法卡：只由方向表命中，与 web/AI 表互不干扰。"""
     wanted = set(tags or [])

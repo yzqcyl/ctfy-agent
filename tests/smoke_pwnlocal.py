@@ -88,12 +88,12 @@ def case_real_run() -> None:
     """Linux 容器内真跑：/bin/echo + gdb（CI/开发机缺 gdb 或 /bin/echo 时跳过，不误红）。"""
     import shutil
 
-    if not Path("/bin/echo").exists():
-        print("[skip] 没有 /bin/echo，跳过 Linux 实跑")
+    if not Path("/bin/cat").exists():
+        print("[skip] 没有 /bin/cat，跳过 Linux 实跑")
         return
     has_gdb = bool(shutil.which("gdb"))
     t = _tools()
-    echo = "/bin/echo" if Path("/bin/echo").exists() else None
+    src_bin = "/bin/cat" if Path("/bin/cat").exists() else None
     if os.name != "nt" and echo is None:
         # 沙盒白名单外，直接构造一个临时副本到沙盒目录
         pass
@@ -102,18 +102,18 @@ def case_real_run() -> None:
     try:
         tmpdir = Path(t._sandbox_dir())
         tmpdir.mkdir(parents=True, exist_ok=True)
-        target = tmpdir / "echo_test"
-        if echo:
-            target.write_bytes(Path(echo).read_bytes())
+        target = tmpdir / "cat_test"
+        if src_bin:
+            target.write_bytes(Path(src_bin).read_bytes())
             target.chmod(0o755)
-        out = t.call("pwnlocal", {"path": "echo_test", "stdin_text": "hello",
-                                  "argv": ["A", "B"]})
-        check("本地运行 echo 输出 argv", "A B" in out, out[:300])
+        # 用 cat 验证「stdin → 本地进程 → stdout」闭环（CI 的 /bin/echo 对多参数会报错）
+        out = t.call("pwnlocal", {"path": "cat_test", "stdin_text": "hello-local"})
+        check("本地运行回显 stdin", "hello-local" in out, out[:300])
         check("本地运行回报 exit=0", "exit=0" in out, out[:200])
         if not has_gdb:
             print("[skip] 容器内没有 gdb，跳过 gdb 用例")
             return
-        out2 = t.call("pwnlocal", {"path": "echo_test", "gdb": True, "argv": ["X"]})
+        out2 = t.call("pwnlocal", {"path": "cat_test", "gdb": True, "stdin_text": "x"})
         low = out2.lower()
         # echo 正常退出时 gdb 报 "exited normally"（无寄存器）；只有崩溃才给 rip/eip。
         check("gdb 模式有确定的运行结论",

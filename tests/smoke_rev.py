@@ -386,6 +386,14 @@ def build_elf64_xref() -> Path:
 @case
 def case_xrefs():
     elf = build_elf64_xref()
+    if not HAS_CAPSTONE:
+        # 无 capstone（CI runner / 干净检出）时，xrefs 必须显式报 DomainToolError，
+        # 不能静默返回空结果——否则「没装引擎」会被当成「没有引用」。
+        try:
+            elfpeek(str(elf), view="xrefs", target="0x40008a")
+        except DomainToolError:
+            return
+        raise AssertionError("无 capstone 时 xrefs 应报 DomainToolError")
     out = elfpeek(str(elf), view="xrefs", target="0x40008a")
     assert "xrefs -> 0x40008a" in out, out[:300]
     if HAS_CAPSTONE:
