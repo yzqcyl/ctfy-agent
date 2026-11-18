@@ -874,10 +874,114 @@ class _Elf:
 
 # >>> [rev-toolbox 2026-10-30] elfpeek 升级：新增 disasm / bytecode 视图；gadgets v2；strings 支持 utf16。
 # 详细说明与验收见 docs/archive/rev-toolbox-plan.md。capstone 为可选引擎：**v5 起才装进镜像**（v4 及以前没有——R2 项漏做），缺失时走 stdlib 退化路径。
+# >>> [xrefs 2026-11-17] re-mcp 式引用导航：谁 call/jmp 了某个地址、哪里存了指向它的指针。
+#     rev 大二进制不必全文读汇编，pwn 也能快速找 read/strcpy 的调用点。capstone 缺失时给中文降级提示。
+def _resolve_target(elf, target: str) -> int:
+    """target 接受 "0x401136" / "877" / 符号名（先精确、再子串唯一命中）。"""
+    raw = str(target or "").strip()
+    if not raw:
+        raise DomainToolError("xrefs 需要 target（地址如 0x401136，或符号名如 read）")
+    try:
+        return int(raw, 0)
+    except ValueError:
+        pass
+    syms = elf.symbols()
+    exact = [(nm, va) for nm, va, _tt in syms if nm == raw and va]
+    if exact:
+        return exact[0][1]
+    fuzzy = [(nm, va) for nm, va, _tt in syms if va and raw in nm]
+    if len(fuzzy) == 1:
+        return fuzzy[0][1]
+    if not fuzzy:
+        raise DomainToolError("xrefs target %r：既不是数字，也没有同名/子串命中的符号" % raw)
+    names = ", ".join("%s@0x%x" % (nm, va) for nm, va in fuzzy[:8])
+    raise DomainToolError("xrefs target %r 命中了多个符号，请给地址或更精确的名字：%s" % (raw, names))
+
+
+def _view_xrefs(data, elf, target="", limit=40, arch=""):
+    """xrefs 视图：代码引用（call/jmp/lea/mov 里指向 target 的立即数或内存位移）+ 数据引用（指针）。"""
+    limit = max(1, min(int(limit or 40), 200))
+    addr = _resolve_target(elf, target)
+    md = _capstone_for(elf, arch)
+    if md is not None:
+        try:
+            md.detail = True  # operands 需要 detail；capstone 5 不设会抛 CS_ERR_DETAIL
+        except Exception:  # noqa: BLE001
+            pass
+    if md is None:
+        return _clip("本环境无 capstone（v5 起镜像内置）——xrefs 不可用：\n"
+                     "退化：1) elfpeek view=relocs 看 call 目标（JUMP_SLOT @地址）；"
+                     "2) view=disasm 分段读，肉眼找 call 0x%x。" % addr)
+    code_hits: list[str] = []
+    data_hits: list[str] = []
+    syms = elf.symbols()
+    scanned = 0
+    for p_type, p_flags, p_off, p_vaddr, p_filesz in _phdrs(elf):
+        if p_type != 1 or not (p_flags & 1) or p_filesz <= 0:
+            continue
+        if scanned > 1024 * 1024:  # 上限 1MB 可执行字节，避免畸形文件卡死
+            break
+        chunk = data[p_off:p_off + p_filesz]
+        scanned += len(chunk)
+        # 线性扫描 + 失败前进 1 字节：真实 ELF 的可执行段里可能夹着数据/对齐填充，
+        # capstone 的 disasm() 遇到非法字节会停，所以自己走（上限 1MB，避免畸形文件卡死）。
+        offset = 0
+        budget = 200000
+        while offset < len(chunk) and len(code_hits) < limit and budget > 0:
+            insn = None
+            for candidate in md.disasm(chunk[offset:], p_vaddr + offset):
+                insn = candidate
+                break
+            if insn is None:
+                offset += 1
+                budget -= 1
+                continue
+            offset += max(1, insn.size)
+            budget -= 1
+            refs = set()
+            for op in insn.operands:
+                if op.type == 2:  # CS_OP_IMM
+                    refs.add(int(op.imm))
+                elif op.type == 3 and getattr(op, "mem", None) is not None:  # CS_OP_MEM
+                    try:
+                        refs.add(int(op.mem.disp))
+                        refs.add(int(op.mem.disp) + insn.address + insn.size)  # rip 相对
+                    except Exception:  # noqa: BLE001
+                        pass
+            if addr in refs:
+                tag = _nearest_symbol(syms, insn.address)
+                code_hits.append("%08x  %-8s %-28s%s" % (
+                    insn.address, insn.mnemonic, insn.op_str, ("  ; %s" % tag) if tag else ""))
+        if len(code_hits) >= limit:
+            break
+    covered: set[int] = set()
+    for size in (8, 4):
+        needle = int(addr).to_bytes(size, "little")
+        start = 0
+        while len(data_hits) < limit:
+            pos = data.find(needle, start)
+            if pos < 0:
+                break
+            start = pos + 1
+            if any(p0 <= pos < p0 + 8 for p0 in covered):
+                continue  # 8 字节命中的低 4 字节会被重复计一次，跳过
+            if size == 8:
+                covered.add(pos)
+            va = _off_to_vaddr(elf, pos)
+            data_hits.append("文件 0x%x%s 存了 %d 字节指针 -> %s" % (
+                pos, ("（vaddr 0x%x）" % va) if va is not None else "", size, hex(addr)))
+    lines = ["xrefs -> 0x%x %s" % (addr, _nearest_symbol(syms, addr))]
+    lines.append("代码引用 %d 处%s：" % (len(code_hits), "（已达 limit）" if len(code_hits) >= limit else ""))
+    lines.extend(("  " + h) for h in code_hits) if code_hits else lines.append("  （无：可能被间接调用/地址在数据里）")
+    lines.append("数据引用 %d 处%s：" % (len(data_hits), "（已达 limit）" if len(data_hits) >= limit else ""))
+    lines.extend(("  " + h) for h in data_hits) if data_hits else lines.append("  （无 8/4 字节指针命中；GOT 项在文件里是重定位占位 0）")
+    return _clip("\n".join(lines))
+
+
 def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60,
             offset: int = 0, length: int = 128, count: int = 40, arch: str = "",
             extract: str = "", func: str = "", utf16: bool = False, filt: str = "",
-            symbol: str = "", search: str = "") -> str:
+            symbol: str = "", search: str = "", target: str = "") -> str:
     """ELF / 字节码静态探测：info / sections / symbols / strings / gadgets / disasm / bytecode / relocs / dynamic。"""
     p = Path(path)
     if not p.exists():
@@ -930,6 +1034,8 @@ def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60,
     if view == "disasm":  # [rev-toolbox] 反汇编视图（capstone 引擎，stdlib 字节视图退化）
         return _view_disasm(data, elf, offset=int(offset or 0), length=int(length or 128),
                             count=int(count or 40), arch=arch)
+    if view == "xrefs":  # [xrefs 2026-11-17] 引用导航（call/jmp/lea/数据指针）
+        return _view_xrefs(data, elf, target=target, limit=int(limit), arch=arch)
     if view == "lookup":  # [pwn-toolbox] 符号/字符串精确查询（ret2libc 辅助）
         return _view_lookup(data, elf, symbol=symbol, search=search)
     if view == "relocs":  # [rev-toolbox 2026-11-02] 重定位表（PLT/GOT 映射、静态链接判定）
@@ -937,7 +1043,7 @@ def elfpeek(path: str, view: str = "info", min_len: int = 4, limit: int = 60,
     if view == "dynamic":  # [rev-toolbox 2026-11-02] 动态段（依赖库/RUNPATH/BIND_NOW/PIE）
         return _view_dynamic(elf, limit=int(limit))
     raise DomainToolError(
-        "view 只支持 info/sections/symbols/strings/gadgets/disasm/bytecode/lookup/relocs/dynamic，收到 %r" % view)
+        "view 只支持 info/sections/symbols/strings/gadgets/disasm/bytecode/lookup/relocs/dynamic/xrefs，收到 %r" % view)
 
 
 # >>> [rev-toolbox 2026-10-30] ===== rev 方向工具箱 v2 实现 =====
@@ -3295,13 +3401,15 @@ ELFPEEK_SPEC = {
             "bytecode 处理 .pyc / PyInstaller（先不带 extract 列目录，再 extract=<名字>，PYZ 用 extract=pyz:<模块名>，func=只看某函数）；"
             "lookup 精确查符号/字符串偏移（ret2libc：symbol=system、search=/bin/sh，附 libc 版本行）；"
             "relocs 看重定位表（JUMP_SLOT 的 @地址就是 foo@got、静态链接判定、.init_array 构造函数）；"
-            "dynamic 看动态段（NEEDED 依赖库、RUNPATH/RPATH、BIND_NOW→full RELRO、FLAGS_1 的 PIE 位）。"
+            "dynamic 看动态段（NEEDED 依赖库、RUNPATH/RPATH、BIND_NOW→full RELRO、FLAGS_1 的 PIE 位）；"
+            "xrefs 看引用关系（target=地址/符号：谁 call/jmp/lea 了它、哪里存了指向它的指针），"
+            "rev 定位校验函数调用点、pwn 找 read/strcpy 调用点用。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "沙盒内文件路径（相对沙盒根）"},
-                "view": {"type": "string", "enum": ["info", "sections", "symbols", "strings", "gadgets", "disasm", "bytecode", "lookup", "relocs", "dynamic"]},
+                "view": {"type": "string", "enum": ["info", "sections", "symbols", "strings", "gadgets", "disasm", "bytecode", "lookup", "relocs", "dynamic", "xrefs"]},
                 "min_len": {"type": "integer", "description": "strings 视图的最小串长（默认 4）"},
                 "limit": {"type": "integer", "description": "最多输出条目数（默认 60）"},
                 "offset": {"type": "integer", "description": "disasm：起始文件偏移（默认吸附到可执行段起点）"},
@@ -3312,6 +3420,7 @@ ELFPEEK_SPEC = {
                 "extract": {"type": "string", "description": "bytecode：PyInstaller 条目名（PYZ 内模块用 pyz:模块名）"},
                 "func": {"type": "string", "description": "bytecode：只反汇编指定函数名（不带则看模块级）"},
                 "utf16": {"type": "boolean", "description": "strings：扫 UTF-16 宽字符串"},
+                "target": {"type": "string", "description": "xrefs：目标地址（0x401136）或符号名（read/verify）"},
                 "symbol": {"type": "string", "description": "lookup：精确符号名（如 system；无命中给相近清单）"},
                 "search": {"type": "string", "description": "lookup：要查的字符串（如 /bin/sh），返回全部出现偏移"},
             },

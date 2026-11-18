@@ -357,6 +357,49 @@ def case_elf32_nx_flags():
     assert "NX=False" in out, "可执行栈应判 NX=False：\n%s" % out[:500]
 
 
+def build_elf64_xref() -> Path:
+    """最小 ELF64 夹具：0x400078 处 call 0x40008a；数据区存 8 字节指针 -> 0x40008a。
+
+    用于 xrefs：代码引用 1 处（call）、数据引用 1 处（指针）。
+    """
+    body = (
+        b"\xe8\x0d\x00\x00\x00"        # 0x400078: call 0x40008a
+        b"\xc3" + b"\x90" * 12          # 0x40007d: ret + nop*12
+        + b"\xc3"                       # 0x40008a: ret（被调用目标）
+        + struct.pack("<Q", 0x40008A)   # 数据区：指针 -> 目标
+        + b"FLAG{XREFS}\x00"
+    )
+    ehdr = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\x00" * 8,
+        2, 62, 1, 0x400078, 64, 0, 0,
+        64, 56, 1, 0, 0, 0,
+    )
+    phdr = struct.pack("<IIQQQQQQ", 1, 5, 0x78, 0x400078, 0x400078,
+                       len(body), len(body), 0x1000)
+    data = ehdr + phdr + body
+    p = TMP / "xref.elf"
+    p.write_bytes(data)
+    return p
+
+
+@case
+def case_xrefs():
+    elf = build_elf64_xref()
+    out = elfpeek(str(elf), view="xrefs", target="0x40008a")
+    assert "xrefs -> 0x40008a" in out, out[:300]
+    if HAS_CAPSTONE:
+        assert "代码引用 1 处" in out, out[:300]
+        assert "call" in out and "400078" in out, out[:300]
+    assert "数据引用 1 处" in out, out[:400]
+    # 符号名解析 + 错误路径
+    try:
+        elfpeek(str(elf), view="xrefs", target="no_such_symbol_xyz")
+        raise AssertionError("不存在的 target 应该报错")
+    except DomainToolError:
+        pass
+
+
 @case
 def case_bad_view_error():
     try:

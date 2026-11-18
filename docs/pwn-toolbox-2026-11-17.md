@@ -11,7 +11,7 @@ pwn/rev ACI 之后，还差四类工具。这里按「镜像依赖 / 纯脚本 /
 | **pwndbg**（gdb 增强：vmmap/telescope/heap bins/cyclic） | 镜像只有 gdb 批处理，无 pwndbg（pip 第三方 + 体积） | 写**纯 gdb Python 扩展** `tools/linux_bootstrap/gdb_pwn.py`（pwndbg-lite）：`pwnrecon`/`pwnmaps`/`pwnoff`/`pwnstack`/`pwnchunks`/`pwnio`/`pwnbins`；`gdb -batch -q -x gdb_pwn.py -ex run -ex pwnrecon ./poc < payload.bin` | ✅ 已落地 + 离线校验 cyclic 偏移反查 |
 | **one_gadget**（libc 里 execve("/bin/sh") 的现成 gadget） | 没有 ruby/gem，也不该在镜像里装 one_gadget | 两条路：①`pwnkit(op=ret2libc)` 已给 system/puts//bin/sh + gadget，覆盖 95% 栈题；②`pwnrop` 搜 `pop rdi; ret` 组合；③真需要 one_gadget 时**按 libc 版本查表**（离线字典放 `tools/linux_bootstrap/one_gadget_db.json`，第一版只放常用 2.27/2.31/2.35，标注来源与约束） | ⏳ 方案定，字典未建（需按版本核对，避免编错） |
 | **FSOP / 堆模板** | `pwnkit` 只有 libc/ret2libc | 模板是「知识 + 偏移表」：house of apple 2（`_IO_wfile_overflow`）、`_IO_str_overflow`、tcache poisoning、`__free_hook`（<2.34）、`_IO_list_all` 链。写成 `docs/pwn-heap-fsop-recipes.md`（含 glibc 2.31/2.35 的 vtable 偏移表）+ `pwngen` 只负责拼字节 | ⏳ 方案定，文档与偏移表待建 |
-| **re-mcp 式导航**（函数列表 / xref / 调用图） | `elfpeek` 有 info/sections/symbols/strings/relocs/disasm，缺 xref 与调用图 | 给 `elfpeek` 加 `view=xrefs`（capstone 反汇编后收集 call/jmp 目标，反查谁引用某地址）与 `view=calls`（call 图，按函数聚类）；纯 Python + capstone，镜像内可用，宿主机可跳 | ⏳ 方案定，待实现 |
+| **re-mcp 式导航**（xref / 调用图） | xref 已补（2026-11-17） | `elfpeek view=xrefs, target=地址/符号`：线性扫描可执行段收集 call/jmp/lea/mov 命中 + 数据区 8/4 字节指针；capstone 缺失给降级提示 | ✅ 已实现（`tests/smoke_rev.py case_xrefs`）；调用图 view=calls 仍未做 |
 | 反编译器 | **已有**（Ghidra headless `ghidra_decompile`，见 `docs/ghidra-rev-2026-11-17.md`） | 不需要补 | ✅ 已有 |
 
 ## 1. pwndbg-lite：`tools/linux_bootstrap/gdb_pwn.py`
@@ -63,12 +63,11 @@ one_gadget 的价值是「libc 版本已知时省一条 ROP 链」，风险是**
 不直接改 `pwnkit` 的原因：模板本质是「payload 布局 + 偏移表」，用 `pwngen` 拼 hex 即可；
 塞进 `pwnkit` 会让这个纯 stdlib 工具依赖 libc 版本表，维护成本高于收益。
 
-## 4. re-mcp 式导航：给 `elfpeek` 加 xrefs / calls
+## 4. re-mcp 式导航：`elfpeek view=xrefs`（2026-11-17 已实现）
 
 re-mcp 的核心不是「反编译」，而是**按引用关系导航**（`decompile_function` + `xrefs` + 调用图）。
 我们已有 `ghidra_decompile --function`，缺的是「谁调用了这个函数/哪引用了这个字符串」。
-方案：`elfpeek view=xrefs, target=0x401234`（capstone 线性/递归扫描，收集 `call/jmp/lea rip` 目标命中）
-与 `view=calls`（按函数聚类的调用图）。收益：rev 大二进制不必全文读汇编，pwn 也能快速找
+已实现：`elfpeek view=xrefs, target=0x401234`（或符号名）——线性扫描可执行段（失败前进 1 字节，上限 1MB / 20 万条指令）收集 `call/jmp/lea/mov` 的立即数与内存位移命中，同时扫数据区 8/4 字节指针；capstone 缺失时给中文降级提示。`view=calls`（调用图）仍未做。收益：rev 大二进制不必全文读汇编，pwn 也能快速找
 `read/strcpy` 的调用点——这正是 EnIGMA/PwnAI 强调的「定点读」。
 
 ## 5. 优先级建议
