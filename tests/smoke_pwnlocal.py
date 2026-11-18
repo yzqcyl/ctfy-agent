@@ -94,9 +94,6 @@ def case_real_run() -> None:
     has_gdb = bool(shutil.which("gdb"))
     t = _tools()
     src_bin = "/bin/cat" if Path("/bin/cat").exists() else None
-    if os.name != "nt" and echo is None:
-        # 沙盒白名单外，直接构造一个临时副本到沙盒目录
-        pass
     # 沙盒路径锚定：把 /bin/echo 复制进沙盒再跑
     from ctfy_agent.tools_local import ToolError  # noqa: PLC0415
     try:

@@ -82,7 +82,11 @@ def main() -> int:
         out = hint(cat, tags)
         check(f"门控：{cat} 题注入方向卡", out.startswith("打法提示") and prefix in out, out[:60])
 
-    check("门控：非 web 未命中 tag 不注入", hint("rev", ["nope"]) == "")
+    # [2026-11-18] 无 tag 命中时按 category 注入 writeup 决策表兜底卡（pwn/rev/crypto）
+    check("门控：无 tag 的 rev 走 category 兜底卡", hint("rev", ["nope"]).startswith("打法提示"))
+    check("门控：无 tag 的 pwn 走 category 兜底卡", hint("pwn", []).startswith("打法提示"))
+    check("门控：misc 无 tag 不注入", hint("misc", ["nope"]) == "")
+    check("门控：未知类别不注入", hint("unknown-cat", []) == "")
     check("门控：web 题仍走 web/AI 卡", hint("web", ["sqli"]).startswith("打法提示"))
     check("门控：AI tag 仍走 ASI 卡", "ASI01" in hint("web", ["owasp_2026_asi01"]))
 
