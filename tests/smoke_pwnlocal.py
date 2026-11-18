@@ -85,7 +85,13 @@ def case_errors() -> None:
 
 
 def case_real_run() -> None:
-    """Linux 容器内真跑：/bin/echo + gdb。"""
+    """Linux 容器内真跑：/bin/echo + gdb（CI/开发机缺 gdb 或 /bin/echo 时跳过，不误红）。"""
+    import shutil
+
+    if not Path("/bin/echo").exists():
+        print("[skip] 没有 /bin/echo，跳过 Linux 实跑")
+        return
+    has_gdb = bool(shutil.which("gdb"))
     t = _tools()
     echo = "/bin/echo" if Path("/bin/echo").exists() else None
     if os.name != "nt" and echo is None:
@@ -104,6 +110,9 @@ def case_real_run() -> None:
                                   "argv": ["A", "B"]})
         check("本地运行 echo 输出 argv", "A B" in out, out[:300])
         check("本地运行回报 exit=0", "exit=0" in out, out[:200])
+        if not has_gdb:
+            print("[skip] 容器内没有 gdb，跳过 gdb 用例")
+            return
         out2 = t.call("pwnlocal", {"path": "echo_test", "gdb": True, "argv": ["X"]})
         low = out2.lower()
         # echo 正常退出时 gdb 报 "exited normally"（无寄存器）；只有崩溃才给 rip/eip。
