@@ -83,7 +83,7 @@ class MenuServer:
 
 
 def case_wiring() -> None:
-    from ctfy_agent.crew import DEFAULT_ROLES  # noqa: PLC0415
+    from ctfy_agent.crew import COORDINATOR_PROMPT, DEFAULT_ROLES  # noqa: PLC0415
     from ctfy_agent.tools_domain_ext import DOMAIN_NAMES, PWN_SESSION_SPEC  # noqa: PLC0415
     from ctfy_agent.tools_misc_ext import MISC_EXT_SPECS  # noqa: PLC0415
 
@@ -110,6 +110,10 @@ def case_wiring() -> None:
     check("DEFAULT_ROLES pwn/rev 兜底含 fileview",
           "fileview" in DEFAULT_ROLES["pwn"]["local"] and "fileview" in DEFAULT_ROLES["rev"]["local"],
           (DEFAULT_ROLES["pwn"]["local"], DEFAULT_ROLES["rev"]["local"]))
+    check("协调者 prompt 含收口判据（连续两轮无决定性事实→单实验否则 stalled）",
+          "收口判据" in COORDINATOR_PROMPT and "单实验" in COORDINATOR_PROMPT)
+    check("pwn prompt 含交付判据（offset/leak/判据链）",
+          "决定性事实" in config["roles"]["pwn"]["system"])
     check("rev.local 不泄漏 pwnsession（门禁按角色名单过滤）",
           "pwnsession" not in (config["roles"]["rev"]["local"] or []),
           config["roles"]["rev"]["local"])
