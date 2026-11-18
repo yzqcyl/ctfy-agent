@@ -228,7 +228,8 @@ def probe_binwalk() -> str:
 
 
 def probe_foremost() -> str:
-    return _version_probe("foremost", ["-V"], "foremost")
+    # Debian foremost 的 -V 只输出 "1.5.7" 加上美国政府声明，不含 "foremost" 字样
+    return _version_probe("foremost", ["-V"], "")
 
 
 def probe_steghide() -> str:
@@ -324,7 +325,8 @@ PY_PROBES = {
     "pwntools": probe_pwntools,
     "crypto": probe_crypto,
     "gmpy2": probe_gmpy2_sympy,
-    "androguard": probe_androguard,
+    # [2026-11-18] 镜像 Dockerfile 未安装 androguard（本地 tools/pylibs 才有），构建期不再要求；
+    # 想加 APK 反编译能力时先在 Dockerfile 里钉版本装好、再放开这一行。
     "uncompyle6": probe_uncompyle6,
 }
 BIN_PROBES = {
