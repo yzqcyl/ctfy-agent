@@ -530,13 +530,20 @@ class Solver:
                 out.append(c)
         return out[:24]
 
+    def _count_dup_block(self, text: str) -> None:
+        """按工具回执原文累计「被 ledger 拦截」次数（不依赖账本实例是否同一份）。"""
+        if "[ledger 拦截]" in str(text or ""):
+            self._dup_blocks = int(getattr(self, "_dup_blocks", 0) or 0) + 1
+
     def _dup_brake(self, ledger, messages: list, challenge_id: str, role: str, step: int) -> None:
         """专家侧累计重复拦截刹车（分级注入，同一档只注入一次）。"""
-        if ledger is None:
-            return
-        try:
-            dups = int((ledger.stats() or {}).get("duplicates_intercepted") or 0)
-        except Exception:  # noqa: BLE001 - 统计失败不能影响解题
+        dups = int(getattr(self, "_dup_blocks", 0) or 0)
+        if not dups and ledger is not None:
+            try:
+                dups = int((ledger.stats() or {}).get("duplicates_intercepted") or 0)
+            except Exception:  # noqa: BLE001 - 统计失败不能影响解题
+                dups = 0
+        if dups <= 0:
             return
         target = 0
         if dups >= DUP_BRAKE_STOP_AT:
@@ -2357,6 +2364,7 @@ class Solver:
 
     def solve(self, challenge_id: str, *, max_steps: int | None = None) -> dict:
         self._dup_brake_level = 0  # P1：每次开跑重置重复刹车档位
+        self._dup_blocks = 0
         """编排入口：k=1 时等价旧 solve（单次尝试）；config.extra.clusterb_k>1/auto 时做多次独立尝试。"""
         from .retry import resolve_k  # noqa: PLC0415 - 与 _solve_clusterb 同处延迟导入，避免顶层耦合
 
@@ -2788,6 +2796,7 @@ class Solver:
                     })
                 self.on_event("tool", {"name": name, "args": args, "result": text})
 
+                self._count_dup_block(text)  # P1：按回执原文计「被拦」次数
                 inject = self._ledger_after(ledger, name, args, text, role="solver", ok=accepted or None)
                 if inject:
                     messages.append({"role": "user", "content": inject})
@@ -3213,6 +3222,7 @@ class Solver:
                         "content": f"[证据可用] 上面工具输出里的这段是逐字原文，report 的 evidence 字段直接复制它：{quotable}",
                     })
 
+                self._count_dup_block(text)  # P1：按回执原文计「被拦」次数
                 inject = self._ledger_after(ledger, name, args, text, role=role)
                 if inject:
                     messages.append({"role": "user", "content": inject})
