@@ -31,7 +31,7 @@ def checks() -> int:
 
     # ---- _budget_minutes 映射 ----
     cfg_default = FakeConfig()
-    check("easy→10", pw._budget_minutes(cfg_default, "easy") == 10)
+    check("easy→15", pw._budget_minutes(cfg_default, "easy") == 15)
     check("medium→25", pw._budget_minutes(cfg_default, "medium") == 25)
     check("hard→40", pw._budget_minutes(cfg_default, "hard") == 40)
     check("大小写归一", pw._budget_minutes(cfg_default, "Hard") == 40)

@@ -78,7 +78,7 @@ def test_pure() -> None:
     check("EV 排序：hard0 沉底", ranked[-1] == "hard0", str(ranked))
 
     check("难度 cap：easy/medium/hard/unknown", (
-        taskplan.token_cap({"difficulty": "easy"}) == 150_000
+        taskplan.token_cap({"difficulty": "easy"}) == 250_000
         and taskplan.token_cap({"difficulty": "medium"}) == 350_000
         and taskplan.token_cap({"difficulty": "hard"}) == 600_000
         and taskplan.token_cap({"difficulty": "?"}) == taskplan.FALLBACK_CAP))
@@ -88,7 +88,7 @@ def test_pure() -> None:
     unlimited = taskplan.plan(rows)
     check("不限池（默认）：quota=难度 cap、按 EV 排序",
           [p["id"] for p in unlimited][0] == "easy1"
-          and unlimited[0]["quota"] == 150_000
+          and unlimited[0]["quota"] == 250_000
           and unlimited[-1]["quota"] == 600_000,
           str([(p["id"], p["quota"]) for p in unlimited]))
 
@@ -245,12 +245,12 @@ def test_wiring() -> None:
 
     caps = {item["id"]: item["cap"] for item in FakeCrew.seen}
     check("每题 quota 落成 config.max_tokens_per_challenge",
-          caps == {"CH-EASY": 150_000, "CH-MED": 350_000, "CH-HARD": 600_000}, str(caps))
+          caps == {"CH-EASY": 250_000, "CH-MED": 350_000, "CH-HARD": 600_000}, str(caps))
     check("GUI 批量不再用 800k 全局上限", all(c < 800_000 for c in caps.values()), str(caps))
 
     batches = [e[1] for e in events if e[0] == "batch_note"]
     check("batch_note 报告 EV 排序与上限",
-          any("按 EV 排序" in str(b) and "150k" in str(b) for b in batches), str(batches)[:300])
+          any("按 EV 排序" in str(b) and "250k" in str(b) for b in batches), str(batches)[:300])
 
     done = [e[1] for e in events if e[0] == "task_done"]
     check("3 题都回调 task_done", len(done) == 3, str(len(done)))

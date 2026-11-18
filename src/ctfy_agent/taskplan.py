@@ -23,7 +23,7 @@ from typing import Any, Iterable
 
 # 单题 token 上限（难度 cap）。这是"最多给一题烧多少"，不是"预期用量"；
 # 预计用量见 EST_TOKENS（只进 EV 分母，不影响真实上限）。
-DIFFICULTY_CAPS: dict[str, int] = {"easy": 150_000, "medium": 350_000, "hard": 600_000}
+DIFFICULTY_CAPS: dict[str, int] = {"easy": 250_000, "medium": 350_000, "hard": 600_000}
 FALLBACK_CAP = 300_000
 
 # EV 分母用的"预计开销"（沿用 policy.py 的难度时长 × 每分钟 token 直觉）。

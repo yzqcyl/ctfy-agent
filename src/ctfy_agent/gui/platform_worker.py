@@ -18,7 +18,7 @@ from ..taskplan import plan as plan_tasks
 # 「按难度动态分配时间预算」（能力评估 §4.1/§6-②）：122 题里 43 题因墙钟被打断，
 # 固定 15 分钟对 Easy 太松、对 Hard 太紧。默认 Easy 10 / Medium 25 / Hard 40 分钟；
 # 经 config.extra.{time_budget, time_budget_minutes, time_budget_fallback} 可关/可调。
-_BUDGET_MINUTES = {"easy": 10, "medium": 25, "hard": 40}
+_BUDGET_MINUTES = {"easy": 15, "medium": 25, "hard": 40}
 
 
 def _budget_minutes(config, difficulty: str) -> int | None:
