@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import ast
 import re
 
 import marshal  # [rev-toolbox] bytecode 视图：.pyc / PyInstaller 的 marshal 载荷
@@ -281,9 +282,74 @@ def fileview(path: str, mode: str = "lines", start_line: int = 1, count: int = 1
     return _clip("文件 %s 共 %d 行，显示 %d-%d\n%s" % (fp.name, len(lines), start, end, window))
 
 
+# >>> [pwnsession-tmpl 2026-11-17] 会话内计算：受限表达式求值 + 发送模板。
+#     为什么：第 5 轮实测暴露「offset 在会话外算、payload 在会话外拼」，模型要在两三次工具调用
+#     之间搬运二进制，既慢又容易错。这里允许 step 里写 {"let": {"off": "72"}}、
+#     {"send_hex": "{pack(off)}"}，算→拼→发一次会话完成。
+_TMPL_RE = re.compile(r"\{([^{}]+)\}")
+
+
+def _tmpl_eval(expr: str, vars: dict) -> int:
+    """受限算式求值：整数常量、变量名、+ - * // % << >> & | ^ ~ 与括号，不执行任意代码。"""
+    tree = ast.parse(str(expr).strip(), mode="eval")
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return int(node.value)
+        if isinstance(node, ast.Name):
+            if node.id in vars:
+                return int(vars[node.id])
+            raise DomainToolError("模板变量未定义：%s（先用 vars 或 step.let 赋值）" % node.id)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -ev(node.operand)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            return ~ev(node.operand)
+        if isinstance(node, ast.BinOp):
+            left, right = ev(node.left), ev(node.right)
+            table = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+                     ast.Mult: lambda a, b: a * b, ast.FloorDiv: lambda a, b: a // b,
+                     ast.Mod: lambda a, b: a % b, ast.LShift: lambda a, b: a << b,
+                     ast.RShift: lambda a, b: a >> b, ast.BitAnd: lambda a, b: a & b,
+                     ast.BitOr: lambda a, b: a | b, ast.BitXor: lambda a, b: a ^ b}
+            for typ, fn in table.items():
+                if isinstance(node.op, typ):
+                    return fn(left, right)
+        raise DomainToolError("模板表达式不支持：%r（只允许整数/变量/算术/位运算）" % expr)
+
+    return ev(tree)
+
+
+def _tmpl_expand(value: str, vars: dict, *, as_hex: bool) -> str:
+    """展开模板。as_hex=True（send_hex 用）时 pack/p32 返回 hex 串；
+    as_hex=False（send 文本用）时 pack 报错并建议改用 send_hex。"""
+    def repl(match):
+        token = match.group(1).strip()
+        name, _, rest = token.partition("(")
+        name = name.strip()
+        arg = rest[:-1].strip() if rest.endswith(")") else ""
+        if name in ("pack", "p64", "p32"):
+            if not as_hex:
+                raise DomainToolError(
+                    "模板 %s() 只能用在 send_hex（二进制 payload）；文本 send 请只用 {变量} 或 {hex(表达式)}" % name)
+            size = 4 if name == "p32" else 8
+            n = _tmpl_eval(arg, vars)
+            return int(n & ((1 << (size * 8)) - 1)).to_bytes(size, "little").hex()
+        if name == "hex":
+            return "0x%x" % _tmpl_eval(arg or token, vars)
+        if rest:
+            raise DomainToolError("未知模板函数：%r（支持 pack/p64/p32/hex 与变量）" % name)
+        if name in vars:
+            return str(vars[name])
+        raise DomainToolError("模板变量未定义：%s（先用 vars 或 step.let 赋值）" % name)
+
+    return _TMPL_RE.sub(repl, str(value))
+
+
 def pwnsession(host: str, port: int, steps: list, tls: bool = False, sni: str = "",
                read_timeout: float = 2.0, max_recv: int = 8192,
-               total_timeout: float = 45.0) -> str:
+               total_timeout: float = 45.0, vars: dict | None = None) -> str:
     """持久会话：连接一次，按 steps 逐步「发送 → 读到空闲/expect」，返回标注过的完整回显。
 
     steps 每项是 dict：
@@ -304,6 +370,7 @@ def pwnsession(host: str, port: int, steps: list, tls: bool = False, sni: str = 
     read_timeout = max(0.05, min(float(read_timeout), float(total_timeout)))
     t0 = time.time()
     sock = _connect(host, int(port), min(10.0, total_timeout), tls=bool(tls), sni=sni)
+    vars = {str(k): int(v) for k, v in (vars or {}).items()}
     lines: list[str] = ["会话 %s:%s（tls=%s）" % (host, port, bool(tls))]
 
     def _read_window(wait: float, expect_b: bytes | None) -> tuple[bytes, bool]:
@@ -343,14 +410,18 @@ def pwnsession(host: str, port: int, steps: list, tls: bool = False, sni: str = 
             if time.time() - t0 > total_timeout:
                 lines.append("…总超时 %.0fs，已执行 %d/%d 步" % (total_timeout, idx - 1, len(steps)))
                 break
+            if isinstance(step.get("let"), dict):
+                for k, v in step["let"].items():
+                    vars[str(k)] = _tmpl_eval(str(v), vars) if not isinstance(v, int) else v
             raw = b""
             if step.get("send_hex") is not None:
                 try:
-                    raw = bytes.fromhex(str(step["send_hex"]).strip())
+                    expanded = _tmpl_expand(str(step["send_hex"]), vars, as_hex=True)
+                    raw = bytes.fromhex(expanded.strip())
                 except ValueError as exc:
                     raise DomainToolError("steps[%d].send_hex 不是合法 hex：%s" % (idx, exc)) from None
             elif step.get("send") is not None:
-                raw = str(step["send"]).encode("utf-8", "surrogateescape")
+                raw = _tmpl_expand(str(step["send"]), vars, as_hex=False).encode("utf-8", "surrogateescape")
             if raw:
                 try:
                     sock.sendall(raw)
@@ -3166,10 +3237,11 @@ PWN_SESSION_SPEC = {
                             "wait": {"type": "number", "description": "本步读多久（秒，默认 read_timeout）"},
                         },
                     },
-                    "description": "步骤数组：每项 {send|send_hex|expect|wait}，最多 40 步",
+                    "description": "步骤数组：每项 {send|send_hex|expect|wait|let}；send_hex 支持 {pack(表达式)}/{p32(表达式)}，send 支持 {变量}/{hex(表达式)}，let 给变量赋值，最多 40 步",
                 },
                 "tls": {"type": "boolean", "description": "是否 TLS（实例 nc_ssl=true 时必须）"},
                 "sni": {"type": "string", "description": "TLS SNI，默认等于 host"},
+                "vars": {"type": "object", "description": "会话变量初值 {name: int}（也可在 step 里用 let 赋值），供 {pack(off)}/{hex(off)}/{off} 模板使用"},
                 "read_timeout": {"type": "number", "description": "每步读空闲超时秒（默认 2.0）"},
                 "max_recv": {"type": "integer", "description": "每步最多读多少字节（默认 8192）"},
                 "total_timeout": {"type": "number", "description": "整段会话总超时秒（默认 45）"},

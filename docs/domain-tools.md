@@ -16,7 +16,7 @@
 |---|---|---|
 | `tcp(host, port, payload, hex_mode, expect, read_timeout, max_recv)` | 单次 TCP 往返：连实例 → 发 payload（文本或 hex）→ 收回显（hex + ascii 双视图） | pwn 打栈溢出、crypto 连 oracle 服务、misc 连通性 |
 | `tcp_batch(host, port, payloads, hex_mode, read_timeout, same_conn)` | 同连接顺序发 N 个 payload 并汇总每条响应（≤200/次） | padding oracle、盲爆破 |
-| `pwnsession(host, port, steps, tls, sni, read_timeout, max_recv, total_timeout)` | **持久** TCP/TLS 会话：一次调用跑完「banner → 多步 send/expect」（≤40 步），每步返回 hex+ascii 回显；`send_hex` 发二进制、`expect` 命中即下一步 | pwn 菜单/协议题、nc 式交互（借鉴 EnIGMA 的 Interactive Agent Tools，见 `docs/open-source-ctf-agents-2026-11-17.md`） |
+| `pwnsession(host, port, steps, tls, sni, read_timeout, max_recv, total_timeout, vars)` | **持久** TCP/TLS 会话：一次调用跑完「banner → 多步 send/expect」（≤40 步），每步返回 hex+ascii 回显；`send_hex` 发二进制、`expect` 命中即下一步；**step 支持会话内计算**：`let` 赋值 + `{pack(表达式)}`/`{p32()}`/`{hex()}`/`{变量}` 模板，offset→payload→发送一次完成 | pwn 菜单/协议题、nc 式交互（借鉴 EnIGMA 的 Interactive Agent Tools，见 `docs/open-source-ctf-agents-2026-11-17.md`） |
 | `ghidra_decompile`（镜像内 CLI，经 `shell` 调用，不是域工具） | Ghidra headless 反编译：`ghidra_decompile <bin> [--function NAME] [--limit N]` 直接出 C 伪代码；镜像自 2026-11-17 内置（JDK25+Ghidra 12.2），rev2 彩排实测 7 次调用解出判据链 | rev 首选（`--function` 定点看校验函数）；pwn 看 main/submit 分支 |
 | `fileview(path, mode, start_line, count, needle, replace, line_end)` | 文本文件视图（2026-11-17 二轮，整篇移植 EnIGMA 的 `open`/`goto`/`scroll`/`search_file`/`edit`）：`lines` 按行窗口带行号、`search` 关键词搜行、`list` 列目录、`edit` 按行区间改写；二进制自动拒绝并建议 hexpeek/elfpeek | rev/pwn 读源码、脚本、伪代码输出；替代「shell cat/sed 扫文件」 |
 | `elfpeek(path, view, min_len, limit)` | 纯 stdlib ELF 解析：`info`（架构/入口/PIE/NX/canary/RELRO）/`sections`/`symbols`/`strings`/`gadgets` | pwn 偏移与缓解、reverse 静态 |

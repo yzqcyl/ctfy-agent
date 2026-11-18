@@ -138,6 +138,24 @@ def case_fileview() -> None:
         check("fileview 缺文件报错", "不存在" in str(exc) or "no_such" in str(exc), str(exc)[:120])
 
 
+def case_templates() -> None:
+    """会话内计算：受限算式 + 发送模板（第 5 轮卡点：offset 与发送跨调用）。"""
+    from ctfy_agent.tools_domain_ext import DomainToolError, _tmpl_eval, _tmpl_expand  # noqa: PLC0415
+
+    check("模板算式：算术/位运算", _tmpl_eval("0x48 + 8*2", {}) == 0x58)
+    check("模板算式：变量", _tmpl_eval("off + 4", {"off": 72}) == 76)
+    check("模板 pack：8 字节小端 hex", _tmpl_expand("{pack(0x48)}", {}, as_hex=True) == "4800000000000000")
+    check("模板 p32", _tmpl_expand("{p32(off+1)}", {"off": 0x41}, as_hex=True) == "42000000")
+    check("模板 hex()", _tmpl_expand("addr={hex(0x10+1)}", {}, as_hex=False) == "addr=0x11")
+    check("模板 {变量}", _tmpl_expand("{off}", {"off": 72}, as_hex=False) == "72")
+    for bad in ("{pack(off)}", "{nope}"):
+        try:
+            _tmpl_expand(bad, {}, as_hex=False)
+            check("模板非法用法报错 %r" % bad, False, "没有抛错")
+        except DomainToolError:
+            check("模板非法用法报错 %r" % bad, True)
+
+
 def case_session() -> None:
     from ctfy_agent.tools_domain_ext import call_domain  # noqa: PLC0415
 
@@ -212,6 +230,7 @@ def case_whitelist() -> None:
 def main() -> int:
     case_wiring()
     case_fileview()
+    case_templates()
     case_session()
     case_errors()
     case_whitelist()
