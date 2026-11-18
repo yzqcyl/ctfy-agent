@@ -45,6 +45,7 @@ from .tools_local import (
     HTTP_SPEC,
     MAP_SPEC,
     NOTE_SPEC,
+    PWNLOCAL_SPEC,
     REPORT_SPEC,
     SHELL_SPEC,
     TRAFFIC_SPEC,
@@ -1006,6 +1007,9 @@ class Crew:
             specs.append(CHAT_SPEC)
         if "shell" in local:
             specs.append(SHELL_SPEC)
+        if "pwnlocal" in local:
+            # 本地运行附件 + gdb -batch（PWN/REV 的「本地优先」闭环；显式登记才可见）
+            specs.append(PWNLOCAL_SPEC)
         if "fuzz" in local:
             specs.append(FUZZ_SPEC)  # P2：ffuf 封装，只有显式登记 local 的角色才看得见
         if "authdiff" in local:
