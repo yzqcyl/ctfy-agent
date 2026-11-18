@@ -3,7 +3,7 @@
 
 用法（真实网关）：
     export OPENAI_BASE_URL="https://<厂商>.<会话域名>"
-    export OPENAI_API_KEY="pk_<会话凭据>"
+    export OPENAI_API_KEY="<会话凭据>"
     export OPENAI_MODEL="<网关模型名>"
     python3 tools/linux_bootstrap/gateway_smoke.py
 

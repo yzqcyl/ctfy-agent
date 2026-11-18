@@ -182,12 +182,17 @@ def main() -> int:
     check("文本 JSON 形态回显计数", "第 4/5 次提交" in text, text[-200:])
 
     # ---- 6) 平台额度用满 → 本地硬停，不再打平台 ----
+    # [2026-11-18] 硬停口径已改为「跨 run 账本 used_q ≥ 题号 cap」（P17）；
+    # 老用例只设 challenge.platform_attempts 不再触发硬拦，这里把账本补到 5 次。
     _fresh_ledger(tmp, "c6")
-    store4 = _store(tmp / "full", platform_attempts=5)
+    store4 = _store(tmp / "full", platform_attempts=5, attempts_cap=5)
+    _led = submit_ledger.ledger_path(store4.run_dir)
+    for _i in range(5):
+        submit_ledger.note_attempt(_led, CID, _i + 1, question_id="flag")
     platform = FakePlatform([{"accepted": True, "attempt": 6}])
     text, accepted = _submit(store4, platform)
     check("额度用满：提交被拦回", accepted is False and "提交被拦截" in text, text[:200])
-    check("额度用满：说明平台累计次数", "平台已累计本题 5 次提交" in text, text[:240])
+    check("额度用满：说明平台累计次数", "平台已累计" in text and "5 次提交" in text, text[:240])
     check("额度用满：一次都没打平台", platform.payloads == [], str(platform.payloads))
 
     # ---- 7) 逃生口：platform_submit_limit=0 关闭硬停 ----

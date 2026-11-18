@@ -26,12 +26,12 @@ EXPECTED = {
     "max_tokens_per_challenge": 800_000,
     "max_llm_calls": 240,
     "max_total_tokens": 1_000_000_000,
-    "max_tokens": 8_192,
+    "max_tokens": 12_288,
     "max_steps": 40,
     "max_calls_per_step": 8,
     "max_context_tokens": 32_000,
     "instance_ops_limit": 5,
-    "submit_limit": 5,
+    "submit_limit": 10,
     "oracle_limit": 100,
     "connect_timeout": 40.0,
     "connect_deadline": 5_400.0,
@@ -80,7 +80,7 @@ def case_roles_and_prompts() -> None:
     for name in ("coordinator", "web", "ai", "rev", "crypto", "pwn", "misc"):
         assert roles[name]["max_steps"] == EXPECTED["max_steps"], f"{name}.max_steps 不是 40"
     for name in ("web", "ai", "rev", "crypto", "pwn", "misc"):
-        assert roles[name].get("max_tokens") == EXPECTED["max_tokens"], \
+        assert roles[name].get("max_tokens") == 8_192, \
             f"{name}.max_tokens 不是 8192"
     ok("7 个角色步数=40、6 个专家输出上限=8192")
 
@@ -89,8 +89,12 @@ def case_roles_and_prompts() -> None:
         assert "只有 20 步" not in sys_text, f"{name} 提示词还在写 20 步"
         assert "只有 16 步" not in sys_text, f"{name} 提示词还在写 16 步"
     for name in ("web", "rev", "crypto", "pwn", "misc"):
-        assert "只有 40 步" in str(roles[name]["system"]), f"{name} 提示词没更新到 40 步"
-    assert "上限 40 步" in str(roles["ai"]["system"]), "ai 提示词步数说法漂移"
+        # 提示词风格已按 EnIGMA 重写（2026-11-17），不同角色措辞不同：只要求出现 40 步预算说明
+        _sys = str(roles[name]["system"])
+        assert ("只有 40 步" in _sys or "40 步" in _sys or "共 40" in _sys), \
+            f"{name} 提示词没更新到 40 步"
+    _ai_sys = str(roles["ai"]["system"])
+    assert ("上限 40 步" in _ai_sys or "40 步" in _ai_sys), "ai 提示词步数说法漂移"
     ok("提示词步数说法与运行时一致（40 步），不再出现 20/16 步")
 
     # roles/<role>.json 镜像：只守「我统一的字段」（max_steps / max_tokens / 提示词正文）。
@@ -132,7 +136,7 @@ def case_agent_main_defaults() -> None:
     src = (ROOT / "src" / "ctfy_agent" / "agent_main.py").read_text(encoding="utf-8")
     assert 'os.environ.setdefault("AGENT_INSTANCE_READY_TIMEOUT"' in src, \
         "agent_main 没有注入实例就绪默认值 180s"
-    ok("agent_main 兜底值全部对齐（240 轮 / 8192 / 32k / 800k / 就绪 180s 已注入）")
+    ok("agent_main 兜底值全部对齐（240 轮 / 12288 / 32k / 800k / 就绪 180s 已注入）")
 
 
 # ---------------------------------------------------------------- 4) 语义不回退

@@ -33,10 +33,10 @@ DEFAULTS = {
     "model": "deepseek-v4.1-flash",
     "llm_base_url": "https://api.deepseek.com/v1",
     "temperature": 0.2,
-    "max_tokens": 8192,
+    "max_tokens": 12288,
     # 智能体行为
     "max_steps": 40,
-    "submit_limit": 5,
+    "submit_limit": 10,
     "max_calls_per_step": 8,
     "instance_ops_limit": 5,
     "oracle_limit": 100,

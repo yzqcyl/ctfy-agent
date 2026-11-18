@@ -39,7 +39,7 @@ from .state import Store
 SCHEMA_VERSION = 3  # v3（2026-11-05）：平台预启实例、token 单题作用域；见 runs/site/standards-live/CTFY-0001.md
 DEFAULT_WORK_DIR = "/ctfy/work"
 DEFAULT_MAX_TURNS = 240         # task.json.max_turns 为 null（无预算）时的上限；统一口径=config/agent.json 的 max_llm_calls
-DEFAULT_MAX_TOKENS = 8192       # 4096 会在 thinking 块截断、一步即「无动作结束」
+DEFAULT_MAX_TOKENS = 12288      # 4096 会在 thinking 块截断、一步即「无动作结束」
 DEFAULT_MAX_CONTEXT = 32000  # 对齐 agent.json 与各角色提示词的「上下文 32k」承诺（原 16000 导致 16k 就丢旧步骤，模型按 32k 规划却提前失忆）
 DEFAULT_MAX_TOKENS_PER_CHALLENGE = 800000
 DEFAULT_INSTANCE_READY_TIMEOUT = 180  # 统一口径：.env 与本地实测都用 180s（solver 默认 45s，仅兜底）

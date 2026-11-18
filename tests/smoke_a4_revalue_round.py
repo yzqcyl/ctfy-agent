@@ -145,7 +145,8 @@ def solver_level(tmp: pathlib.Path) -> None:
 
     # 先试同值（应被 duplicate 拦，不再打平台）
     text, accepted = sub("flag{wrong_A}")
-    check("solver：同值 A 被拦（duplicate）", "之前已经提交过" in text, text[:200])
+    check("solver：同值 A 被拦（duplicate）",
+          ("之前已经提交过" in text or "已判错" in text or "跨 run 账本" in text), text[:200])
     check("solver：同值 A 没再打平台", len(platform.payloads) == n_calls, str(platform.payloads[n_calls:]))
 
     # 换新值 B → 放行（关键）

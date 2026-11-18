@@ -4,7 +4,7 @@
 # 前置：
 #   1) 平台「本地 Agent 会话」生成网关变量，写入 $HOME/gateway.env（权限 600）：
 #        export OPENAI_BASE_URL="https://<厂商>.<会话域名>"
-#        export OPENAI_API_KEY="pk_<会话凭据>"
+#        export OPENAI_API_KEY="<会话凭据>"
 #        export OPENAI_MODEL="<网关支持的模型名>"      # 可选，视赛段/厂商
 #        export CTFY_TOKEN="pf_xxx"                    # 平台解题令牌（agent_play 模板）
 #        export AGENT_COMPETITION_ID="c0d8b4e3dd3b42c095d63d7dfa66431f"

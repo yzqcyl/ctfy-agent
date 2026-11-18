@@ -10,7 +10,7 @@
 #   sh tools/linux_bootstrap/vm_test.sh
 #   # 3) 走真实网关时：
 #   export OPENAI_BASE_URL="https://<厂商>.<会话域名>"
-#   export OPENAI_API_KEY="pk_<会话凭据>"
+#   export OPENAI_API_KEY="<会话凭据>"
 #   export OPENAI_MODEL="<网关模型名>"
 #   sh tools/linux_bootstrap/vm_test.sh --gateway
 set -eu
