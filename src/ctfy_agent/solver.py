@@ -57,6 +57,16 @@ _DUP_BRAKE_STOP = (
     "下一步只有两条路：①换一个**方法族**（不是换参数）；②立即 report 交付卡点。\n"
     "再重复同类调用等于把本题剩余预算白扔。"
 )
+# ---------- 本地优先（2026-11-18） ----------
+# 记录实测：pwn 专家 15 分钟里 66 次 shell 全是「写远程脚本打实例」，pwnlocal 一次没调用
+# （spec 明明在工具面里）。长 system prompt 里的规则会被忽略，所以开跑时单独注入一条。
+_LOCAL_FIRST_RULE = (
+    "【本地优先·强制】第 1 步必须调用 pwnlocal 在本容器里运行附件：先空 stdin 跑一次看"
+    "退出码/输出；需要偏移或崩溃点就加 gdb=true（可配 gdb_cmds）。"
+    "只有本地跑通、或 pwnlocal 明确报「无法本地运行」之后，才允许写远端 exploit / 连实例。"
+    "远端盲试不算实验证据。"
+)
+
 DUP_BRAKE_HINT_AT = 6
 DUP_BRAKE_STRONG_AT = 12
 DUP_BRAKE_STOP_AT = 18
@@ -2931,6 +2941,14 @@ class Solver:
             {"role": "user", "content": task},
         ]
         self.store.append_transcript(challenge_id, {"role": role, "content": task})
+
+        # 本地优先：pwn/rev 拿到 pwnlocal 就确定性要求先本地跑（见 _LOCAL_FIRST_RULE）
+        _spec_names = {str((s.get("function") or {}).get("name") or "") for s in (specs or [])}
+        if "pwnlocal" in _spec_names and role in ("pwn", "rev"):
+            messages.append({"role": "user", "content": _LOCAL_FIRST_RULE})
+            self.store.append_transcript(
+                challenge_id, {"role": role, "local_first": "注入 pwnlocal 本地优先指令"}
+            )
 
         # 与 solve() 同一套成本机制：事实块常驻头部 user 消息 + 工具结果瘦身
         base_head = task
