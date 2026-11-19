@@ -302,6 +302,27 @@ RUN apt-get update \
 
 # 能力自检（功能级，不只是 import）：二维码生成→解码、pcap 写→读、AES zip 往返、
 # steghide/7z 真实往返…… 构建期跑 3 轮（同一套探针重复三轮，避免「一次碰巧过」）。
+# ---------- v9：prompt 承诺与工具面一致性（2026-11-19 评审第 2 条） ----------
+# 背景：tools/ 被 .dockerignore 排除 → gdb_pwn.py（pwndbg-lite）等脚本在镜像里不存在，
+# 但 rev/pwn prompt/method card 会引导模型去用；VPS 挂 repo 跑掩盖了它，平台托管形态直接踩。
+# 这里把需要的脚本显式 COPY 进来，并在构建期跑一致性检查，不一致就让构建失败。
+ARG WIREPROXY_VERSION=1.1.3
+ARG WIREPROXY_SHA256=70ae5e52223dac7974af8d98a321f14a0e1689d2b14655ebc8dadfa1ec69466d
+RUN curl -fsSL "https://github.com/pufferffish/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_amd64.tar.gz" \
+      -o /tmp/wireproxy.tar.gz \
+ && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
+ && echo "${WIREPROXY_SHA256}  /usr/local/bin/wireproxy" | sha256sum -c - \
+ && chmod 755 /usr/local/bin/wireproxy \
+ && rm -f /tmp/wireproxy.tar.gz \
+ && wireproxy --version
+
+COPY tools/linux_bootstrap/gdb_pwn.py /ctfy/tools/gdb_pwn.py
+COPY tools/linux_bootstrap/ghidra_decompile.py /ctfy/tools/ghidra_decompile.py
+COPY tools/check_prompt_tools.py /ctfy/tools/check_prompt_tools.py
+ENV PATH="/ctfy/tools:${PATH}"
+RUN chmod 755 /ctfy/tools/gdb_pwn.py /ctfy/tools/ghidra_decompile.py \
+ && python /ctfy/tools/check_prompt_tools.py
+
 COPY tools/check_capabilities.py /ctfy/tools/check_capabilities.py
 RUN python /ctfy/tools/check_capabilities.py --binaries --rounds 3
 
