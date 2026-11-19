@@ -320,8 +320,7 @@ COPY tools/linux_bootstrap/gdb_pwn.py /ctfy/tools/gdb_pwn.py
 COPY tools/linux_bootstrap/ghidra_decompile.py /ctfy/tools/ghidra_decompile.py
 COPY tools/check_prompt_tools.py /ctfy/tools/check_prompt_tools.py
 ENV PATH="/ctfy/tools:${PATH}"
-RUN chmod 755 /ctfy/tools/gdb_pwn.py /ctfy/tools/ghidra_decompile.py \
- && python /ctfy/tools/check_prompt_tools.py
+RUN chmod 755 /ctfy/tools/gdb_pwn.py /ctfy/tools/ghidra_decompile.py
 
 COPY tools/check_capabilities.py /ctfy/tools/check_capabilities.py
 RUN python /ctfy/tools/check_capabilities.py --binaries --rounds 3
@@ -348,6 +347,8 @@ WORKDIR /ctfy
 # stdlib-only：只拷源码 + 角色 profile（web allow_shell / 各角色 system 提示词等；无凭据）
 COPY src/ /ctfy/src/
 COPY config/agent.json /ctfy/config/agent.json
+# v9 一致性检查：必须在 config/agent.json 就位后跑（否则 prompt 读不到 -> 构建失败）
+RUN python /ctfy/tools/check_prompt_tools.py
 
 # ---------- [v7] 镜像不带 GUI / 多平台档案适配器：构建期硬校验 ----------
 # 正赛容器只跑 `python -m ctfy_agent agent`（CTFY 单平台）。src/ctfy_agent/gui/ 里是
