@@ -322,6 +322,8 @@ CATEGORY_FALLBACK: dict[str, str] = {
         "或「只有 syscall 包装」时用 SROP（sigreturn frame 设 execve，先把 frame 写到可写段）；"
         "④ 64 位无 pop rdi → ret2csu（__libc_csu_init 的 call gadget）；"
         "⑤ 有格式化串 → 先 %p 定位参数偏移，再 %n 任意写；⑥ 堆题 → 先看 malloc/free 顺序、tcache double-free/UAF。"
+        "协议/菜单题（如 easyROPtocol）：先逆出报文结构与状态机，本地写脚本用 pwntools tube 跑通"
+        "「连接→握手→构造 payload→触发」全流程，再打远端；每步 recvuntil + 超时兜底，别裸 recv。"
         "纪律：偏移用 pwnlocal+gdb 本地确认（gdb=true 看 $eip/$rip 与栈），本地跑不通不许打远端。"
     ),
     "rev": (
@@ -331,6 +333,14 @@ CATEGORY_FALLBACK: dict[str, str] = {
         "用差分把「输入→比较→输出」钉死；④ 校验是方程/约束 → 把比较翻成 z3（z3solve）解；"
         "⑤ 常见算法手工复现：异或/RC4/TEA/XTEA/迷宫/矩阵乘法/Base 变体；"
         "⑥ 静态链接/被 strip → 用 relocs 与字符串交叉定位；.pyc/PyInstaller 用 elfpeek view=bytecode。"
+    ),
+    "misc": (
+        "MISC 决策表（按类型选工具，别用 shell 硬拼）："
+        "① 先判型：file/strings/hexpeek 看头尾与附加数据；② 压缩包→unpack_archive（伪加密/CRC/明文碰撞）；"
+        "③ 流量包（pcap）→ 优先 scapy/dpkt 解析：http 流提取、过滤目标 host、找上传/回连；"
+        "tshark 不保证有，别卡在装工具上；④ Webshell/回连流量→搜 POST body 与响应里的命令回显、"
+        "base64/hex 解码后再看；⑤ 取证/内存→volatility 思路：先 strings 找明文，再看进程/网络；"
+        "⑥ 编码链→decode_blob 逐层剥（base32/base64/hex/rot/URL），每层留一行断言。"
     ),
     "crypto": (
         "CRYPTO 决策表：① 先判题型（RSA/分组密码/流密码/哈希/格/协议）；② RSA 先试 "
@@ -345,6 +355,27 @@ def fallback_cards(category: str, limit: int = 1) -> list[str]:
     """按 category 返回兜底打法卡（无 tags 时用）；未知类别返回空列表。"""
     card = CATEGORY_FALLBACK.get(str(category or "").strip().lower(), "")
     return [card][:limit] if card else []
+
+
+# 2026-11-19：测试暴露的 misc / 协议题关键词 → 打法卡（与 DOMAIN_CARDS 同表合并）
+_EXTRA_CARDS: list[tuple[tuple[str, ...], str]] = [
+    (("pcap", "traffic", "network_forensics", "wireshark", "流量"),
+     "流量分析：scapy/dpkt 解析而不是硬拼 tshark；先 http 流与上传/回连，再按 host/端口过滤；"
+     "可疑载荷 base64/hex 解一层再读。"),
+    (("webshell", "webshell_traffic", "backdoor"),
+     "Webshell 流量：搜 POST body 与响应命令回显；base64/hex/自定义魔数解一层；"
+     "对照时间线找「上传点→执行→回连」。"),
+    (("forensics", "memory", "disk", "volatility", "取证"),
+     "取证：先 strings/file 判型，再按镜像/内存/日志分支；内存看进程与网络连接的明文；"
+     "时间线是主力证据，别一开始就装重型工具。"),
+    (("stego", "image", "audio", "隐写"),
+     "隐写：先看附加数据（binwalk/foremost 思路）、PNG 文本块、EXIF；再做 LSB/异或/频域；"
+     "每层都要有可复现断言。"),
+    (("protocol", "binary_protocol", "pwn_protocol"),
+     "协议题：逆报文结构与状态机 → 本地 pwntools tube 跑通全流程 → 再打远端；"
+     "每步 recvuntil+超时，保留状态同步。"),
+]
+DOMAIN_CARDS = list(DOMAIN_CARDS) + _EXTRA_CARDS
 
 
 def domain_cards(tags, limit: int = MAX_CARDS) -> list[str]:

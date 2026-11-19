@@ -39,9 +39,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    # 8 张 = 4 方向 × 2（rev/pwn/crypto/misc 各 2）；2026-11-13 又补了 udp 卡（UDP 服务打法），
-    # 所以现在是 9 张。改了卡表就同步这里，别让计数漂移成「测试过期」。
-    check("方向卡共 9 张（4 方向 × 2 + udp）", len(DOMAIN_CARDS) == 9, str(len(DOMAIN_CARDS)))
+    # 9 张 = 4 方向 × 2 + udp；2026-11-19 又补 5 张（pcap/webshell/forensics/stego/protocol）
+    # 所以现在是 14 张。改了卡表就同步这里，别让计数漂移成「测试过期」。
+    check("方向卡共 14 张（4 方向 × 2 + udp + 5 张 misc/协议卡）",
+          len(DOMAIN_CARDS) == 14, str(len(DOMAIN_CARDS)))
 
     cases = {
         "REV": ["python", "xor", "per-team-artifact"],
@@ -85,7 +86,7 @@ def main() -> int:
     # [2026-11-18] 无 tag 命中时按 category 注入 writeup 决策表兜底卡（pwn/rev/crypto）
     check("门控：无 tag 的 rev 走 category 兜底卡", hint("rev", ["nope"]).startswith("打法提示"))
     check("门控：无 tag 的 pwn 走 category 兜底卡", hint("pwn", []).startswith("打法提示"))
-    check("门控：misc 无 tag 不注入", hint("misc", ["nope"]) == "")
+    check("门控：misc 无 tag 走 category 兜底卡", hint("misc", ["nope"]).startswith("打法提示"))
     check("门控：未知类别不注入", hint("unknown-cat", []) == "")
     check("门控：web 题仍走 web/AI 卡", hint("web", ["sqli"]).startswith("打法提示"))
     check("门控：AI tag 仍走 ASI 卡", "ASI01" in hint("web", ["owasp_2026_asi01"]))

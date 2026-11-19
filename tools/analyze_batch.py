@@ -16,15 +16,23 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-TOOL_NOISE = [
-    (re.compile(r"python3"), "用 python3（本机是 Windows，可能没有该命令）"),
-    (re.compile(r"\btee\b"), "用 tee（Windows 无此命令）"),
-    (re.compile(r"/bin/(?:sh|bash)"), "用 /bin/sh 或 /bin/bash（Windows 无）"),
+# 环境坑模式表。
+# 跨平台习惯差异（python3/tee//bin/sh）只在 Windows 宿主跑批时才算环境坑；
+# Linux 容器里它们是正常命令，计进去会淹没真实问题（2026-11-19 批跑实测误报 700+ 条）。
+TOOL_NOISE: list[tuple[re.Pattern[str], str]] = []
+if os.name == "nt":
+    TOOL_NOISE += [
+        (re.compile(r"python3"), "用 python3（本机是 Windows，可能没有该命令）"),
+        (re.compile(r"\btee\b"), "用 tee（Windows 无此命令）"),
+        (re.compile(r"/bin/(?:sh|bash)"), "用 /bin/sh 或 /bin/bash（Windows 无）"),
+    ]
+TOOL_NOISE += [
     (re.compile(r"command not found|不是内部或外部命令|无法将.*项识别为"), "命令不存在"),
     (re.compile(r"Permission denied|拒绝访问"), "权限被拒"),
     (re.compile(r"UnicodeEncodeError|codec can't encode|gbk"), "控制台编码坑"),

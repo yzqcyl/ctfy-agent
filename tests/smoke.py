@@ -3052,7 +3052,10 @@ def case_a3_method_cards(tmp: Path) -> None:
     assert "打法提示" in Solver._role_context(item)
     assert "打法提示" in Solver._initial_prompt(item, LocalTools(store, "web-01"))
     misc = Challenge(id="A3-M", category="misc", tags=tags_035)
-    assert Solver._method_hint(misc) == "" and "打法提示" not in Solver._role_context(misc)
+    # [2026-11-19] 无 tag 的题按 category 兜底注入决策表（pwn/rev/crypto/misc）
+    assert "打法提示" in Solver._method_hint(misc) and "打法提示" in Solver._role_context(misc)
+    _unknown = Challenge(id="T-2", name="t", category="unknown-cat", tags=[])
+    assert Solver._method_hint(_unknown) == ""
     unknown = Challenge(id="A3-U", category="web", tags=["not_a_real_tag"])
     assert Solver._method_hint(unknown) == ""
 
